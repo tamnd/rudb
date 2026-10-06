@@ -18,7 +18,9 @@
 //! when it has a quote in it, and then only to check that the quotes are where a quoted field puts
 //! them. A quote anywhere else, which is a literal character in the middle of a bare field, hands
 //! that one record to the byte loop, since the parity trick has no way to know the quote was not
-//! meant. A dialect whose escape is not its quote is read by the byte loop throughout.
+//! meant. A dialect whose escape is not its quote, such as the backslash of the JOB files, has the
+//! bytes its escapes cover taken out of the quote and field ending bits first, and a field with an
+//! escape in it is checked the same way a field with a quote in it is.
 //!
 //! Fields used to arrive as owned strings, a copy per field before the conversion made a second
 //! one. The borrowed ranges were the change to make when there was a number saying it mattered, and
@@ -374,8 +376,10 @@ pub fn records(
 ) -> Result<usize> {
     let quote = dialect.quote_byte();
     let delimiter = dialect.delimiter;
+    let escape = dialect.escape_byte();
     let structural = |byte: u8| byte == quote || byte == b'\n' || byte == b'\r';
-    if dialect.escape_byte() == quote && !structural(delimiter) {
+    let masked = escape == quote || (!structural(escape) && escape != delimiter);
+    if masked && !structural(delimiter) {
         blocks(bytes, from, dialect, eof, limit, out)
     } else {
         let mut at = from;
@@ -401,6 +405,13 @@ pub fn records(
 /// were outside a quote at its start and nothing in it flips them. A field with a quote in it is
 /// checked, and one that is not shaped like a quoted field goes to the byte loop from the start of
 /// its record, after which the blocks start again behind that record with the parity cleared.
+///
+/// An escape that is not the quote is a fourth mask. Each escape the one before it does not cover
+/// covers the byte after it, and the covered bytes are taken out of the quotes before the prefix
+/// XOR and out of the field endings after it, which is what the byte loop does inside a quoted
+/// field. Outside one the byte loop reads an escape as itself, so a field with an escape in it is
+/// checked like one with a quote in it, and a bare field with either goes to the byte loop. The JOB
+/// files escape with a backslash, and until this every byte of them went through that loop.
 fn blocks(
     bytes: &[u8],
     from: usize,
@@ -411,6 +422,7 @@ fn blocks(
 ) -> Result<usize> {
     let delimiter = dialect.delimiter;
     let quote = dialect.quote_byte();
+    let escape = dialect.escape_byte();
     let len = bytes.len();
     let mut record = from;
     loop {
@@ -420,13 +432,17 @@ fn blocks(
         let mut field = record;
         let mut quoted = false;
         let mut inside = 0u64;
+        let mut carried = false;
         let mut block = record;
         'blocks: while block < len && out.len() < limit {
             let end = len.min(block + 64);
-            let (quotes, ends, lines) = masks(&bytes[block..end], delimiter, quote);
-            let prefix = prefix_xor(quotes) ^ inside;
+            let (quotes, ends, lines, escapes) =
+                masks(&bytes[block..end], delimiter, quote, escape);
+            let covered = if escape == quote { 0 } else { covered_by(escapes, &mut carried) };
+            let marked = quotes | escapes;
+            let prefix = prefix_xor(quotes & !covered) ^ inside;
             inside = 0u64.wrapping_sub(prefix >> 63);
-            let mut structural = ends & !prefix;
+            let mut structural = ends & !prefix & !covered;
             while structural != 0 {
                 let bit = structural.trailing_zeros() as usize;
                 structural &= structural - 1;
@@ -436,8 +452,8 @@ fn blocks(
                     continue;
                 }
                 let low = field.saturating_sub(block);
-                if quoted || quotes & below(bit) & !below(low) != 0 {
-                    let Some(escaped) = enclosed(&bytes[field..at], quote) else {
+                if quoted || marked & below(bit) & !below(low) != 0 {
+                    let Some(escaped) = enclosed(&bytes[field..at], quote, escape) else {
                         break 'blocks;
                     };
                     out.spans.push(Span::new(field + 1, at - 1, escaped));
@@ -471,7 +487,7 @@ fn blocks(
                     return Ok(record);
                 }
             }
-            if field < end && quotes >> field.saturating_sub(block) != 0 {
+            if field < end && marked >> field.saturating_sub(block) != 0 {
                 quoted = true;
             }
             block = end;
@@ -491,15 +507,15 @@ fn blocks(
     }
 }
 
-/// The quotes in a block of up to sixty four bytes, the bytes that can end a field, and of those
-/// the ones that can end a line, one bit a byte with the first byte in the lowest bit.
+/// The quotes in a block of up to sixty four bytes, the bytes that can end a field, of those the
+/// ones that can end a line, and the escapes, one bit a byte with the first byte in the lowest bit.
 ///
 /// A short block at the end of the buffer is padded and the bits for the padding are cleared
 /// afterwards, so the padding byte does not have to be one that cannot be a delimiter.
 #[inline]
-fn masks(block: &[u8], delimiter: u8, quote: u8) -> (u64, u64, u64) {
-    let needles = [quote, delimiter, b'\n', b'\r'];
-    let [quotes, delimiters, newlines, returns] = if let Ok(full) = block.try_into() {
+fn masks(block: &[u8], delimiter: u8, quote: u8, escape: u8) -> (u64, u64, u64, u64) {
+    let needles = [quote, delimiter, b'\n', b'\r', escape];
+    let [quotes, delimiters, newlines, returns, escapes] = if let Ok(full) = block.try_into() {
         rudb_vector::bytes::masks(full, needles)
     } else {
         let mut padded = [0u8; 64];
@@ -508,7 +524,32 @@ fn masks(block: &[u8], delimiter: u8, quote: u8) -> (u64, u64, u64) {
         rudb_vector::bytes::masks(&padded, needles).map(|mask| mask & live)
     };
     let lines = newlines | returns;
-    (quotes, delimiters | lines, lines)
+    (quotes, delimiters | lines, lines, escapes)
+}
+
+/// The bytes the escapes in `escapes` cover, for a dialect whose escape is not its quote.
+///
+/// An escape covers the byte after it unless an escape before it covered the escape itself, which
+/// is how `\\` is one backslash and leaves the byte after it alone. `carried` says the first byte
+/// of this block is covered by an escape that ended the block before, and comes back saying the same
+/// of the next block. Escapes are rare in text, so this walks them one at a time.
+fn covered_by(escapes: u64, carried: &mut bool) -> u64 {
+    let mut covered = 0u64;
+    let mut rest = escapes;
+    if std::mem::take(carried) {
+        covered |= 1;
+        rest &= !1;
+    }
+    while rest != 0 {
+        let bit = rest.trailing_zeros();
+        if bit == 63 {
+            *carried = true;
+            break;
+        }
+        covered |= 2 << bit;
+        rest &= !(3 << bit);
+    }
+    covered
 }
 
 /// Every bit set that has an odd number of set bits at or below it in `bits`.
@@ -533,7 +574,30 @@ const fn below(count: usize) -> u64 {
 /// exactly the field the byte loop would read as quoted and close on the last byte. Pairs are taken
 /// from the left the way the byte loop takes them, so `"a"""` is `a"` and `"a""` is not a field the
 /// byte loop would have closed where it stops.
-fn enclosed(field: &[u8], quote: u8) -> Option<bool> {
+///
+/// With an escape that is not the quote, an escape takes the byte after it whatever it is, and the
+/// first quote no escape takes has to be the last byte of the field.
+fn enclosed(field: &[u8], quote: u8, escape: u8) -> Option<bool> {
+    if escape != quote {
+        let [first, inner @ ..] = field else { return None };
+        if *first != quote {
+            return None;
+        }
+        let mut escaped = false;
+        let mut at = 0;
+        loop {
+            let found =
+                at + inner[at..].iter().position(|&byte| byte == quote || byte == escape)?;
+            if inner[found] == quote {
+                return (found + 1 == inner.len()).then_some(escaped);
+            }
+            if found + 1 >= inner.len() {
+                return None;
+            }
+            escaped = true;
+            at = found + 2;
+        }
+    }
     let [first, inner @ .., last] = field else { return None };
     if *first != quote || *last != quote {
         return None;
@@ -864,7 +928,7 @@ mod agree {
     #[test]
     fn the_tricky_ones_split_the_same_both_ways() {
         let long = "x".repeat(61);
-        let cases: Vec<Vec<u8>> = vec![
+        let mut cases: Vec<Vec<u8>> = vec![
             b"".to_vec(),
             b"\n".to_vec(),
             b"\n\n".to_vec(),
@@ -897,6 +961,12 @@ mod agree {
             format!("{long}ab\r\n{long}abc\r\n").into_bytes(),
             format!("\"{long}\"\"\",\"\n\"\n{long},x\"\n").into_bytes(),
         ];
+        // Backslash escapes on and either side of a block edge, a run of three among them.
+        for pad in 58..70 {
+            let pad = "x".repeat(pad);
+            cases
+                .push(format!("\"{pad}\\\"y\\\\\",z\n{pad}\\,w\n\"{pad}\\\\\\\"\"\n").into_bytes());
+        }
         for bytes in &cases {
             let cuts: Vec<usize> = (0..=bytes.len()).collect();
             for dialect in dialects() {
@@ -962,7 +1032,17 @@ mod agree {
                     }
                     body.extend_from_slice(piece);
                 }
-                match rng.below(4) {
+                match rng.below(5) {
+                    4 => {
+                        out.push(b'"');
+                        for &byte in &body {
+                            if byte == b'"' || byte == b'\\' {
+                                out.push(b'\\');
+                            }
+                            out.push(byte);
+                        }
+                        out.push(b'"');
+                    }
                     0 => {
                         out.push(b'"');
                         for &byte in &body {
