@@ -877,9 +877,19 @@ fn exact_out(run: Vec<i128>, width: Option<u8>, physical: PhysicalType) -> Optio
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match physical {
                 $(PhysicalType::$variant => {
-                    let mut out = Vec::with_capacity(run.len());
-                    for &whole in &run {
-                        out.push(<$native>::try_from(whole).ok()?);
+                    // A value that does not fit is noted rather than returned on, so the loop is
+                    // a narrowing of each value with no push and no exit in it.
+                    let mut wide = false;
+                    let out: Vec<$native> = run
+                        .iter()
+                        .map(|&whole| {
+                            let narrow = <$native>::try_from(whole);
+                            wide |= narrow.is_err();
+                            narrow.unwrap_or_default()
+                        })
+                        .collect();
+                    if wide {
+                        return None;
                     }
                     Data::$variant(out.into())
                 })+
