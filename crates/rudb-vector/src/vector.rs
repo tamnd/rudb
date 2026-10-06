@@ -8656,7 +8656,8 @@ mod tests {
         let words: Vec<u64> =
             (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
         let runs = [(0, 3), (5, 1), (63, 2), (70, 0), (100, 64), (299, 1)];
-        let rows: Vec<u32> = runs.iter().flat_map(|&(start, length)| start..start + length).collect();
+        let rows: Vec<u32> =
+            runs.iter().flat_map(|&(start, length)| start..start + length).collect();
         for width in [1, 7, 13, 32, 33, 50] {
             for ty in [LogicalType::BigInt, LogicalType::Integer] {
                 let base = if ty == LogicalType::BigInt { -1_000 } else { 0 };
@@ -8665,8 +8666,11 @@ mod tests {
                     .expect("enough words for 300 codes");
                 for at in [0, 1] {
                     let cut = whole.slice(at, 300 - at).expect("a cut inside the column");
-                    let runs: Vec<(u32, u32)> =
-                        runs.iter().filter(|&&(start, length)| start + length <= 299).copied().collect();
+                    let runs: Vec<(u32, u32)> = runs
+                        .iter()
+                        .filter(|&&(start, length)| start + length <= 299)
+                        .copied()
+                        .collect();
                     let rows: Vec<u32> = rows.iter().filter(|&&row| row < 299).copied().collect();
                     let got = cut.gather_runs(&runs).expect("runs inside the column");
                     assert_eq!(got.form(), Form::Flat);

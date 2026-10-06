@@ -692,9 +692,11 @@ fn list(local: &mut Walking) -> Result<()> {
     local.rids.clear();
     for &(first, length) in &local.runs {
         for rid in first..first + u64::from(length) {
-            local.rids.push(u32::try_from(rid).map_err(|_| {
-                Error::internal("a sibling row id is past what a gather can hold")
-            })?);
+            local.rids.push(
+                u32::try_from(rid).map_err(|_| {
+                    Error::internal("a sibling row id is past what a gather can hold")
+                })?,
+            );
         }
     }
     Ok(())
