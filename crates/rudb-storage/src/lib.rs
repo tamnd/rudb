@@ -35,7 +35,7 @@ pub use freezer::{Encoder, Freezer, Pass};
 pub use grams::Grams;
 pub use graveyard::{Cell, Graveyard, Seen};
 pub use horizon::{Horizons, Killed, Reads};
-pub use hot::{HotStripe, Lease, Width};
+pub use hot::{HotStripe, Lane, Lease, PartColumn, Width};
 pub use memory::MemoryTable;
 pub use mostly::{ReadGuard, ReadMostly, WriteGuard};
 pub use park::Wait;

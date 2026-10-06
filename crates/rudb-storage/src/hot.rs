@@ -24,6 +24,13 @@
 //! or the chunk and offset of the whole string in the stripe's [`Arena`]. An update writes a new
 //! view in place and the column never shifts.
 //!
+//! A scan reads a part at a time, `14-reads-stay-fast.md` section 14.2, with
+//! [`HotStripe::read_part`]: each column's cells copied as they are, the way a frozen vector is
+//! decoded, and then the few rows whose newest undo record the reader does not see put back from
+//! their chains. Finding those is one load a row of the part's undo heads, almost all 0, and the
+//! row of a vector that meets undo costs its walk and nothing more, so the rest of the vector
+//! stays on the fast path.
+//!
 //! A stripe is frozen in steps, `10-freezing-and-checkpoint.md` section 10.3. It is sealed, so
 //! it leases no more slots, and then marked freezing. From then on a row of it is not written in
 //! place: an update is refused with [`Refusal::Freezing`] and the caller moves the row, and a
@@ -137,6 +144,81 @@ impl Width {
     }
 }
 
+/// A column of a part as [`HotStripe::read_part`] reads it: the cells in their own width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lane {
+    /// [`Width::One`].
+    One(Vec<u8>),
+    /// [`Width::Two`].
+    Two(Vec<u16>),
+    /// [`Width::Four`].
+    Four(Vec<u32>),
+    /// [`Width::Eight`].
+    Eight(Vec<u64>),
+    /// [`Width::Sixteen`], and the views of [`Width::Text`], which [`HotStripe::text`] reads.
+    Sixteen(Vec<u128>),
+}
+
+impl Lane {
+    /// The value at `at`, zero extended.
+    ///
+    /// # Panics
+    ///
+    /// If `at` is past the end of the part.
+    #[must_use]
+    pub fn get(&self, at: usize) -> u128 {
+        match self {
+            Self::One(cells) => cells[at].into(),
+            Self::Two(cells) => cells[at].into(),
+            Self::Four(cells) => cells[at].into(),
+            Self::Eight(cells) => cells[at].into(),
+            Self::Sixteen(cells) => cells[at],
+        }
+    }
+
+    fn set(&mut self, at: usize, value: u128) {
+        match self {
+            Self::One(cells) => cells[at] = value as u8,
+            Self::Two(cells) => cells[at] = value as u16,
+            Self::Four(cells) => cells[at] = value as u32,
+            Self::Eight(cells) => cells[at] = value as u64,
+            Self::Sixteen(cells) => cells[at] = value,
+        }
+    }
+}
+
+/// A column of a part as a reader sees it: the values, and one bit a slot set when the value is
+/// not null. A null value is 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartColumn {
+    /// The values.
+    pub values: Lane,
+    /// The validity.
+    pub valid: Box<[u64; PART_WORDS]>,
+}
+
+impl PartColumn {
+    /// The value at `at`, or `None` for null.
+    #[must_use]
+    pub fn value(&self, at: usize) -> Option<u128> {
+        (self.valid[at / 64] & (1 << (at % 64)) != 0).then(|| self.values.get(at))
+    }
+
+    fn put(&mut self, at: usize, value: Option<u128>) {
+        let bit = 1 << (at % 64);
+        match value {
+            Some(value) => {
+                self.values.set(at, value);
+                self.valid[at / 64] |= bit;
+            }
+            None => {
+                self.values.set(at, 0);
+                self.valid[at / 64] &= !bit;
+            }
+        }
+    }
+}
+
 /// 64 arrays of 8,192 `T`, each allocated the first time it is asked for.
 #[derive(Debug)]
 struct Parts<T> {
@@ -226,6 +308,31 @@ impl Cells {
                 u128::from(c[2 * at].load(Ordering::Relaxed))
                     | (u128::from(c[2 * at + 1].load(Ordering::Relaxed)) << 64)
             }),
+        }
+    }
+
+    /// The cells of `part` as they are, or 0s if it was never allocated.
+    fn copy(&self, part: usize) -> Lane {
+        fn each<T: Copy + Default, A>(part: Option<&[A]>, load: impl Fn(&A) -> T) -> Vec<T> {
+            part.map_or_else(|| vec![T::default(); ROWS], |cells| cells.iter().map(load).collect())
+        }
+        match self {
+            Self::One(parts) => Lane::One(each(parts.get(part), |c| c.load(Ordering::Relaxed))),
+            Self::Two(parts) => Lane::Two(each(parts.get(part), |c| c.load(Ordering::Relaxed))),
+            Self::Four(parts) => Lane::Four(each(parts.get(part), |c| c.load(Ordering::Relaxed))),
+            Self::Eight(parts) => Lane::Eight(each(parts.get(part), |c| c.load(Ordering::Relaxed))),
+            Self::Sixteen(parts) => Lane::Sixteen(parts.get(part).map_or_else(
+                || vec![0; ROWS],
+                |cells| {
+                    cells
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            u128::from(pair[0].load(Ordering::Relaxed))
+                                | (u128::from(pair[1].load(Ordering::Relaxed)) << 64)
+                        })
+                        .collect()
+                },
+            )),
         }
     }
 
@@ -816,8 +923,77 @@ impl HotStripe {
         fence(Ordering::Acquire);
         let (part, at) = place(slot);
         let Some(undo) = self.undo.get(part) else { return };
+        self.undo_into(undo[at].load(Ordering::Acquire), columns, snapshot, txn | UNCOMMITTED, out);
+    }
+
+    /// The columns of part `part` as a reader at `snapshot` running as `txn` sees them, a vector
+    /// at a time, see the module documentation, and how many rows took their values from undo.
+    /// A slot the reader does not see reads as whatever it holds: [`Self::mask`] says which ones
+    /// it sees.
+    ///
+    /// # Panics
+    ///
+    /// If `part` is past the end of the stripe or a column does not exist.
+    #[must_use]
+    pub fn read_part(
+        &self,
+        part: u32,
+        columns: &[usize],
+        snapshot: u64,
+        txn: u64,
+        out: &mut Vec<PartColumn>,
+    ) -> usize {
+        let part = part as usize;
+        out.clear();
+        out.extend(columns.iter().map(|&column| {
+            let column = &self.columns[column];
+            let mut valid = Box::new([0; PART_WORDS]);
+            if let Some(words) = column.valid.get(part) {
+                for (out, word) in valid.iter_mut().zip(words) {
+                    *out = word.load(Ordering::Relaxed);
+                }
+            }
+            PartColumn { values: column.cells.copy(part), valid }
+        }));
+        // As in `read_as_of`: a value copied above that an update wrote means its record is at
+        // the head below.
+        fence(Ordering::Acquire);
+        let Some(heads) = self.undo.get(part) else { return 0 };
         let me = txn | UNCOMMITTED;
-        let mut next = undo[at].load(Ordering::Acquire);
+        let mut values = vec![None; columns.len()];
+        let mut patched = 0;
+        for (at, head) in heads.iter().enumerate() {
+            if head.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            let head = head.load(Ordering::Acquire);
+            let Some(ts) = self.undos.record(head).map(|record| record.ts()) else { continue };
+            if ts == me || (ts & UNCOMMITTED == 0 && ts <= snapshot) {
+                continue;
+            }
+            for (value, column) in values.iter_mut().zip(out.iter()) {
+                *value = column.value(at);
+            }
+            self.undo_into(head, columns, snapshot, me, &mut values);
+            for (&value, column) in values.iter().zip(out.iter_mut()) {
+                column.put(at, value);
+            }
+            patched += 1;
+        }
+        patched
+    }
+
+    /// Puts back over `out`, the values of `columns` of a row as they are now, what the undo
+    /// chain from `next` says a reader at `snapshot` running as `me`, its id with the top bit
+    /// set, sees instead.
+    fn undo_into(
+        &self,
+        mut next: UndoRef,
+        columns: &[usize],
+        snapshot: u64,
+        me: u64,
+        out: &mut [Option<u128>],
+    ) {
         let mut apply = |images: &mut dyn Iterator<Item = Image>| {
             for image in images {
                 if let Some(i) = columns.iter().position(|&c| c == usize::from(image.column)) {
@@ -2163,5 +2339,100 @@ mod tests {
         assert_eq!(*order.lock().expect("order"), [3, 5, 7], "oldest first");
         assert_eq!(lock_word(&stripe, slot).load(Ordering::Acquire), 0);
         assert_eq!(as_of(&stripe, slot, 1, 0)[0], Some(1), "every write was taken back");
+    }
+
+    /// Reads `part` of the first two columns with `read_part`, checks every leased slot against
+    /// `as_of`, and says how many rows took their values from undo.
+    fn read_part(stripe: &HotStripe, part: u32, snapshot: u64, txn: u64) -> usize {
+        let mut out = Vec::new();
+        let patched = stripe.read_part(part, &[0, 1], snapshot, txn, &mut out);
+        let first = part * PART_ROWS;
+        for slot in first..stripe.reserved().min(first + PART_ROWS) {
+            let at = (slot - first) as usize;
+            let row = vec![out[0].value(at), out[1].value(at)];
+            assert_eq!(row, as_of(stripe, slot, snapshot, txn), "slot {slot} at {snapshot}");
+        }
+        patched
+    }
+
+    #[test]
+    fn a_part_reads_in_place_and_only_the_rows_with_newer_undo_walk_their_chains() {
+        let stripe = HotStripe::new(0, &[Width::Four, Width::Sixteen]);
+        for i in 0..u128::from(PART_ROWS) + 100 {
+            row(&stripe, &[Some(i), Some(i * 3)]);
+        }
+        let mut buffer = UndoBuffer::default();
+        let mut update = |slot: u32, value: u128, txn: u64, commit: Option<u64>| {
+            let values = [(0, Some(value)), (1, None)];
+            stripe.update(slot, &values, txn - 1, txn, Wait::NEVER, &mut buffer).expect("free");
+            if let Some(ts) = commit {
+                stripe.commit_write(slot, txn, ts);
+            }
+        };
+        for (ts, slot) in [(2, 5), (3, 700), (4, 8_000), (5, 8_100), (6, 8_100)] {
+            update(slot, 1_000_000 + u128::from(slot), ts, Some(ts));
+        }
+        update(9, 7, 20, None);
+
+        // The old snapshot walks the five rows written after it, and nothing else.
+        assert_eq!(read_part(&stripe, 0, 1, 99), 5);
+        // A later one walks the row written after it and the one nobody has committed.
+        assert_eq!(read_part(&stripe, 0, 4, 99), 2);
+        // The writer of the open row sees its own write in place.
+        assert_eq!(read_part(&stripe, 0, 6, 20), 0);
+        assert_eq!(read_part(&stripe, 1, 1, 99), 0, "no row of the second part has undo");
+
+        let mut out = Vec::new();
+        let _ = stripe.read_part(0, &[0, 1], 6, 20, &mut out);
+        assert_eq!((out[0].value(9), out[1].value(9)), (Some(7), None));
+        assert_eq!((out[0].value(10), out[1].value(10)), (Some(10), Some(30)));
+        let _ = stripe.read_part(0, &[1, 0], 1, 99, &mut out);
+        assert_eq!((out[0].value(5), out[1].value(5)), (Some(15), Some(5)), "columns in order");
+    }
+
+    #[test]
+    fn a_part_read_while_rows_are_written_sees_each_row_as_of_its_snapshot() {
+        let stripe = Arc::new(HotStripe::new(0, &[Width::Eight, Width::Eight]));
+        for i in 0..u128::from(PART_ROWS) {
+            row(&stripe, &[Some(i), None]);
+        }
+        let clock = Arc::new(AtomicU64::new(1));
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stripe, clock, done) =
+                (Arc::clone(&stripe), Arc::clone(&clock), Arc::clone(&done));
+            thread::spawn(move || {
+                let mut buffer = UndoBuffer::default();
+                let mut written = Vec::new();
+                for ts in 2..3_000_u64 {
+                    let slot = (ts * 7_919 % u64::from(PART_ROWS)) as u32;
+                    let values = [(0, Some(u128::from(ts)))];
+                    stripe
+                        .update(slot, &values, ts - 1, ts, Wait::NEVER, &mut buffer)
+                        .expect("one writer");
+                    stripe.commit_write(slot, ts, ts);
+                    clock.store(ts, Ordering::SeqCst);
+                    written.push((slot, ts));
+                }
+                done.store(true, Ordering::SeqCst);
+                written
+            })
+        };
+        let mut reads = Vec::new();
+        let mut out = Vec::new();
+        while (!done.load(Ordering::SeqCst) || reads.is_empty()) && reads.len() < 200 {
+            let snapshot = clock.load(Ordering::SeqCst);
+            let _ = stripe.read_part(0, &[0], snapshot, 0, &mut out);
+            let values: Vec<_> = (0..PART_ROWS as usize).map(|at| out[0].value(at)).collect();
+            reads.push((snapshot, values));
+        }
+        let written = writer.join().expect("writes");
+        for (snapshot, values) in reads {
+            let mut expected: Vec<_> = (0..u128::from(PART_ROWS)).map(Some).collect();
+            for &(slot, ts) in written.iter().take_while(|&&(_, ts)| ts <= snapshot) {
+                expected[slot as usize] = Some(u128::from(ts));
+            }
+            assert_eq!(values, expected, "at {snapshot}");
+        }
     }
 }
