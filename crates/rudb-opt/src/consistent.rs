@@ -1017,7 +1017,16 @@ fn with_domains(mut weights: Vec<Weight>) -> Vec<Weight> {
 }
 
 impl Weight {
-    /// What the scan costs once the relations before it left `standing` of each class's values.
+    /// What the scan costs once the relations before it left `standing` of each class's values,
+    /// read and handed to the join. See [`HAND`].
+    #[expect(clippy::cast_precision_loss, reason = "a count of rows is a weight here")]
+    fn cost(&self, standing: &Standing, classes: &BTreeSet<u32>) -> f64 {
+        let handed = self.fed(standing, classes) * self.kept * self.rows as f64;
+        self.read(standing, classes) + handed * HAND
+    }
+
+    /// What reading the scan costs once the relations before it left `standing` of each class's
+    /// values.
     ///
     /// The key column is read in every part the handed keys do not rule out, and the rest at the
     /// rows they keep. See `Scan::read_deferring` in `rudb-exec`. The parts left are the fewest any
@@ -1030,7 +1039,7 @@ impl Weight {
     /// few units less read last, the order put it there, and `cast_info` was read at 1,687 roles
     /// where `role_type` read first leaves 11.
     #[expect(clippy::cast_precision_loss, reason = "a count of rows is a weight here")]
-    fn cost(&self, standing: &Standing, classes: &BTreeSet<u32>) -> f64 {
+    fn read(&self, standing: &Standing, classes: &BTreeSet<u32>) -> f64 {
         if self.rows <= CHUNK {
             return self.rows as f64 * (1 + self.width) as f64;
         }
@@ -1305,6 +1314,14 @@ impl std::ops::Index<&u32> for Standing {
 /// read `name` with its pattern first. Across the JOB queries whose plans this moves, 0.3 ran faster
 /// than both 1 and 0.1, where 0.1 made gathers so cheap that 17c took `cast_info` early again.
 const DECODE: f64 = 0.3;
+
+/// What a row a scan keeps costs the join it is handed to, in the units of [`Weight::cost`]: its
+/// keys go into the sets the tree passes along, and it is held or probed. In JOB 15d the plan read
+/// `movie_keyword` whole first, since that leaves the fifth of the movies it has keywords for. That
+/// handed the join 4.5 million rows, which took 1.5 ms to read and 33 ms more to join than the
+/// 370,000 rows `aka_title` read whole handed over instead. Priced at the read alone, the whole of
+/// `movie_keyword` cost less than reading it at the movies `aka_title` keeps.
+const HAND: f64 = 4.0;
 
 /// What reading a column at one row the keys picked out of a part costs, as rows of a scan of it.
 /// The rows left are read one by one where a scan runs over the column, and a string column is
@@ -2147,7 +2164,7 @@ mod tests {
         name.gathered = vec![1];
         let classes = BTreeSet::from([1]);
         let few = Standing::from([(1, 0.00001)]);
-        let cost = name.cost(&few, &classes);
+        let cost = name.read(&few, &classes);
         let parts = (4_000_000.0_f64 / 8192.0).ceil();
         let decoded = 1.0 - (1.0 - 1.0 / parts).powf(40.0);
         let gathered = 4_000_000.0 * decoded * DECODE * 5.0 + 40.0 * GATHER;
@@ -2157,10 +2174,10 @@ mod tests {
         // scan of the key column with the rest read at the rows it keeps is cheaper.
         let spread = Standing::from([(1, 0.001)]);
         let picked = 4_000_000.0 * (1.0 + 4.0 * 0.001 * PICK);
-        assert!((name.cost(&spread, &classes) - picked).abs() < 1.0);
+        assert!((name.read(&spread, &classes) - picked).abs() < 1.0);
         // Half the people is past what a gather takes, and the scan reads every row of the rest.
         let many = Standing::from([(1, 0.5)]);
-        assert!((name.cost(&many, &classes) - 20_000_000.0).abs() < 1.0);
+        assert!((name.read(&many, &classes) - 20_000_000.0).abs() < 1.0);
     }
 
     /// JOB 6d's `movie_keyword`: eight keywords of 134,170 reach 35,548 rows, which the average
@@ -2172,9 +2189,9 @@ mod tests {
         movie_keyword.gathered = vec![0];
         let classes = BTreeSet::from([0]);
         let eight = Standing::from([(0, 8.0 / 134_170.0)]);
-        let even = movie_keyword.cost(&eight, &classes);
+        let even = movie_keyword.read(&eight, &classes);
         movie_keyword.skew = vec![(0, 133.0, 134_170)];
-        let skewed = movie_keyword.cost(&eight, &classes);
+        let skewed = movie_keyword.read(&eight, &classes);
         // The even guess finds 270 rows in 553 parts and decodes a third of them. The skewed one
         // finds 35,548, which fall in every part, and so it decodes the whole table.
         let found = 4_523_930.0 * 8.0 * 133.0 / 134_170.0;
@@ -2298,10 +2315,10 @@ mod tests {
         let mut name = weight(4_167_491, 4, 1.0);
         name.domain = vec![(1, 4_167_491)];
         let classes = BTreeSet::from([1]);
-        let whole = name.cost(&Standing::new(), &classes);
-        let people = name.cost(&Standing::from([(1, 0.068)]), &classes);
+        let whole = name.read(&Standing::new(), &classes);
+        let people = name.read(&Standing::from([(1, 0.068)]), &classes);
         assert!(people > whole * 0.4, "{people} {whole}");
-        let few = name.cost(&Standing::from([(1, 10.0 / 4_167_491.0)]), &classes);
+        let few = name.read(&Standing::from([(1, 10.0 / 4_167_491.0)]), &classes);
         assert!(few < whole / 4.0, "{few} {whole}");
     }
 
@@ -2348,9 +2365,9 @@ mod tests {
         movie_info.domain = vec![(0, 113)];
         let standing = Standing::from([(0, 1.0 / 113.0)]);
         let classes = BTreeSet::from([0]);
-        let average = movie_info.cost(&standing, &classes);
+        let average = movie_info.read(&standing, &classes);
         movie_info.named = vec![(0, 1, 0.085, Some(390.0 / 1_812.0))];
-        let counted = movie_info.cost(&standing, &classes);
+        let counted = movie_info.read(&standing, &classes);
         // The rows the keys keep are read one by one in every part the named value is in.
         let touched = 390.0 / 1_812.0;
         let wide = touched * (0.085_f64 * PICK).min(1.0);
@@ -2367,9 +2384,9 @@ mod tests {
         movie_info.skew = vec![(0, 1.0, 2_468_825)];
         let standing = Standing::from([(0, 8.0 / 2_468_825.0)]);
         let classes = BTreeSet::from([0]);
-        let scattered = movie_info.cost(&standing, &classes);
+        let scattered = movie_info.read(&standing, &classes);
         movie_info.placed = vec![(0, 1.0)];
-        let together = movie_info.cost(&standing, &classes);
+        let together = movie_info.read(&standing, &classes);
         let parts = (14_835_720.0_f64 / 8192.0).ceil();
         let found = 14_835_720.0 * 8.0 / 2_468_825.0;
         let expected = 14_835_720.0 * (8.0 / parts) * DECODE * 5.0 + found * GATHER;
