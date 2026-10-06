@@ -819,6 +819,25 @@ const SPARSE_READ: usize = 8;
 ///
 /// Sets over tables of different sizes would be a bug above, and the first alone is still every
 /// row that can survive.
+/// Whether keys that reach `reach` rows are worth gathering to narrow `rows`, which the scan
+/// already reads one at a time.
+///
+/// A row of `rows` the keys would remove costs the scan a read of one column and a bit test, see
+/// `Scan::read_reduced`, and gathering costs a few instructions or a few tens for every row the
+/// keys reach, which are more. What gathering buys beyond that is a part with no row left in it,
+/// which is never opened. So the keys are gathered when the rows in both, taking the two as
+/// independent, are expected to touch under half the parts `rows` touches. In JOB 24a the rows
+/// of `cast_info` in both sets are expected to be about 147 against 800 parts the first touches,
+/// so both are read. On TPC-H q07 the orders kept reach 173 thousand rows of `lineitem` in about
+/// 2,930 parts and the suppliers kept 478 thousand, and the rows in both are expected to be 13.8
+/// thousand, which still sit in nearly every part, so pushing the suppliers' lists buys nothing a
+/// bitmap test does not.
+fn leaves_parts(rows: &Rids, reach: u64) -> bool {
+    let expected = u128::from(rows.len()) * u128::from(reach) / u128::from(rows.rows().max(1));
+    let touched = rows.parts_touched(VECTOR_SIZE as u64);
+    expected.saturating_mul(2) < u128::from(touched)
+}
+
 fn narrowed(held: Option<Rids>, rows: Rids) -> Rids {
     match held {
         None => rows,
@@ -2534,26 +2553,49 @@ impl<'a> Scan<'a> {
     /// The rows the file records for the values the pushed filter can keep go in with them, see
     /// [`Valued`].
     fn handed(&self) -> Option<Rids> {
-        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
-        let sets = joins.filter_map(|sideways| sideways.rows(self.index).cloned());
+        let joins = || self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
+        let sets = joins().filter_map(|sideways| sideways.rows(self.index).cloned());
         let mut held: Option<Rids> = None;
         for rows in sets {
             held = Some(narrowed(held, rows));
         }
-        // Of the relations of a consistent reduction that kept keys for this scan, the one whose
-        // keys reach fewest rows is read as those rows, when they are fewer than the rows already
-        // handed, and so is any other within `ALONGSIDE` of it. The rest are tested row by row.
-        // See `Listing`.
-        let joins = self.sideways.iter().chain(self.also.iter().map(|(sideways, _)| sideways));
-        let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> =
-            joins.filter_map(|sideways| Some((sideways.reach(self.index)?, sideways))).collect();
+        // Of the joins and the relations of a consistent reduction that kept keys for this scan,
+        // the one whose keys reach fewest rows is read as those rows, when they are fewer than the
+        // rows already handed. The rest are tested row by row. See `Listing`.
+        //
+        // Rows few enough to read one at a time are narrowed by any keys that reach fewer, whatever
+        // their share of the table, see `listed_keys`. Those rows can be a join's own lists, so the
+        // keys refused against the rows handed are asked again against the fewest the lists reach.
+        let total = u64::try_from(self.table.rows().len()).unwrap_or(u64::MAX);
+        let sparse = |rows: u64| rows.saturating_mul(SPARSE_READ as u64) <= total;
+        let mut within = held.as_ref().map(Rids::len).filter(|&rows| sparse(rows));
+        let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> = joins()
+            .filter_map(|sideways| Some((sideways.reach(self.index, within)?, sideways)))
+            .collect();
+        let fewest = reaching.iter().map(|(reach, _)| *reach).filter(|&reach| sparse(reach)).min();
+        if let Some(fewest) = fewest
+            && within.is_none_or(|within| fewest < within)
+        {
+            within = Some(fewest);
+            for sideways in joins() {
+                if !reaching.iter().any(|(_, asked)| Arc::ptr_eq(asked, sideways))
+                    && let Some(reach) = sideways.reach(self.index, within)
+                {
+                    reaching.push((reach, sideways));
+                }
+            }
+        }
         reaching.sort_by_key(|(reach, _)| *reach);
         if let Some(&(fewest, _)) = reaching.first()
             && held.as_ref().is_none_or(|rows| fewest < rows.len())
         {
-            for (_, sideways) in
-                reaching.iter().take_while(|(reach, _)| *reach <= fewest.saturating_mul(ALONGSIDE))
-            {
+            for (place, &(reach, sideways)) in reaching.iter().enumerate() {
+                if reach > fewest.saturating_mul(ALONGSIDE) {
+                    break;
+                }
+                if place > 0 && held.as_ref().is_some_and(|rows| !leaves_parts(rows, reach)) {
+                    continue;
+                }
                 if let Some(rows) = sideways.gather(self.index) {
                     held = Some(narrowed(held, rows.clone()));
                 }
