@@ -1582,7 +1582,10 @@ impl Binder<'_> {
             let name = written.to_ascii_lowercase();
             return Err(rudb_functions::named_mismatch(&name, &spelled, false));
         }
-        let bound = self.variant_arguments(ast, &written, &arguments, bound)?;
+        let mut bound = self.variant_arguments(ast, &written, &arguments, bound)?;
+        if postgres {
+            self.postgres_rounding(&written, &mut bound);
+        }
         // PostgreSQL counts the bytes of a text with `octet_length` and of a bytea with `length`,
         // and the pin has `strlen` and `octet_length` for these.
         if postgres && let [only] = &types[..] {

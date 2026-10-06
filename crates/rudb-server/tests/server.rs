@@ -943,6 +943,13 @@ fn the_functions_of_postgres_have_its_result_types() {
             "-1,1,10",
             vec![1700, 701, 20],
         ),
+        (
+            "select round(x, 2), trunc(x, 1), ceil(x), floor(x), abs(x), round(5::int8, 1), round(5) \
+             from (values (-123456789012345678901.555::numeric)) t(x)",
+            "-123456789012345678901.56,-123456789012345678901.5,-123456789012345678901,\
+             -123456789012345678902,123456789012345678901.555,5.0,5",
+            vec![1700, 1700, 1700, 1700, 1700, 1700, 701],
+        ),
     ];
     for (sql, expected, oids) in cases {
         let messages = client.query(sql);
@@ -960,7 +967,7 @@ fn a_parameter_in_a_call_gets_the_type_of_postgres() {
     let mut client = Client::unix(&server);
     connect(&mut client, PROTOCOL_3_0);
     // Each case has the parameter types and the column types of PostgreSQL.
-    let cases: [(&str, &[u32], &[u32]); 12] = [
+    let cases: [(&str, &[u32], &[u32]); 13] = [
         ("select abs($1)", &[701], &[701]),
         ("select substr($1, $2)", &[25, 23], &[25]),
         ("select repeat($1, $2)", &[25, 23], &[25]),
@@ -969,6 +976,7 @@ fn a_parameter_in_a_call_gets_the_type_of_postgres() {
         ("select nullif($1, $2)", &[25, 25], &[25]),
         ("select max($1)", &[25], &[25]),
         ("select sign($1)", &[701], &[701]),
+        ("select round($1, 2)", &[1700], &[1700]),
         ("select mod($1, 2)", &[23], &[23]),
         ("select $1 + $2", &[23, 23], &[23]),
         ("select * from generate_series(1, $1)", &[23], &[23]),

@@ -269,6 +269,7 @@ fn floored(up: bool, value: &Value, returns: &LogicalType) -> Result<Value> {
     match *value {
         Value::Float(x) => Ok(Value::Float(if up { x.ceil() } else { x.floor() })),
         Value::Double(x) => Ok(Value::Double(if up { x.ceil() } else { x.floor() })),
+        Value::Numeric(ref bytes) => numeric(rudb_pgtypes::Numeric::from_bytes(bytes).whole(up)),
         Value::Decimal { unscaled, scale, .. } => {
             let step = pow10(scale);
             let mut whole = unscaled / step;
@@ -282,6 +283,16 @@ fn floored(up: bool, value: &Value, returns: &LogicalType) -> Result<Value> {
         }
         _ => Err(Error::internal(format!("floor of a {}", value.logical_type()))),
     }
+}
+
+/// A `numeric` that came out of a `rudb_pgtypes` function, or the error that it gave.
+fn numeric(
+    answer: std::result::Result<rudb_pgtypes::Numeric, rudb_pgtypes::TypeError>,
+) -> Result<Value> {
+    // An overflow is a fault of the row and not of a place in the text.
+    answer
+        .map(|held| Value::Numeric(held.to_bytes()))
+        .map_err(|error| Error::from(error).unplaced())
 }
 
 /// A decimal of `returns`, holding `unscaled` at the scale `returns` has.
@@ -343,6 +354,14 @@ fn rounded(name: &str, value: &Value, digits: i64, returns: &LogicalType) -> Res
     match *value {
         Value::Double(x) => Ok(Value::Double(rounded_double(rule, x, digits))),
         Value::Float(x) => Ok(Value::Float(rounded_double(rule, f64::from(x), digits) as f32)),
+        Value::Numeric(ref bytes) => {
+            let held = rudb_pgtypes::Numeric::from_bytes(bytes);
+            let scale = i32::try_from(digits.clamp(-2000, 2000)).unwrap_or_default();
+            numeric(match rule {
+                Rule::Toward => held.trunc(scale),
+                _ => held.round(scale),
+            })
+        }
         Value::Decimal { unscaled, scale, .. } => {
             let kept = returns.decimal_shape().map_or(scale, |(_, kept)| kept);
             let places = if digits < 0 {

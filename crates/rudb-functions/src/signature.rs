@@ -1921,6 +1921,14 @@ fn numericked(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>
             [_, _],
         ) if arguments.iter().all(exact) => Some((vec![Numeric, Numeric], Numeric)),
         ("-", [Numeric]) => Some((vec![Numeric], Numeric)),
+        // The roundings of a `numeric` keep it a `numeric`, as they do in PostgreSQL, rather than
+        // going through a double and losing the digits past the sixteenth.
+        ("round" | "trunc" | "abs" | "ceil" | "ceiling" | "floor", [Numeric]) => {
+            Some((vec![Numeric], Numeric))
+        }
+        ("round" | "trunc", [Numeric, digits]) if digits.is_integer() || *digits == Null => {
+            Some((vec![Numeric, LogicalType::Integer], Numeric))
+        }
         _ => None,
     }
 }
