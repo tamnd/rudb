@@ -2948,7 +2948,7 @@ impl<'a> Aggregate<'a> {
                     // per row, and the groups a place has none for yet are opened afterwards in
                     // the order their first rows come in, the same order as the pass below.
                     let combos = coded_map.len();
-                    place_sums.add_places(&mut coded_places[..*length], kept, combos)?;
+                    place_sums.add_places(&mut coded_places[..*length], kept, combos, &inputs)?;
                     if place_sums.touched(coded_map)? {
                         for (row, &place) in coded_places[..*length].iter().enumerate() {
                             let place = place as usize;
@@ -2962,7 +2962,13 @@ impl<'a> Aggregate<'a> {
                 } else {
                     let mut row = 0;
                     loop {
-                        row = place_sums.add(coded_map, &coded_places[..*length], kept, row)?;
+                        row = place_sums.add(
+                            coded_map,
+                            &coded_places[..*length],
+                            kept,
+                            row,
+                            &inputs,
+                        )?;
                         if row == *length {
                             break;
                         }

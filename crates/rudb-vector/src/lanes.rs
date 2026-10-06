@@ -249,6 +249,93 @@ pub(crate) fn add_codes(
     groups * 8
 }
 
+/// [`add_pairs`] with each row's two values read out of two packed runs as it goes, rather than out
+/// of two columns unpacked into words first, and returns how many rows it added.
+///
+/// Each side is the run's bytes, the byte its first row's group starts at, and its width, which is
+/// between one and [`LANE_WIDTH_MAX`]. A group of eight codes of each side is one shuffle, shift and
+/// mask, and four of them widened to 64 bits are a load's worth of [`add_pairs`].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+pub(crate) fn add_pair_codes(
+    cells: &mut [[i64; 4]],
+    sides: [(&[u8], usize, usize); 2],
+    places: &[u32],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_castsi256_si128,
+        _mm256_cmpeq_epi32, _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_max_epu32, _mm256_movemask_epi8, _mm256_set1_epi32, _mm256_unpackhi_epi64,
+        _mm256_unpacklo_epi64,
+    };
+    let mut groups = places.len() / 8;
+    for &(bytes, at, width) in &sides {
+        assert!((1..=LANE_WIDTH_MAX).contains(&width));
+        // Group `g` reads sixteen bytes at `at + g * width` and sixteen at `4 * width / 8` past that.
+        let room =
+            bytes.len().checked_sub(at + 4 * width / 8 + 16).map_or(0, |room| room / width + 1);
+        groups = groups.min(room);
+    }
+    let Some(Ok(last)) = cells.len().checked_sub(1).map(u32::try_from) else { return 0 };
+    let mut done = 0;
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. Each side's group
+    // `g` reads inside its bytes for every `g` under `groups`, which is what `room` counts, and the
+    // eight places of a group are inside `places`. Every place of a group is at most `last` before
+    // any of its rows is added, so each row's cells are inside `cells`.
+    #[expect(clippy::cast_possible_wrap, reason = "the lanes are read unsigned")]
+    unsafe {
+        let side = |(bytes, at, width): (&[u8], usize, usize)| {
+            let (shuffle, shifts) = &LANES[width];
+            (
+                bytes.as_ptr().add(at),
+                width,
+                4 * width / 8,
+                _mm256_loadu_si256(shuffle.as_ptr().cast()),
+                _mm256_loadu_si256(shifts.as_ptr().cast()),
+                _mm256_set1_epi32(((1_u32 << width) - 1) as i32),
+            )
+        };
+        let [ones, twos] = sides.map(side);
+        let top = _mm256_set1_epi32(last as i32);
+        let to = cells.as_mut_ptr();
+        for group in 0..groups {
+            let held = _mm256_loadu_si256(places.as_ptr().add(done).cast());
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi32(_mm256_max_epu32(held, top), top)) != -1 {
+                break;
+            }
+            let [first, second] = [ones, twos].map(|(at, width, half, shuffle, shifts, mask)| {
+                group_codes(at.add(group * width), half, shuffle, shifts, mask)
+            });
+            let halves = [
+                (_mm256_castsi256_si128(first), _mm256_castsi256_si128(second)),
+                (_mm256_extracti128_si256::<1>(first), _mm256_extracti128_si256::<1>(second)),
+            ];
+            for (half, (first, second)) in halves.into_iter().enumerate() {
+                let (first, second) = (_mm256_cvtepu32_epi64(first), _mm256_cvtepu32_epi64(second));
+                let (even, odd) =
+                    (_mm256_unpacklo_epi64(first, second), _mm256_unpackhi_epi64(first, second));
+                let pairs = [
+                    _mm256_castsi256_si128(even),
+                    _mm256_castsi256_si128(odd),
+                    _mm256_extracti128_si256::<1>(even),
+                    _mm256_extracti128_si256::<1>(odd),
+                ];
+                for (row, pair) in pairs.into_iter().enumerate() {
+                    let place = *places.get_unchecked(done + 4 * half + row) as usize;
+                    let cell = to.add(place).cast::<i64>();
+                    _mm_storeu_si128(
+                        cell.cast(),
+                        _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair),
+                    );
+                    *cell.add(2) = (*cell.add(2)).wrapping_add(1);
+                }
+            }
+            done += 8;
+        }
+    }
+    done
+}
+
 /// The codes of one group of eight at `first`, each in a 32 bit lane, for a side whose table,
 /// shift, mask and half are the ones [`within_words`] sets up for its width.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -528,6 +615,60 @@ pub(crate) fn add_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pairs added out of two packed runs come to the cells the codes read a bit at a time would,
+    /// for two widths, a run that starts some groups in, and a place past the cells.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn pairs_added_out_of_packed_codes_are_the_codes_added_a_row_at_a_time() {
+        let pack = |codes: &[u32], width: usize| {
+            let mut bytes = vec![0_u8; codes.len() * width / 8 + 1];
+            for (i, &code) in codes.iter().enumerate() {
+                for b in 0..width {
+                    if code >> b & 1 == 1 {
+                        bytes[(i * width + b) / 8] |= 1 << ((i * width + b) % 8);
+                    }
+                }
+            }
+            bytes
+        };
+        let rows = 300;
+        for (one, two, skip) in [(6, 24, 0), (25, 1, 16), (3, 13, 64)] {
+            let ones: Vec<u32> =
+                (0..rows as u32).map(|i| i.wrapping_mul(2_654_435_761) % (1 << one)).collect();
+            let twos: Vec<u32> =
+                (0..rows as u32).map(|i| i.wrapping_mul(40_503) % (1 << two)).collect();
+            let (first, second) = (pack(&ones, one), pack(&twos, two));
+            for past in [None, Some(9), Some(150)] {
+                let mut places: Vec<u32> =
+                    (0..(rows - skip) as u32).map(|row| (row * 13) % 11).collect();
+                if let Some(past) = past {
+                    places[past] = 11;
+                }
+                let mut cells = vec![[0_i64; 4]; 11];
+                let sides = [(&first[..], skip * one / 8, one), (&second[..], skip * two / 8, two)];
+                let done = add_pair_codes(&mut cells, sides, &places);
+                assert!(
+                    done % 8 == 0 && done <= past.unwrap_or(rows),
+                    "{one} {two} {skip} {past:?}"
+                );
+                if past.is_none() {
+                    // A group reads sixteen bytes past where it starts, so the narrower side
+                    // stops the pass that many bytes of codes short of the end.
+                    let short = 8 * (16 / one.min(two) + 2);
+                    assert!(done + short >= rows - skip, "{one} {two} {skip} stopped at {done}");
+                }
+                let mut want = vec![[0_i64; 4]; 11];
+                for row in 0..done {
+                    let cell = &mut want[places[row] as usize];
+                    cell[0] += i64::from(ones[skip + row]);
+                    cell[1] += i64::from(twos[skip + row]);
+                    cell[2] += 1;
+                }
+                assert_eq!(cells, want, "{one} {two} {skip} {past:?}");
+            }
+        }
+    }
 
     /// Codes added in lanes are the codes read a bit at a time, lifted and multiplied, for every
     /// width the lanes take, and the pass stops where the bytes run out.

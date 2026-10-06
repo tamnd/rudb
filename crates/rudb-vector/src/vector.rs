@@ -4287,6 +4287,34 @@ pub fn add_pairs_by_place(
     }
 }
 
+/// [`add_pairs_by_place`] with the two values read out of two packed runs, for runs that start on a
+/// group of eight codes and are no wider than the lanes take. It adds nothing for any other runs,
+/// and nothing without AVX2.
+pub fn add_packed_pairs_by_place(
+    cells: &mut [[i64; 4]],
+    first: &Packed<'_>,
+    second: &Packed<'_>,
+    places: &[u32],
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        fn side<'a>(packed: &Packed<'a>) -> Option<(&'a [u8], usize, usize)> {
+            let width = packed.width as usize;
+            ((1..=crate::lanes::LANE_WIDTH_MAX).contains(&width) && packed.offset % 8 == 0)
+                .then(|| (crate::lanes::bytes_of(packed.words), packed.offset * width / 8, width))
+        }
+        if let (Some(one), Some(two)) = (side(first), side(second)) {
+            return crate::lanes::add_pair_codes(cells, [one, two], places);
+        }
+        0
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let _ = (cells, first, second, places);
+        0
+    }
+}
+
 /// The bits of a packed vector and what they mean, for a kernel that wants to stay in code space.
 ///
 /// Borrowed from the vector rather than owning anything, so getting one costs nothing and a kernel
