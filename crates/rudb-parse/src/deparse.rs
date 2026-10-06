@@ -419,6 +419,11 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             let any = format!("({} {word} ANY({}))", expr(ast, operand), query(ast, inner));
             if negate { format!("(NOT {any})") } else { any }
         }
+        Expr::QuantifiedArray { operand, op, array, all } => {
+            let quantifier = if all { "ALL" } else { "ANY" };
+            let word = operator_word(ast, op);
+            format!("({} {word} {quantifier}({}))", expr(ast, operand), expr(ast, array))
+        }
         Expr::Parameter { name } => format!("${}", ast.string(name)),
         Expr::Default => "DEFAULT".to_string(),
         // A bracketed list is a call to `list_value`, including when it is empty.
@@ -643,7 +648,12 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
         BinaryOp::Collate => return format!("{left} COLLATE {right}"),
         _ => {}
     }
-    let word = match op {
+    format!("({left} {} {right})", operator_word(ast, op))
+}
+
+/// How an infix operator is written back out.
+fn operator_word(ast: &Ast, op: BinaryOp) -> &str {
+    match op {
         BinaryOp::Or => "OR",
         BinaryOp::And => "AND",
         BinaryOp::Eq => "=",
@@ -692,8 +702,7 @@ fn binary(ast: &Ast, op: BinaryOp, left: ExprRef, right: ExprRef) -> String {
         BinaryOp::SimilarTo | BinaryOp::NotSimilarTo | BinaryOp::AtTimeZone | BinaryOp::Collate => {
             unreachable!("the four that return above")
         }
-    };
-    format!("({left} {word} {right})")
+    }
 }
 
 /// A function call.

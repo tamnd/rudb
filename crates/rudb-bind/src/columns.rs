@@ -226,7 +226,8 @@ fn children(ast: &Ast, expr: ast::ExprRef) -> Vec<ast::ExprRef> {
         | ast::Expr::InSubquery { operand, .. }
         | ast::Expr::QuantifiedSubquery { operand, .. } => vec![operand],
         ast::Expr::Lambda { body, .. } => vec![body],
-        ast::Expr::Binary { left, right, .. } => vec![left, right],
+        ast::Expr::Binary { left, right, .. }
+        | ast::Expr::QuantifiedArray { operand: left, array: right, .. } => vec![left, right],
         ast::Expr::Function { args, filter, .. } => {
             let mut out = list(args);
             out.push(filter);

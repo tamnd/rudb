@@ -57,6 +57,19 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
         ("list_contains", [Value::List { values, .. }, needle]) => {
             found(values, needle).map(|at| Value::Boolean(at.is_some()))
         }
+        // The fold of `x op ANY (array)` and `x op ALL (array)` over the answer for each element.
+        // `ANY` is true on a true answer and `ALL` is false on a false one. Without one, a null
+        // answer makes the whole answer null.
+        ("pg_quantified_any" | "pg_quantified_all", [Value::List { values, .. }]) => {
+            let all = name == "pg_quantified_all";
+            if values.contains(&Value::Boolean(!all)) {
+                Ok(Value::Boolean(!all))
+            } else if values.iter().any(Value::is_null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(all))
+            }
+        }
         ("list_has_any", [Value::List { values, .. }, Value::List { values: wanted, .. }]) => {
             has_any(values, wanted).map(Value::Boolean)
         }
