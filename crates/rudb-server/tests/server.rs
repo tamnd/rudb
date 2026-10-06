@@ -722,18 +722,26 @@ fn create_unlogged_and_a_serial_column() {
     connect(&mut client, PROTOCOL_3_0);
     let messages = client.query("create unlogged table u (a int); insert into u values (1)");
     assert_eq!(tags(&messages), "CCZ");
-    // A serial column is an integer with a sequence the table owns, and the file cannot keep a
-    // sequence yet, so the test makes a temporary table.
-    let messages = client.query("create temp table s (id serial, b text)");
+    // A serial column is an integer with a sequence the table owns, and the file keeps both.
+    let messages = client.query("create table s (id serial, b text)");
     assert_eq!(tags(&messages), "CZ");
     client.query("insert into s (b) values ('x'), ('y')");
-    let messages = client.query("select id from s order by id");
-    assert_eq!(data_row(&messages[1]), [Some(b"1".to_vec())]);
-    assert_eq!(data_row(&messages[2]), [Some(b"2".to_vec())]);
     let messages = client.query("select nextval('s_id_seq')");
     assert_eq!(data_row(&messages[1]), [Some(b"3".to_vec())]);
     let messages = client.query("insert into s (id) values (null)");
     assert_eq!(messages[0].field(b'C').as_deref(), Some("23502"));
+    server.stop().unwrap();
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("insert into s (b) values ('z')");
+    let messages = client.query("select id from s order by id");
+    let ids: Vec<_> = messages[1..4].iter().map(|row| data_row(row)[0].clone().unwrap()).collect();
+    assert_eq!(ids, [b"1".to_vec(), b"2".to_vec(), b"4".to_vec()]);
+    // The table owns the sequence, so a drop of the table drops it.
+    client.query("drop table s");
+    let messages = client.query("select nextval('s_id_seq')");
+    assert_eq!(tags(&messages), "EZ");
     let messages = client.query("create temp table d (id serial default 4)");
     assert_eq!(messages[0].field(b'C').as_deref(), Some("42601"));
     server.stop().unwrap();

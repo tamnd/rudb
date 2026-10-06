@@ -38,7 +38,15 @@ struct State {
     last: Option<i64>,
     /// How many values have been handed out.
     uses: u64,
+    /// How many of the uses the file and the log of the database already make durable. A use past
+    /// this needs a log record before the commit that wrote it is durable, see [`Counter::ahead`].
+    durable: u64,
 }
+
+/// How many values one log record of a counter covers, as `SEQ_LOG_VALS` does on the pin. After a
+/// crash the counter starts after the values the last record covered, so up to this many values
+/// are never handed out.
+pub const PREFETCH: i64 = 32;
 
 /// One sequence's counter.
 #[derive(Debug)]
@@ -69,12 +77,64 @@ impl Counter {
             id,
             name: name.to_owned(),
             options,
-            state: Mutex::new(State { counter: options.start, last: None, uses: 0 }),
+            state: Mutex::new(State { counter: options.start, last: None, uses: 0, durable: 0 }),
         });
         let mut all = COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         all.retain(|_, counter| counter.strong_count() > 0);
         all.insert(id, Arc::downgrade(&counter));
         counter
+    }
+
+    /// A counter that a database file kept, at the place it had got to when the file was written.
+    #[must_use]
+    pub fn resume(name: &str, options: Options, counter: i64, uses: u64) -> Arc<Self> {
+        let resumed = Self::register(name, options);
+        *resumed.lock() = State { counter, last: None, uses, durable: uses };
+        resumed
+    }
+
+    /// The value the next `nextval` hands out and how many values have been handed out, read
+    /// together.
+    #[must_use]
+    pub fn snapshot(&self) -> (i64, u64) {
+        let state = self.lock();
+        (state.counter, state.uses)
+    }
+
+    /// Says that a checkpoint wrote the counter down after `uses` values, so that is what the
+    /// file makes durable. The log records before the checkpoint are not read again.
+    pub fn covered(&self, uses: u64) {
+        self.lock().durable = uses;
+    }
+
+    /// The `setval` that a log record must carry so that a replay of the log starts the counter
+    /// after every value it has handed out, or `None` when the last record still covers them.
+    ///
+    /// The record goes past the counter by [`PREFETCH`] values, so most commits do not need one.
+    /// The answer is the value and whether `setval` hands it out as called.
+    pub fn ahead(&self) -> Option<(i64, bool)> {
+        let mut state = self.lock();
+        if state.uses <= state.durable {
+            return None;
+        }
+        let Options { increment, min, max, cycle, .. } = self.options;
+        let counter = state.counter;
+        let target = counter.saturating_add(increment.saturating_mul(PREFETCH));
+        let (value, called, covers) = if cycle {
+            (counter, false, 0)
+        } else if increment > 0 && counter > max {
+            (max, true, 0)
+        } else if increment < 0 && counter < min {
+            (min, true, 0)
+        } else if increment > 0 {
+            let value = target.min(max);
+            (value, false, (value - counter) / increment)
+        } else {
+            let value = target.max(min);
+            (value, false, (counter - value) / -increment)
+        };
+        state.durable = state.uses + covers.unsigned_abs();
+        Some((value, called))
     }
 
     /// The number [`lookup`] finds this counter by.
@@ -184,6 +244,8 @@ impl Counter {
         }
         let mut state = self.lock();
         state.counter = value;
+        // The values the last log record covered say nothing about where the counter is now.
+        state.durable = 0;
         if !called {
             state.uses += 1;
             return Ok(value);
@@ -240,5 +302,25 @@ mod tests {
         assert_eq!(seq.current().unwrap(), 11);
         assert_eq!(seq.next().unwrap(), 5);
         assert!(seq.set(0, true).is_err());
+    }
+
+    #[test]
+    fn a_log_record_covers_the_values_ahead_of_the_counter() {
+        let seq = Counter::register("seq", options(1, 1, 40, 1, false));
+        assert_eq!(seq.ahead(), None, "nothing is handed out yet");
+        assert_eq!(seq.next().unwrap(), 1);
+        assert_eq!(seq.ahead(), Some((34, false)), "the record covers 2 to 33");
+        for _ in 0..32 {
+            seq.next().unwrap();
+        }
+        assert_eq!(seq.ahead(), None, "the record still covers 33");
+        assert_eq!(seq.next().unwrap(), 34);
+        assert_eq!(seq.ahead(), Some((40, false)), "the record stops at the maximum");
+        let resumed = Counter::resume("seq", seq.options(), 7, 6);
+        assert_eq!(resumed.next().unwrap(), 7);
+        resumed.covered(7);
+        assert_eq!(resumed.ahead(), None);
+        resumed.set(3, false).unwrap();
+        assert_eq!(resumed.ahead(), Some((35, false)));
     }
 }

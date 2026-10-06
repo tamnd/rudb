@@ -624,3 +624,27 @@ fn a_checkpoint_notes_the_tables_it_wrote_in_the_log_and_replay_skips_the_note()
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(wal(&path));
 }
+
+#[test]
+fn a_sequence_hands_out_no_value_twice_across_a_crash() {
+    let path = path("sequence");
+    let db = open(&path);
+    db.execute("CREATE SEQUENCE s").expect("creates");
+    db.execute("CREATE TABLE t (id BIGINT DEFAULT nextval('s'), name VARCHAR)").expect("creates");
+    db.execute("INSERT INTO t (name) VALUES ('a')").expect("inserts");
+    db.execute("INSERT INTO t (name) VALUES ('b'), ('c')").expect("inserts");
+    crash(db);
+
+    // The log said the counter goes past the values it handed out, by up to 32 of them.
+    let db = open(&path);
+    let ids = vec![vec![Value::BigInt(1)], vec![Value::BigInt(2)], vec![Value::BigInt(3)]];
+    assert_eq!(rows(&db, "SELECT id FROM t ORDER BY id"), ids);
+    db.execute("INSERT INTO t (name) VALUES ('d')").expect("inserts");
+    let Value::BigInt(after) = rows(&db, "SELECT max(id) FROM t")[0][0] else { panic!() };
+    assert!((4..=35).contains(&after), "{after}");
+    drop(db);
+
+    // A close writes the counter as it is, so no value is skipped.
+    let db = open(&path);
+    assert_eq!(rows(&db, "SELECT nextval('s')"), [[Value::BigInt(after + 1)]]);
+}
