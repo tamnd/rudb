@@ -40,8 +40,9 @@ use rudb_vector::Vector;
 /// binary, which is the list at the commit the grammar is vendored from. rudb has the sequence
 /// functions, `random` and `setseed` so far, and the rest are listed anyway so that the next one to
 /// land is refused by code that already knew about it rather than folded by code that had never
-/// heard of it. `TRY` refuses an operand that calls any of them.
-pub const VOLATILE: [&str; 17] = [
+/// heard of it. `TRY` refuses an operand that calls any of them. The advisory lock functions of a
+/// PostgreSQL session are here too, because each call takes or releases a lock.
+pub const VOLATILE: [&str; 28] = [
     "current_connection_id",
     "current_query",
     "current_query_id",
@@ -50,6 +51,17 @@ pub const VOLATILE: [&str; 17] = [
     "error",
     "gen_random_uuid",
     "nextval",
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_all",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
+    "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
     "random",
     "setseed",
     "setval",

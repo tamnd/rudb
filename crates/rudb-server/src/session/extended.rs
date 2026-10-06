@@ -616,6 +616,7 @@ impl Portal {
                     None => unreachable!("a statement without a plan is a command"),
                 }
             });
+            runner.advisory_warnings(out);
             let outcome = match ran {
                 Ok(outcome) => outcome,
                 Err(failure) => {

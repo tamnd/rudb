@@ -59,6 +59,13 @@ impl Connection {
         self.cancel.cancel();
     }
 
+    /// The flag that [`Connection::interrupt`] sets, for a wait outside of the engine that has to
+    /// stop with the statement, such as the wait for an advisory lock of a PostgreSQL session.
+    #[must_use]
+    pub fn cancel_flag(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
     /// The token for one statement: this connection's flag, and the configured time limit.
     fn token(&self) -> Cancel {
         self.shared.restart(&self.cancel)

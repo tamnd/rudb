@@ -1104,6 +1104,9 @@ impl Binder<'_> {
             };
             return Ok(self.add_constant(Value::Varchar(name)));
         }
+        if !modified && let Some(call) = self.advisory_call(ast, &written, &arguments, scope)? {
+            return Ok(call);
+        }
         if let Some(expanded) = self.builtin_macro(ast, &written, &arguments, scope)? {
             return Ok(expanded);
         }

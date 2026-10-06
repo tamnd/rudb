@@ -58,6 +58,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod advisory;
 pub mod aggregate;
 mod arg_extreme;
 mod bits;

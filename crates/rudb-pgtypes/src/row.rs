@@ -195,7 +195,7 @@ impl Kind {
                 L::UBigInt | L::HugeInt | L::UHugeInt => Kind::Display { numeric: true },
                 _ => return None,
             },
-            oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME | oids::UNKNOWN
+            oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME | oids::UNKNOWN | oids::VOID
                 if *logical == L::Varchar =>
             {
                 Kind::Text

@@ -269,6 +269,7 @@ struct Registered<'a> {
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
         self.shared.unregister(self.pid);
+        rudb_common::advisory::end_session(self.pid);
     }
 }
 
@@ -616,6 +617,7 @@ fn serve(
         encoder: RowEncoder::default(),
         implicit: false,
     };
+    rudb_common::advisory::register(pid, runner.connection.cancel_flag());
     runner.refresh();
     session.set_utf8(runner.utf8);
     let mut extended = Extended::default();
@@ -1085,6 +1087,8 @@ impl Runner {
             settings: self.guc.clone(),
             version: VERSION.to_owned(),
             input: Some(Arc::new(input)),
+            backend: self.pid,
+            database: self.database,
         };
         self.connection.set_postgres(Arc::new(postgres));
     }
@@ -1120,6 +1124,7 @@ impl Runner {
         if self.connection.transaction() == Transaction::Idle && !self.implicit {
             self.guc.end(commit);
             self.refresh();
+            rudb_common::advisory::end_transaction(self.pid);
         }
     }
 
@@ -1383,6 +1388,14 @@ impl Runner {
         ]);
     }
 
+    /// Writes the warnings of the advisory lock functions, such as for the release of a lock that
+    /// the session does not hold.
+    fn advisory_warnings(&self, out: &mut OutBuf) {
+        for warning in rudb_common::advisory::warnings(self.pid) {
+            self.notice(out, Severity::Warning, "01000", &warning);
+        }
+    }
+
     /// True when the server stops or `DROP DATABASE ... WITH (FORCE)` ends the session.
     fn ending(&self) -> bool {
         self.shared.stopping() || self.shared.terminating(self.pid)
@@ -1432,6 +1445,7 @@ impl Runner {
             let result = match ran {
                 Ok(Outcome::Result(result)) => result,
                 Ok(Outcome::Done(tag)) => {
+                    self.advisory_warnings(out);
                     out.command_tag(tag, 0);
                     continue;
                 }
@@ -1443,6 +1457,7 @@ impl Runner {
                         if let Some(result) = self.connection.rows_before_error() {
                             let _ = self.rows(&result, out, &mut flush)?;
                         }
+                        self.advisory_warnings(out);
                         failure.write(sql, out);
                     }
                     return Ok(true);
@@ -1464,6 +1479,7 @@ impl Runner {
             } else {
                 0
             };
+            self.advisory_warnings(out);
             out.command_tag(tag, rows);
         }
         if let Err(failure) = self.end_implicit() {
@@ -1495,6 +1511,9 @@ impl Runner {
             .map(|(at, (name, ty))| field(name, ty, result.origin(at), 0))
             .collect();
         out.row_description(&fields);
+        // PostgreSQL sends the `RowDescription` before the statement runs, so the warnings of the
+        // statement come after it.
+        self.advisory_warnings(out);
         let columns: Vec<_> = result
             .types()
             .iter()
