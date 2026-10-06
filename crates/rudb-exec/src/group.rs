@@ -2843,6 +2843,8 @@ impl<'a> Aggregate<'a> {
         let mut placed = false;
         if let Some(codes) = &direct {
             if !codes.same_as(coded_on) {
+                // The totals kept by place were added up against the map as it is.
+                place_sums.fold_places(coded_map, states)?;
                 if codes.reads_values() {
                     *coded_spent += codes.combos() - grown.unwrap_or(0);
                 }
@@ -2865,6 +2867,14 @@ impl<'a> Aggregate<'a> {
             };
             let summed =
                 !in_runs && by_place && place_sums.ready(states, calls, &inputs, offered, *length);
+            // Totals by place go on in the cells of the chunks before while the calls stay the
+            // same, and are folded in here, before `resolve` below takes the states, when not.
+            if summed
+                && place_sums.adds_by_place(coded_map.len(), *length)
+                && !place_sums.carries(*length)
+            {
+                place_sums.fold_places(coded_map, states)?;
+            }
             // A row the map has nothing for goes through the probe and the insert every row used to
             // go through, there and then, and what comes back is written into the map before the
             // next row is looked at. A key sorted the way `CounterID` is brings each value in as a
@@ -2958,7 +2968,6 @@ impl<'a> Aggregate<'a> {
                             }
                         }
                     }
-                    place_sums.fold_places(coded_map, states, calls)?;
                 } else {
                     let mut row = 0;
                     loop {
@@ -5907,6 +5916,7 @@ impl Building {
     /// Folds in the totals [`PlaceSums`] still owes the accumulators, which everything that reads
     /// them or moves the groups asks for first.
     fn settle(&mut self) -> Result<()> {
+        self.place_sums.fold_places(&self.coded_map, &mut self.states)?;
         self.place_sums.settle(&mut self.states)
     }
 }
