@@ -56,7 +56,9 @@ use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::{Live, Validity};
-use rudb_vector::{Buffer, Chunk, Data, Packed, Runs, TextSource, Vector, search_below};
+use rudb_vector::{
+    Buffer, Chunk, Data, Packed, Runs, TextSource, Vector, enum_code_type, search_below,
+};
 
 mod anchor;
 mod distinct;
@@ -10409,7 +10411,8 @@ pub fn stores(ty: &LogicalType) -> bool {
 /// the only thing that may happen to this list is that it grows. 1 to 13 are the tags the format
 /// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
 /// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list, 30 is the `numeric`
-/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS`, 33 is `TIMESTAMPTZ_NS` and 34 is `JSON`.
+/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS`, 33 is `TIMESTAMPTZ_NS`, 34 is `JSON` and 35 is
+/// an `ENUM`.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -10446,16 +10449,19 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::Json => Ok(34),
         LogicalType::TimeNs => Ok(32),
         LogicalType::TimestampTzNs => Ok(33),
+        LogicalType::Enum(_) => Ok(35),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
 
 /// The tag of a column type, and the parameters of the ones that have any.
 ///
-/// `DECIMAL` and `LIST` have parameters. Width and scale go after the tag rather than into it
-/// because they are what says how wide a value is on disk, and a reader that guessed would read the
-/// wrong number of bytes per row rather than the wrong number of digits. A list puts the type of its
-/// elements after its tag, with the parameters of that type.
+/// `DECIMAL`, `LIST` and `ENUM` have parameters. Width and scale go after the tag rather than into
+/// it because they are what says how wide a value is on disk, and a reader that guessed would read
+/// the wrong number of bytes per row rather than the wrong number of digits. A list puts the type
+/// of its elements after its tag, with the parameters of that type. An enum puts the number of its
+/// labels and then each label, since its pages hold only the positions and the labels are what
+/// gives them a meaning.
 fn put_type(out: &mut Vec<u8>, ty: &LogicalType) -> Result<()> {
     out.push(type_tag(ty)?);
     match ty {
@@ -10464,6 +10470,15 @@ fn put_type(out: &mut Vec<u8>, ty: &LogicalType) -> Result<()> {
             out.push(*scale);
         }
         LogicalType::List(element) => put_type(out, element)?,
+        LogicalType::Enum(labels) => {
+            put_u32(out, u32::try_from(labels.len()).map_err(|_| invalid("too many enum labels"))?);
+            for label in labels.iter() {
+                let label = label.as_bytes();
+                let len = u16::try_from(label.len()).map_err(|_| invalid("enum label too long"))?;
+                put_u16(out, len);
+                out.extend_from_slice(label);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -10480,6 +10495,14 @@ fn read_type(cur: &mut Cursor<'_>) -> Result<LogicalType> {
     }
     if tag == 29 {
         return Ok(LogicalType::List(Box::new(read_type(cur)?)));
+    }
+    if tag == 35 {
+        let count = cur.u32()? as usize;
+        let mut labels = Vec::with_capacity(count.min(cur.len()));
+        for _ in 0..count {
+            labels.push(cur.text()?);
+        }
+        return Ok(LogicalType::Enum(labels.into()));
     }
     tag_type(tag)
 }
@@ -13832,6 +13855,11 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
     if let LogicalType::List(_) = ty {
         return encode(&nested::to_bytes(vector)?, settling);
     }
+    // An enum's page is its positions, written the way the unsigned integer they are held in is, so
+    // that it is packed and cascaded like one.
+    if let LogicalType::Enum(_) = ty {
+        return encode(&vector.enum_codes()?, settling);
+    }
     // flatten: the file writer needs a uniform scalar page and does it once per loaded chunk.
     let flat = vector.flatten()?;
     let mut out = Vec::new();
@@ -15398,6 +15426,10 @@ fn decode_at(
     if let LogicalType::List(_) = ty {
         return decode(ty, rows, bytes, global)?.gather(positions);
     }
+    if let LogicalType::Enum(_) = ty {
+        let codes = decode_at(&enum_code_type(ty), rows, bytes, None, positions, runs)?;
+        return enum_from_codes(ty, &codes);
+    }
     // Past about one row in eight, unpacking the whole part and picking the rows out is the cheaper
     // of the two, since a unit unpacks at a fraction of what a row unpacked on its own costs.
     if positions.len().saturating_mul(SPARSE_RENT) <= rows
@@ -15562,6 +15594,27 @@ fn push_values(values: &mut StringColumn, ty: &LogicalType, ends: &[usize]) -> R
     Ok(())
 }
 
+/// An enum vector over the positions a page of one was read back as.
+///
+/// A position past the end of the labels is a damaged file and is refused here, because every
+/// reader after this one takes the position as an index into the labels.
+fn enum_from_codes(ty: &LogicalType, codes: &Vector) -> Result<Vector> {
+    let count = ty.labels().map_or(0, <[String]>::len);
+    // flatten: a page comes back packed or as runs, and an enum is read through its flat codes.
+    let flat = codes.flatten()?;
+    let data = flat.data().cloned().unwrap_or(Data::Empty);
+    match &data {
+        Data::UInt8(_) | Data::UInt16(_) | Data::UInt32(_) => {}
+        Data::Empty => return Ok(Vector::constant(ty.clone(), Value::Null, flat.len())),
+        _ => return Err(invalid("enum page is not held as its positions")),
+    }
+    let past = |row: usize| data.unsigned_at(row).is_none_or(|code| code >= count as u128);
+    if (0..data.len()).any(|row| !flat.is_null_at(row) && past(row)) {
+        return Err(invalid("enum page holds a position past its labels"));
+    }
+    Ok(Vector::flat(ty.clone(), data)?.with_validity(flat.validity().clone()))
+}
+
 fn decode(
     ty: &LogicalType,
     rows: usize,
@@ -15570,6 +15623,9 @@ fn decode(
 ) -> Result<Vector> {
     if let LogicalType::List(_) = ty {
         return nested::from_bytes(ty, &decode(&LogicalType::Blob, rows, bytes, None)?);
+    }
+    if let LogicalType::Enum(_) = ty {
+        return enum_from_codes(ty, &decode(&enum_code_type(ty), rows, bytes, None)?);
     }
     let mut cur = Cursor::new(bytes);
     let codec = cur.u8()?;
@@ -18950,6 +19006,49 @@ mod tests {
         for (at, (ty, values)) in columns.iter().enumerate() {
             assert_eq!(read.value_at(0, at), values[0], "the low end of {ty}");
             assert_eq!(read.value_at(1, at), values[1], "the high end of {ty}");
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// An enum of each width its positions can be held in, written and read back with its labels.
+    ///
+    /// The labels live in the directory and the pages hold only positions, so a reader that got
+    /// the labels wrong or lost the width would hand back the wrong strings rather than fail.
+    #[test]
+    fn an_enum_round_trips_with_its_labels() {
+        let path = path("enum-labels");
+        let labels = |count: usize| (0..count).map(|at| format!("l{at}")).collect::<Vec<_>>();
+        let columns = [3, 300, 70_000].map(|count| {
+            let labels = labels(count);
+            let values = vec![
+                Value::Varchar(labels[0].clone()),
+                Value::Null,
+                Value::Varchar(labels[count - 1].clone()),
+            ];
+            (LogicalType::Enum(labels.into()), values)
+        });
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(at, (ty, _))| Field::new(format!("c{at}"), ty.clone()))
+            .collect::<Vec<_>>();
+        let vectors = columns
+            .iter()
+            .map(|(ty, values)| Vector::from_values(ty.clone(), values).expect("a vector"))
+            .collect::<Vec<_>>();
+        let mut writer = Writer::create(&path, "moods", fields).expect("new file");
+        writer.append(&Chunk::new(vectors).expect("matching rows")).expect("one stripe");
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let read = reader.read(0, &[0, 1, 2]).expect("every column");
+        for (at, (ty, values)) in columns.iter().enumerate() {
+            assert_eq!(&reader.table.fields[at].ty, ty, "the labels of column {at}");
+            let found = read.column(at).expect("a column").logical_type();
+            assert_eq!(found, ty, "the type of column {at}");
+            for (row, value) in values.iter().enumerate() {
+                assert_eq!(&read.value_at(row, at), value, "row {row} of column {at}");
+            }
         }
         fs::remove_file(path).expect("remove scratch file");
     }

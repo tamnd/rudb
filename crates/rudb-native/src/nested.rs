@@ -134,7 +134,11 @@ fn put(out: &mut Vec<u8>, value: &Value, ty: &LogicalType) -> Result<()> {
             out.extend_from_slice(&days.to_le_bytes());
             out.extend_from_slice(&micros.to_le_bytes());
         }
-        (LogicalType::Varchar, Value::Varchar(held)) => put_bytes(out, held.as_bytes())?,
+        // An enum element is written as its label, which the column's type turns back into its
+        // position when the list is read.
+        (LogicalType::Varchar | LogicalType::Enum(_), Value::Varchar(held)) => {
+            put_bytes(out, held.as_bytes())?;
+        }
         (LogicalType::Blob, Value::Blob(held))
         | (LogicalType::Bit, Value::Bit(held))
         | (LogicalType::BigNum, Value::BigNum(held)) => put_bytes(out, held)?,
@@ -225,7 +229,7 @@ fn get(cur: &mut Reader<'_>, ty: &LogicalType) -> Result<Value> {
             days: i32::from_le_bytes(cur.array()?),
             micros: i64::from_le_bytes(cur.array()?),
         },
-        LogicalType::Varchar => {
+        LogicalType::Varchar | LogicalType::Enum(_) => {
             let len = cur.len()?;
             let text = std::str::from_utf8(cur.take(len)?)
                 .map_err(|_| invalid("list element of a varchar list is not UTF-8"))?;
