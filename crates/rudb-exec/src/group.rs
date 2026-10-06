@@ -6140,8 +6140,9 @@ struct FewDistinct {
 /// order of the sets.
 const DIRECT_SETS: usize = 1 << 10;
 
-/// How many held values are given to their sets at once.
-const HELD_DISTINCT: usize = 1 << 16;
+/// How many held values are given to their sets at once, which with the spare the sort writes into
+/// is half a megabyte, the size of a core's second level cache on the machines this was measured on.
+const HELD_DISTINCT: usize = 1 << 14;
 
 /// The values offered to the BIGINT distinct sets of a table, held so that they are given to the
 /// sets in the order the sets are in rather than the order the rows came.
