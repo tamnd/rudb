@@ -551,7 +551,11 @@ mod tests {
                 let room = (bytes.len() - skip * width / 8 - 4 * width / 8 - 16) / width + 1;
                 assert_eq!(done, 8 * (136 / 8).min(room), "{width} {skip}");
                 for (row, &place) in into.iter().enumerate() {
-                    let want = if row < done { row as u32 + (codes[skip + row] + 3) * 5 } else { row as u32 };
+                    let want = if row < done {
+                        row as u32 + (codes[skip + row] + 3) * 5
+                    } else {
+                        row as u32
+                    };
                     assert_eq!(place, want, "{width} {skip} {row}");
                 }
             }

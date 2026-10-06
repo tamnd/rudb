@@ -4371,7 +4371,10 @@ impl Packed<'_> {
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         let at = head;
         for row in (0..head).chain(at..into.len()) {
-            #[expect(clippy::cast_possible_truncation, reason = "a key column's codes fit its places")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a key column's codes fit its places"
+            )]
             let code = code_at(self.words, (start + row) * width, self.width) as u32;
             into[row] += (code + lift) * stride;
         }
