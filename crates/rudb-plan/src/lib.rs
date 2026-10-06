@@ -79,7 +79,7 @@ pub use node::{
     Bound, BuildSide, JoinKind, Node, SetOpKind, Share, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,
 };
-pub use plan::Plan;
+pub use plan::{Plan, Watched};
 pub use reducer::{Edge, Extreme, Key, Leaf, Reducer};
 pub use rid::{Carried, rids_of};
 pub use seams::seams_of;

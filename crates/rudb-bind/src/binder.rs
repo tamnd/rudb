@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
+use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, Table, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder,
@@ -87,6 +87,40 @@ pub fn bind_with(
     plan.set_root(root);
     plan.validate()?;
     Ok(plan)
+}
+
+/// Records on `plan` what the stored table bound at `index` knows about its rows, which is what the
+/// estimates are made from and what a plan kept to run again reads again off a catalog whose rows
+/// have moved on.
+///
+/// What the store wrote down about itself goes against the table index the same way a Parquet
+/// footer does. A table with nothing to say records nothing and the estimate falls back to the
+/// constants it used before, which is what every table did until the file had a directory worth
+/// asking.
+pub(crate) fn attach_facts(plan: &mut Plan, index: u32, table: &Table, want_ascending: bool) {
+    if let Some(zones) = table.rows().zones() {
+        plan.set_zones(index, zones);
+    }
+    if let Some(frequencies) = table.frequencies() {
+        plan.set_frequencies(index, frequencies);
+    }
+    // A stored table hands over what it gathered once for the whole plan to share. Only a table
+    // whose rows can change is asked column by column.
+    if let Some(facts) = table.facts() {
+        plan.set_facts(index, facts, want_ascending);
+        return;
+    }
+    for (column, distinct) in table.distincts() {
+        plan.measure_distinct(index, &column, distinct);
+    }
+    if want_ascending {
+        for column in table.ascending() {
+            plan.mark_ascending(index, &column);
+        }
+    }
+    for (column, bytes) in table.widths() {
+        plan.measure_width(index, &column, bytes);
+    }
 }
 
 /// Parses and binds one query, which is the whole front end in one call.
@@ -554,12 +588,16 @@ impl<'a> Binder<'a> {
         parameters: &'a Parameters,
         session: &'a Session,
     ) -> Self {
+        let mut plan = Plan::new();
+        if parameters.kept().is_some() {
+            plan.watch_parameters();
+        }
         Self {
             catalog,
             parameters,
             session,
             semantics: session.semantics(),
-            plan: Plan::new(),
+            plan,
             next_index: 0,
             current_span: Span::new(0, 0),
             pinned_span: None,
@@ -677,7 +715,11 @@ impl<'a> Binder<'a> {
         self.plan.add_node_at(node, self.current_span)
     }
 
-    pub(crate) fn into_plan(self) -> Plan {
+    /// The plan, which a prepared statement cannot keep when `now()` was folded into it.
+    pub(crate) fn into_plan(mut self) -> Plan {
+        if self.started.is_some() {
+            self.plan.spoil_parameters();
+        }
         self.plan
     }
 
@@ -3895,33 +3937,10 @@ impl<'a> Binder<'a> {
         let table_name = self.plan.intern(&resolved.table);
         let alias = self.plan.intern(&label);
         let columns = self.plan.add_fields(fields);
-        // What the store wrote down about itself, against the table index the same way a Parquet
-        // footer is. A table with nothing to say records nothing and the estimate falls back to the
-        // constants it used before, which is what every table did until the file had a directory
-        // worth asking.
-        if let Some(zones) = table.rows().zones().filter(|_| !excluded) {
-            self.plan.set_zones(index, zones);
-        }
-        if let Some(frequencies) = table.frequencies().filter(|_| !excluded) {
-            self.plan.set_frequencies(index, frequencies);
-        }
-        // A stored table hands over what it gathered once for the whole plan to share. Only a table
-        // whose rows can change is asked column by column.
-        let facts = table.facts().filter(|_| !excluded);
-        if let Some(facts) = facts {
-            self.plan.set_facts(index, facts, self.want_ascending);
-        } else if !excluded {
-            for (column, distinct) in table.distincts() {
-                self.plan.measure_distinct(index, &column, distinct);
-            }
-            if self.want_ascending {
-                for column in table.ascending() {
-                    self.plan.mark_ascending(index, &column);
-                }
-            }
-            for (column, bytes) in table.widths() {
-                self.plan.measure_width(index, &column, bytes);
-            }
+        if !excluded {
+            attach_facts(&mut self.plan, index, table, self.want_ascending);
+            let names = [resolved.catalog.as_str(), &resolved.schema, &resolved.table];
+            self.plan.note_table(index, names, self.want_ascending);
         }
         let node = self.add_node(Node::Get {
             catalog: catalog_name,

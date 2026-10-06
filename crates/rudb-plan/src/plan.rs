@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rudb_common::bounds::{Frequencies, Zones};
 use rudb_common::{ColumnFacts, Error, Field, LogicalType, Origin, Result, Span, Stat, Value};
@@ -152,6 +153,41 @@ pub struct Plan {
     /// Beside the pools for the reason `measured` is. Only the binder still knows which result
     /// column is a plain table column, and only a PostgreSQL client asks, after the plan has run.
     origins: Vec<Option<Origin>>,
+    /// What binding a prepared statement left behind for running the plan again with other values,
+    /// while the binder is watching for it. See [`Plan::watch_parameters`].
+    watch: Option<Box<Watch>>,
+}
+
+/// The constants a plan holds its parameters' values in and the stored tables it read facts off,
+/// which is what a plan kept by a prepared statement needs to run again with other values in a
+/// catalog whose rows have moved on.
+#[derive(Debug, Clone, Default)]
+pub struct Watched {
+    /// Each constant that holds a parameter's value, with the parameter's name.
+    pub slots: Vec<(ValueRef, String)>,
+    /// Each stored table the binder read facts off, by table index, with its catalog, schema and
+    /// table names and whether its ascending columns were wanted.
+    pub tables: Vec<(u32, [String; 3], bool)>,
+}
+
+/// [`Watched`] while the binder is still at it, with whether anything has read a parameter's value.
+///
+/// A plan that read one made something of the value, a row count or a folded call, that the slot
+/// no longer reaches, so a later value set into the slot would not reach it either. Atomic only
+/// because a plan is shared between threads, and nothing reads the flag until the binder is done.
+#[derive(Debug, Default)]
+struct Watch {
+    watched: Watched,
+    read: AtomicBool,
+}
+
+impl Clone for Watch {
+    fn clone(&self) -> Self {
+        Self {
+            watched: self.watched.clone(),
+            read: AtomicBool::new(self.read.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Default for Plan {
@@ -336,6 +372,7 @@ impl Plan {
             reducers: Vec::new(),
             declined: Vec::new(),
             origins: Vec::new(),
+            watch: None,
         }
     }
 
@@ -360,6 +397,65 @@ impl Plan {
     /// Records the table column of each column of the result.
     pub fn set_origins(&mut self, origins: Vec<Option<Origin>>) {
         self.origins = origins;
+    }
+
+    /// Starts noting which constants hold a parameter's value and which stored tables facts are
+    /// read off, for a prepared statement that keeps its plan to run again with other values.
+    pub fn watch_parameters(&mut self) {
+        self.watch = Some(Box::default());
+    }
+
+    /// Appends the value `name` was given, noted as that parameter's when the plan is watched.
+    pub fn add_parameter(&mut self, name: &str, value: Value) -> ValueRef {
+        let reference = self.add_value(value);
+        if let Some(watch) = &mut self.watch {
+            watch.watched.slots.push((reference, name.to_owned()));
+        }
+        reference
+    }
+
+    /// Notes, when the plan is watched, that the facts of the stored table `names` were read for the
+    /// table index `index`, with `ascending` as [`Self::set_facts`] was given it.
+    pub fn note_table(&mut self, index: u32, names: [&str; 3], ascending: bool) {
+        if let Some(watch) = &mut self.watch {
+            watch.watched.tables.push((index, names.map(str::to_owned), ascending));
+        }
+    }
+
+    /// Says the plan holds something the values of its parameters cannot be set into again, such
+    /// as the instant `now()` was folded to.
+    pub fn spoil_parameters(&mut self) {
+        if let Some(watch) = &self.watch {
+            watch.read.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Stops watching, and answers what was noted, or `None` when the plan was not watched or
+    /// something read a parameter's value while it was.
+    pub fn take_parameters(&mut self) -> Option<Watched> {
+        let watch = self.watch.take()?;
+        (!watch.read.load(Ordering::Relaxed)).then_some(watch.watched)
+    }
+
+    /// Sets the constant at `reference` to `value`, which is how a kept plan is given the values of
+    /// another execution.
+    ///
+    /// # Panics
+    ///
+    /// If the reference is not in the arena.
+    pub fn set_value(&mut self, reference: ValueRef, value: Value) {
+        self.values[reference as usize] = value;
+    }
+
+    /// Forgets every fact recorded about the table bound at `index`, so that they can be read again
+    /// off a catalog whose rows have changed.
+    pub fn forget_facts(&mut self, index: u32) {
+        self.distincts.remove(&index);
+        self.facts.remove(&index);
+        self.zones.remove(&index);
+        self.frequencies.remove(&index);
+        self.ascending.remove(&index);
+        self.widths.remove(&index);
     }
 
     /// Records what the binder found out about the table bound at `index`.
@@ -878,6 +974,11 @@ impl Plan {
     /// If the reference is not in the arena.
     #[must_use]
     pub fn value(&self, reference: ValueRef) -> &Value {
+        if let Some(watch) = &self.watch
+            && watch.watched.slots.iter().any(|&(slot, _)| slot == reference)
+        {
+            watch.read.store(true, Ordering::Relaxed);
+        }
         &self.values[reference as usize]
     }
 
@@ -1357,8 +1458,10 @@ impl Plan {
                 }
                 // A null literal takes its type from context, so it is the one case where the
                 // stored type is allowed to disagree with the value. A `TYPE`, a `JSON` and a
-                // `JSONB` are held as their text, which is a string.
-                let held = self.value(value);
+                // `JSONB` are held as their text, which is a string. Read past `value`, since
+                // checking a parameter's type is not reading the value a kept plan would have to
+                // bind again.
+                let held = &self.values[value as usize];
                 let ty = self.expr_type(reference);
                 let text = matches!(ty, LogicalType::Type | LogicalType::Json | LogicalType::Jsonb)
                     && matches!(held, Value::Varchar(_));

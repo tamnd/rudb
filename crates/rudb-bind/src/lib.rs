@@ -30,6 +30,7 @@ mod explain;
 mod expr;
 mod figure;
 pub mod fold;
+mod kept;
 mod lambda;
 mod listaggr;
 mod macros;
@@ -56,6 +57,7 @@ mod windoworder;
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
 pub use collation::check_collation;
 pub use context::{is_session_word, micros_now};
+pub use kept::Kept;
 pub use macros::kept_macro;
 pub use parameters::{Capture, Caught, Described, Parameters, Placeholders, Written};
 pub use statement::{

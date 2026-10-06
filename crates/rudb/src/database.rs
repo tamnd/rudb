@@ -738,13 +738,14 @@ struct Simple {
 }
 
 /// A statement `PREPARE` gave a name to, parsed, with its parameters in the order they were
-/// written.
+/// written and the plans `EXECUTE` keeps for it.
 #[derive(Debug)]
 struct Named {
     sql: String,
     ast: Ast,
     names: Vec<String>,
     listed: PreparedStatement,
+    kept: rudb_bind::Kept,
 }
 
 impl Conn {
@@ -6350,7 +6351,8 @@ impl Shared {
             parameters: names.len(),
             results: self.result_types(&ast, &names, &session),
         };
-        let named = Arc::new(Named { sql: text.to_string(), ast, names, listed });
+        let kept = rudb_bind::Kept::default();
+        let named = Arc::new(Named { sql: text.to_string(), ast, names, listed, kept });
         let mut prepared = self.prepared();
         prepared.insert(name.to_lowercase(), named);
         self.relist(&prepared);
@@ -6509,6 +6511,7 @@ impl Shared {
             )));
         }
         supply_parameters(&self.session(), &named.names, &mut parameters)?;
+        parameters.keep_in(named.kept.clone());
         self.execute_ast(&named.ast, &named.sql, &parameters, cancel, 0)
     }
 
@@ -7020,7 +7023,14 @@ impl Shared {
         let context = self.optimizer(&catalog)?;
         let session = self.session();
         let outlined = mirror && self.inner.settings.config().parquet_mirror();
-        let (bound, bind_ns) = timed(|| {
+        // A prepared statement keeps its plan under the names it resolved and the settings it was
+        // bound with, and sets the values of the next execution into it.
+        let kept = parameters.kept();
+        let at = (catalog.naming(), self.inner.settings_revision.load(Ordering::Relaxed));
+        let (mut bound, bind_ns) = timed(|| {
+            if let Some(plan) = kept.and_then(|kept| kept.take(at, parameters, &catalog)) {
+                return Ok(Bound::Query(plan));
+            }
             if outlined {
                 rudb_bind::bind_statement_outlined(ast, &catalog, parameters, &session)
             } else {
@@ -7037,6 +7047,9 @@ impl Shared {
                 self.mirror(&wanted);
                 return self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, false, noted);
             }
+        }
+        if let (Some(kept), Bound::Query(plan)) = (kept, &mut bound) {
+            kept.keep(at, parameters, plan);
         }
         let writes = matches!(
             bound,

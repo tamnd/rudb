@@ -648,11 +648,12 @@ impl Binder<'_> {
 
     /// `?`, `?1`, `$1` or `$name`, which is the value the statement was prepared with.
     ///
-    /// A constant, because the value is known by the time this runs. A statement is parsed once and
-    /// bound once per set of values, so the plan a prepared statement runs is an ordinary plan and
-    /// nothing after the binder knows a parameter was ever written. The cost of that is binding
-    /// again for each execution, which is the front end and not the query, and the benefit is that
-    /// the optimizer gets to fold and prune with the values in hand.
+    /// A constant, because the value is known by the time this runs, so the plan a prepared
+    /// statement runs is an ordinary plan and nothing after the binder knows a parameter was ever
+    /// written. The optimizer gets to fold and prune with the values in hand. The plan keeps which
+    /// constant is which parameter's, so that a prepared statement can keep the plan and set the
+    /// next execution's values into it rather than bind again, as long as nothing in binding read
+    /// the value (see [`crate::Kept`]).
     fn bind_parameter(&mut self, ast: &Ast, name: ast::StrRef) -> Result<ExprRef> {
         let name = ast.string(name);
         if let Some(inlined) = &self.inlined
@@ -690,9 +691,12 @@ impl Binder<'_> {
                 name.trim_start_matches('$')
             )));
         };
-        let constant = self.add_constant(value.clone());
+        let (ty, value) = (value.logical_type(), value.clone());
+        let null = value.is_null();
+        let reference = self.plan_mut().add_parameter(name, value);
+        let constant = self.add_expr(Expr::Constant(reference), ty);
         // A null has no type, and in PostgreSQL it is a null of the type of its parameter.
-        if value.is_null()
+        if null
             && self.semantics.unknown_types() == UnknownTypes::Postgres
             && let Some(ty) = self.parameters.declared_type(name)
             && let Some(ty) = rudb_pgtypes::logical_type(ty.oid)
@@ -700,7 +704,7 @@ impl Binder<'_> {
             return Ok(self.cast_to(constant, &ty));
         }
         // A null handed to an `EXECUTE` as `NULL::INT` is a null of that type, as it is on the pin.
-        if value.is_null()
+        if null
             && let Some(ty) = self.parameters.null_type(name)
         {
             let ty = ty.clone();
