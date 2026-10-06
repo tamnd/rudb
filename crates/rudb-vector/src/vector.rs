@@ -3818,6 +3818,92 @@ impl Vector {
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
     }
 
+    /// The rows of each of `runs`, a start and a length, laid end to end.
+    ///
+    /// [`Self::gather`] of every row the runs cover, without writing those rows out first. A packed
+    /// column with no nulls reads each run straight through, where a gather reads each row on its
+    /// own and asks a prefetch for the row sixteen on. The lines of one order sit together in
+    /// `lineitem`, so a walk from a line to the other lines of its order reads runs of about five.
+    /// In TPC-H q21 that walk reads three columns at about 780 thousand rows, and the gather took
+    /// about forty instructions a value. Anything else goes through the rows.
+    ///
+    /// # Errors
+    ///
+    /// If a run goes past the end, or whatever the gather raises.
+    pub fn gather_runs(&self, runs: &[(u32, u32)]) -> Result<Self> {
+        let mut rows = 0;
+        for &(start, length) in runs {
+            if start as usize + length as usize > self.len {
+                return Err(Error::internal("a run is past the end of its vector"));
+            }
+            rows += length as usize;
+        }
+        if let Some(unpacked) = self.unpacked_runs(runs, rows) {
+            return Ok(unpacked);
+        }
+        let mut at = Vec::with_capacity(rows);
+        for &(start, length) in runs {
+            at.extend(start..start + length);
+        }
+        self.gather(&at)
+    }
+
+    /// [`Self::gather_runs`] of a packed column with no nulls whose ends fit an `i64`, `None` for
+    /// anything else. Every run is inside the column, which the caller checked.
+    fn unpacked_runs(&self, runs: &[(u32, u32)], rows: usize) -> Option<Self> {
+        fn each<T>(
+            packed: &Packed<'_>,
+            runs: &[(u32, u32)],
+            rows: usize,
+            value: impl Fn(u64) -> T,
+        ) -> Vec<T> {
+            let width = packed.width as usize;
+            let mut out = Vec::with_capacity(rows);
+            for &(start, length) in runs {
+                let first = (packed.offset + start as usize) * width;
+                let last = first + length as usize * width;
+                out.extend(
+                    (first..last)
+                        .step_by(width)
+                        .map(|bit| value(code_at(packed.words, bit, packed.width))),
+                );
+            }
+            out
+        }
+        let Body::Packed { words, width, base, offset } = &self.body else {
+            return None;
+        };
+        if self.validity.has_nulls(self.len) || *width == 0 {
+            return None;
+        }
+        let packed = Packed { words, width: *width, base: *base, offset: *offset };
+        let low = i64::try_from(packed.base()).ok()?;
+        i64::try_from(packed.ceiling()).ok()?;
+        // The same reasoning as `unpacked_at`: both ends fit, so the add does not wrap and the
+        // narrowing keeps every value.
+        #[expect(clippy::cast_possible_wrap, reason = "a code is below the span, which fits")]
+        let value = move |code: u64| low.wrapping_add(code as i64);
+        #[expect(clippy::cast_possible_truncation, reason = "the layout holds every value")]
+        let data = match self.ty.physical() {
+            rudb_common::PhysicalType::Int64 => {
+                Data::Int64(Buffer::from_vec(each(&packed, runs, rows, value)))
+            }
+            rudb_common::PhysicalType::Int32 => {
+                Data::Int32(Buffer::from_vec(each(&packed, runs, rows, |code| value(code) as i32)))
+            }
+            rudb_common::PhysicalType::Int16 => {
+                Data::Int16(Buffer::from_vec(each(&packed, runs, rows, |code| value(code) as i16)))
+            }
+            _ => return None,
+        };
+        Some(Self {
+            ty: self.ty.clone(),
+            len: rows,
+            validity: Validity::AllValid,
+            body: Body::flat(data),
+        })
+    }
+
     /// A gather off a flat run of fixed width values, every position inside it.
     ///
     /// That is what a join hands out on both of its sides, and the general copy below made a run of

@@ -143,6 +143,13 @@ pub(crate) struct Walking {
     keys: Vec<i64>,
     /// The siblings of one batch, each once, in the order they were found.
     rids: Vec<u32>,
+    /// The same siblings as runs of rows, a first row and a length, which is how a walk over a
+    /// link finds them and how they are read.
+    runs: Vec<(u64, u32)>,
+    /// How many siblings the batch has.
+    count: usize,
+    /// The runs of one part, from its first row.
+    within: Vec<(u32, u32)>,
     /// For each pair of the batch, where its sibling is in `rids` and which row it belongs to.
     places: Vec<u32>,
     owners: Vec<u32>,
@@ -318,6 +325,12 @@ impl Siblings {
         // The parent of the row before and where its siblings are in the batch, so that a run of
         // rows with one parent looks it up and finds its siblings once.
         let paired = matches!(self.tests, Tests::Pairs { .. });
+        // A compared walk over a link takes each parent's children as the run they are and never
+        // lists them, see [`Self::compare`].
+        let link = match &self.children {
+            Children::Runs(link) if !paired => Some(link),
+            _ => None,
+        };
         let mut last: Option<(i128, Rid)> = None;
         let mut group: Option<(Rid, u32, u32)> = None;
         for row in 0..rows {
@@ -344,26 +357,51 @@ impl Siblings {
                     (start, len)
                 }
                 _ => {
-                    local.found.clear();
-                    self.children.of(parent, &mut local.cursor, &mut local.found)?;
-                    let len = local.found.len();
-                    if local.rids.len() + len > VECTOR_SIZE
+                    let run = match link {
+                        Some(link) => {
+                            link.backward_from(parent, &mut local.cursor).ok_or_else(|| {
+                                Error::internal("a link has no run for a parent it holds")
+                            })?
+                        }
+                        None => {
+                            local.found.clear();
+                            self.children.of(parent, &mut local.cursor, &mut local.found)?;
+                            0..local.found.len() as u64
+                        }
+                    };
+                    // Under the table's rows, which a chunk's length is.
+                    let len = (run.end - run.start) as usize;
+                    if local.count + len > VECTOR_SIZE
                         || (paired && local.places.len() + len > VECTOR_SIZE)
                     {
                         self.flush(chunk, local)?;
                         self.clear(local);
                     }
                     // Under a vector's worth, by the test just above.
-                    let start = local.rids.len() as u32;
-                    for &child in &local.found {
-                        let child = u32::try_from(child).map_err(|_| {
-                            Error::internal("a sibling row id is past what a gather can hold")
-                        })?;
-                        if local.rids.last().is_some_and(|&before| before >= child) {
+                    let start = local.count as u32;
+                    if link.is_some() {
+                        if local
+                            .runs
+                            .last()
+                            .is_some_and(|&(first, length)| first + u64::from(length) > run.start)
+                        {
                             local.rising = false;
                         }
-                        local.rids.push(child);
+                        if len > 0 {
+                            local.runs.push((run.start, len as u32));
+                        }
+                    } else {
+                        for &child in &local.found {
+                            let child = u32::try_from(child).map_err(|_| {
+                                Error::internal("a sibling row id is past what a gather can hold")
+                            })?;
+                            if local.rids.last().is_some_and(|&before| before >= child) {
+                                local.rising = false;
+                            }
+                            local.rids.push(child);
+                        }
                     }
+                    local.count += len;
                     group = Some((parent, start, len as u32));
                     (start, len as u32)
                 }
@@ -419,53 +457,54 @@ impl Siblings {
 
     fn clear(&self, local: &mut Walking) {
         local.rids.clear();
+        local.runs.clear();
+        local.count = 0;
         local.places.clear();
         local.owners.clear();
         local.spans.clear();
         local.rising = true;
     }
 
-    /// The stored columns at `rids`, which rise, one vector per column.
+    /// The stored columns at `runs`, which rise and do not overlap, one vector per column.
     ///
     /// A part the batch reads densely is read whole and kept in `kept`, because the next batch's
     /// siblings are mostly in the same part and a compressed page costs the same to decode for one
     /// row as for all of them. A part read sparsely, which is a child in no order, is read at the
-    /// rows asked for.
-    fn read(&self, rids: &[u32], kept: &mut Option<(usize, Chunk)>) -> Result<Vec<Vector>> {
+    /// rows asked for. `within` is room for the runs of one part.
+    fn read(
+        &self,
+        runs: &[(u64, u32)],
+        kept: &mut Option<(usize, Chunk)>,
+        within: &mut Vec<(u32, u32)>,
+    ) -> Result<Vec<Vector>> {
         let starts = self.starts()?;
+        let past = || Error::internal("a sibling row id is past the end of its table");
         let mut pieces: Vec<Vec<Vector>> = vec![Vec::new(); self.read.len()];
-        let mut positions = Vec::new();
-        let mut at = 0;
-        while at < rids.len() {
-            let rid = u64::from(rids[at]);
-            let part = starts.partition_point(|&start| start <= rid).saturating_sub(1);
-            let end = *starts
-                .get(part + 1)
-                .ok_or_else(|| Error::internal("a sibling row id is past the end of its table"))?;
-            positions.clear();
-            while at < rids.len() && u64::from(rids[at]) < end {
+        let mut part = 0;
+        let mut wanted = 0;
+        within.clear();
+        for &(first, length) in runs {
+            let (mut from, end) = (first, first + u64::from(length));
+            while from < end {
+                let stop = *starts.get(part + 1).ok_or_else(past)?;
+                if from < starts[part] || from >= stop {
+                    if !within.is_empty() {
+                        self.read_part(part, within, wanted, kept, &mut pieces)?;
+                        within.clear();
+                        wanted = 0;
+                    }
+                    part = starts.partition_point(|&start| start <= from).saturating_sub(1);
+                    continue;
+                }
+                let take = (end - from).min(stop - from);
                 // Inside the part, whose length is a `usize` it was read into.
-                positions.push((u64::from(rids[at]) - starts[part]) as u32);
-                at += 1;
+                within.push(((from - starts[part]) as u32, take as u32));
+                wanted += take;
+                from += take;
             }
-            let length = end - starts[part];
-            let dense = positions.len() as u64 * DENSE >= length;
-            if dense && kept.as_ref().is_none_or(|(at, _)| *at != part) {
-                *kept = Some((part, self.rows.read(part, &self.read)?));
-            }
-            match kept {
-                Some((at, whole)) if *at == part => {
-                    for (column, piece) in pieces.iter_mut().enumerate() {
-                        piece.push(whole.column(column)?.gather(&positions)?);
-                    }
-                }
-                _ => {
-                    let read = self.rows.read_rows(part, &self.read, &positions)?;
-                    for (column, piece) in pieces.iter_mut().enumerate() {
-                        piece.push(read.column(column)?.clone());
-                    }
-                }
-            }
+        }
+        if !within.is_empty() {
+            self.read_part(part, within, wanted, kept, &mut pieces)?;
         }
         pieces
             .into_iter()
@@ -482,6 +521,38 @@ impl Siblings {
             .collect()
     }
 
+    /// The runs of part `part`, `wanted` rows between them, one piece a column.
+    fn read_part(
+        &self,
+        part: usize,
+        runs: &[(u32, u32)],
+        wanted: u64,
+        kept: &mut Option<(usize, Chunk)>,
+        pieces: &mut [Vec<Vector>],
+    ) -> Result<()> {
+        let starts = self.starts()?;
+        let length = starts[part + 1] - starts[part];
+        if wanted * DENSE >= length && kept.as_ref().is_none_or(|(at, _)| *at != part) {
+            *kept = Some((part, self.rows.read(part, &self.read)?));
+        }
+        match kept {
+            Some((at, whole)) if *at == part => {
+                for (column, piece) in pieces.iter_mut().enumerate() {
+                    piece.push(whole.column(column)?.gather_runs(runs)?);
+                }
+            }
+            _ => {
+                let positions: Vec<u32> =
+                    runs.iter().flat_map(|&(start, length)| start..start + length).collect();
+                let read = self.rows.read_rows(part, &self.read, &positions)?;
+                for (column, piece) in pieces.iter_mut().enumerate() {
+                    piece.push(read.column(column)?.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One batch of pairs, each a row of `chunk` at `owners` beside its sibling at `places`.
     fn pairs(
         &self,
@@ -492,8 +563,8 @@ impl Siblings {
     ) -> Result<()> {
         // A child in no order, or a parent that came back after another, is read in row order and
         // each pair's place moved to where its sibling went.
-        let read = if local.rising {
-            self.read(&local.rids, &mut local.part)?
+        if local.rising {
+            coalesce(&local.rids, &mut local.runs);
         } else {
             local.sorted.clear();
             local.sorted.extend_from_slice(&local.rids);
@@ -504,8 +575,9 @@ impl Siblings {
                 // Every id is in `sorted`, which is no longer than a vector.
                 *place = local.sorted.binary_search(&rid).map_or(0, |at| at as u32);
             }
-            self.read(&local.sorted, &mut local.part)?
-        };
+            coalesce(&local.sorted, &mut local.runs);
+        }
+        let read = self.read(&local.runs, &mut local.part, &mut local.within)?;
         let mut columns = Vec::with_capacity(carried.len() + read.len());
         for &at in carried {
             columns.push(chunk.column(at)?.gather(&local.owners)?);
@@ -554,9 +626,20 @@ impl Siblings {
         column: usize,
         local: &mut Walking,
     ) -> Result<()> {
-        let rids = if local.rising {
-            &local.rids
-        } else {
+        // A walk over a link found runs and has no rows listed. A parent that came back after another
+        // lists them here and goes the way every walk in no order goes.
+        let listed = matches!(self.children, Children::Listed(_));
+        if !local.rising && !listed {
+            local.rids.clear();
+            for &(first, length) in &local.runs {
+                for rid in first..first + u64::from(length) {
+                    local.rids.push(u32::try_from(rid).map_err(|_| {
+                        Error::internal("a sibling row id is past what a gather can hold")
+                    })?);
+                }
+            }
+        }
+        if !local.rising {
             local.sorted.clear();
             local.sorted.extend_from_slice(&local.rids);
             local.sorted.sort_unstable();
@@ -566,10 +649,12 @@ impl Siblings {
                 // Every id is in `sorted`, which is no longer than a vector.
                 local.moved.push(local.sorted.binary_search(rid).map_or(0, |at| at as u32));
             }
-            &local.sorted
-        };
-        let read = self.read(rids, &mut local.part)?;
-        let length = rids.len();
+            coalesce(&local.sorted, &mut local.runs);
+        } else if listed {
+            coalesce(&local.rids, &mut local.runs);
+        }
+        let read = self.read(&local.runs, &mut local.part, &mut local.within)?;
+        let length = local.runs.iter().map(|&(_, length)| length as usize).sum();
         local.values.clear();
         values_of(
             Chunk::with_rows(read, length)?,
@@ -599,6 +684,17 @@ impl Siblings {
             }
         }
         Ok(())
+    }
+}
+
+/// `rids`, which rise, as runs of rows, a first row and a length, in `runs`.
+fn coalesce(rids: &[u32], runs: &mut Vec<(u64, u32)>) {
+    runs.clear();
+    for &rid in rids {
+        match runs.last_mut() {
+            Some((first, length)) if *first + u64::from(*length) == u64::from(rid) => *length += 1,
+            _ => runs.push((u64::from(rid), 1)),
+        }
     }
 }
 
@@ -737,6 +833,9 @@ impl Stream for Siblings {
             },
             keys: Vec::new(),
             rids: Vec::new(),
+            runs: Vec::new(),
+            count: 0,
+            within: Vec::new(),
             places: Vec::new(),
             owners: Vec::new(),
             spans: Vec::new(),
