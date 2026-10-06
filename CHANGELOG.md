@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.32
+
+This release continues the PostgreSQL work inside PG2 (#2490) and has engine speed work.
+
+#2615 sends a NOTICE for each name that `IF EXISTS` or `IF NOT EXISTS` skips. #2616 gives integer division the result of PostgreSQL and the division by zero error 22012. #2617 accepts `CREATE UNLOGGED TABLE` and `serial` columns, and gives the not-null error of PostgreSQL. #2619 keeps sequences in the database file and logs their counters, so a sequence comes back after a restart with its next value. #2620 gives a call that no function takes the error 42883 of PostgreSQL, with its detail and its hint.
+
+#2623 makes a `Describe` of a portal answer from the statement description, and the portal runs at `Execute`, as in PostgreSQL. An error or a notice of the run now comes after the `RowDescription`. The description is kept in the prepared statement while the catalog, the settings, the session and the declared parameter types are the same.
+
+#2614 and #2618 make q01 faster: two packed totals are added by place out of their codes, and the totals by place are kept from chunk to chunk and folded only when needed. #2622 reads a CSV file whose escape is not its quote 64 bytes at a time.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.31
 
 This release makes rudb-server faster and smaller inside PG1, and has engine speed work and a new crate.
