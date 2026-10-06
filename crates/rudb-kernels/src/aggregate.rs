@@ -3087,6 +3087,19 @@ fn by_place<const W: usize, const S: usize>(
             Error::internal("a summed chunk of other rows than it read".to_string())
         })?;
     }
+    // Two totals and a count are a pair added in lanes and one more add, eight rows at a time. See
+    // `spec/perf/123-pairs-by-place-in-lanes.md`.
+    let mut done = 0;
+    if let (4, &[first, second]) = (S, &columns[..]) {
+        done = rudb_vector::vector::add_pairs_by_place(
+            cells.as_chunks_mut::<4>().0,
+            first,
+            second,
+            places,
+        );
+    }
+    let places = &places[done..];
+    let columns = columns.map(|column| &column[done..]);
     let cells = cells.as_chunks_mut::<S>().0;
     // Eight rows at a time, so that each column is checked against the rows once a block rather
     // than once a row.

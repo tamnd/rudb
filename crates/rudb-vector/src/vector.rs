@@ -4263,6 +4263,30 @@ impl AsRef<Vector> for Vector {
     }
 }
 
+/// Adds each row's `first` and `second` value and a one for its count into the first three cells of
+/// its place in `cells`, for as many rows as it can do eight at a time, and returns how many that
+/// was. The rest, and any block with a place past `cells`, are left for the caller to add one at a
+/// time. Without AVX2 it adds nothing.
+///
+/// The pass a total by place makes over every row of q01, which sums two columns, and written as a
+/// row at a time it built each row's pair out of two scalar loads and checked its place on its own.
+pub fn add_pairs_by_place(
+    cells: &mut [[i64; 4]],
+    first: &[u64],
+    second: &[u64],
+    places: &[u32],
+) -> usize {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        crate::lanes::add_pairs(cells, (first, second), places)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let _ = (cells, first, second, places);
+        0
+    }
+}
+
 /// The bits of a packed vector and what they mean, for a kernel that wants to stay in code space.
 ///
 /// Borrowed from the vector rather than owning anything, so getting one costs nothing and a kernel

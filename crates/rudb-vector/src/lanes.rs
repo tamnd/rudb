@@ -417,9 +417,100 @@ pub(crate) fn retain_set(
     (kept, at)
 }
 
+/// Adds each row's `first` and `second` value and a one for its count into the first three cells of
+/// its place in `cells`, eight rows at a time, and returns how many rows it added, for the caller to
+/// finish the rest one at a time.
+///
+/// Four rows of each column are one load, and two unpacks make them four pairs of the row's two
+/// values, each the low or the high half of a register, so a row is its place, one add of a pair
+/// into its cells and one more for its count. A block of eight stops the pass before it is added
+/// when one of its places is past `cells`, so the caller meets that place itself.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(unsafe_code)]
+pub(crate) fn add_pairs(
+    cells: &mut [[i64; 4]],
+    (first, second): (&[u64], &[u64]),
+    places: &[u32],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_castsi256_si128,
+        _mm256_cmpeq_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epu32,
+        _mm256_movemask_epi8, _mm256_set1_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
+    };
+    let rows = places.len().min(first.len()).min(second.len());
+    let Some(Ok(last)) = cells.len().checked_sub(1).map(u32::try_from) else { return 0 };
+    let mut at = 0;
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. Each block reads
+    // eight places and eight values of each column at `at`, which is eight short of `rows` or
+    // less. Every place of a block is at most `last` before any of its rows is added, so each
+    // row's cells are inside `cells`.
+    #[expect(clippy::cast_possible_wrap, reason = "an unsigned compare of the lanes")]
+    unsafe {
+        let top = _mm256_set1_epi32(last as i32);
+        let to = cells.as_mut_ptr();
+        while at + 8 <= rows {
+            let held = _mm256_loadu_si256(places.as_ptr().add(at).cast());
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi32(_mm256_max_epu32(held, top), top)) != -1 {
+                break;
+            }
+            for from in [at, at + 4] {
+                let ones = _mm256_loadu_si256(first.as_ptr().add(from).cast());
+                let twos = _mm256_loadu_si256(second.as_ptr().add(from).cast());
+                let (even, odd) =
+                    (_mm256_unpacklo_epi64(ones, twos), _mm256_unpackhi_epi64(ones, twos));
+                let pairs = [
+                    _mm256_castsi256_si128(even),
+                    _mm256_castsi256_si128(odd),
+                    _mm256_extracti128_si256::<1>(even),
+                    _mm256_extracti128_si256::<1>(odd),
+                ];
+                for (row, pair) in pairs.into_iter().enumerate() {
+                    let cell = to.add(*places.get_unchecked(from + row) as usize).cast::<i64>();
+                    _mm_storeu_si128(
+                        cell.cast(),
+                        _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair),
+                    );
+                    *cell.add(2) = (*cell.add(2)).wrapping_add(1);
+                }
+            }
+            at += 8;
+        }
+    }
+    at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pairs added in lanes come to the cells a row at a time would, for places that repeat and a
+    /// place past the cells that stops the pass at its block.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn pairs_added_in_lanes_are_the_pairs_added_a_row_at_a_time() {
+        let rows = 203;
+        let first: Vec<u64> = (0..rows as u64).map(|row| row * 7 + 3).collect();
+        let second: Vec<u64> =
+            (0..rows as u64).map(|row| (row * 2_654_435_761) % 100_003).collect();
+        for past in [None, Some(0), Some(77), Some(200)] {
+            let mut places: Vec<u32> = (0..rows as u32).map(|row| (row * 13) % 11).collect();
+            if let Some(past) = past {
+                places[past] = 11;
+            }
+            let mut cells = vec![[0_i64; 4]; 11];
+            let done = add_pairs(&mut cells, (&first, &second), &places);
+            let stop = past.map_or(rows, |past| past / 8 * 8);
+            assert_eq!(done, stop / 8 * 8, "{past:?}");
+            let mut want = vec![[0_i64; 4]; 11];
+            for row in 0..done {
+                let cell = &mut want[places[row] as usize];
+                cell[0] += first[row] as i64;
+                cell[1] += second[row] as i64;
+                cell[2] += 1;
+            }
+            assert_eq!(cells, want, "{past:?}");
+        }
+    }
 
     /// The shuffle and shift for a width reproduce a code read a bit at a time, for every width the
     /// lanes take, so the table is right whatever the hardware the tests run on.
