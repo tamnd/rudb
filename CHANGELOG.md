@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.37
+
+This release continues the PostgreSQL work inside PG2 (#2490), stores the nested types in a database file, and has engine speed work.
+
+#2694 reads a `numeric`, `json` or `jsonb` literal with the input function of PostgreSQL, and sends a `numeric` overflow with the error of PostgreSQL. #2695 binds a `numeric` parameter as a `numeric` with all its digits, in the text and the binary formats, so Describe and Execute give one column type. #2696 sums a `numeric` and takes its mean as a `numeric`, with `NaN`, the infinities, `DISTINCT`, `FILTER` and windows. #2698 makes `avg` of an integer or a `numeric(p, s)` value a `numeric` in a PostgreSQL session, as the exact sum divided by the count. The fast paths for `sum` and `count` stay in use, so a grouped mean over 20 million rows takes 9.4 ms, against 774 ms in PostgreSQL 19.
+
+#2692 stores struct, map, union and fixed size array columns in a database file, with the column type tags 37 to 40. Before this change such a table was refused at `CREATE TABLE`.
+
+#2693 counts the distinct values of a group a run at a time and tests an integer `IN` list with a 64 bit mask, which takes TPC-H q16 from 133 to 120 million instructions. #2697 walks only the rows that the sketch keeps in a `LIKE` over compressed text, which takes q13 from 232 to 191 million instructions.
+
+The native file format now has the column type tags 37 for `STRUCT`, 38 for `MAP`, 39 for `UNION` and 40 for `ARRAY`. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.36
 
 This release continues the PostgreSQL work inside PG2 (#2490), makes the write path of a table in memory cheaper, and has engine speed work.
