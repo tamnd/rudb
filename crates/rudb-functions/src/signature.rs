@@ -1921,6 +1921,8 @@ fn numericked(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>
             [_, _],
         ) if arguments.iter().all(exact) => Some((vec![Numeric, Numeric], Numeric)),
         ("-", [Numeric]) => Some((vec![Numeric], Numeric)),
+        // PostgreSQL sums a `numeric` and takes its mean as a `numeric`, with all the digits.
+        ("sum" | "avg", [Numeric]) => Some((vec![Numeric], Numeric)),
         // The roundings of a `numeric` keep it a `numeric`, as they do in PostgreSQL, rather than
         // going through a double and losing the digits past the sixteenth.
         ("round" | "trunc" | "abs" | "ceil" | "ceiling" | "floor", [Numeric]) => {
