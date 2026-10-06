@@ -253,10 +253,15 @@ fn within_narrow(
             clippy::cast_possible_wrap,
             reason = "both are under 2^16 and the lanes are read unsigned"
         )]
-        let (low, span) = (_mm256_set1_epi16(low as u16 as i16), _mm256_set1_epi16(span as u16 as i16));
+        let (low, span) =
+            (_mm256_set1_epi16(low as u16 as i16), _mm256_set1_epi16(span as u16 as i16));
         let inside = |at: *const u8| -> __m256i {
-            let lanes = _mm256_set_m128i(_mm_loadu_si128(at.add(width).cast()), _mm_loadu_si128(at.cast()));
-            let codes = _mm256_srl_epi16(_mm256_mullo_epi16(_mm256_shuffle_epi8(lanes, shuffle), multiply), down);
+            let lanes =
+                _mm256_set_m128i(_mm_loadu_si128(at.add(width).cast()), _mm_loadu_si128(at.cast()));
+            let codes = _mm256_srl_epi16(
+                _mm256_mullo_epi16(_mm256_shuffle_epi8(lanes, shuffle), multiply),
+                down,
+            );
             let offset = _mm256_sub_epi16(codes, low);
             _mm256_cmpeq_epi16(_mm256_min_epu16(offset, span), offset)
         };
