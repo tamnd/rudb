@@ -165,6 +165,9 @@ fn run<V: AsRef<Vector>>(
     if let Some(vector) = crate::sequence::call(name, args, rows)? {
         return Ok(vector);
     }
+    if let Some(vector) = crate::advisory::call(name, args, rows)? {
+        return Ok(vector);
+    }
     if name == "strftime" {
         let refs: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
         if let Some(vector) = crate::strftime::vectorized(&refs, rows)? {

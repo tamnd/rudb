@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+mod advisory;
 mod binder;
 mod columns;
 mod context;

@@ -670,6 +670,15 @@ fn the_errors_of_the_extended_query_flow() {
     let messages = client.sync();
     assert_eq!(tags(&messages), "12CZ");
     assert_eq!(messages[3].body, b"I");
+
+    // An error goes to the client at once, also in a pipeline that sends Flush and no Sync.
+    client.parse("", "select nope(1)", &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    client.send(&Frontend::Flush);
+    let error = client.next().unwrap();
+    assert_eq!((error.tag, error.field(b'C').as_deref()), (b'E', Some("42883")));
+    assert_eq!(tags(&client.sync()), "Z");
     server.stop().unwrap();
 }
 
@@ -1514,5 +1523,62 @@ fn tls_with_an_ssl_request_and_with_direct_tls() {
     connect(&mut client, PROTOCOL_3_0);
     let messages = client.query("show ssl_library");
     assert_eq!(data_row(&messages[1]), vec![Some(b"rustls".to_vec())]);
+    server.stop().unwrap();
+}
+
+#[test]
+fn advisory_locks_are_held_by_the_session_or_the_transaction() {
+    let dirs = Dirs::new("advisory");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut first = Client::unix(&server);
+    connect(&mut first, PROTOCOL_3_0);
+    let mut second = Client::unix(&server);
+    connect(&mut second, PROTOCOL_3_0);
+    let value = |messages: &[Message]| {
+        let row = messages.iter().find(|m| m.tag == b'D').map(data_row).unwrap();
+        String::from_utf8(row[0].clone().unwrap()).unwrap()
+    };
+    let try_lock = |client: &mut Client, key: &str| {
+        value(&client.query(&format!("select pg_try_advisory_lock({key})")))
+    };
+
+    // A lock that gives void sends an empty value of type void.
+    let messages = first.query("select pg_advisory_lock(42)");
+    assert_eq!(tags(&messages), "TDCZ");
+    assert_eq!(row_shape(&messages[0])[0].1, 2278);
+    assert_eq!(value(&messages), "");
+    assert_eq!(try_lock(&mut second, "42"), "f");
+    // The pair of keys (0, 42) is not the same lock as the key 42.
+    assert_eq!(try_lock(&mut second, "0, 42"), "t");
+    let messages = second.query("set lock_timeout = 50; select pg_advisory_lock(42)");
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("55P03"));
+
+    // A release of a lock that the session does not hold gives a warning and false.
+    let messages = second.query("select pg_advisory_unlock(42)");
+    assert_eq!(tags(&messages), "TNDCZ");
+    assert_eq!(messages[1].field(b'C').as_deref(), Some("01000"));
+    assert_eq!(value(&messages), "f");
+
+    // A lock of the transaction level ends with the transaction, also after an error.
+    first.query("begin");
+    first.query("select pg_advisory_xact_lock(7)");
+    assert_eq!(try_lock(&mut second, "7"), "f");
+    first.query("select 1 / 0");
+    first.query("rollback");
+    assert_eq!(try_lock(&mut second, "7"), "t");
+    assert_eq!(value(&second.query("select pg_advisory_unlock(7)")), "t");
+
+    // A lock of the session level stays after an error, and ends with the session.
+    assert_eq!(tags(&first.query("select 1 / 0")), "EZ");
+    assert_eq!(try_lock(&mut second, "42"), "f");
+    first.send(&Frontend::Terminate);
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while try_lock(&mut second, "42") == "f" {
+        assert!(std::time::Instant::now() < deadline, "the lock stays after the session ended");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(tags(&second.query("select pg_advisory_unlock_all()")), "TDCZ");
     server.stop().unwrap();
 }

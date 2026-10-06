@@ -41,6 +41,7 @@ use crate::scope::{Joined, Scope, Visible};
 
 /// The PostgreSQL type `name`, which `current_user` and the other session names have.
 const NAME: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::NAME, typmod: -1 };
+const VOID: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::VOID, typmod: -1 };
 
 /// Binds a parsed statement against a catalog.
 ///
@@ -2135,6 +2136,12 @@ impl<'a> Binder<'a> {
                 // A bare `current_user` is a one-part column to the parser, so this comes first.
                 _ if origin.is_none() && crate::context::gives_name(ast, target.expr) => {
                     Some(Origin::typed(NAME))
+                }
+                // An advisory lock function such as `pg_advisory_lock` gives `void`.
+                _ if self.session.postgres().is_some()
+                    && crate::advisory::gives_void(ast, target.expr) =>
+                {
+                    Some(Origin::typed(VOID))
                 }
                 _ if plain => origin,
                 // A cast keeps the type it wrote, with the typmod, and is no table column.

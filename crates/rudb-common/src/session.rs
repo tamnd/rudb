@@ -55,6 +55,10 @@ pub struct Postgres {
     pub version: String,
     /// The input functions of the types, which read the text of a string literal in a cast.
     pub input: Option<Arc<dyn LiteralInput>>,
+    /// The backend number of the session, which holds its advisory locks in [`crate::advisory`].
+    pub backend: i32,
+    /// The OID of the database of the session, which is part of the key of an advisory lock.
+    pub database: u32,
 }
 
 /// Reads the text of a literal such as `'infinity'::date` with the input function of the type, as
