@@ -942,6 +942,9 @@ impl Binder<'_> {
             }
         }
         if let Some(comparison) = comparison_of(op) {
+            if self.session.postgres().is_some() {
+                self.bpchar_operands(ast, written, [&mut left, &mut right], scope)?;
+            }
             return self.compare(comparison, left, right);
         }
         match op {
@@ -1027,6 +1030,64 @@ impl Binder<'_> {
             Some(name) => self.call(name, vec![left, right]),
             None => Err(Error::not_implemented(format!("the {} operator", spelling(ast, op)))),
         }
+    }
+
+    /// A `char(n)` column keeps its values with no trailing spaces, and PostgreSQL compares a
+    /// `char(n)` value with no regard to its trailing spaces. So a string that is compared with
+    /// such a column as a `bpchar` loses its trailing spaces too, and `c = 'ab  '` finds the row of
+    /// `'ab'`. That is a string literal, a parameter, and a `varchar` or `char` column or cast. A
+    /// `text` value, such as `c::text` or the result of a function, compares as `text`, and then
+    /// the column is the text with no trailing spaces, which is what it holds.
+    fn bpchar_operands(
+        &mut self,
+        ast: &Ast,
+        written: [ast::ExprRef; 2],
+        [left, right]: [&mut ExprRef; 2],
+        scope: &Scope,
+    ) -> Result<()> {
+        use rudb_pgtypes::oid::{BPCHAR, VARCHAR};
+        let declared = |binder: &Self, written: ast::ExprRef, expr: ExprRef| match ast.expr(written)
+        {
+            ast::Expr::Column { .. } => binder
+                .through(expr, scope)
+                .and_then(|column| column.origin)
+                .and_then(|origin| origin.ty),
+            ast::Expr::Cast { ty, .. } => rudb_pgtypes::declared_type(ast.string(ty)),
+            _ => None,
+        };
+        let sides = [(written[0], *left), (written[1], *right)].map(|(written, expr)| {
+            let ty = declared(self, written, expr);
+            let column = matches!(ast.expr(written), ast::Expr::Column { .. })
+                && ty.is_some_and(|ty| ty.oid == BPCHAR && ty.typmod >= 4);
+            let untyped = matches!(
+                ast.expr(written),
+                ast::Expr::Literal { kind: LiteralKind::String, .. } | ast::Expr::Parameter { .. }
+            );
+            let bpchar = untyped || ty.is_some_and(|ty| matches!(ty.oid, BPCHAR | VARCHAR));
+            (column, bpchar)
+        });
+        // A `char(n)` column on both sides holds no trailing spaces on either.
+        for (side, (column, _), (held, bpchar)) in
+            [(right, sides[0], sides[1]), (left, sides[1], sides[0])]
+        {
+            let placeholder = self.is_placeholder(*side);
+            let string = *self.plan().expr_type(*side) == LogicalType::Varchar;
+            if !column || held || !bpchar || !(string || placeholder) {
+                continue;
+            }
+            if placeholder {
+                *side = self.cast_to(*side, &LogicalType::Varchar);
+            }
+            // A parameter compared with a `char(n)` column is a `bpchar`, as in PostgreSQL.
+            if let Some(placeholders) = self.parameters.placeholders() {
+                let bpchar = DeclaredType { oid: BPCHAR, typmod: -1 };
+                for (name, _) in self.placeholders_under(*side, &LogicalType::Varchar, 1) {
+                    placeholders.resolve_written(&name, bpchar);
+                }
+            }
+            *side = self.call("rtrim", vec![*side])?;
+        }
+        Ok(())
     }
 
     /// Casts a parameter of no known type on one side of an arithmetic operator to the type that
@@ -1702,8 +1763,13 @@ impl Binder<'_> {
             (CompareOp::Equal, ConjunctionOp::Or)
         };
         let mut tests = Vec::with_capacity(written.len());
-        for item in written {
-            let item = self.bind_expr(ast, item, scope)?;
+        let postgres = self.session.postgres().is_some();
+        for written in written {
+            let mut item = self.bind_expr(ast, written, scope)?;
+            let mut subject = subject;
+            if postgres {
+                self.bpchar_operands(ast, [operand, written], [&mut subject, &mut item], scope)?;
+            }
             tests.push(self.compare(op, subject, item)?);
         }
         Ok(self.conjunction(connective, tests))
@@ -1966,10 +2032,14 @@ impl Binder<'_> {
             oid::BPCHAR if declared.typmod >= 4 => "__rudb_pg_bpchar",
             _ => return Ok(expr),
         };
-        if explicit {
+        if explicit && declared.oid == oid::VARCHAR {
             let length = self.add_constant(Value::BigInt(i64::from(declared.typmod - 4)));
             return self.call("left", vec![expr, length]);
         }
+        let stored = match explicit {
+            true => "__rudb_pg_bpchar_cut",
+            false => stored,
+        };
         let typmod = self.add_constant(Value::BigInt(i64::from(declared.typmod)));
         self.call_as("left", stored, vec![expr, typmod])
     }

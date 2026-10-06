@@ -1726,13 +1726,20 @@ impl Runner {
             Err(failure) => return Ok(Err(failure)),
         };
         let binary = options.format == Format::Binary;
-        let columns: Vec<_> = result
+        let types: Vec<_> = result
             .types()
             .iter()
             .enumerate()
-            .map(|(at, ty)| (ty.clone(), column_type(ty, result.origin(at)).oid, binary))
+            .map(|(at, ty)| column_type(ty, result.origin(at)))
             .collect();
-        let mut encoder = match RowEncoder::new(&columns) {
+        let columns: Vec<_> = result
+            .types()
+            .iter()
+            .zip(&types)
+            .map(|(ty, pg)| (ty.clone(), pg.oid, binary))
+            .collect();
+        let typmods: Vec<i32> = types.iter().map(|pg| pg.typmod).collect();
+        let mut encoder = match RowEncoder::with_typmods(&columns, &typmods) {
             Ok(encoder) => encoder,
             Err(error) => return Ok(Err(type_failure(error))),
         };

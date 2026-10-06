@@ -851,6 +851,56 @@ fn any_and_all_compare_against_the_elements_of_an_array() {
 }
 
 #[test]
+fn a_char_column_pads_on_output_and_ignores_trailing_spaces() {
+    let dirs = Dirs::new("bpchar");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    client.query("create table t (c char(4) primary key, v varchar(6))");
+    client.query("insert into t values ('ab', 'ab  '), ('a b  ', 'x')");
+    // The value goes out padded to 4 characters, and the trailing spaces count nowhere else.
+    let cases = [
+        ("select c, length(c), c || '|', c::text = 'ab' from t where v = 'ab  '", "ab  ,2,ab|,t"),
+        ("select c = v, c = 'ab    ', c::text = v from t where v = 'ab  '", "t,t,f"),
+        ("select count(*) from t where c in ('ab ', 'a b')", "2"),
+        ("select 'ab'::char(4), 'ab'::char(4) = 'ab  '::char(4), 'abcdef'::char(3)", "ab  ,t,abc"),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    let messages = client.query("insert into t values ('abcde', 'y')");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22001"));
+    // A parameter compared with the column is a `bpchar`, and a stored parameter keeps the
+    // length rule of the column.
+    client.parse("", "select c from t where c = $1", &[]);
+    client.describe(Target::Statement, "");
+    client.bind("", "", &[], &[Some(b"ab  ")]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(parameter_types(&messages[1]), [1042]);
+    assert_eq!(text(data_row(&messages[4])), "ab  ");
+    client.parse("", "insert into t values ($1, $2)", &[]);
+    client.bind("", "", &[], &[Some(b"q  "), Some(b"q")]);
+    client.execute("", 0);
+    assert_eq!(tags(&client.sync()), "12CZ");
+    client.bind("", "", &[], &[Some(b"qqqqq"), Some(b"q")]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "2EZ");
+    assert_eq!(messages[1].field(b'C').as_deref(), Some("22001"));
+    let messages = client.query("select length(c), c from t where c = 'q'");
+    assert_eq!(text(data_row(&messages[1])), "1,q   ");
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_rows_before_an_error_go_before_the_error() {
     let dirs = Dirs::new("partial");
     let server = Server::start(dirs.config()).unwrap();
