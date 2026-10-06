@@ -1915,7 +1915,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ConsistentExtremes, DECODE, GATHER, Reach, Standing, Weight, gyo, take, trail, widens,
+        ConsistentExtremes, DECODE, GATHER, PICK, Reach, Standing, Weight, gyo, take, trail, widens,
     };
     use crate::pass::{Context, Pass};
     use rudb_common::LogicalType;
@@ -2353,7 +2353,7 @@ mod tests {
         let counted = movie_info.cost(&standing, &classes);
         // The rows the keys keep are read one by one in every part the named value is in.
         let touched = 390.0 / 1_812.0;
-        let wide = touched * (0.085 * PICK).min(1.0);
+        let wide = touched * (0.085_f64 * PICK).min(1.0);
         assert!((counted - 14_835_720.0 * (touched + 4.0 * wide)).abs() < 1.0, "{counted}");
         assert!(counted > average * 4.0, "{average} {counted}");
     }
