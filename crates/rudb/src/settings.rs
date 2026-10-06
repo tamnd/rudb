@@ -344,6 +344,12 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting either.
     log_lanes: RwLock<Option<usize>>,
+    /// Whether a commit that takes the log past `checkpoint_threshold` hands the checkpoint to a
+    /// thread of its own and returns, as `SET background_checkpoint` has left it, rather than
+    /// write the file before it returns. On until a statement says otherwise.
+    ///
+    /// Not a DuckDB setting either.
+    background_checkpoint: RwLock<bool>,
     /// When a commit's rows are seen by other connections, as `SET visibility` has left it.
     visibility: RwLock<Visibility>,
     /// What `SET VARIABLE` has left, in the order the names were first set.
@@ -466,6 +472,7 @@ impl Settings {
             commit_sync: RwLock::new(CommitSync::Full),
             lock_timeout: RwLock::new(LOCK_TIMEOUT),
             log_lanes: RwLock::new(None),
+            background_checkpoint: RwLock::new(true),
             visibility: RwLock::new(Visibility::Durable),
             variables: RwLock::new(Vec::new()),
             changes: AtomicU64::new(0),
@@ -544,6 +551,11 @@ impl Settings {
     /// What `SET log_lanes` left: a number of lanes, or `None` for `auto`.
     pub(crate) fn log_lanes(&self) -> Option<usize> {
         *self.log_lanes.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// What `SET background_checkpoint` left.
+    pub(crate) fn background_checkpoint(&self) -> bool {
+        *self.background_checkpoint.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The log size after which a commit checkpoints, `SET checkpoint_threshold`.
@@ -831,6 +843,11 @@ impl Settings {
                 ),
             };
             *self.log_lanes.write().unwrap_or_else(|held| held.into_inner()) = lanes;
+            return Ok(());
+        }
+        if is_background_checkpoint(name) {
+            let on = value.map_or(Ok(true), boolean_of)?;
+            *self.background_checkpoint.write().unwrap_or_else(|held| held.into_inner()) = on;
             return Ok(());
         }
         if is_lock_timeout(name) {
@@ -1398,6 +1415,9 @@ impl Settings {
         if is_log_lanes(name) {
             return Ok(self.log_lanes().map_or_else(|| "auto".to_string(), |n| n.to_string()));
         }
+        if is_background_checkpoint(name) {
+            return Ok(self.background_checkpoint().to_string());
+        }
         if is_visibility(name) {
             let word = match self.visibility() {
                 Visibility::Durable => "durable",
@@ -1824,6 +1844,12 @@ fn is_lock_timeout(name: &str) -> bool {
 /// Whether this name is the log's lane count, the same shape as [`is_engine`].
 fn is_log_lanes(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("log_lanes")
+}
+
+/// Whether this name is the checkpoint off the commit path, the same shape as [`is_engine`].
+fn is_background_checkpoint(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none()
+        && name.eq_ignore_ascii_case("background_checkpoint")
 }
 
 /// How long a write waits for a held row until a statement says otherwise, the second section
