@@ -402,6 +402,7 @@ impl RowEncoder {
                 match vector.form() {
                     // A list has no other form, and its elements are flattened in the first pass.
                     Form::Flat | Form::List => Ok(Cow::Borrowed(vector)),
+                    // flatten: the encoder reads each value by its place in a flat column.
                     _ => vector.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string())),
                 }
             })
@@ -780,6 +781,7 @@ fn array_lengths(
     let low = low.min(high);
     let child = match child.form() {
         Form::Flat | Form::List => Cow::Borrowed(child),
+        // flatten: the elements are read by their place in a flat column.
         _ => child.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string()))?,
     };
     if child.len() < high {

@@ -339,7 +339,7 @@ pub(crate) fn conf_files(outer: &str, name: &str) -> Result<Vec<String>, (String
         )
     })?;
     let mut files = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries.filter_map(Result::ok) {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.len() < 6 || file.starts_with('.') || !file.ends_with(".conf") {
@@ -765,6 +765,7 @@ fn parse_hba_line(
         clientname: ClientName::Cn,
     };
     let mut oauth = OAuthOptions::default();
+    // flatten: the tokens of the fields of the line, not a column.
     for token in fields.flatten() {
         let Some((name, value)) = token.text.split_once('=') else {
             return fail(

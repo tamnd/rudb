@@ -176,7 +176,7 @@ pub(crate) fn check() -> Result<(), String> {
             }
         }
         let present = std::fs::read_dir(&dest).map_err(|e| format!("could not list {dir}: {e}"))?;
-        for entry in present.flatten() {
+        for entry in present.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name != "VENDOR" && !recorded.contains_key(&name) {
                 problems.push(format!("{dir}/{name} is in the tree and not in VENDOR"));

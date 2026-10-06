@@ -223,7 +223,8 @@ impl Connection {
                 (Some(values), _) => values,
                 (None, None) => vec![Value::Null; rows],
                 (None, Some(default)) => {
-                    let sql = format!("SELECT CAST(({default}) AS {}) FROM range({rows})", field.ty);
+                    let sql =
+                        format!("SELECT CAST(({default}) AS {}) FROM range({rows})", field.ty);
                     let result = self.query(&sql)?;
                     (0..result.len()).map(|row| result.value_at(row, 0)).collect()
                 }
