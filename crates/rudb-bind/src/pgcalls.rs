@@ -202,6 +202,29 @@ impl Binder<'_> {
         }
     }
 
+    /// Casts the value of a call of `round`, `trunc`, `ceil` or `floor` to the overload that
+    /// PostgreSQL chooses for it.
+    ///
+    /// PostgreSQL has these over `float8` and `numeric` and not over an integer. An integer goes
+    /// to `float8` when the call has one argument, and to `numeric` when it has a scale, since
+    /// only the `numeric` overload takes one. A parameter of no type with a scale is a `numeric`
+    /// for the same reason.
+    pub(crate) fn postgres_rounding(&mut self, written: &str, arguments: &mut [ExprRef]) {
+        let named =
+            |names: &[&str]| names.iter().any(|name| rudb_catalog::same_name(written, name));
+        let ty = match arguments.len() {
+            1 if named(&["round", "trunc", "ceil", "ceiling", "floor"]) => LogicalType::Double,
+            2 if named(&["round", "trunc"]) => LogicalType::Numeric,
+            _ => return,
+        };
+        let value = arguments[0];
+        let given = self.plan().expr_type(value);
+        let placeholder = *given == LogicalType::Null && self.is_placeholder(value);
+        if given.is_integer() || (placeholder && ty == LogicalType::Numeric) {
+            arguments[0] = self.cast_to(value, &ty);
+        }
+    }
+
     /// Whether `function(arguments)` is the series over `int4` of PostgreSQL, which gives an
     /// `int4` column where the series here gives a BIGINT. A parameter of no type is typed as an
     /// `int4` here, as PostgreSQL types it.

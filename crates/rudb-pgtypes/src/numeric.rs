@@ -23,6 +23,8 @@ const HALF_NBASE: i32 = 5000;
 const DEC_DIGITS: i64 = 4;
 /// `NUMERIC_DSCALE_MAX`, the largest display scale that the format can hold.
 const DSCALE_MAX: i64 = 0x3fff;
+/// `NUMERIC_MAX_RESULT_SCALE`: the most digits that `round` and `trunc` keep after the point.
+const NUMERIC_MAX_RESULT_SCALE: i32 = 2000;
 /// `round_powers` in `numeric.c`.
 const ROUND_POWERS: [i32; 4] = [0, 1000, 100, 10];
 /// The most base-10000 digits that a scaled `i128` needs: 39 decimal digits, split at the point.
@@ -239,6 +241,52 @@ impl Numeric {
         let mut var = Var::from(self);
         var.apply_typmod(typmod)?;
         var.make()
+    }
+
+    /// `numeric_round`: half away from zero to `scale` digits after the point, or before it when
+    /// the scale is negative.
+    pub fn round(&self, scale: i32) -> Result<Numeric, TypeError> {
+        self.rescaled(scale, Var::round)
+    }
+
+    /// `numeric_trunc`: the digits after `scale` digits after the point dropped.
+    pub fn trunc(&self, scale: i32) -> Result<Numeric, TypeError> {
+        self.rescaled(scale, Var::trunc)
+    }
+
+    /// `numeric_round` and `numeric_trunc`, which differ in how they drop the digits.
+    fn rescaled(&self, scale: i32, drop: fn(&mut Var, i64)) -> Result<Numeric, TypeError> {
+        if !self.sign.is_finite() {
+            return Ok(self.clone());
+        }
+        let scale = i64::from(scale.clamp(-NUMERIC_MAX_RESULT_SCALE, NUMERIC_MAX_RESULT_SCALE));
+        let mut var = Var::from(self);
+        drop(&mut var, scale);
+        if scale < 0 {
+            var.dscale = 0;
+        }
+        var.make()
+    }
+
+    /// `numeric_ceil` when `up` and `numeric_floor` when not: the nearest whole number on that
+    /// side.
+    pub fn whole(&self, up: bool) -> Result<Numeric, TypeError> {
+        let truncated = self.trunc(0)?;
+        let toward = if up { NumericSign::Positive } else { NumericSign::Negative };
+        if self.sign != toward || truncated.compare(self).is_eq() {
+            return Ok(truncated);
+        }
+        let one = Numeric::from_integer(if up { 1 } else { -1 });
+        truncated.add(&one)
+    }
+
+    /// `numeric_abs`.
+    pub fn abs(&self) -> Numeric {
+        match self.sign {
+            NumericSign::Negative => self.negate(),
+            NumericSign::NegativeInfinity => self.negate(),
+            _ => self.clone(),
+        }
     }
 
     /// `numeric_uminus`.
@@ -1335,6 +1383,29 @@ mod tests {
         assert_eq!(round_trip("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", -1), u128::MAX.to_string());
         assert_eq!(round_trip("1e-16384", -1), "value overflows numeric format");
         assert_eq!(round_trip("1e2147483647", -1), "value overflows numeric format");
+    }
+
+    #[test]
+    fn round_trunc_ceil_and_floor_keep_the_digits() {
+        let text = |value: Numeric| {
+            let mut out = Vec::new();
+            numeric_out(&value, &mut out);
+            String::from_utf8(out).unwrap()
+        };
+        let value = numeric_in("-123456789012345678901.555", -1).unwrap();
+        assert_eq!(text(value.round(2).unwrap()), "-123456789012345678901.56");
+        assert_eq!(text(value.round(-1).unwrap()), "-123456789012345678900");
+        assert_eq!(text(value.trunc(1).unwrap()), "-123456789012345678901.5");
+        assert_eq!(text(value.whole(true).unwrap()), "-123456789012345678901");
+        assert_eq!(text(value.whole(false).unwrap()), "-123456789012345678902");
+        assert_eq!(text(value.abs()), "123456789012345678901.555");
+        let small = numeric_in("-0.5", -1).unwrap();
+        assert_eq!(text(small.whole(true).unwrap()), "0");
+        assert_eq!(text(small.whole(false).unwrap()), "-1");
+        assert_eq!(text(numeric_in("9.99", -1).unwrap().round(1).unwrap()), "10.0");
+        assert_eq!(text(numeric_in("5", -1).unwrap().round(1).unwrap()), "5.0");
+        let nan = numeric_in("NaN", -1).unwrap();
+        assert_eq!(text(nan.round(2).unwrap()), "NaN");
     }
 
     #[test]

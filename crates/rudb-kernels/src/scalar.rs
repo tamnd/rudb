@@ -5021,6 +5021,9 @@ fn absolute(value: &Value, ty: &LogicalType) -> Result<Value> {
     match value {
         Value::Float(v) => Ok(Value::Float(v.abs())),
         Value::Double(v) => Ok(Value::Double(v.abs())),
+        Value::Numeric(bytes) => {
+            Ok(Value::Numeric(rudb_pgtypes::Numeric::from_bytes(bytes).abs().to_bytes()))
+        }
         Value::Decimal { unscaled, width, scale } => {
             Ok(Value::Decimal { unscaled: unscaled.abs(), width: *width, scale: *scale })
         }
