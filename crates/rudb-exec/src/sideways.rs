@@ -2545,7 +2545,9 @@ mod tests {
         let found = found(&keyed, Some(&exact), &[chunk(&[Some(103), None]), chunk(&[Some(140)])])
             .expect("integers");
 
-        let rows = found.rows.expect("an exact side");
+        assert!(found.rows.is_none() && found.domain.is_some(), "left for the scan to read");
+        assert_eq!(found.reach(Some(&exact), None), Some(2_000));
+        let rows = &found.gather(Some(&exact)).expect("an exact side").rids;
         let kept: Vec<u64> = rows.iter().collect();
         let expected: Vec<u64> =
             (0..50_000).filter(|child| child % 50 == 3 || child % 50 == 40).collect();
