@@ -1749,14 +1749,14 @@ mod tests {
         let sequence = Sequence::new(&[b"com", b"/"]).expect("an automaton");
         let searched = |row: usize| {
             let text = &values[row];
-            text.windows(3).position(|window| window == b"com").is_some_and(|at| {
-                text[at + 3..].contains(&b'/')
-            })
+            text.windows(3)
+                .position(|window| window == b"com")
+                .is_some_and(|at| text[at + 3..].contains(&b'/'))
         };
         for rows in [(0..1000).collect::<Vec<_>>(), vec![0, 1, 2, 500, 999], vec![999], vec![]] {
             let mut found = Vec::new();
-            let count = holds_in_rows(&fsst, &sequence, rows.iter().copied(), &mut found)
-                .expect("walked");
+            let count =
+                holds_in_rows(&fsst, &sequence, rows.iter().copied(), &mut found).expect("walked");
             assert_eq!(count, Some(1000));
             let wanted: Vec<u32> =
                 rows.iter().copied().filter(|&row| searched(row)).map(|row| row as u32).collect();
