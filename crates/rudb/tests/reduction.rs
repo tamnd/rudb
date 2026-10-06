@@ -213,6 +213,48 @@ fn a_child_with_no_link_is_reduced_through_the_parents_key_map() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A child whose link was over the budget still has its backward adjacency, and that names the
+/// parent whose key map turns the keys of a build side that is not the parent into the child rows
+/// they reach. This is the shape of TPC-H q20, where `lineitem` is joined to pairs of `partsupp`
+/// and the link from `l_partkey` to `part` did not fit. Here the key is scattered and the note is
+/// wide, so the link costs more than a tenth of the table and the adjacency less than all of it.
+#[test]
+fn a_child_with_only_its_adjacency_is_reduced_through_it() {
+    let (database, path) = open("adjacency");
+    database.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").expect("creates");
+    database.execute("CREATE TABLE visits (v_custkey INTEGER, v_note VARCHAR)").expect("creates");
+    database.execute("CREATE TABLE picked (p_key INTEGER)").expect("creates");
+    database
+        .execute("INSERT INTO customer SELECT i, 'c' || i FROM range(1, 30001) AS r(i)")
+        .expect("loads");
+    database
+        .execute(
+            "INSERT INTO visits SELECT 1 + i * 7919 % 30000, md5(i::VARCHAR) FROM range(0, \
+             200000) AS r(i)",
+        )
+        .expect("loads");
+    database.execute("INSERT INTO picked VALUES (1), (2), (30000)").expect("loads");
+    database.execute("SET graph_links = 'visits(v_custkey) -> customer(c_custkey)'").expect("sets");
+    database.execute("CHECKPOINT").expect("builds the adjacency");
+    database.execute("SET graph_sections = 'on'").expect("turns the layer on");
+    let refused = rows(
+        &database,
+        "SELECT count(*) FROM rudb_links() WHERE note LIKE '%link was measured and not kept%'",
+    );
+    assert_eq!(refused, [[Value::BigInt(1)]], "the link should be over the budget");
+    let sql = "SELECT count(*), max(v_note) FROM visits WHERE v_custkey IN (SELECT p_key FROM \
+               picked)";
+    let reduced = rows(&database, sql);
+    assert_eq!(reduced[0][0], Value::BigInt(20));
+    let line = scan_of(&database, "visits", sql);
+    assert!(line.contains("link kept 20 of 200000 rows"), "the adjacency should list them: {line}");
+
+    database.execute("SET graph_sections = 'off'").expect("the layer has a switch");
+    assert_eq!(rows(&database, sql), reduced, "the adjacency changed an answer");
+    drop(database);
+    std::fs::remove_file(&path).ok();
+}
+
 /// A build side that is not a stored parent, joined to a table's own unique key, is turned into the
 /// rows of that table by the key's map, which is the shape of TPC-H q18 where the orders kept by a
 /// grouping of `lineitem` are looked up in `orders`. The scan of `customer` reads those rows alone.
