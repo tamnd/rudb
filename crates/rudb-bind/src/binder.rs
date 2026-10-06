@@ -3055,6 +3055,11 @@ impl<'a> Binder<'a> {
         if !pragma && let Some(bound) = self.all_types(ast, function_name, args, alias, columns)? {
             return Ok(bound);
         }
+        if !pragma
+            && let Some(bound) = self.vector_types(ast, function_name, args, alias, columns)?
+        {
+            return Ok(bound);
+        }
         // The name is looked up before the arguments are bound so that a call of something that is
         // not a table function says that, rather than reporting whatever is wrong with the
         // arguments of a function that was never going to exist.
