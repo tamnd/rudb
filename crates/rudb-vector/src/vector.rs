@@ -8649,6 +8649,48 @@ mod tests {
         );
     }
 
+    /// Runs of a packed column, cut at rows that do and do not start a word, read what a gather
+    /// of the same rows reads, and a column with nulls goes through the gather.
+    #[test]
+    fn a_gather_of_runs_reads_what_a_gather_of_their_rows_reads() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let runs = [(0, 3), (5, 1), (63, 2), (70, 0), (100, 64), (299, 1)];
+        let rows: Vec<u32> = runs.iter().flat_map(|&(start, length)| start..start + length).collect();
+        for width in [1, 7, 13, 32, 33, 50] {
+            for ty in [LogicalType::BigInt, LogicalType::Integer] {
+                let base = if ty == LogicalType::BigInt { -1_000 } else { 0 };
+                let width = if ty == LogicalType::Integer { width.min(31) } else { width };
+                let whole = Vector::packed(ty, words.clone(), width, base, 300)
+                    .expect("enough words for 300 codes");
+                for at in [0, 1] {
+                    let cut = whole.slice(at, 300 - at).expect("a cut inside the column");
+                    let runs: Vec<(u32, u32)> =
+                        runs.iter().filter(|&&(start, length)| start + length <= 299).copied().collect();
+                    let rows: Vec<u32> = rows.iter().filter(|&&row| row < 299).copied().collect();
+                    let got = cut.gather_runs(&runs).expect("runs inside the column");
+                    assert_eq!(got.form(), Form::Flat);
+                    let want = cut.gather(&rows).expect("rows inside the column");
+                    assert_eq!(
+                        got.iter().collect::<Vec<_>>(),
+                        want.iter().collect::<Vec<_>>(),
+                        "width {width} cut at {at}"
+                    );
+                }
+            }
+        }
+        let values: Vec<i32> = (0..64).map(|row| 10 + row).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let packed =
+            flat.bit_packed().unwrap().with_validity(Validity::from_iter(64, |row| row % 3 != 0));
+        let taken = packed.gather_runs(&[(2, 2), (62, 1)]).unwrap();
+        assert_eq!(
+            taken.iter().collect::<Vec<_>>(),
+            vec![Value::Integer(12), Value::Null, Value::Integer(72)]
+        );
+        assert!(packed.gather_runs(&[(60, 5)]).is_err());
+    }
+
     /// The pair a comparison kernel asks for before it reads a bit. A literal inside the range has a
     /// code and a literal outside it does not, which answers the whole vector at once.
     #[test]
