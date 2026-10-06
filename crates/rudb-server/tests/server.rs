@@ -1144,6 +1144,81 @@ fn a_call_that_no_function_takes_is_the_error_of_postgres() {
 }
 
 #[test]
+fn a_literal_that_a_cast_cannot_read_has_its_place_and_an_overflow_has_none() {
+    let dirs = Dirs::new("literal-place");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let overflow =
+        "A field with precision 6, scale 2 must round to an absolute value less than 10^4.";
+    for (sql, code, message, detail, context, place) in [
+        (
+            "select '1.5x'::numeric",
+            "22P02",
+            "invalid input syntax for type numeric: \"1.5x\"",
+            None,
+            None,
+            Some("8"),
+        ),
+        (
+            "select '{\"a\":1'::jsonb",
+            "22P02",
+            "invalid input syntax for type json",
+            Some("The input string ended unexpectedly."),
+            Some("JSON data, line 1: {\"a\":1"),
+            Some("8"),
+        ),
+        (
+            "select 1, '[1 2]'::json",
+            "22P02",
+            "invalid input syntax for type json",
+            Some("Expected \",\" or \"]\", but found \"2\"."),
+            Some("JSON data, line 1: [1 2..."),
+            Some("11"),
+        ),
+        (
+            "select 12345.6::numeric(6,2)",
+            "22003",
+            "numeric field overflow",
+            Some(overflow),
+            None,
+            None,
+        ),
+        (
+            "select '12345.6'::numeric(6,2)",
+            "22003",
+            "numeric field overflow",
+            Some(overflow),
+            None,
+            None,
+        ),
+        (
+            "select 123456::numeric(6,2)",
+            "22003",
+            "numeric field overflow",
+            Some(overflow),
+            None,
+            None,
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'D').as_deref(), detail, "{sql}");
+        assert_eq!(messages[0].field(b'W').as_deref(), context, "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), place, "{sql}");
+    }
+    // A literal keeps every digit of a `numeric`, and a `jsonb` is in its normal form.
+    let digits = "12345678901234567890123456789012345678901234.5";
+    let messages =
+        client.query(&format!("select '{digits}'::numeric, '{{\"b\":1,\"a\":2}}'::jsonb"));
+    let row: Vec<_> = data_row(&messages[1]).into_iter().map(Option::unwrap).collect();
+    assert_eq!(row, [digits.as_bytes().to_vec(), br#"{"a": 2, "b": 1}"#.to_vec()]);
+    server.stop().unwrap();
+}
+
+#[test]
 fn create_unlogged_and_a_serial_column() {
     let dirs = Dirs::new("serial");
     let server = Server::start(dirs.config()).unwrap();
