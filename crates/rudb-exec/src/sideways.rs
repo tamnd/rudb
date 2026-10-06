@@ -72,7 +72,7 @@ use std::sync::{Arc, OnceLock};
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{LogicalType, Result, SessionTimeZone};
 use rudb_graph::link::Form;
-use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
+use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids, Spans};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
@@ -185,10 +185,10 @@ struct Listing {
 /// What [`listed_keys`] found out before gathering anything.
 #[derive(Debug)]
 enum Planned {
-    /// The parents the keys name, to push through the adjacency, and how many rows they reach.
+    /// Where the lists of the parents the keys name are, to push through the adjacency, and how
+    /// many rows they reach.
     Through {
-        held: Rids,
-        reach: u64,
+        spans: Spans,
         /// Whether the rows go in however thickly they sit in their parts, which they do when they
         /// are a join's own or narrow a set the scan already reads one at a time.
         placed: bool,
@@ -201,7 +201,7 @@ enum Planned {
 impl Planned {
     fn reach(&self) -> u64 {
         match self {
-            Self::Through { reach, .. } => *reach,
+            Self::Through { spans, .. } => spans.rows(),
             Self::Ready(pushed) => pushed.rids.len(),
         }
     }
@@ -1611,11 +1611,11 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
     let Some(held) = held.parents(map, adjacency.parents())? else {
         return Ok(None);
     };
-    let reach = adjacency.reached(held)?;
-    if reach.saturating_mul(LISTED) >= children {
+    let spans = adjacency.spans(held)?;
+    if spans.rows().saturating_mul(LISTED) >= children {
         return Ok(None);
     }
-    Ok(Some(Planned::Through { held: held.clone(), reach, placed: true }))
+    Ok(Some(Planned::Through { spans, placed: true }))
 }
 
 /// How the driving rows that hold one of `count` key values would be read off the backward
@@ -1662,11 +1662,11 @@ fn listed_keys(
         return pushed_keys(exact, map, keys, worth, within.is_some()).map(Planned::Ready);
     };
     let held = keyed_parents(map, adjacency.parents(), keys)?;
-    let reach = adjacency.reached(&held).ok()?;
-    if !worth(reach) {
+    let spans = adjacency.spans(&held).ok()?;
+    if !worth(spans.rows()) {
         return None;
     }
-    Some(Planned::Through { held, reach, placed: within.is_some() })
+    Some(Planned::Through { spans, placed: within.is_some() })
 }
 
 /// The parents that hold `keys`, as a set over the `parents` rows of the parent table, `None` when
@@ -1707,9 +1707,9 @@ fn pushed_keys(
 fn gathered(exact: &Exact, planned: &Planned) -> Option<Pushed> {
     match planned {
         Planned::Ready(pushed) => Some(pushed.clone()),
-        Planned::Through { held, placed, .. } => {
+        Planned::Through { spans, placed } => {
             let children = exact.children?;
-            let rids = exact.adjacency()?.push(held).ok()?;
+            let rids = exact.adjacency()?.push_spans(spans).ok()?;
             if !placed && !thin(&rids) {
                 return None;
             }

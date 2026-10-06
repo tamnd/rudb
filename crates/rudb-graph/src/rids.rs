@@ -265,6 +265,33 @@ impl Rids {
             .chain(dense.into_iter().flatten())
     }
 
+    /// Hands `each` every member in order, and stops at the first error it returns.
+    ///
+    /// What [`Self::iter`] gives, as a loop over the one form the set is in. Through `iter` a
+    /// member of a dense set came out of three chained iterators, and on JOB 13a the call to the
+    /// one the compiler did not inline was 3.6 percent of the query.
+    ///
+    /// # Errors
+    ///
+    /// The first error `each` returns.
+    pub fn try_for_each(&self, mut each: impl FnMut(Rid) -> Result<()>) -> Result<()> {
+        match &self.body {
+            Body::Full => (0..self.rows).try_for_each(each),
+            Body::Sparse(members) => members.iter().try_for_each(|&member| each(member)),
+            Body::Dense { words, .. } => {
+                for (at, &word) in words.iter().enumerate() {
+                    let base = count(at) * 64;
+                    let mut rest = word;
+                    while rest != 0 {
+                        each(base + u64::from(rest.trailing_zeros()))?;
+                        rest &= rest - 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// The rows in both sets.
     ///
     /// # Errors
@@ -816,6 +843,34 @@ mod tests {
     /// The members of a set, the slow way, for comparing against.
     fn members(rids: &Rids) -> Vec<Rid> {
         (0..rids.rows()).filter(|&rid| rids.contains(rid)).collect()
+    }
+
+    #[test]
+    fn a_walk_over_the_members_is_what_iter_gives_in_every_form() {
+        let rows = 1024;
+        let sets = [
+            Rids::full(rows),
+            Rids::none(rows),
+            Rids::from_sorted(rows, vec![3, 64, 1023]).expect("sparse"),
+            Rids::from_words(rows, vec![0x5555_5555_5555_5555; 16]).expect("dense"),
+        ];
+        let forms: Vec<Form> = sets.iter().map(Rids::form).collect();
+        assert!(forms.contains(&Form::Sparse) && forms.contains(&Form::Dense), "{forms:?}");
+        for set in &sets {
+            let mut walked = Vec::new();
+            set.try_for_each(|member| {
+                walked.push(member);
+                Ok(())
+            })
+            .expect("walk");
+            assert_eq!(walked, members(set), "{:?}", set.form());
+        }
+        let mut seen = 0;
+        let stopped = Rids::full(rows).try_for_each(|member| {
+            seen += 1;
+            if member == 4 { Err(rudb_common::Error::internal("stop")) } else { Ok(()) }
+        });
+        assert!(stopped.is_err() && seen == 5, "stops at the first error");
     }
 
     #[test]

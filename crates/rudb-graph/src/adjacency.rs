@@ -59,6 +59,26 @@ const RANGE_BITS: u32 = 10;
 /// `children`, `parents`, `edges`, then the width, the layout and padding to an eight byte boundary.
 pub const HEADER_BYTES: usize = 32;
 
+/// Where the lists of some parents lie among an adjacency's child rows, which [`Adjacency::spans`]
+/// finds and [`Adjacency::push_spans`] reads.
+#[derive(Debug, Clone)]
+pub struct Spans {
+    /// The lists that hold a child, in rising order of parent.
+    lists: Vec<std::ops::Range<usize>>,
+    /// The child rows the lists hold between them.
+    rows: u64,
+    /// Rows in the child table of the adjacency the lists are in.
+    children: u64,
+}
+
+impl Spans {
+    /// How many child rows the lists hold, which is what [`Adjacency::reached`] counts.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+}
+
 /// A relationship's parent to children map.
 #[derive(Debug, Clone)]
 pub struct Adjacency {
@@ -337,6 +357,30 @@ impl Adjacency {
         Ok(reached)
     }
 
+    /// Where the lists of the parents of `held` lie, and how many child rows they hold, from one
+    /// walk over the starts.
+    ///
+    /// For a caller that counts the rows before it decides to read them, and then reads them with
+    /// [`Self::push_spans`]. Counting with [`Self::reached`] and reading with [`Self::push`] walked
+    /// the starts twice, and the walk is most of what a count costs. On JOB 13a at one thread the
+    /// walk was 6.6 percent of the query and the iteration over the held parents feeding it
+    /// another 3.6.
+    ///
+    /// # Errors
+    ///
+    /// If `held` is not a set over the parent table.
+    pub fn spans(&self, held: &Rids) -> Result<Spans> {
+        let mut spans = Spans { lists: Vec::new(), rows: 0, children: self.children };
+        self.lists(held, |list| {
+            if !list.is_empty() {
+                spans.rows += count(list.len());
+                spans.lists.push(list);
+            }
+            Ok(())
+        })?;
+        Ok(spans)
+    }
+
     /// The child rows that point into `held`, which is a set over the parent table.
     ///
     /// The lists of the members, set as bits of one bitmap over the children, which the set then
@@ -355,6 +399,59 @@ impl Adjacency {
     ///
     /// If `held` is not a set over the parent table.
     pub fn push(&self, held: &Rids) -> Result<Rids> {
+        self.dealt(|deal| {
+            // A list is asked for from memory when the walk reaches it and read [`AHEAD`] lists
+            // later. The lists of a sparse set of parents are a cache line or two each, megabytes
+            // apart, and read where the walk found them every one was a wait on memory. On JOB 17f
+            // that was most of the push, which was a sixth of the query. Which order the lists are
+            // dealt in does not matter, because each child is a bit.
+            let mut waiting: [std::ops::Range<usize>; AHEAD] = std::array::from_fn(|_| 0..0);
+            let mut next = 0;
+            self.lists(held, |list| {
+                self.ask(&list);
+                let due = std::mem::replace(&mut waiting[next], list);
+                next = (next + 1) % AHEAD;
+                deal(due)
+            })?;
+            for list in waiting {
+                deal(list)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// [`Self::push`] of the parents [`Self::spans`] found the lists of.
+    ///
+    /// # Errors
+    ///
+    /// If `spans` was found over an adjacency with another number of children.
+    pub fn push_spans(&self, spans: &Spans) -> Result<Rids> {
+        if spans.children != self.children {
+            return Err(Error::internal(format!(
+                "lists over {} children pushed through an adjacency over {}",
+                spans.children, self.children
+            )));
+        }
+        self.dealt(|deal| {
+            let lists = &spans.lists;
+            for list in lists.iter().take(AHEAD) {
+                self.ask(list);
+            }
+            for (at, list) in lists.iter().enumerate() {
+                if let Some(ahead) = lists.get(at + AHEAD) {
+                    self.ask(ahead);
+                }
+                deal(list.clone())?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The child rows of the lists `walk` hands its dealer, as a set over the children.
+    fn dealt(
+        &self,
+        walk: impl FnOnce(&mut dyn FnMut(std::ops::Range<usize>) -> Result<()>) -> Result<()>,
+    ) -> Result<Rids> {
         let mut words = vec![0_u64; usize::try_from(self.children.div_ceil(64)).unwrap_or(0)];
         let mut buckets: Vec<Vec<u16>> = vec![Vec::new(); words.len().div_ceil(BUCKET_ROWS / 64)];
         let mut deal = |list: std::ops::Range<usize>| -> Result<()> {
@@ -368,22 +465,7 @@ impl Adjacency {
             }
             Ok(())
         };
-        // A list is asked for from memory when the walk reaches it and read [`AHEAD`] lists later.
-        // The lists of a sparse set of parents are a cache line or two each, megabytes apart, and
-        // read where the walk found them every one was a wait on memory. On JOB 17f that was most
-        // of the push, which was a sixth of the query. Which order the lists are dealt in does not
-        // matter, because each child is a bit.
-        let mut waiting: [std::ops::Range<usize>; AHEAD] = std::array::from_fn(|_| 0..0);
-        let mut next = 0;
-        self.lists(held, |list| {
-            self.ask(&list);
-            let due = std::mem::replace(&mut waiting[next], list);
-            next = (next + 1) % AHEAD;
-            deal(due)
-        })?;
-        for list in waiting {
-            deal(list)?;
-        }
+        walk(&mut deal)?;
         for (words, bucket) in words.chunks_mut(BUCKET_ROWS / 64).zip(&buckets) {
             for &row in bucket {
                 let row = usize::from(row);
@@ -434,7 +516,7 @@ impl Adjacency {
         // `at` is where the list of parent `parent` starts among the bits, which is past `parent`
         // zeros, so the children listed before it are `at - parent`.
         let (mut parent, mut at) = (0_u64, 0_usize);
-        for member in held.iter() {
+        held.try_for_each(|member| {
             if member > parent {
                 let found = if member - parent > FAR {
                     self.starts.select0(member - 1).map(|zero| zero + 1)
@@ -452,8 +534,8 @@ impl Adjacency {
             // The zero after the list, which moves on to the next parent.
             at += run + 1;
             parent += 1;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Appends the header and the body.
@@ -710,6 +792,10 @@ mod tests {
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
         assert_eq!(adjacency.reached(&held).expect("reached"), count(expected.len()));
+        let spans = adjacency.spans(&held).expect("spans");
+        assert_eq!(spans.rows(), count(expected.len()));
+        let read = adjacency.push_spans(&spans).expect("push the spans");
+        assert_eq!(read.iter().collect::<Vec<_>>(), expected, "the same rows as the push");
     }
 
     #[test]
@@ -728,6 +814,11 @@ mod tests {
         expected.sort_unstable();
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
+        let spans = adjacency.spans(&held).expect("spans");
+        let read = adjacency.push_spans(&spans).expect("push the spans");
+        assert_eq!(read.iter().collect::<Vec<_>>(), expected, "the same rows as the push");
+        let other = Adjacency::build(&[0, 1], 2).expect("another adjacency");
+        assert!(other.push_spans(&spans).is_err(), "lists of another adjacency");
     }
 
     #[test]
