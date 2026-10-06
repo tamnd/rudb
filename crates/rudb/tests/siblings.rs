@@ -62,7 +62,7 @@ fn plan(database: &Database, sql: &str) -> String {
 
 /// The shape of TPC-H q21, one `EXISTS` and one `NOT EXISTS` over the other children of the
 /// same parent, each with a condition the key alone does not answer.
-const QUERIES: [&str; 10] = [
+const QUERIES: [&str; 12] = [
     "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE o1.o_late AND EXISTS (SELECT * \
      FROM orders o2 WHERE o2.o_custkey = o1.o_custkey AND o2.o_clerk <> o1.o_clerk) AND NOT \
      EXISTS (SELECT * FROM orders o3 WHERE o3.o_custkey = o1.o_custkey AND o3.o_clerk <> \
@@ -93,6 +93,11 @@ const QUERIES: [&str; 10] = [
      c_custkey)",
     "SELECT count(*), sum(o_orderkey) FROM orders o1 WHERE EXISTS (SELECT * FROM orders o2 WHERE \
      o2.o_custkey = o1.o_orderkey)",
+    // The key and a filter on the child alone, which is TPC-H q04's shape.
+    "SELECT count(*), sum(c_custkey) FROM customer WHERE EXISTS (SELECT * FROM orders WHERE \
+     o_custkey = c_custkey AND o_late)",
+    "SELECT count(*), sum(c_custkey) FROM customer WHERE c_custkey % 3 = 0 AND NOT EXISTS (SELECT \
+     * FROM orders WHERE o_custkey = c_custkey AND o_clerk > 2)",
 ];
 
 fn answers_the_same(shuffled: bool) {
@@ -112,6 +117,13 @@ fn answers_the_same(shuffled: bool) {
     assert!(scan.contains("not measured"), "{text}");
     // Nor is it when the key is the whole condition, since the parent's child count says it all.
     let text = plan(&database, QUERIES[8]);
+    let scan = text
+        .lines()
+        .find(|line| line.contains("Get ") && line.contains("orders"))
+        .unwrap_or_else(|| panic!("no scan of orders on the tree:\n{text}"));
+    assert!(scan.contains("not measured"), "{text}");
+    // Nor when the child has a filter of its own and the key is the only condition between them.
+    let text = plan(&database, QUERIES[10]);
     let scan = text
         .lines()
         .find(|line| line.contains("Get ") && line.contains("orders"))
