@@ -1304,7 +1304,7 @@ impl Database {
                 Vector::from_values(ty.clone(), &[high])?,
             ])?;
             return Ok(Some(QueryResult::new(
-                names.into(),
+                Vec::from(names),
                 vec![ty.clone(), ty],
                 vec![chunk],
                 Memory::unlimited().reservation(),
@@ -1349,7 +1349,7 @@ impl Database {
             .collect::<Result<Vec<_>>>()?;
         let chunk = Chunk::new(vectors)?;
         Ok(Some(QueryResult::new(
-            names.into(),
+            Vec::from(names),
             types,
             vec![chunk],
             Memory::unlimited().reservation(),
@@ -4318,8 +4318,12 @@ impl Shared {
                 rudb_catalog::Point::Found(chunk) => vec![chunk],
             };
             let reservation = Memory::unlimited().reservation();
-            let result =
-                QueryResult::new(target.names.clone(), target.types.clone(), chunks, reservation);
+            let result = QueryResult::new(
+                Arc::clone(&target.names),
+                Arc::clone(&target.types),
+                chunks,
+                reservation,
+            );
             // The session is built under a lock every statement shares, and only a zoned value
             // reads it.
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
@@ -4376,8 +4380,12 @@ impl Shared {
                 return Err(Error::internal("a range read the table cannot answer by its key"));
             };
             let reservation = Memory::unlimited().reservation();
-            let result =
-                QueryResult::new(target.names.clone(), target.types.clone(), chunks, reservation);
+            let result = QueryResult::new(
+                Arc::clone(&target.names),
+                Arc::clone(&target.types),
+                chunks,
+                reservation,
+            );
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
         (!unanswered).then_some(result)
@@ -7763,7 +7771,15 @@ fn lookup_target(
     let key = lookup.equal.iter().map(|(written, _)| column(written)).collect::<Option<_>>()?;
     let types: Vec<LogicalType> = columns.iter().map(|&at| fields[at].ty.clone()).collect();
     let zoned = types.iter().any(|ty| !unzoned(ty));
-    Some(crate::prepared::Target { name, key, columns, names, types, zoned, sets: Vec::new() })
+    Some(crate::prepared::Target {
+        name,
+        key,
+        columns,
+        names: names.into(),
+        types: types.into(),
+        zoned,
+        sets: Vec::new(),
+    })
 }
 
 /// What a [`crate::prepared::PointWrite`] writes: its lookup's target, every column, with the

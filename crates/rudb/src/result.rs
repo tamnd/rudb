@@ -46,8 +46,10 @@ pub struct QueryResult {
 /// The part of a [`QueryResult`] its clones share.
 #[derive(Debug)]
 struct Body {
-    names: Vec<String>,
-    types: Vec<LogicalType>,
+    /// Shared with whoever made the result, so a prepared read by key hands out the names and types
+    /// it resolved once rather than a copy of every name on every execution.
+    names: Arc<[String]>,
+    types: Arc<[LogicalType]>,
     chunks: Vec<Chunk>,
     /// Where each chunk starts, so a row number finds its chunk by a search rather than by walking.
     /// The last entry is the row count, which is what makes the search a plain partition point.
@@ -96,11 +98,12 @@ impl QueryResult {
     /// A result of the given columns and chunks.
     #[must_use]
     pub(crate) fn new(
-        names: Vec<String>,
-        types: Vec<LogicalType>,
+        names: impl Into<Arc<[String]>>,
+        types: impl Into<Arc<[LogicalType]>>,
         chunks: Vec<Chunk>,
         held: Reservation,
     ) -> Self {
+        let (names, types) = (names.into(), types.into());
         let mut starts = Vec::with_capacity(chunks.len() + 1);
         let mut rows = 0;
         for chunk in &chunks {
