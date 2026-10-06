@@ -134,6 +134,57 @@ const TAIL_BUILDS: usize = 8;
 /// How many values an append counts statistics for on each thread it starts, at least.
 const VALUES_PER_THREAD: usize = 1 << 16;
 
+/// How many zones [`Zones`] keeps in one block.
+const ZONE_BLOCK: usize = 256;
+
+/// The zone of every chunk of a table, in blocks that copies of the table share until one of them
+/// writes to a block.
+///
+/// A transaction takes a copy of every table it writes, and the zones were one `Vec`, so the copy
+/// was a copy of the bounds of every column of every chunk, text bounds and all, which grows with
+/// the table. Over a YCSB load of ten million rows in transactions of a thousand, that was five
+/// thousand zones of eleven columns copied and freed per transaction by the end. Now a copy shares
+/// the blocks, and a write copies the one block it writes to, which for an append is the last.
+#[derive(Debug, Clone, Default)]
+struct Zones {
+    blocks: Vec<Arc<Vec<Zone>>>,
+    len: usize,
+}
+
+impl Zones {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, zone: Zone) {
+        if self.len % ZONE_BLOCK == 0 {
+            self.blocks.push(Arc::new(Vec::with_capacity(ZONE_BLOCK)));
+        }
+        Arc::make_mut(self.blocks.last_mut().expect("a block for the zone")).push(zone);
+        self.len += 1;
+    }
+
+    fn get(&self, at: usize) -> Option<&Zone> {
+        self.blocks.get(at / ZONE_BLOCK)?.get(at % ZONE_BLOCK)
+    }
+
+    fn get_mut(&mut self, at: usize) -> Option<&mut Zone> {
+        Arc::make_mut(self.blocks.get_mut(at / ZONE_BLOCK)?).get_mut(at % ZONE_BLOCK)
+    }
+
+    fn last(&self) -> Option<&Zone> {
+        self.get(self.len.checked_sub(1)?)
+    }
+
+    fn last_mut(&mut self) -> Option<&mut Zone> {
+        self.get_mut(self.len.checked_sub(1)?)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Zone> {
+        self.blocks.iter().flat_map(|block| block.iter())
+    }
+}
+
 /// A table held in memory as row groups, read a chunk at a time.
 #[derive(Debug, Clone)]
 pub struct MemoryTable {
@@ -178,7 +229,7 @@ pub struct MemoryTable {
     /// How many rows are in `tail` and `building` together.
     tail_rows: usize,
     /// One per chunk, in the same numbering as `slots`.
-    zones: Vec<Zone>,
+    zones: Zones,
     /// The distinct count of every column, over the whole table rather than per chunk.
     ///
     /// Per table and not per chunk because the question it answers is about the column, and a
@@ -229,7 +280,7 @@ impl MemoryTable {
             building: Arc::default(),
             built: 0,
             tail_rows: 0,
-            zones: Vec::new(),
+            zones: Zones::default(),
             counts,
             grams,
             lists,
@@ -1710,6 +1761,46 @@ mod tests {
         assert_eq!(read(&table), kept);
         assert_eq!(copy.distinct_values(0), Some(15));
         assert_eq!(table.distinct_values(0), Some(11));
+    }
+
+    /// A copy of a table shares the blocks of its zones, and a chunk appended to the copy, or a
+    /// zone widened in it, leaves the original's zones as they were.
+    #[test]
+    fn a_copy_of_a_table_shares_its_zones_until_it_writes_one() {
+        let types = vec![LogicalType::BigInt, LogicalType::Varchar];
+        let chunk = |from: i64| {
+            let ints = (from..from + 100).map(Value::BigInt).collect::<Vec<_>>();
+            let texts = (from..from + 100).map(|at| Value::Varchar(format!("v{at}")));
+            Chunk::new(vec![
+                Vector::from_values(LogicalType::BigInt, &ints).expect("a column"),
+                Vector::from_values(LogicalType::Varchar, &texts.collect::<Vec<_>>())
+                    .expect("a column"),
+            ])
+            .expect("a chunk")
+        };
+        let mut table = MemoryTable::new(types);
+        for at in 0..600 {
+            table.append(chunk(at * 100)).expect("a chunk of the table's types");
+        }
+        assert_eq!(table.zones.len(), table.chunk_count());
+        let before = (0..table.chunk_count())
+            .map(|at| table.zone(at).cloned().expect("a zone per chunk"))
+            .collect::<Vec<_>>();
+        let mut copy = table.clone();
+        for (copied, kept) in copy.zones.blocks.iter().zip(&table.zones.blocks) {
+            assert!(Arc::ptr_eq(copied, kept), "the copy shares every block");
+        }
+        copy.append(chunk(1_000_000)).expect("a chunk of the table's types");
+        copy.append_row(&[Value::BigInt(-5), Value::Varchar("a".to_string())]).expect("a row");
+        assert!(Arc::ptr_eq(&copy.zones.blocks[0], &table.zones.blocks[0]), "an untouched block");
+        assert_eq!(copy.zones.len(), copy.chunk_count());
+        assert_eq!(table.chunk_count(), before.len());
+        for (at, zone) in before.iter().enumerate() {
+            assert_eq!(table.zone(at), Some(zone), "zone {at} of the original");
+        }
+        let zones = copy.zones.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(zones[..before.len()], before[..]);
+        assert_eq!(zones.len(), copy.chunk_count());
     }
 
     #[test]
