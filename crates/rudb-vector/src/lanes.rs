@@ -59,6 +59,52 @@ const fn lanes() -> [([u8; 32], [u32; 8]); LANE_WIDTH_MAX + 1] {
     table
 }
 
+/// Whether every code of `width` bits fits in the two bytes it starts in, which is what the
+/// sixteen bit lanes of [`within_words`] need. A code starts up to seven bits into its first byte,
+/// so that is every width up to nine, and of the wider ones those whose codes only start on the
+/// bits that leave room: ten starts on even bits, twelve on a nibble and sixteen on a byte.
+const fn narrow(width: usize) -> bool {
+    if width == 0 || width > 16 {
+        return false;
+    }
+    let mut code = 0;
+    while code < 8 {
+        if code * width % 8 + width > 16 {
+            return false;
+        }
+        code += 1;
+    }
+    true
+}
+
+/// For each width [`narrow`] takes, the shuffle that puts code `i`'s two bytes in sixteen bit lane
+/// `i`, and the multiplier that shifts the code up against the top of its lane. The low half of a
+/// group of sixteen codes is loaded from the group's first byte and the high half from the byte
+/// code 8 starts on, so both halves take the same eight places.
+const NARROW: [([u8; 32], [u16; 16]); 17] = narrow_lanes();
+
+const fn narrow_lanes() -> [([u8; 32], [u16; 16]); 17] {
+    let mut table = [([0x80_u8; 32], [0_u16; 16]); 17];
+    let mut width = 1;
+    while width <= 16 {
+        if narrow(width) {
+            let mut lane = 0;
+            while lane < 16 {
+                let bit = lane % 8 * width;
+                #[expect(clippy::cast_possible_truncation, reason = "a byte under sixteen")]
+                {
+                    table[width].0[lane * 2] = (bit / 8) as u8;
+                    table[width].0[lane * 2 + 1] = (bit / 8 + 1) as u8;
+                }
+                table[width].1[lane] = 1 << (16 - width - bit % 8);
+                lane += 1;
+            }
+        }
+        width += 1;
+    }
+    table
+}
+
 /// The bytes of `words`, in memory order. On x86-64 that is little end first, which is the order
 /// the packed form numbers its bits in, so bit `b` of the codes is bit `b % 8` of byte `b / 8`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -111,6 +157,9 @@ pub(crate) fn within_words(
     assert!((1..=LANE_WIDTH_MAX).contains(&width));
     let Some(last) = words.len().checked_sub(1) else { return 0 };
     assert!(bytes.len() >= last * 8 * width + readable(width));
+    if narrow(width) {
+        return within_narrow(bytes, width, low, span, words, fresh);
+    }
     let (shuffle, shifts) = &LANES[width];
     let half = 4 * width / 8;
     let mut kept = 0;
@@ -149,6 +198,84 @@ pub(crate) fn within_words(
                 #[expect(clippy::cast_sign_loss, reason = "eight bits of a movemask")]
                 let bits = _mm256_movemask_ps(_mm256_castsi256_ps(inside)) as u64;
                 found |= bits << (group * 8);
+            }
+            *word = if fresh { found } else { *word & found };
+            kept += word.count_ones() as usize;
+        }
+    }
+    kept
+}
+
+/// [`within_words`] for a width [`narrow`] takes, sixteen codes to a register rather than eight.
+///
+/// Each code goes into a sixteen bit lane with its two bytes, a multiply shifts it up against the
+/// top of the lane, which drops the bits of the code after it, and one shift down by the same count
+/// for every lane drops the bits of the code before it. AVX2 has no shift of sixteen bit lanes by a
+/// different count each, and the multiply is that shift. Two registers of answers pack into one
+/// of bytes, so a block of 64 codes is two `movemask`s rather than eight. The dates of TPC-H are
+/// twelve bits and its discounts four, and a filter on them did half the work a code it did in
+/// lanes of 32 bits. The arguments are as [`within_words`] has checked them.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+fn within_narrow(
+    bytes: &[u8],
+    width: usize,
+    low: u32,
+    span: u32,
+    words: &mut [u64],
+    fresh: bool,
+) -> usize {
+    use std::arch::x86_64::{
+        __m256i, _mm_cvtsi32_si128, _mm_loadu_si128, _mm256_cmpeq_epi16, _mm256_loadu_si256,
+        _mm256_min_epu16, _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_packs_epi16,
+        _mm256_permute4x64_epi64, _mm256_set_m128i, _mm256_set1_epi16, _mm256_shuffle_epi8,
+        _mm256_srl_epi16, _mm256_sub_epi16,
+    };
+    let (shuffle, multiply) = &NARROW[width];
+    let mut kept = 0;
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. The table loads read
+    // the 32 bytes of one entry. Block `b` starts at `8 * b * width`, and its group `g` of sixteen
+    // codes loads sixteen bytes at `2 * g * width` and at `2 * g * width + width` from there, so
+    // the last load of the last block ends at `8 * last * width + 7 * width + 16`, under the length
+    // [`within_words`] checked. `loadu` has no alignment requirement.
+    unsafe {
+        let shuffle = _mm256_loadu_si256(shuffle.as_ptr().cast());
+        let multiply = _mm256_loadu_si256(multiply.as_ptr().cast());
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "a count under sixteen"
+        )]
+        let down = _mm_cvtsi32_si128((16 - width) as i32);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "both are under 2^16 and the lanes are read unsigned"
+        )]
+        let (low, span) = (_mm256_set1_epi16(low as u16 as i16), _mm256_set1_epi16(span as u16 as i16));
+        let inside = |at: *const u8| -> __m256i {
+            let lanes = _mm256_set_m128i(_mm_loadu_si128(at.add(width).cast()), _mm_loadu_si128(at.cast()));
+            let codes = _mm256_srl_epi16(_mm256_mullo_epi16(_mm256_shuffle_epi8(lanes, shuffle), multiply), down);
+            let offset = _mm256_sub_epi16(codes, low);
+            _mm256_cmpeq_epi16(_mm256_min_epu16(offset, span), offset)
+        };
+        for (block, word) in words.iter_mut().enumerate() {
+            if !fresh && *word == 0 {
+                continue;
+            }
+            let at = bytes.as_ptr().add(8 * block * width);
+            let mut found = 0_u64;
+            for pair in 0..2 {
+                let first = at.add(4 * pair * width);
+                // Packing works within each half, so the four runs of eight answers come out as
+                // the first group's low half, the second's low half, then the two high halves, and
+                // the permute puts them back in code order.
+                let packed = _mm256_packs_epi16(inside(first), inside(first.add(2 * width)));
+                let ordered = _mm256_permute4x64_epi64::<0b1101_1000>(packed);
+                #[expect(clippy::cast_sign_loss, reason = "32 bits of a movemask")]
+                let bits = u64::from(_mm256_movemask_epi8(ordered) as u32);
+                found |= bits << (32 * pair);
             }
             *word = if fresh { found } else { *word & found };
             kept += word.count_ones() as usize;
@@ -918,6 +1045,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_narrow_widths_are_the_ones_whose_codes_fit_two_bytes() {
+        let widths: Vec<usize> = (0..=LANE_WIDTH_MAX).filter(|&width| narrow(width)).collect();
+        assert_eq!(widths, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16]);
     }
 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
