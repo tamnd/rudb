@@ -1,5 +1,6 @@
 //! The handle everything else hangs off.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8067,6 +8068,48 @@ fn tables_read_twice(plan: &Plan) -> Vec<&str> {
     twice
 }
 
+thread_local! {
+    /// The rows that the last query of a PostgreSQL session on this thread made before it failed.
+    /// See [`crate::Connection::rows_before_error`].
+    static BEFORE_ERROR: RefCell<Option<QueryResult>> = const { RefCell::new(None) };
+}
+
+/// Takes the rows that [`keep_before_error`] kept on this thread.
+pub(crate) fn rows_before_error() -> Option<QueryResult> {
+    BEFORE_ERROR.with(|kept| kept.borrow_mut().take())
+}
+
+/// Keeps the rows that a failed query queued before its error, because PostgreSQL sends the rows
+/// it made before the error. Keeps nothing when there are no rows.
+fn keep_before_error(
+    query: &rudb_exec::Query<'_>,
+    names: Vec<String>,
+    types: Vec<LogicalType>,
+    memory: &Memory,
+    session: &Session,
+) {
+    if query.failed().is_err() {
+        return;
+    }
+    let mut held = memory.reservation();
+    let mut chunks = Vec::new();
+    while let Ok(Some(chunk)) = query.next_chunk() {
+        if chunk.is_empty() {
+            continue;
+        }
+        let Ok(chunk) = chunk.into_flat() else { break };
+        if held.grow(u64::try_from(chunk.footprint()).unwrap_or(u64::MAX)).is_err() {
+            break;
+        }
+        chunks.push(chunk);
+    }
+    if chunks.is_empty() {
+        return;
+    }
+    let result = QueryResult::new(names, types, chunks, held).in_session(session.clone());
+    BEFORE_ERROR.with(|kept| *kept.borrow_mut() = Some(result));
+}
+
 /// Runs a query the first engine built, and fills in the metrics document `run` returns.
 fn finish(
     sql: &str,
@@ -8090,7 +8133,12 @@ fn finish(
     // is. The loop after it is the one that turns the queued chunks into a result set, and it is
     // inside the span because a caller waiting for rows is waiting for that too.
     let driving = Span::start();
-    query.run(cancel, pool)?;
+    if let Err(error) = query.run(cancel, pool) {
+        if going == Rows::ForACaller && session.postgres().is_some() {
+            keep_before_error(&query, names, types, memory, session);
+        }
+        return Err(error);
+    }
     while let Some(chunk) = query.next_chunk()? {
         if chunk.is_empty() {
             continue;

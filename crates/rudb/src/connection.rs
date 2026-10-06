@@ -83,6 +83,17 @@ impl Connection {
         self.shared.set_postgres(postgres);
     }
 
+    /// The rows that the last statement of this thread made before it failed, once.
+    ///
+    /// Only a statement of a PostgreSQL session keeps them, see [`Connection::set_postgres`],
+    /// because PostgreSQL sends the rows that a query made before an error and then the error. A
+    /// server takes them after each error, and gets `None` when the statement made no rows or
+    /// failed before it ran.
+    #[must_use]
+    pub fn rows_before_error(&self) -> Option<QueryResult> {
+        crate::database::rows_before_error()
+    }
+
     /// Runs one query and returns every row it produced.
     ///
     /// # Errors

@@ -614,6 +614,32 @@ impl Prepared {
         out: &mut Vec<Vector>,
     ) -> Result<()> {
         self.run(&chunk, scratch)?;
+        self.hand_over(chunk, scratch, out)
+    }
+
+    /// Runs every step over `chunk` and keeps the answers in `scratch`, for
+    /// [`hand_over`](Self::hand_over) to take. A caller that wants `chunk` back when a step fails
+    /// calls the two halves of [`evaluate_taking`](Self::evaluate_taking) itself.
+    ///
+    /// # Errors
+    ///
+    /// Anything a kernel reports.
+    pub(crate) fn steps(&self, chunk: &Chunk, scratch: &mut Scratch) -> Result<()> {
+        self.run(chunk, scratch)
+    }
+
+    /// The second half of [`evaluate_taking`](Self::evaluate_taking), after
+    /// [`steps`](Self::steps) ran over the same chunk.
+    ///
+    /// # Errors
+    ///
+    /// An internal error if a root has no answer in `scratch`.
+    pub(crate) fn hand_over(
+        &self,
+        chunk: Chunk,
+        scratch: &mut Scratch,
+        out: &mut Vec<Vector>,
+    ) -> Result<()> {
         let width = chunk.width();
         let mut columns: Vec<Option<Vector>> = chunk.into_columns().into_iter().map(Some).collect();
         let mut uses = vec![0usize; width];

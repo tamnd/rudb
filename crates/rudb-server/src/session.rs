@@ -1348,6 +1348,8 @@ impl Runner {
             self.refresh();
             return done;
         }
+        // Rows that an earlier statement left behind are not the rows of this one.
+        drop(self.connection.rows_before_error());
         let result = run(&self.connection).map_err(|e| Failure::engine(&e, offset))?;
         for notice in result.notices() {
             self.notice(out, Severity::Notice, notice.sqlstate, &notice.message);
@@ -1423,6 +1425,11 @@ impl Runner {
                 Err(failure) => {
                     // A session that the server ends sends only the FATAL, as in PostgreSQL.
                     if !self.ending() {
+                        // The rows that the query made before the error go first, as in
+                        // PostgreSQL. A failure to send one of them does not change the error.
+                        if let Some(result) = self.connection.rows_before_error() {
+                            let _ = self.rows(&result, out, &mut flush)?;
+                        }
                         failure.write(sql, out);
                     }
                     return Ok(true);

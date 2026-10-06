@@ -133,6 +133,25 @@ impl Binder<'_> {
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
             ast::Expr::Unary { op, operand } => self.bind_unary(ast, op, operand, scope),
             ast::Expr::Binary { op, left, right } => self.bind_binary(ast, op, left, right, scope),
+            // A set-returning function in the select list of a PostgreSQL session makes a row per
+            // value. See `Binder::bind_series`.
+            ast::Expr::Function { name, args, distinct: false, filter }
+                if filter == NONE
+                    && name.len == 1
+                    && self.unnest_here
+                    && !self.in_unnest
+                    && !self.in_aggregate
+                    && !self.in_window
+                    && !self.in_lambda()
+                    && self.session.postgres().is_some()
+                    && rudb_catalog::same_name(
+                        ast.name(name).last().unwrap_or_default(),
+                        "generate_series",
+                    ) =>
+            {
+                let args = ast.expr_list(args).to_vec();
+                self.bind_series(ast, expr, &args, scope)
+            }
             ast::Expr::Function { name, args, distinct, filter }
                 if name.len == 1
                     && rudb_catalog::same_name(
@@ -1706,7 +1725,24 @@ impl Binder<'_> {
         }
         let types: Vec<LogicalType> =
             args.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
-        let resolved = resolve(resolved_name, &types)?;
+        let mut resolved = resolve(resolved_name, &types)?;
+        // A parameter of no type in a PostgreSQL session prefers a string to a blob, as an
+        // `unknown` argument prefers the string category there, so `repeat($1, 2)` repeats text.
+        if self.session.postgres().is_some() {
+            let mut texts = types.clone();
+            for (at, arg) in args.iter().enumerate() {
+                if resolved.arguments.get(at) == Some(&LogicalType::Blob)
+                    && self.placeholders.iter().any(|(held, _)| held == arg)
+                {
+                    texts[at] = LogicalType::Varchar;
+                }
+            }
+            if texts != types
+                && let Ok(text) = resolve(resolved_name, &texts)
+            {
+                resolved = text;
+            }
+        }
         // The sort order and the null order of a list sort are read once for the whole call on the
         // pin, which is why it refuses one that could change from row to row.
         let settled: &[&str] = match resolved.name {
@@ -3942,11 +3978,11 @@ mod tests {
         );
         assert!(matches!(
             number("340282366920938463463374607431768211456", false).expect("a number"),
-            Value::Double(_)
+            Value::BigNum(_)
         ));
         assert!(matches!(
             number("170141183460469231731687303715884105729", true).expect("a number"),
-            Value::Double(_)
+            Value::BigNum(_)
         ));
     }
 

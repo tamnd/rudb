@@ -245,6 +245,71 @@ impl Binder<'_> {
         Ok(column)
     }
 
+    /// A set-returning function in the select list of a PostgreSQL session, which makes a row per
+    /// value, as in PostgreSQL. The function of the engine with the same name gives a list, so the
+    /// call binds as an `unnest` of that list.
+    ///
+    /// The list of `generate_series` holds `bigint` values. PostgreSQL gives `integer` values when
+    /// each argument is an `integer`, so the values are cast back for those arguments. A parameter
+    /// with no type takes the type of the other arguments, as in PostgreSQL.
+    pub(crate) fn bind_series(
+        &mut self,
+        ast: &Ast,
+        call: ast::ExprRef,
+        args: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let before = self.unnests.len();
+        let column = self.bind_unnest(ast, call, &[call], scope)?;
+        if self.unnests.len() != before + 1 || self.plan().expr_type(column) != &LogicalType::BigInt
+        {
+            return Ok(column);
+        }
+        let list = self.unnests[before].arg;
+        let Expr::Function { args: bound, .. } = *self.plan().expr(list) else {
+            return Ok(column);
+        };
+        let bound = self.plan().expr_list(bound).to_vec();
+        let integers = bound.len() == args.len()
+            && args.iter().zip(&bound).all(|(&written, &bound)| self.integer(ast, written, bound));
+        if !integers {
+            return Ok(column);
+        }
+        self.checked_cast_to(column, &LogicalType::Integer, false)
+    }
+
+    /// Whether an argument is an `integer` in PostgreSQL: a number literal that fits in one, a
+    /// parameter, or a value of an integer type of 32 bits or fewer.
+    fn integer(&self, ast: &Ast, written: ast::ExprRef, bound: ExprRef) -> bool {
+        let fits = |text: &str| text.parse::<i32>().is_ok();
+        match ast.expr(written) {
+            ast::Expr::Parameter { .. } => return true,
+            ast::Expr::Literal { kind: ast::LiteralKind::Number, text } => {
+                return fits(ast.string(text));
+            }
+            ast::Expr::Unary { op: ast::UnaryOp::Negate, operand } => {
+                if let ast::Expr::Literal { kind: ast::LiteralKind::Number, text } =
+                    ast.expr(operand)
+                {
+                    return fits(&format!("-{}", ast.string(text)));
+                }
+            }
+            _ => {}
+        }
+        let value = match *self.plan().expr(bound) {
+            Expr::Cast { input, .. } => input,
+            _ => bound,
+        };
+        matches!(
+            self.plan().expr_type(value),
+            LogicalType::TinyInt
+                | LogicalType::SmallInt
+                | LogicalType::Integer
+                | LogicalType::UTinyInt
+                | LogicalType::USmallInt
+        )
+    }
+
     /// The columns a root `unnest` of a struct stands for, each a `struct_extract` of `input`, and
     /// their names, taking apart `depth` levels of struct.
     pub(crate) fn unnest_fields(
