@@ -1611,10 +1611,9 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
     let Some(held) = held.parents(map, adjacency.parents())? else {
         return Ok(None);
     };
-    let spans = adjacency.spans(held)?;
-    if spans.rows().saturating_mul(LISTED) >= children {
+    let Some(spans) = adjacency.spans(held, below(children, LISTED))? else {
         return Ok(None);
-    }
+    };
     Ok(Some(Planned::Through { spans, placed: true }))
 }
 
@@ -1662,7 +1661,11 @@ fn listed_keys(
         return pushed_keys(exact, map, keys, worth, within.is_some()).map(Planned::Ready);
     };
     let held = keyed_parents(map, adjacency.parents(), keys)?;
-    let spans = adjacency.spans(&held).ok()?;
+    let most = match within {
+        Some(held) => held.saturating_sub(1),
+        None => below(children, exact.gathered),
+    };
+    let spans = adjacency.spans(&held, most).ok()??;
     if !worth(spans.rows()) {
         return None;
     }
@@ -1700,6 +1703,12 @@ fn pushed_keys(
     let link = exact.link()?;
     let pushed = keyed_parents(map, link.parents(), keys)?.forward(link).ok()?;
     (worth(pushed.rids.len()) && (within || thin(&pushed.rids))).then_some(pushed)
+}
+
+/// The most rows that are fewer than one in `share` of `children`, which is where [`listed`] and
+/// [`listed_keys`] turn a set of lists down.
+fn below(children: u64, share: u64) -> u64 {
+    children.saturating_sub(1).checked_div(share).unwrap_or(u64::MAX)
 }
 
 /// The rows a plan of [`listed_keys`] names, `None` when they sit too thickly in their parts to be

@@ -358,7 +358,7 @@ impl Adjacency {
     }
 
     /// Where the lists of the parents of `held` lie, and how many child rows they hold, from one
-    /// walk over the starts.
+    /// walk over the starts, or `None` once they hold more than `most`.
     ///
     /// For a caller that counts the rows before it decides to read them, and then reads them with
     /// [`Self::push_spans`]. Counting with [`Self::reached`] and reading with [`Self::push`] walked
@@ -366,19 +366,34 @@ impl Adjacency {
     /// walk was 6.6 percent of the query and the iteration over the held parents feeding it
     /// another 3.6.
     ///
+    /// `most` is where the caller would turn the rows down. The walk stops there, because a set
+    /// that is turned down needs no more of a count, and a range kept for each list of a set of
+    /// millions of parents was a write of tens of megabytes for nothing: JOB 6f was a fifth slower
+    /// for it.
+    ///
     /// # Errors
     ///
     /// If `held` is not a set over the parent table.
-    pub fn spans(&self, held: &Rids) -> Result<Spans> {
+    pub fn spans(&self, held: &Rids, most: u64) -> Result<Option<Spans>> {
         let mut spans = Spans { lists: Vec::new(), rows: 0, children: self.children };
-        self.lists(held, |list| {
+        let mut over = false;
+        let walked = self.lists(held, |list| {
+            spans.rows += count(list.len());
+            if spans.rows > most {
+                // Only to stop the walk, and dropped below.
+                over = true;
+                return Err(Error::internal("past the rows a caller reads"));
+            }
             if !list.is_empty() {
-                spans.rows += count(list.len());
                 spans.lists.push(list);
             }
             Ok(())
-        })?;
-        Ok(spans)
+        });
+        if over {
+            return Ok(None);
+        }
+        walked?;
+        Ok(Some(spans))
     }
 
     /// The child rows that point into `held`, which is a set over the parent table.
@@ -792,10 +807,14 @@ mod tests {
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
         assert_eq!(adjacency.reached(&held).expect("reached"), count(expected.len()));
-        let spans = adjacency.spans(&held).expect("spans");
-        assert_eq!(spans.rows(), count(expected.len()));
+        let rows = count(expected.len());
+        let spans = adjacency.spans(&held, rows).expect("spans").expect("not past the most");
+        assert_eq!(spans.rows(), rows);
         let read = adjacency.push_spans(&spans).expect("push the spans");
         assert_eq!(read.iter().collect::<Vec<_>>(), expected, "the same rows as the push");
+        if rows > 0 {
+            assert!(adjacency.spans(&held, rows - 1).expect("spans").is_none(), "one past it");
+        }
     }
 
     #[test]
@@ -814,7 +833,7 @@ mod tests {
         expected.sort_unstable();
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
-        let spans = adjacency.spans(&held).expect("spans");
+        let spans = adjacency.spans(&held, u64::MAX).expect("spans").expect("no most");
         let read = adjacency.push_spans(&spans).expect("push the spans");
         assert_eq!(read.iter().collect::<Vec<_>>(), expected, "the same rows as the push");
         let other = Adjacency::build(&[0, 1], 2).expect("another adjacency");
