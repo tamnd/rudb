@@ -4437,6 +4437,17 @@ impl Shared {
                 }
                 Some(format!("POINT Lookup {}", named(&target.name, &target.key)?))
             }
+            Shape::Write(write) if write.delete => {
+                let target = point_write_target(&catalog, write)?;
+                let table = catalog.table(&target.name).ok()?;
+                if !self.inner.writable
+                    || !table.finds_by(&target.key)
+                    || catalog.referenced(&target.name)
+                {
+                    return None;
+                }
+                Some(format!("DeleteOne {}", named(&target.name, &target.key)?))
+            }
             Shape::Write(write) => {
                 let target = point_write_target(&catalog, write)?;
                 let table = catalog.table(&target.name).ok()?;
@@ -4795,6 +4806,83 @@ impl Shared {
         if unanswered {
             return None;
         }
+        drop(catalog);
+        let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
+        Some(result.and_then(|result| settled.map(|()| result)))
+    }
+
+    /// Runs a prepared delete by key without binding it, or says it cannot and leaves everything
+    /// as it was, for [`Shared::execute_ast`] to run, see [`crate::prepared::PointWrite`].
+    ///
+    /// The row is found by its key and taken out where it is, see
+    /// [`rudb_catalog::Table::remove_rows`], rather than by a scan of every row that flags the one,
+    /// and logged and committed the way the plan's delete of it would be. A table some foreign key
+    /// points into goes the long way, because the plan checks that no row is left without its
+    /// parent. Inside a transaction the row is the one in the transaction's own catalog and is
+    /// claimed first, as for [`Shared::write_point`].
+    pub(crate) fn delete_point(
+        &self,
+        write: &crate::prepared::PointWrite,
+        given: crate::prepared::Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        if !self.inner.writable {
+            return None;
+        }
+        let keys = write
+            .lookup
+            .equal
+            .iter()
+            .map(|(_, item)| given.value(item))
+            .collect::<Option<Vec<_>>>()?;
+        let transacting = match self.open().as_ref() {
+            Some(open) if open.aborted || open.read_only => return None,
+            open => open.is_some(),
+        };
+        let writing = (!transacting).then(|| self.writing());
+        let mut catalog = self.write();
+        let target = match write.lookup.found.get(catalog.naming()) {
+            Some(target) => target,
+            None => {
+                let target = Arc::new(point_write_target(&catalog, write)?);
+                write.lookup.found.keep(catalog.naming(), Arc::clone(&target));
+                target
+            }
+        };
+        let name = &target.name;
+        if catalog.referenced(name) {
+            return None;
+        }
+        let table = catalog.table(name).ok()?;
+        let Some((spot, _)) = table.spot(&target.key, &keys, &target.key).ok()?? else {
+            drop(catalog);
+            drop(writing);
+            return Some(kept(sql, 0, |_| QueryResult::changed(0)));
+        };
+        let number = [spot.number];
+        let len = table.rows().len();
+        let watched = transacting || self.registry().watched();
+        let claim = if watched { self.claim(table, true, &number, len).ok()? } else { None };
+        let oid = table.oid();
+        let logs = self.journal().as_ref().is_some_and(Journal::logs);
+        let staged = logs.then(|| {
+            let journal = self.journal();
+            journal.as_ref()?.encode_delete(&name.schema, &name.table, &number)
+        });
+        let workers = self.inner.pool.threads();
+        let result = kept(sql, 0, |_| {
+            catalog.table_mut(name)?.remove_rows(&number, workers)?;
+            if let Some(marks) = claim {
+                self.claimed(oid, marks);
+            }
+            self.wrote(oid, |written, base| written.deleted(&number, len, base));
+            if let Some(record) = staged
+                && let Some(journal) = self.journal().as_mut()
+            {
+                journal.stage(record);
+            }
+            QueryResult::changed(1)
+        });
         drop(catalog);
         let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
         Some(result.and_then(|result| settled.map(|()| result)))

@@ -195,12 +195,17 @@ fn equalities(ast: &Ast, filter: ast::ExprRef) -> Option<Vec<(Vec<String>, Item)
 /// row of the table to change one. An execution that finds a plain table and the row by its key
 /// writes the row where it is. Anything the shape cannot settle by itself, a column in a key, a
 /// constraint to check or a value that is not already its column's type, goes the long way.
+///
+/// A `DELETE` with the same `WHERE` is one too, with nothing to set, and takes the row out where it
+/// is, see `Table::remove_rows`, unless a foreign key points into the table.
 #[derive(Debug, Clone)]
 pub(crate) struct PointWrite {
     /// The table and the key, as a [`Lookup`] of every column.
     pub(crate) lookup: Lookup,
     /// Each column the `SET` names, as written, with what it is set to.
     pub(crate) sets: Vec<(String, Set)>,
+    /// Whether this is a `DELETE`, which sets nothing.
+    pub(crate) delete: bool,
 }
 
 /// What one column of a [`PointWrite`] is set to.
@@ -696,7 +701,11 @@ impl PointWrite {
     /// The statement is held as `SELECT *, hit, values... FROM table`, see the parser's
     /// `changed_rows`, so that is the query looked for here.
     fn of(ast: &Ast) -> Option<Self> {
-        let [ast::Statement::Update(at)] = ast.statements.as_slice() else { return None };
+        let (at, delete) = match ast.statements.as_slice() {
+            [ast::Statement::Update(at)] => (at, false),
+            [ast::Statement::Delete(at)] => (at, true),
+            _ => return None,
+        };
         let update = ast.insert(*at);
         if update.returning.is_some()
             || update.conflict.is_some()
@@ -736,7 +745,7 @@ impl PointWrite {
         }
         let equal = equalities(ast, hit.expr)?;
         let columns: Vec<String> = ast.name(update.columns).map(str::to_owned).collect();
-        if columns.is_empty() || columns.len() != values.len() {
+        if columns.is_empty() != delete || columns.len() != values.len() {
             return None;
         }
         let parameter = |expr| match ast.expr(expr) {
@@ -785,7 +794,7 @@ impl PointWrite {
             equal,
             found: Resolved::default(),
         };
-        Some(Self { lookup, sets })
+        Some(Self { lookup, sets, delete })
     }
 }
 
@@ -907,8 +916,8 @@ impl Prepared {
     /// time.
     ///
     /// The point plans are `InsertOne t`, `InsertRows t`, `POINT Lookup t(key)`,
-    /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column`, `Range t(key)` and
-    /// `Upsert t(key)`. They hold for values of the key's and the columns' types. Inside a
+    /// `UpdateOne t(key) SET column`, `DeltaOne t(key) SET column`, `DeleteOne t(key)`,
+    /// `Range t(key)` and `Upsert t(key)`. They hold for values of the key's and the columns' types. Inside a
     /// transaction all of them take the short way too, until the transaction aborts.
     /// A benchmark checks this before it measures, so a statement that would fall back to the
     /// pipeline is found out by name rather than by a slow number.
@@ -990,7 +999,11 @@ impl Prepared {
             return Some(done);
         }
         if let Some(write) = &self.write
-            && let Some(done) = shared.write_point(write, given, sql)
+            && let Some(done) = if write.delete {
+                shared.delete_point(write, given, sql)
+            } else {
+                shared.write_point(write, given, sql)
+            }
         {
             return Some(done);
         }
