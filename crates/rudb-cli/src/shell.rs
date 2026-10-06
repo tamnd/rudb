@@ -225,11 +225,12 @@ impl Shell {
                 }
                 continue;
             }
-            if !pending.is_empty() {
+            let first = pending.is_empty();
+            if !first {
                 pending.push('\n');
             }
             pending.push_str(line);
-            if rudb::is_complete(&pending) {
+            if (first || may_finish(line)) && rudb::is_complete(&pending) {
                 let statement = std::mem::take(&mut pending);
                 if self.run_sql(&statement, false) == Stop::Failed {
                     return Stop::Done;
@@ -261,11 +262,12 @@ impl Shell {
                 }
                 continue;
             }
-            if !pending.is_empty() {
+            let first = pending.is_empty();
+            if !first {
                 pending.push('\n');
             }
             pending.push_str(line);
-            if rudb::is_complete(&pending) {
+            if (first || may_finish(line)) && rudb::is_complete(&pending) {
                 let statement = std::mem::take(&mut pending);
                 if self.run_sql(&statement, closing && at >= end) == Stop::Failed {
                     return Stop::Failed;
@@ -544,6 +546,17 @@ impl Shell {
     }
 }
 
+/// Whether adding `line` to a statement that was not finished yet can have finished it.
+///
+/// Asking [`rudb::is_complete`] after every line tokenizes the whole statement again each time, so
+/// a statement of a hundred lines was tokenized a hundred times before it ran. Only a semicolon
+/// ends a statement, and a line without one can only end it anyway by closing a block comment that
+/// came after one. Any other line leaves the last token something other than a semicolon, so the
+/// answer is no without asking.
+fn may_finish(line: &str) -> bool {
+    line.contains(';') || line.contains("*/")
+}
+
 /// Whether a name matches a `.tables` or `.schema` pattern, where `%` stands for any run.
 fn matches(name: &str, pattern: &str) -> bool {
     let pattern = pattern.trim_matches('\'');
@@ -638,8 +651,45 @@ fn pointer(sql: &str, span: Span) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches, on, pointer, split};
+    use super::{matches, may_finish, on, pointer, split};
     use rudb::Span;
+
+    /// Where statements end when every line is checked, and where they end when only the lines
+    /// [`may_finish`] passes are.
+    fn ends(script: &str, skip: bool) -> Vec<usize> {
+        let mut pending = String::new();
+        let mut found = Vec::new();
+        for (at, line) in script.lines().enumerate() {
+            let first = pending.is_empty();
+            if !first {
+                pending.push('\n');
+            }
+            pending.push_str(line);
+            if (!skip || first || may_finish(line)) && rudb::is_complete(&pending) {
+                pending.clear();
+                found.push(at);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_line_that_cannot_finish_a_statement_is_not_checked() {
+        for script in [
+            "SELECT 1;\nSELECT\n2\n;\n",
+            "-- a comment\nSELECT 1\n-- another\n;",
+            "SELECT 1; /* a comment\nthat runs on\n*/\nSELECT 2;",
+            "SELECT 'a;\nb'\n;",
+            "SELECT $$a;\nb$$\n;",
+            "SELECT 1 /* x */\n; SELECT\n2;",
+            "\n\nSELECT 1\n\n;\n\n",
+            "/* only\na comment */\nSELECT 1;",
+            "SELECT \"a;\nb\" FROM t;",
+            "SELECT 1; -- done\nSELECT 2 -- not yet\n;",
+        ] {
+            assert_eq!(ends(script, true), ends(script, false), "{script}");
+        }
+    }
 
     #[test]
     fn a_dot_command_splits_on_whitespace() {
