@@ -4270,7 +4270,12 @@ impl AsRef<Vector> for Vector {
 ///
 /// The pass a total by place makes over every row of q01, which sums two columns, and written as a
 /// row at a time it built each row's pair out of two scalar loads and checked its place on its own.
-pub fn add_pairs_by_place(cells: &mut [[i64; 4]], first: &[u64], second: &[u64], places: &[u32]) -> usize {
+pub fn add_pairs_by_place(
+    cells: &mut [[i64; 4]],
+    first: &[u64],
+    second: &[u64],
+    places: &[u32],
+) -> usize {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
         crate::lanes::add_pairs(cells, (first, second), places)

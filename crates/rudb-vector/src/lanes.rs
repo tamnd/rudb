@@ -427,7 +427,11 @@ pub(crate) fn retain_set(
 /// when one of its places is past `cells`, so the caller meets that place itself.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(unsafe_code)]
-pub(crate) fn add_pairs(cells: &mut [[i64; 4]], (first, second): (&[u64], &[u64]), places: &[u32]) -> usize {
+pub(crate) fn add_pairs(
+    cells: &mut [[i64; 4]],
+    (first, second): (&[u64], &[u64]),
+    places: &[u32],
+) -> usize {
     use std::arch::x86_64::{
         _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_castsi256_si128,
         _mm256_cmpeq_epi32, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epu32,
@@ -452,7 +456,8 @@ pub(crate) fn add_pairs(cells: &mut [[i64; 4]], (first, second): (&[u64], &[u64]
             for from in [at, at + 4] {
                 let ones = _mm256_loadu_si256(first.as_ptr().add(from).cast());
                 let twos = _mm256_loadu_si256(second.as_ptr().add(from).cast());
-                let (even, odd) = (_mm256_unpacklo_epi64(ones, twos), _mm256_unpackhi_epi64(ones, twos));
+                let (even, odd) =
+                    (_mm256_unpacklo_epi64(ones, twos), _mm256_unpackhi_epi64(ones, twos));
                 let pairs = [
                     _mm256_castsi256_si128(even),
                     _mm256_castsi256_si128(odd),
@@ -461,7 +466,10 @@ pub(crate) fn add_pairs(cells: &mut [[i64; 4]], (first, second): (&[u64], &[u64]
                 ];
                 for (row, pair) in pairs.into_iter().enumerate() {
                     let cell = to.add(*places.get_unchecked(from + row) as usize).cast::<i64>();
-                    _mm_storeu_si128(cell.cast(), _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair));
+                    _mm_storeu_si128(
+                        cell.cast(),
+                        _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair),
+                    );
                     *cell.add(2) = (*cell.add(2)).wrapping_add(1);
                 }
             }
@@ -482,7 +490,8 @@ mod tests {
     fn pairs_added_in_lanes_are_the_pairs_added_a_row_at_a_time() {
         let rows = 203;
         let first: Vec<u64> = (0..rows as u64).map(|row| row * 7 + 3).collect();
-        let second: Vec<u64> = (0..rows as u64).map(|row| (row * 2_654_435_761) % 100_003).collect();
+        let second: Vec<u64> =
+            (0..rows as u64).map(|row| (row * 2_654_435_761) % 100_003).collect();
         for past in [None, Some(0), Some(77), Some(200)] {
             let mut places: Vec<u32> = (0..rows as u32).map(|row| (row * 13) % 11).collect();
             if let Some(past) = past {
