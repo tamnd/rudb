@@ -84,6 +84,15 @@ const PLACES: u64 = 4;
 /// q21's 157 thousand late lines hold order keys spread over six million values, 38 a line.
 const RANKED: u64 = 256;
 
+/// How many places a key may span in the ranked form whatever the number of rows, which is a side
+/// too small for [`RANKED`] to let in.
+///
+/// At this many places the ranked form is 192 KB, under half the second level cache of a core. The
+/// side it is for is q16's handful of suppliers whose comment names complaints, five of them spread
+/// over ten thousand keys at SF1 and a million at SF100. Hashed, every line of `partsupp` that gets
+/// past `part` paid a hash and a probe of the table to find out it was not one of them.
+const FEW: u64 = 1 << 20;
+
 /// Below this many rows a side is built on one thread.
 ///
 /// Partitioning costs a pass over the hashes per partition and a table per partition, and on a side
@@ -395,7 +404,7 @@ impl Lookup {
         let Ok(places) = u64::try_from(i128::from(high) - i128::from(low) + 1) else {
             return Ok(None);
         };
-        if places > (rows as u64).saturating_mul(RANKED) || places >= u64::from(NONE) {
+        if places > (rows as u64).saturating_mul(RANKED).max(FEW) || places >= u64::from(NONE) {
             return Ok(None);
         }
         cancel.check()?;
@@ -1198,6 +1207,19 @@ mod tests {
         answers_in_order(&lookup, &values, spread);
         let found = found(&lookup, &[Some(1), Some(spread - 1), Some(-spread), Some(9 * spread)]);
         assert!(found.iter().all(Vec::is_empty), "a key between keys or past the ends is a miss");
+    }
+
+    /// A side of a few rows spread over more places than [`RANKED`] lets in for that many rows, which
+    /// is ranked because the whole span is still small.
+    #[test]
+    fn a_few_keys_over_a_small_span_are_ranked() {
+        let lookup = built(&[Some(9_000), Some(17), Some(4_242), Some(17)]);
+        assert_eq!(lookup.low, Some(17));
+        assert!(lookup.ranked.is_some(), "four rows over nine thousand places are ranked");
+        assert_eq!(
+            found(&lookup, &[Some(17), Some(18), Some(9_000), Some(4_242), Some(9_001)]),
+            vec![vec![1, 3], Vec::new(), vec![0], vec![2], Vec::new()]
+        );
     }
 
     /// The ranked form over one row a key, with keys either side of a word's edge, so that a slot
