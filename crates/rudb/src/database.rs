@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
 use rudb_catalog::{
-    Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName, View, same_name,
+    Alteration, Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName, View,
+    same_name,
 };
 use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
@@ -2858,6 +2859,18 @@ fn holds_a_file(inner: &Inner, catalog: &Catalog, database: &str) -> bool {
         return inner.path.is_some() && inner.writable;
     }
     catalog.attached(database).is_some_and(|held| held.path().is_some() && !held.read_only())
+}
+
+/// Refuses a column whose type the database file cannot store so far. This runs before the catalog
+/// changes, because the file is written after the statement, and a table that it cannot write
+/// would make every later write fail.
+fn stored(name: &str, ty: &LogicalType) -> Result<()> {
+    if rudb_native::stores(ty) {
+        return Ok(());
+    }
+    Err(Error::not_implemented(format!(
+        "column \"{name}\" of type {ty} in a database file, which cannot store it so far"
+    )))
 }
 
 /// The attached databases with a file behind them that may be written, by name and path.
@@ -6617,6 +6630,11 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::CreateTable(mut create) => {
+                if holds_a_file(&self.inner, &catalog, &create.name.catalog) {
+                    for field in &create.columns {
+                        stored(&field.name, &field.ty)?;
+                    }
+                }
                 // A `CREATE TABLE AS SELECT` into a file-backed database is the same write as an
                 // `INSERT` into a table that was just created, so it takes the same sink and the
                 // rows reach the file without the whole table being held in memory first. Without
@@ -6860,6 +6878,17 @@ impl Shared {
                 let (Some(name), Some(alteration)) = (alter.name, alter.alteration) else {
                     return Ok(QueryResult::empty());
                 };
+                if holds_a_file(&self.inner, &catalog, &name.catalog) {
+                    match &alteration {
+                        Alteration::AddColumn { field, .. } => stored(&field.name, &field.ty)?,
+                        Alteration::Type { column, ty, .. } => {
+                            let table = catalog.table(&name)?;
+                            let field = table.columns().get(*column);
+                            stored(field.map_or("", |field| &field.name), ty)?;
+                        }
+                        _ => {}
+                    }
+                }
                 self.altering(&name)?;
                 self.held(name.clone());
                 let rows = match alter.rewrite {
