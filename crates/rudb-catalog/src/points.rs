@@ -88,6 +88,10 @@ pub(crate) struct Located {
     levels: Vec<Arc<Level>>,
     /// The number of the first row of each part, and after them the number of rows.
     starts: Vec<u64>,
+    /// The numbers the keys have for the rows taken out since this was built, in order. A key
+    /// whose number is here has no row, and any other key's row is numbered as the key has it
+    /// less how many of these come before it, see [`Self::take`].
+    taken: Vec<u64>,
     /// The keys in order, each with its row's number, built the first time a read of a range of
     /// keys asks.
     sorted: OnceLock<Ordered>,
@@ -314,6 +318,7 @@ impl Located {
             columns: columns.to_vec(),
             levels: vec![Arc::new(level)],
             starts,
+            taken: Vec::new(),
             sorted: OnceLock::new(),
         })
     }
@@ -326,6 +331,7 @@ impl Located {
             columns: self.columns.clone(),
             levels: self.levels.clone(),
             starts: self.starts.clone(),
+            taken: self.taken.clone(),
             sorted: self.sorted.get().cloned().map(OnceLock::from).unwrap_or_default(),
         }
     }
@@ -380,13 +386,15 @@ impl Located {
         // The keys in order get a run of the keys noted here, and are dropped when a key is not of
         // the kind they hold.
         let mut sorted = self.sorted.get_mut().map(|_| (Vec::new(), Vec::new()));
+        // Every row taken out came before these, so their keys skip that many numbers.
+        let first = before + self.taken.len() as u64;
         let level = {
             if !self.levels.last_mut().is_some_and(|level| Arc::get_mut(level).is_some()) {
                 self.levels.push(Arc::default());
             }
             Arc::get_mut(self.levels.last_mut().expect("just made sure")).expect("just made sure")
         };
-        for (key, number) in keys.into_iter().zip(before..) {
+        for (key, number) in keys.into_iter().zip(first..) {
             match key {
                 Noted::Null => {}
                 Noted::Int(key) => {
@@ -417,6 +425,77 @@ impl Located {
         Ok(true)
     }
 
+    /// Notes that the rows `numbers` names, which rise, are taken out of `rows`, and works out
+    /// again where the parts start: from the parts themselves when `moved` says they did not stay
+    /// as they were, and otherwise by moving each start down past the rows taken before it.
+    ///
+    /// The keys stay where they are and the rows' numbers go into `taken`, so a delete by key
+    /// costs the rows it takes and not a read of every key. Says whether the rows came out as many
+    /// as this now counts, and `false` as well once a quarter of the keys held are of rows taken
+    /// out, and then the caller drops this and the next lookup builds it again.
+    fn take(&mut self, rows: &Rows, numbers: &[u64], moved: bool) -> Result<bool> {
+        let Some(&before) = self.starts.last() else { return Ok(false) };
+        if numbers.windows(2).any(|pair| pair[0] >= pair[1])
+            || numbers.last().is_some_and(|&last| last >= before)
+        {
+            return Ok(false);
+        }
+        // A row's number as its key has it is its number now plus how many rows taken before
+        // came before it.
+        let mut taken = Vec::with_capacity(self.taken.len() + numbers.len());
+        let mut earlier = self.taken.iter().copied().peekable();
+        let mut passed = 0;
+        for &number in numbers {
+            let mut noted = number + passed;
+            while let Some(skipped) = earlier.next_if(|&skipped| skipped <= noted) {
+                taken.push(skipped);
+                noted += 1;
+                passed += 1;
+            }
+            taken.push(noted);
+        }
+        taken.extend(earlier);
+        let left = before - numbers.len() as u64;
+        if left != rows.len() as u64 || taken.len() as u64 > left / 4 {
+            return Ok(false);
+        }
+        if moved || self.starts.len() != rows.chunk_count() + 1 {
+            let mut starts = Vec::with_capacity(rows.chunk_count() + 1);
+            let mut number = 0;
+            for part in 0..rows.chunk_count() {
+                starts.push(number);
+                number += rows.chunk_len(part)? as u64;
+            }
+            starts.push(number);
+            self.starts = starts;
+        } else {
+            let mut gone = numbers.iter().peekable();
+            let mut down = 0;
+            for start in &mut self.starts {
+                while gone.next_if(|&&number| number < *start).is_some() {
+                    down += 1;
+                }
+                *start -= down;
+            }
+        }
+        if self.starts.last() != Some(&left) {
+            return Ok(false);
+        }
+        self.taken = taken;
+        Ok(true)
+    }
+
+    /// The number of the row whose key has the number `noted`, or `None` when it was taken out.
+    fn number(&self, noted: u64) -> Option<u64> {
+        let before = self.taken.partition_point(|&taken| taken < noted);
+        (self.taken.get(before) != Some(&noted)).then(|| noted - before as u64)
+    }
+
+    /// Whether the row whose key has the number `noted` is still there.
+    fn kept(&self, noted: u64) -> bool {
+        self.taken.binary_search(&noted).is_err()
+    }
+
     /// The keys in order with their rows' numbers, sorted from the levels the first time a read
     /// of a range asks.
     fn sorted(&self) -> &Ordered {
@@ -435,7 +514,13 @@ impl Located {
         if self.levels.iter().all(|level| level.bytes.is_empty()) {
             let mut sorted: Vec<(i64, usize, u64)> = Vec::with_capacity(self.len());
             for (at, level) in self.levels.iter().enumerate() {
-                sorted.extend(level.ints.iter().map(|(&key, &number)| (key, newest(at), number)));
+                sorted.extend(
+                    level
+                        .ints
+                        .iter()
+                        .filter(|&(_, &number)| self.kept(number))
+                        .map(|(&key, &number)| (key, newest(at), number)),
+                );
             }
             sorted.sort_unstable();
             sorted.dedup_by_key(|&mut (key, _, _)| key);
@@ -449,6 +534,7 @@ impl Located {
                 level
                     .bytes
                     .iter()
+                    .filter(|&(_, &number)| self.kept(number))
                     .filter_map(|(key, &number)| Some((text_of(key)?.into(), newest(at), number))),
             );
         }
@@ -466,7 +552,8 @@ impl Located {
 
     /// The part and the place in it of the row holding `key`, and its number, if one does.
     fn find(&self, key: Encoded, scratch: &[u8]) -> Option<(usize, u32, u64)> {
-        let number = self.levels.iter().rev().find_map(|level| level.find(key, scratch))?;
+        let noted = self.levels.iter().rev().find_map(|level| level.find(key, scratch))?;
+        let number = self.number(noted)?;
         let (part, place) = self.place(number)?;
         Some((part, place, number))
     }
@@ -520,6 +607,14 @@ impl Clone for Points {
     }
 }
 
+/// `located` to change, copied first when something else holds it, sharing its levels.
+fn unshared(located: &mut Arc<Located>) -> &mut Located {
+    if Arc::get_mut(located).is_none() {
+        *located = Arc::new(located.layered());
+    }
+    Arc::get_mut(located).expect("just made sure")
+}
+
 /// The key of one row about to be appended, the way [`Located`] holds it.
 #[derive(Debug)]
 enum Noted {
@@ -544,14 +639,14 @@ fn window<T>(sorted: &[T], reach: Reach, order: impl Fn(&T) -> std::cmp::Orderin
 }
 
 /// The first `limit` entries over `windows`, which are of runs in the order of `key`, oldest run
-/// first, from the highest when `descending`. A key more than one window holds is taken from the
-/// newest.
+/// first, from the highest when `descending`, that `f` keeps. A key more than one window holds is
+/// taken from the newest, and is passed over when `f` does not keep that one.
 fn pick<'a, T, K: Ord + Copy, P>(
     windows: &[&'a [T]],
     descending: bool,
     limit: usize,
     key: impl Fn(&'a T) -> K,
-    f: impl Fn(&'a T) -> P,
+    f: impl Fn(&'a T) -> Option<P>,
 ) -> Vec<P> {
     let head = |window: &'a [T], taken: usize| {
         if descending {
@@ -580,7 +675,7 @@ fn pick<'a, T, K: Ord + Copy, P>(
                 *taken += 1;
             }
         }
-        picked.push(f(entry));
+        picked.extend(f(entry));
     }
     picked
 }
@@ -768,14 +863,7 @@ impl Points {
             let keys = appending.next_if(|(at, _)| *at == which).map(|(_, keys)| keys);
             let kept = match (slot.get_mut(), keys) {
                 (Some(located), Some(keys)) => {
-                    let located = match Arc::get_mut(located) {
-                        Some(located) => located,
-                        None => {
-                            *located = Arc::new(located.layered());
-                            Arc::get_mut(located).expect("just made")
-                        }
-                    };
-                    located.extend(rows, before, from, keys).unwrap_or(false)
+                    unshared(located).extend(rows, before, from, keys).unwrap_or(false)
                 }
                 _ => false,
             };
@@ -787,6 +875,33 @@ impl Points {
         if self.built.iter().all(|slot| slot.get().is_none()) {
             *self.stale.get_mut() = false;
         }
+    }
+
+    /// Notes that the rows `numbers` names, which rise, are taken out of `rows`, for a table that
+    /// keeps its placing across the take, see [`Located::take`]. `moved` says the parts of `rows`
+    /// did not stay as they were. What a copy of the table shares is copied first, as for
+    /// [`Self::appended`], and anything that does not come out right is dropped.
+    pub(crate) fn taken(&mut self, rows: &Rows, numbers: &[u64], moved: bool) {
+        self.again.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
+        let stale = *self.stale.get_mut();
+        for slot in &mut self.built {
+            let kept = !stale
+                && slot.get_mut().is_some_and(|located| {
+                    unshared(located).take(rows, numbers, moved).unwrap_or(false)
+                });
+            if !kept {
+                *slot = OnceLock::new();
+            }
+        }
+        if self.built.iter().all(|slot| slot.get().is_none()) {
+            *self.stale.get_mut() = false;
+        }
+    }
+
+    /// How many rows were taken out of what is built for the key at `which`, if it is built.
+    #[cfg(test)]
+    pub(crate) fn taken_out(&self, which: usize) -> Option<usize> {
+        Some(self.built.get(which)?.get()?.taken.len())
     }
 
     /// Puts the levels of what is built back into one where nothing else holds the first, which is
@@ -855,7 +970,7 @@ impl Points {
                         descending,
                         limit,
                         |&(at, _)| at,
-                        |&(at, number)| (Wanted::Int(at), number),
+                        |&(at, number)| Some((Wanted::Int(at), located.number(number)?)),
                     )
                 }
                 Edge::Text(bound) => {
@@ -873,12 +988,13 @@ impl Points {
                         descending,
                         limit,
                         |(at, _)| &**at,
-                        |(at, number)| (Wanted::Text(at), *number),
+                        |(at, number)| Some((Wanted::Text(at), located.number(*number)?)),
                     )
                 }
             };
             let mut chunks = Vec::with_capacity(picked.len());
             for (wanted, number) in picked {
+                // The number of the row now, which is where it is.
                 let found = match located.place(number) {
                     Some((part, place)) if (place as usize) < rows.chunk_len(part)? => {
                         let chunk = rows.read_selected(part, &read, &[place])?;

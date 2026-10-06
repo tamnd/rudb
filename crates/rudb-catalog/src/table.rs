@@ -2570,8 +2570,8 @@ impl Table {
     /// A file's rows are marked gone beside it, see [`Rows::Masked`], and rows in memory are taken
     /// out where they are, see [`MemoryTable::take`], so a delete of a few rows costs those rows and
     /// not a read of the table. The keys of the rows taken come out of the key sets the same way,
-    /// see `Seen::forget`. That is a delete by key in a table of ten million rows, which used to
-    /// build all ten million again. A delete of more than a quarter of the rows reads the ones that
+    /// see `Seen::forget`, and where the keys are stays built, see `Points::taken`. That is a delete
+    /// by key in a table of ten million rows, which used to build all ten million again. A delete of more than a quarter of the rows reads the ones that
     /// stay and puts them back with [`Self::replace_all`], which gives back what the others held,
     /// and so does the table in memory once a quarter of the rows it holds are taken out.
     ///
@@ -2582,13 +2582,16 @@ impl Table {
         if numbers.is_empty() {
             return Ok(());
         }
-        if self.takes_rows() {
-            return self.take_rows(numbers);
-        }
-        // Where the keys are moves with the rows.
-        self.points = Points::default();
-        if numbers.len().saturating_mul(4) > self.rows.len() {
-            return self.keep_rows(numbers, workers);
+        // Where the keys are is noted again below once the rows are out, and is dropped should
+        // anything go wrong on the way or the rows be put back some other way.
+        let mut points = std::mem::take(&mut self.points);
+        if self.takes_rows() || numbers.len().saturating_mul(4) > self.rows.len() {
+            self.placed = next_revision();
+            return if self.takes_rows() {
+                self.take_rows(numbers)
+            } else {
+                self.keep_rows(numbers, workers)
+            };
         }
         let picks = self.picks(numbers)?;
         // The keys of the rows going, read while they are still there.
@@ -2611,6 +2614,8 @@ impl Table {
             }
         };
         let split = picks.partition_point(|(part, _)| *part < filed);
+        // Whether the parts did not stay as they were, which has where they start read again.
+        let mut moved = false;
         if split > 0 {
             let (reader, mut gone) = match &self.rows {
                 Rows::Native(reader) | Rows::Grown(reader, _) => {
@@ -2631,6 +2636,7 @@ impl Table {
             let empty = Rows::Memory(MemoryTable::new(Vec::new()));
             self.rows = match std::mem::replace(&mut self.rows, empty) {
                 Rows::Native(_) if gone.total() >= reader.table().rows() => {
+                    moved = true;
                     Rows::Memory(MemoryTable::new(self.types()))
                 }
                 Rows::Native(_) => Rows::masked(reader, Arc::new(gone)),
@@ -2654,8 +2660,11 @@ impl Table {
                 let mut rows = MemoryTable::new(tail.types().to_vec());
                 rows.append_all(chunks, workers)?;
                 *tail = rows;
+                moved = true;
             }
         }
+        points.taken(&self.rows, numbers, moved);
+        self.points = points;
         self.frame = next_revision();
         for (at, key, chunks) in going {
             let projected = Key { columns: (0..key.columns.len()).collect(), primary: key.primary };
@@ -3807,6 +3816,89 @@ mod tests {
             assert!(copy.append_rows(&rows(model[1], model[1] + 1)).is_err());
             let free = (0..5000).find(|at| !model.contains(at)).expect("a key taken out");
             copy.append_rows(&rows(free, free + 1)).expect("a key taken out");
+        }
+    }
+
+    /// Rows taken out by number leave where the keys are built as it was: every key left finds its
+    /// row at its number now, a key taken out finds none, a read of a range passes over it, and a
+    /// key appended after finds its row, in a copy and without building anything again, while the
+    /// original keeps its own.
+    #[test]
+    fn rows_taken_out_leave_where_the_keys_are_built() {
+        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+            (LogicalType::BigInt, Value::BigInt),
+            (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
+        ];
+        let order = |left: &Value, right: &Value| match (left, right) {
+            (Value::BigInt(left), Value::BigInt(right)) => left.cmp(right),
+            (Value::Varchar(left), Value::Varchar(right)) => left.cmp(right),
+            _ => panic!("keys of one type"),
+        };
+        for (ty, key) in keys {
+            let mut table = Table::new(
+                QualifiedName::new("memory", "main", "t"),
+                vec![Field::new("k", ty), Field::new("v", LogicalType::Varchar)],
+            )
+            .expect("two columns");
+            table.set_keys(vec![Key { columns: vec![0], primary: true }]).expect("an empty table");
+            let rows = |from: i64, to: i64| {
+                (from..to)
+                    .map(|at| vec![key(at), Value::Varchar(format!("v{at}"))])
+                    .collect::<Vec<_>>()
+            };
+            let first = |table: &Table, descending: bool| {
+                let (reach, bound) =
+                    if descending { (Reach::AtMost, key(9999)) } else { (Reach::AtLeast, key(0)) };
+                let chunks = table
+                    .range(0, (reach, &bound), descending, 30, &[0])
+                    .expect("readable rows")
+                    .expect("a range by the key");
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.column(0).expect("one column").value_at(0))
+                    .collect::<Vec<_>>()
+            };
+            table.append_rows(&rows(0, 5000)).expect("new keys");
+            assert!(finds(&table, key(10)));
+            first(&table, false);
+            let mut copy = table.clone();
+            let mut model = (0..5000).collect::<Vec<i64>>();
+            for numbers in [vec![3, 10, 2047, 2048, 4990], vec![0], vec![100, 101, 102]] {
+                copy.remove_rows(&numbers, 1).expect("rows of the table");
+                for &number in numbers.iter().rev() {
+                    model.remove(number as usize);
+                }
+            }
+            copy.append_rows(&rows(10, 11)).expect("a key taken out");
+            model.push(10);
+            copy.remove_rows(&[model.len() as u64 - 2], 1).expect("a row of the table");
+            model.remove(model.len() - 2);
+            assert_eq!(copy.points.taken_out(0), Some(10));
+            for (number, &at) in model.iter().enumerate() {
+                let (spot, chunk) = copy
+                    .spot(&[0], &[key(at)], &[1])
+                    .expect("readable rows")
+                    .expect("a lookup by the key")
+                    .expect("a key left");
+                assert_eq!(spot.number, number as u64, "key {at}");
+                let value = chunk.column(0).expect("one column").value_at(0);
+                assert_eq!(value, Value::Varchar(format!("v{at}")));
+            }
+            for at in (0..5000).filter(|at| !model.contains(at)) {
+                assert!(!finds(&copy, key(at)), "key {at} taken out");
+            }
+            for descending in [false, true] {
+                let mut expected = model.iter().map(|&at| key(at)).collect::<Vec<_>>();
+                expected.sort_by(order);
+                if descending {
+                    expected.reverse();
+                }
+                expected.truncate(30);
+                assert_eq!(first(&copy, descending), expected, "descending {descending}");
+            }
+            assert_eq!(copy.points.taken_out(0), Some(10));
+            assert!(finds(&table, key(3)) && finds(&table, key(4990)));
+            assert_eq!(table.points.taken_out(0), Some(0));
         }
     }
 

@@ -4871,7 +4871,7 @@ impl Shared {
         });
         let workers = self.inner.pool.threads();
         let result = kept(sql, 0, |_| {
-            catalog.table_mut(name)?.remove_rows(&number, workers)?;
+            catalog.table_appending(name)?.remove_rows(&number, workers)?;
             if let Some(marks) = claim {
                 self.claimed(oid, marks);
             }
