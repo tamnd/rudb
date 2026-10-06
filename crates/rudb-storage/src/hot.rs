@@ -608,16 +608,30 @@ impl HotStripe {
         let Some(undo) = self.undo.get(part) else { return };
         let me = txn | UNCOMMITTED;
         let mut next = undo[at].load(Ordering::Acquire);
+        let mut apply = |images: &mut dyn Iterator<Item = Image>| {
+            for image in images {
+                if let Some(i) = columns.iter().position(|&c| c == usize::from(image.column)) {
+                    out[i] = image.value;
+                }
+            }
+        };
         while let Some(record) = self.undos.record(next) {
             let ts = record.ts();
             if ts == me || (ts & UNCOMMITTED == 0 && ts <= snapshot) {
                 break;
             }
-            for image in record.images() {
-                if let Some(i) = columns.iter().position(|&c| c == usize::from(image.column)) {
-                    out[i] = image.value;
+            if record.kind() == UndoKind::Spilled {
+                // The rest of the chain is in the spill file, every record of it committed or
+                // aborted.
+                for older in self.undos.unspill(record) {
+                    if older.ts & UNCOMMITTED == 0 && older.ts <= snapshot {
+                        break;
+                    }
+                    apply(&mut older.images.into_iter());
                 }
+                break;
             }
+            apply(&mut record.images());
             next = record.prev();
         }
     }
@@ -727,30 +741,47 @@ impl HotStripe {
     /// the row's head, is pointed at the record after it, or at none when the `older` records go
     /// too. Only the collector calls this, one call at a time.
     pub(crate) fn unlink(&self, slot: u32, record: UndoRef, older: bool) {
-        let (part, at) = place(slot);
-        let Some(undo) = self.undo.get(part) else { return };
         let Some(after) = self.undos.record(record).map(|record| record.prev()) else { return };
-        let after = if older { 0 } else { after };
+        self.relink(slot, record, if older { 0 } else { after });
+    }
+
+    /// The newest undo record of `slot`, or 0.
+    pub(crate) fn head(&self, slot: u32) -> UndoRef {
+        let (part, at) = place(slot);
+        self.undo.get(part).map_or(0, |undo| undo[at].load(Ordering::Acquire))
+    }
+
+    /// Puts the stub `with` in the chain of `slot` where `record` is, with the records from
+    /// `record` down gone to the spill file, if it is still in the chain. Says whether it was.
+    /// Only the collector calls this, one call at a time.
+    pub(crate) fn replace(&self, slot: u32, record: UndoRef, with: UndoRef) -> bool {
+        self.relink(slot, record, with)
+    }
+
+    /// Points the record before `record` in the chain of `slot`, or the row's head, at `to`, and
+    /// says whether `record` was in the chain.
+    fn relink(&self, slot: u32, record: UndoRef, to: UndoRef) -> bool {
+        let (part, at) = place(slot);
+        let Some(undo) = self.undo.get(part) else { return false };
         let head = &undo[at];
         loop {
             let mut next = head.load(Ordering::Acquire);
             if next == record {
                 // A writer that pushed a record on top since is found by the walk on the next
                 // pass.
-                if head.compare_exchange(record, after, Ordering::AcqRel, Ordering::Acquire).is_ok()
-                {
-                    return;
+                if head.compare_exchange(record, to, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return true;
                 }
                 continue;
             }
             while let Some(newer) = self.undos.record(next) {
                 if newer.prev() == record {
-                    newer.set_prev(after);
-                    return;
+                    newer.set_prev(to);
+                    return true;
                 }
                 next = newer.prev();
             }
-            return;
+            return false;
         }
     }
 

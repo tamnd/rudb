@@ -399,6 +399,20 @@ impl Heads for StripeDirectory {
             _ => Vec::new(),
         }
     }
+
+    fn replace(&self, table: u32, rid: u64, record: UndoRef, with: UndoRef) -> bool {
+        let rid = Rid::from_u64(rid);
+        table == self.table
+            && matches!(self.find(rid.stripe()), Some(Stripe::Hot(stripe)) if stripe.replace(rid.slot(), record, with))
+    }
+
+    fn head(&self, table: u32, rid: u64) -> UndoRef {
+        let rid = Rid::from_u64(rid);
+        match self.find(rid.stripe()) {
+            Some(Stripe::Hot(stripe)) if table == self.table => stripe.head(rid.slot()),
+            _ => 0,
+        }
+    }
 }
 
 /// A worker's inserts into a table: slots leased from the open hot stripe, moving to the next one
