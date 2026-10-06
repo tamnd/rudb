@@ -5722,10 +5722,17 @@ mod tests {
             let pattern =
                 Vector::constant(LogicalType::Varchar, Value::Varchar(format!("{prefix}%")), count);
             for (name, negated) in [("~~", false), ("!~~", true)] {
-                let out =
-                    binary(name, &Hoisted::Nothing, &text, &pattern, &LogicalType::Boolean, count, None)
-                        .expect("the call is written")
-                        .expect("flat text has a loop of its own");
+                let out = binary(
+                    name,
+                    &Hoisted::Nothing,
+                    &text,
+                    &pattern,
+                    &LogicalType::Boolean,
+                    count,
+                    None,
+                )
+                .expect("the call is written")
+                .expect("flat text has a loop of its own");
                 for (row, held) in seen.iter().enumerate() {
                     let want = held.map_or(Value::Null, |held| {
                         Value::Boolean(held.starts_with(prefix) != negated)
