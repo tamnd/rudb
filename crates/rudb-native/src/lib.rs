@@ -10863,6 +10863,7 @@ fn code_frequency(
             ordinals: Vec::new(),
             ordinal_entries: Vec::new(),
             ordinal_bound: 0,
+            quantiles: Vec::new(),
         },
         texts,
     ))
