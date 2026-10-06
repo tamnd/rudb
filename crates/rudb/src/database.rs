@@ -953,8 +953,8 @@ impl Drop for Inner {
         let catalog = self.catalog.get_mut();
         if let Some(path) = self.path.as_ref().filter(|_| self.writable) {
             let journal = self.journal.get_mut().unwrap_or_else(PoisonError::into_inner);
-            let depth = self.settings.recluster_depth();
-            let _ = persist_main(path, catalog, &self.pages, journal, true, depth);
+            let upkeep = Upkeep::of(&self.settings);
+            let _ = persist_main(path, catalog, &self.pages, journal, true, &upkeep);
         }
         // Every attached file gets the same write, which is what the pin does for one that was
         // never detached.
@@ -1749,8 +1749,8 @@ impl Database {
         let _writing = self.shared.writing();
         let mut catalog = self.shared.committed();
         let mut journal = self.shared.committed_journal();
-        let depth = self.shared.inner.settings.recluster_depth();
-        persist_main(&path, &mut catalog, &self.shared.inner.pages, &mut journal, true, depth)?;
+        let upkeep = Upkeep::of(&self.shared.inner.settings);
+        persist_main(&path, &mut catalog, &self.shared.inner.pages, &mut journal, true, &upkeep)?;
         drop(journal);
         for (name, path) in attached_files(&catalog) {
             persist(&path, &mut catalog, &self.shared.inner.pages, &name)?;
@@ -2051,7 +2051,7 @@ fn persist(
     pages: &rudb_native::PagePool,
     database: &str,
 ) -> Result<()> {
-    persist_anchored(path, catalog, pages, database, None, false)
+    persist_anchored(path, catalog, pages, database, None, false, &BTreeSet::new())
 }
 
 /// Whether a schema change is one a Ddl record carries, which replay runs again from its text.
@@ -2406,12 +2406,14 @@ fn persist_main(
     pages: &rudb_native::PagePool,
     journal: &mut Option<Journal>,
     closing: bool,
-    depth: f64,
+    upkeep: &Upkeep,
 ) -> Result<()> {
     let Some(journal) = journal.as_mut() else {
-        return reclustered(catalog, depth, |catalog| {
-            persist(path, catalog, pages, DEFAULT_CATALOG)
-        });
+        let refresh = drifted(catalog, DEFAULT_CATALOG);
+        reclustered(catalog, upkeep.depth, &refresh, |catalog| {
+            persist_anchored(path, catalog, pages, DEFAULT_CATALOG, None, false, &refresh)
+        })?;
+        return relink(path, catalog, pages, &upkeep.links, &refresh);
     };
     // A checkpoint in flight lands first, since this one writes the file from where it left it.
     land(catalog, journal, true)?;
@@ -2423,9 +2425,11 @@ fn persist_main(
         .filter(|held| same_name(&held.name().catalog, DEFAULT_CATALOG))
         .map(|held| (Arc::clone(held.counter()), held.counter().snapshot().1))
         .collect();
-    reclustered(catalog, depth, |catalog| {
-        persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor), false)
+    let refresh = drifted(catalog, DEFAULT_CATALOG);
+    reclustered(catalog, upkeep.depth, &refresh, |catalog| {
+        persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor), false, &refresh)
     })?;
+    relink(path, catalog, pages, &upkeep.links, &refresh)?;
     for (counter, uses) in counters {
         counter.covered(uses);
     }
@@ -2437,20 +2441,95 @@ fn persist_main(
     journal.checkpointed(&tables, catalog.generation())
 }
 
-/// `write` with every clustered table of the default database that decayed past `depth` put back
-/// in order first, see [`crate::recluster`]. A write that fails gets the tables back as they were,
-/// since the file and the log still number their rows the old way.
+/// `write` with every clustered table of the default database that decayed past `depth`, or that
+/// `whole` says is written whole anyway, put back in order first, see [`crate::recluster`]. A
+/// write that fails gets the tables back as they were, since the file and the log still number
+/// their rows the old way.
 fn reclustered(
     catalog: &mut Catalog,
     depth: f64,
+    whole: &BTreeSet<String>,
     write: impl FnOnce(&mut Catalog) -> Result<()>,
 ) -> Result<()> {
-    let before = crate::recluster::reorder(catalog, DEFAULT_CATALOG, depth)?;
+    let before = crate::recluster::reorder(catalog, DEFAULT_CATALOG, depth, whole)?;
     let written = write(catalog);
     if written.is_err() {
         crate::recluster::restore(catalog, before);
     }
     written
+}
+
+/// What a checkpoint of the default database looks after besides writing what changed, read from
+/// the settings once per checkpoint.
+pub(crate) struct Upkeep {
+    /// How far a clustered table may decay before it is put back in order, see
+    /// [`crate::recluster`].
+    depth: f64,
+    /// The relationships declared for links, see [`index`].
+    links: String,
+}
+
+impl Upkeep {
+    pub(crate) fn of(settings: &Settings) -> Self {
+        Self { depth: settings.recluster_depth(), links: settings.links() }
+    }
+}
+
+/// The share of a table, in tenths, that may change before a checkpoint writes it again whole
+/// rather than extend it or mark rows gone, `engine-v4/10-freezing-and-checkpoint.md` section 10.10.
+///
+/// A table extended in place keeps its extremes and sums but loses its frequencies, distinct
+/// counts and sketches, and a table with rows marked gone loses all of them, since the file's
+/// numbers no longer say what the rows are. Its links and key maps go the same way. Only a table
+/// written whole gets them back, and writing a large table whole at every checkpoint is what
+/// extending is there to avoid. A tenth is where the planner's estimates from the old numbers
+/// stop being close enough to trust.
+const DRIFT_SHARE: usize = 10;
+
+/// The tables of `database` that changed by a tenth or more since a checkpoint last wrote them
+/// whole, counting what this checkpoint is about to write, see [`DRIFT_SHARE`].
+///
+/// A row appended counts once and a row deleted or updated counts once: the rows appended by the
+/// table's count and its tail, and the rows deleted or updated by its record of them, which holds
+/// every one since the table was written whole, the file's and the ones since. Only tables the
+/// file holds and rows were appended to or deleted from are asked, since one held whole in memory
+/// is written whole anyway and one nothing changed in is not written at all.
+fn drifted(catalog: &Catalog, database: &str) -> BTreeSet<String> {
+    catalog
+        .stored_tables_in(database)
+        .filter(|table| {
+            let (held, tail, gone) = match table.rows() {
+                rudb_catalog::Rows::Grown(reader, tail) => (reader.table().rows(), tail.len(), 0),
+                rudb_catalog::Rows::Masked(reader, gone, tail) => {
+                    (reader.table().rows(), tail.len(), gone.total() + gone.patched_rows())
+                }
+                rudb_catalog::Rows::Native(_) | rudb_catalog::Rows::Memory(_) => return false,
+            };
+            let changed = table.drift().saturating_add(tail).saturating_add(gone);
+            held > 0 && changed.saturating_mul(DRIFT_SHARE) >= held.saturating_add(tail)
+        })
+        .map(|table| table.name().table.clone())
+        .collect()
+}
+
+/// Builds again the key maps and links of the tables of `refresh`, which a checkpoint just wrote
+/// whole for [`drifted`], and the text sections and key runs the file is missing. A table written
+/// whole is written without them, and the links into it from a table that was not written name
+/// rows by a numbering the planner checks against the file, so those are built again too.
+fn relink(
+    path: &Path,
+    catalog: &mut Catalog,
+    pages: &rudb_native::PagePool,
+    links: &str,
+    refresh: &BTreeSet<String>,
+) -> Result<()> {
+    if refresh.is_empty() {
+        return Ok(());
+    }
+    sketch(path, catalog, pages, |catalog| {
+        index(path, catalog, links, pages, Some(refresh))?;
+        seal(path, catalog, pages)
+    })
 }
 
 /// A checkpoint of the default database on a thread of its own, which a commit that takes the log
@@ -2513,8 +2592,17 @@ fn launch(
     let (file, written, pool) = (path.to_path_buf(), anchor.clone(), pages.clone());
     let spawned =
         std::thread::Builder::new().name("rudb-checkpoint".to_string()).spawn(move || {
-            persist_anchored(&file, &mut copy, &pool, DEFAULT_CATALOG, Some(&written), false)
-                .map(|()| copy)
+            let refresh = BTreeSet::new();
+            persist_anchored(
+                &file,
+                &mut copy,
+                &pool,
+                DEFAULT_CATALOG,
+                Some(&written),
+                false,
+                &refresh,
+            )
+            .map(|()| copy)
         });
     let Ok(handle) = spawned else { return false };
     journal.open_window();
@@ -2556,14 +2644,17 @@ fn land(catalog: &mut Catalog, journal: &mut Journal, wait: bool) -> Result<()> 
             changed.push(name.clone());
             continue;
         }
-        let reader = match written.table(name).map(rudb_catalog::Table::rows) {
-            Ok(rudb_catalog::Rows::Native(reader) | rudb_catalog::Rows::Masked(reader, ..)) => {
+        let Ok(then) = written.table(name) else { continue };
+        let reader = match then.rows() {
+            rudb_catalog::Rows::Native(reader) | rudb_catalog::Rows::Masked(reader, ..) => {
                 reader.clone()
             }
             _ => continue,
         };
-        if let Ok(table) = catalog.table_mut(name) {
-            let _ = table.rebind_native(reader);
+        if let Ok(table) = catalog.table_mut(name)
+            && table.rebind_native(reader).is_ok()
+        {
+            table.set_drift(then.drift());
         }
     }
     if let Some(since) = since
@@ -2635,9 +2726,9 @@ fn vacuum_main(
     catalog: &mut Catalog,
     pages: &rudb_native::PagePool,
     journal: &mut Option<Journal>,
-    depth: f64,
+    upkeep: &Upkeep,
 ) -> Result<()> {
-    persist_main(path, catalog, pages, journal, false, depth)?;
+    persist_main(path, catalog, pages, journal, false, upkeep)?;
     let names = catalog
         .stored_tables_in(DEFAULT_CATALOG)
         .map(|table| table.name().clone())
@@ -2646,7 +2737,7 @@ fn vacuum_main(
         return Ok(());
     }
     let anchor = journal.as_ref().map(Journal::anchor);
-    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, anchor.as_ref(), true)
+    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, anchor.as_ref(), true, &BTreeSet::new())
 }
 
 /// How much of a file a `VACUUM` leaves to space nothing reads before it writes the file again: a
@@ -2682,7 +2773,8 @@ fn wasted(path: &Path, catalog: &Catalog, names: &[QualifiedName]) -> Result<boo
 /// [`persist`], writing `anchor` into the file when there is one, and carrying the file's own
 /// forward when there is not. With `whole` every table is written again into a new file, even
 /// those the file already holds, which drops the rows deleted from them and the space no table
-/// reads any more.
+/// reads any more. The tables of `refresh` are written again whole whatever else happens to the
+/// file, see [`drifted`].
 fn persist_anchored(
     path: &Path,
     catalog: &mut Catalog,
@@ -2690,6 +2782,7 @@ fn persist_anchored(
     database: &str,
     anchor: Option<&LogAnchor>,
     whole: bool,
+    refresh: &BTreeSet<String>,
 ) -> Result<()> {
     let names =
         catalog.stored_tables_in(database).map(|table| table.name().clone()).collect::<Vec<_>>();
@@ -2702,7 +2795,9 @@ fn persist_anchored(
     // catalog holds. The second half is what stops a `CLUSTER BY` on a table that was checkpointed
     // before the declaration existed from being decided as nothing to do and quietly lost.
     let held = committed(path)?;
-    let stale = stale(catalog, &names, held.as_ref());
+    let mut stale = stale(catalog, &names, held.as_ref());
+    stale.extend(refresh.iter().cloned());
+    let changes = changes(catalog, &names);
     let mut clean = true;
     for table in catalog.stored_tables_in(database) {
         clean &= !stale.contains(&table.name().table)
@@ -2746,10 +2841,13 @@ fn persist_anchored(
     });
     if restated && marked && held.is_some_and(|held| held.tables == wanted(&names)) {
         rudb_native::Writer::restate_marking(path, &views, anchor, &marks)?;
-        return rebind(path, catalog, &names, pages);
+        rebind(path, catalog, &names, pages)?;
+        return settle(catalog, &names, &changes, |_| false);
     }
-    if restated && appended(path, catalog, &names, &views, anchor, marks, &stale)? {
-        return rebind(path, catalog, &names, pages);
+    if restated && let Some(whole) = appended(path, catalog, &names, &views, anchor, marks, &stale)?
+    {
+        rebind(path, catalog, &names, pages)?;
+        return settle(catalog, &names, &changes, |name| whole.contains(name));
     }
     let temporary = scratch(path)?;
     let mut writer: Option<rudb_native::Writer> = None;
@@ -2776,7 +2874,47 @@ fn persist_anchored(
     }
     writer.with_views(views).finish()?;
     rename(&temporary, path)?;
-    rebind(path, catalog, &names, pages)
+    rebind(path, catalog, &names, pages)?;
+    settle(catalog, &names, &changes, |_| true)
+}
+
+/// The rows appended to each table of `names` since the file last held it, for the tables a
+/// checkpoint is about to write something of. The rows deleted or updated are not counted here,
+/// since the file keeps every one of them since the table was written whole and the table reads
+/// them back from it, see [`drifted`].
+fn changes(catalog: &Catalog, names: &[QualifiedName]) -> BTreeMap<String, usize> {
+    names
+        .iter()
+        .filter_map(|name| {
+            let changed = match catalog.table(name).ok()?.rows() {
+                rudb_catalog::Rows::Grown(_, tail) | rudb_catalog::Rows::Masked(_, _, tail) => {
+                    tail.len()
+                }
+                rudb_catalog::Rows::Native(_) | rudb_catalog::Rows::Memory(_) => return None,
+            };
+            Some((name.table.clone(), changed))
+        })
+        .collect()
+}
+
+/// Brings each table's count of rows changed since it was last written whole up to date once a
+/// checkpoint wrote the file, see [`drifted`]. A table `whole` says was written whole starts again
+/// from nought, and one extended adds the rows it was extended with, from [`changes`].
+fn settle(
+    catalog: &mut Catalog,
+    names: &[QualifiedName],
+    changes: &BTreeMap<String, usize>,
+    whole: impl Fn(&str) -> bool,
+) -> Result<()> {
+    for name in names {
+        let table = catalog.table_mut(name)?;
+        if whole(&name.table) {
+            table.set_drift(0);
+        } else if let Some(changed) = changes.get(&name.table) {
+            table.set_drift(table.drift().saturating_add(*changed));
+        }
+    }
+    Ok(())
 }
 
 /// Writes into the file what each table it holds is now declared with, where that changed and the
@@ -3367,6 +3505,7 @@ fn index(
     catalog: &mut Catalog,
     links: &str,
     pages: &rudb_native::PagePool,
+    only: Option<&BTreeSet<String>>,
 ) -> Result<()> {
     let declared = rudb_exec::declared(catalog, links);
     if declared.is_empty() {
@@ -3386,13 +3525,27 @@ fn index(
         };
         let Some(at) = table.column_index(column) else { continue };
         let name = table.name().clone();
+        if only.is_some_and(|only| !only.contains(&name.table)) {
+            continue;
+        }
         match wanted.iter_mut().find(|(held, _)| held == &name) {
             Some((_, columns)) if columns.contains(&at) => {}
             Some((_, columns)) => columns.push(at),
             None => wanted.push((name, vec![at])),
         }
     }
-    if wanted.is_empty() {
+    // A table whose links are built again has all of them built, since a child table's links share
+    // one budget and are attached together.
+    let mut edges = edges_of(catalog, &declared);
+    if let Some(only) = only {
+        let touched = edges
+            .iter()
+            .filter(|edge| only.contains(&edge.child) || only.contains(&edge.parent))
+            .map(|edge| edge.child.clone())
+            .collect::<BTreeSet<_>>();
+        edges.retain(|edge| touched.contains(&edge.child));
+    }
+    if wanted.is_empty() && (only.is_none() || edges.is_empty()) {
         return Ok(());
     }
     for (name, columns) in &wanted {
@@ -3403,7 +3556,6 @@ fn index(
     // the loop above is what put that map in the file. Doing both in one walk would mean building
     // a link against a map that is still in memory, which works until the relationship's two tables
     // arrive in the other order.
-    let edges = edges_of(catalog, &declared);
     let mut names = wanted.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
     if !edges.is_empty() {
         rudb_native::graph::build_links(path, &edges)?;
@@ -3641,10 +3793,10 @@ fn appended(
     anchor: Option<&LogAnchor>,
     mut marks: Vec<(String, rudb_native::GoneRows)>,
     stale: &BTreeSet<String>,
-) -> Result<bool> {
-    let Some(held) = held_rows(path)? else { return Ok(false) };
+) -> Result<Option<BTreeSet<String>>> {
+    let Some(held) = held_rows(path)? else { return Ok(None) };
     if held.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     // A table some rows were deleted from is carried forward too, with the rows gone written down
     // beside it, see [`marks`]. One that rows were appended to as well is extended below.
@@ -3705,10 +3857,10 @@ fn appended(
             || dirty.iter().any(|d| &d.table == name)
     });
     if !carried || !native.iter().all(|name| held.contains_key(name)) {
-        return Ok(false);
+        return Ok(None);
     }
     if rewritten && !mostly_live(path, catalog, names, &extended)? {
-        return Ok(false);
+        return Ok(None);
     }
     let mut writer: Option<rudb_native::Writer> = None;
     for name in &dirty {
@@ -3737,7 +3889,7 @@ fn appended(
         write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?;
         writer = Some(open);
     }
-    let Some(mut writer) = writer else { return Ok(false) };
+    let Some(mut writer) = writer else { return Ok(None) };
     writer = writer.with_marks(marks);
     if let Some(anchor) = anchor {
         writer = writer.with_log_anchor(anchor.clone());
@@ -3746,7 +3898,8 @@ fn appended(
     // is whatever the committed generation had. A view that was dropped since then is only missing
     // from the first of those.
     writer.with_views(views.to_vec()).finish()?;
-    Ok(true)
+    let whole = dirty.into_iter().filter(|name| !extended.contains_key(&name.table));
+    Ok(Some(whole.map(|name| name.table).collect()))
 }
 
 /// The rows deleted from each table since its file last said, for the tables whose file is still
@@ -5769,7 +5922,7 @@ impl Shared {
                             &self.inner.pages,
                             &mut journal,
                             false,
-                            self.inner.settings.recluster_depth(),
+                            &Upkeep::of(&self.inner.settings),
                         );
                     }
                     if pending.wait().is_ok() {
@@ -5782,8 +5935,8 @@ impl Shared {
                 Err(_) => {}
             }
         }
-        let depth = self.inner.settings.recluster_depth();
-        persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false, depth)
+        let upkeep = Upkeep::of(&self.inner.settings);
+        persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false, &upkeep)
     }
 
     /// The checkpoint a commit makes once the log it wrote passed `checkpoint_threshold`: started
@@ -5798,7 +5951,7 @@ impl Shared {
         catalog: &mut Catalog,
         journal: &mut Option<Journal>,
     ) -> Result<()> {
-        let depth = self.inner.settings.recluster_depth();
+        let upkeep = Upkeep::of(&self.inner.settings);
         if self.inner.settings.background_checkpoint()
             && let Some(held) = journal.as_mut()
         {
@@ -5808,15 +5961,16 @@ impl Shared {
                     return Ok(());
                 }
             }
-            // A table to put back in order is written before the commit returns, see
-            // `crate::recluster`.
-            if !crate::recluster::any_decayed(catalog, DEFAULT_CATALOG, depth)
+            // A table to put back in order or to write whole for its statistics is written before
+            // the commit returns, see `crate::recluster` and [`drifted`].
+            if !crate::recluster::any_decayed(catalog, DEFAULT_CATALOG, upkeep.depth)
+                && drifted(catalog, DEFAULT_CATALOG).is_empty()
                 && launch(path, catalog, &self.inner.pages, held)
             {
                 return Ok(());
             }
         }
-        persist_main(path, catalog, &self.inner.pages, journal, false, depth)
+        persist_main(path, catalog, &self.inner.pages, journal, false, &upkeep)
     }
 
     /// Lands the checkpoint in flight, if there is one, for a write of the file that does not go
@@ -7714,11 +7868,11 @@ impl Shared {
                         &mut catalog,
                         &self.inner.pages,
                         &mut self.committed_journal(),
-                        self.inner.settings.recluster_depth(),
+                        &Upkeep::of(&self.inner.settings),
                     )?;
                     let links = self.inner.settings.links();
                     sketch(path, &mut catalog, &self.inner.pages, |catalog| {
-                        index(path, catalog, &links, &self.inner.pages)?;
+                        index(path, catalog, &links, &self.inner.pages, None)?;
                         seal(path, catalog, &self.inner.pages)
                     })?;
                 }
@@ -7842,11 +7996,11 @@ impl Shared {
                         &self.inner.pages,
                         &mut self.committed_journal(),
                         false,
-                        self.inner.settings.recluster_depth(),
+                        &Upkeep::of(&self.inner.settings),
                     )?;
                     let links = self.inner.settings.links();
                     sketch(path, &mut catalog, &self.inner.pages, |catalog| {
-                        index(path, catalog, &links, &self.inner.pages)?;
+                        index(path, catalog, &links, &self.inner.pages, None)?;
                         seal(path, catalog, &self.inner.pages)
                     })?;
                 }

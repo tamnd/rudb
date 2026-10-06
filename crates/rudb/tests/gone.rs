@@ -130,7 +130,8 @@ fn rows_gone_from_a_file_stay_gone_through_a_checkpoint_and_a_reopen() {
 fn a_checkpoint_after_a_delete_writes_the_rows_gone_and_not_the_rows_kept() {
     let (path, file, memory) = loaded("marks");
     let before = std::fs::metadata(&path).expect("the file is there").len();
-    both(&file, &memory, "DELETE FROM t WHERE id % 10 = 3 OR id BETWEEN 40000 AND 41000");
+    // Under a tenth of the rows, which a checkpoint marks rather than write the table whole.
+    both(&file, &memory, "DELETE FROM t WHERE id % 20 = 3 OR id BETWEEN 40000 AND 41000");
     file.execute("CHECKPOINT").expect("checkpoints");
     let grown = std::fs::metadata(&path).expect("the file is there").len() - before;
     // A bit for each row of every part that lost one, which is every part here, and a catalog.
@@ -148,7 +149,8 @@ fn a_checkpoint_after_a_delete_writes_the_rows_gone_and_not_the_rows_kept() {
         want,
         format!("{:?}", [rudb::Value::HugeInt(got.0), rudb::Value::BigInt(got.1 as i64)])
     );
-    both(&file, &memory, "DELETE FROM t WHERE k = 5");
+    // With the first, still under a tenth of the rows.
+    both(&file, &memory, "DELETE FROM t WHERE k = 5 AND id % 5 = 0");
     file.execute("CHECKPOINT").expect("checkpoints");
     drop(file);
     let file = open(&path);
@@ -302,7 +304,8 @@ fn a_checkpoint_after_an_update_writes_the_rows_it_changed_and_not_the_table() {
 #[test]
 fn an_update_beside_a_file_is_replayed_and_rolled_back() {
     let (path, file, memory) = loaded("update-log");
-    both(&file, &memory, "UPDATE t SET v = -v, s = 'neg' WHERE k = 3");
+    // Both statements together stay under a tenth of the rows, so they stay beside the file.
+    both(&file, &memory, "UPDATE t SET v = -v, s = 'neg' WHERE k = 3 AND id % 5 = 0");
     assert!(patched(&file), "the update read the table into memory");
     let connection = file.connect();
     connection.execute("BEGIN").expect("begins");
@@ -317,7 +320,7 @@ fn an_update_beside_a_file_is_replayed_and_rolled_back() {
     connection.execute("ROLLBACK").expect("rolls back");
     drop(connection);
     same(&file, &memory, "after the rollback");
-    both(&file, &memory, "DELETE FROM t WHERE k = 6");
+    both(&file, &memory, "DELETE FROM t WHERE k = 6 AND id % 5 = 0");
     drop(file);
     // The log has the update and the file does not, so this is replay putting it back, beside the
     // file the way the statements did, with only the columns the update set marked as set.
@@ -413,10 +416,12 @@ fn writes_by_key_after_rows_were_appended_leave_the_table_in_its_file() {
     let file = open(&path);
     let memory = Database::new();
     both(&file, &memory, "CREATE TABLE k (id BIGINT PRIMARY KEY, s VARCHAR, n BIGINT)");
+    // Enough rows that what the test adds stays under a tenth of them, which a checkpoint keeps
+    // beside the file rather than write the table whole.
     both(
         &file,
         &memory,
-        "INSERT INTO k SELECT range, 's' || (range % 50), range FROM range(20000)",
+        "INSERT INTO k SELECT range, 's' || (range % 50), range FROM range(40000)",
     );
     file.execute("CHECKPOINT").expect("checkpoints");
     assert_eq!(shape(&file), "file");

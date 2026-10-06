@@ -1705,6 +1705,10 @@ pub struct Table {
     placed: u64,
     /// Where the row of each key is, built the first time a lookup by key asks.
     points: Points,
+    /// Rows appended to the file behind it since the file last held it written whole, which is
+    /// when its statistics and links were last built. A checkpoint that extends the table adds
+    /// to it and one that writes it whole sets it back to nought, see [`Table::drift`].
+    drift: usize,
 }
 
 impl Table {
@@ -1743,6 +1747,7 @@ impl Table {
             frame: next_revision(),
             placed: next_revision(),
             points: Points::default(),
+            drift: 0,
         })
     }
 
@@ -1793,6 +1798,7 @@ impl Table {
             frame: next_revision(),
             placed: next_revision(),
             points: Points::default(),
+            drift: 0,
         })
     }
 
@@ -2129,6 +2135,24 @@ impl Table {
     #[must_use]
     pub fn frame(&self) -> u64 {
         self.frame
+    }
+
+    /// Rows appended to the file behind this table since the file last held it written whole.
+    ///
+    /// An extended table has no frequencies, distinct counts or links for the rows it was
+    /// extended with, so it has none at all, and a checkpoint that finds this, the rows appended
+    /// since and the rows gone together past a tenth of the table writes it whole again, which
+    /// builds them. The count is kept for as long as the process runs. A table opened from a file
+    /// starts at nought, so the rows a file was extended with before it was opened are not
+    /// counted, and only cost a later rebuild some delay.
+    #[must_use]
+    pub fn drift(&self) -> usize {
+        self.drift
+    }
+
+    /// Sets what [`Self::drift`] says, which only a checkpoint knows.
+    pub fn set_drift(&mut self, drift: usize) {
+        self.drift = drift;
     }
 
     /// Takes the numbering of the rows `frame` names, for a table built again with the same rows in
