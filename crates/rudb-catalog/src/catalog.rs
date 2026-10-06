@@ -1692,7 +1692,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// Adds an index over a table, stamping its oid.
+    /// Adds an index over a table, stamping its oid. Gives false when `quiet` let a name that is
+    /// taken be, and the statement made nothing.
     ///
     /// `OR REPLACE` is no help with a name that is taken, which is the pin's rule as well: it
     /// refuses the second index the same way it would without the clause.
@@ -1706,11 +1707,11 @@ impl Catalog {
         table: &QualifiedName,
         mut index: crate::Index,
         quiet: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let schema = QualifiedName::new(table.catalog.clone(), table.schema.clone(), &index.name);
         if self.index_in(&schema).is_some() {
             if quiet {
-                return Ok(());
+                return Ok(false);
             }
             return Err(Error::catalog(format!(
                 "Index with name \"{}\" already exists!",
@@ -1719,26 +1720,28 @@ impl Catalog {
         }
         index.oid = self.stamp();
         self.changed();
-        self.table_mut(table)?.add_index(index)
+        self.table_mut(table)?.add_index(index)?;
+        Ok(true)
     }
 
-    /// Removes an index by its written name.
+    /// Removes an index by its written name. Gives false when `quiet` let a name that is not there
+    /// be, and the statement removed nothing.
     ///
     /// # Errors
     ///
     /// If no index has the name, unless `quiet` says that is fine.
-    pub fn drop_index(&mut self, parts: &[&str], quiet: bool) -> Result<()> {
+    pub fn drop_index(&mut self, parts: &[&str], quiet: bool) -> Result<bool> {
         let found = self.candidates(parts)?.iter().find_map(|candidate| self.index_in(candidate));
         let Some((holder, at)) = found else {
             if quiet {
-                return Ok(());
+                return Ok(false);
             }
             let name = parts.last().copied().unwrap_or_default();
             return Err(Error::catalog(format!("Index with name {name} does not exist!")));
         };
         self.changed();
         self.table_mut(&holder)?.drop_index(at);
-        Ok(())
+        Ok(true)
     }
 
     /// The table holding the index this name means, read as schema and index name, and where the

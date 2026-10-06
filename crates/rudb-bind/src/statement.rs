@@ -388,6 +388,9 @@ pub struct DropTable {
     pub kind: Entry,
     /// Whether `CASCADE` was written, which takes the triggers that read one of them along.
     pub cascade: bool,
+    /// The last part of each name that `IF EXISTS` let go, in the order written, for the notice
+    /// PostgreSQL gives for each one.
+    pub missing: Vec<String>,
 }
 
 /// A bound `INSERT`.
@@ -2310,17 +2313,20 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
     let written = ast.drop_table(index);
     let kind = if written.view { Entry::View } else { Entry::Table };
     let mut names = Vec::new();
+    let mut missing = Vec::new();
     for &name in ast.name_list(written.names) {
         let parts: Vec<&str> = ast.name(name).collect();
         // The statement said which of the two it meant, so a name that is not there is a missing
         // one of those and not a missing table.
         match catalog.resolve_as(&parts, kind) {
             Ok(resolved) => names.push(resolved),
-            Err(error) if written.if_exists => drop(error),
+            Err(_) if written.if_exists => {
+                missing.push(parts.last().copied().unwrap_or_default().to_owned());
+            }
             Err(error) => return Err(error),
         }
     }
-    Ok(Bound::DropTable(DropTable { names, kind, cascade: written.cascade }))
+    Ok(Bound::DropTable(DropTable { names, kind, cascade: written.cascade, missing }))
 }
 
 /// Recognises `CALL enable_logging(...)` and the other spellings of the same thing, which are a
