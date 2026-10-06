@@ -2620,6 +2620,7 @@ impl<'a> Aggregate<'a> {
             compact: Vec::new(),
             overflow: HashMap::new(),
             seen: Vec::new(),
+            held_distinct: HeldDistinct::default(),
             groups: 0,
             // One row of arguments per call, filled again for each input row and kept between rows
             // so that the buffers behind them are asked for once and not once per row. Only a row
@@ -2700,6 +2701,7 @@ impl<'a> Aggregate<'a> {
             compact,
             overflow,
             seen,
+            held_distinct,
             groups,
             given,
             hashes,
@@ -3361,7 +3363,7 @@ impl<'a> Aggregate<'a> {
             }
             if call.distinct {
                 fill_now(slots, slot_runs);
-                aside += self.distinct(states, seen, seen_rows, slots, at, given)?;
+                aside += self.distinct(states, seen, held_distinct, seen_rows, slots, at, given)?;
                 continue;
             }
             if by_runs
@@ -4698,10 +4700,12 @@ impl<'a> Aggregate<'a> {
     ///
     /// What comes back is what the values copied into the sets own away from themselves, which the
     /// caller charges once for the chunk.
+    #[allow(clippy::too_many_arguments)]
     fn distinct(
         &self,
         states: &mut [Accumulator],
         seen: &mut [DistinctSet],
+        held: &mut HeldDistinct,
         rows: &Rows,
         slots: &[usize],
         at: usize,
@@ -4733,6 +4737,10 @@ impl<'a> Aggregate<'a> {
             };
             (long >= slots.len()).then_some((values, flat.validity()))
         });
+        // Held and given in the order of the sets once there are enough sets that going to them in
+        // the order the rows came is a cache miss a row. Once any value is held every later one is,
+        // so that a set is always given its values in the order they arrived.
+        let hold = seen.len() >= DIRECT_SETS || !held.values.is_empty();
         // row at a time: a set of rows is what `DISTINCT` is, and the table that would replace this
         // one is the one #237 built for grouping. Until that is shared, this is the honest loop.
         for (row, &slot) in slots.iter().enumerate() {
@@ -4755,7 +4763,9 @@ impl<'a> Aggregate<'a> {
                         Ints::Wide(values) => values[row],
                         Ints::Narrow(values) => i64::from(values[row]),
                     };
-                    if set.insert(value) {
+                    if hold {
+                        held.hold(slot * calls + at, value)?;
+                    } else if set.insert(value) {
                         aside += width_of(size_of::<i64>() * 2);
                         states[slot * calls + at].update(&[Value::BigInt(value)])?;
                     }
@@ -4776,7 +4786,9 @@ impl<'a> Aggregate<'a> {
                         }
                     },
                 };
-                if set.insert(value) {
+                if hold {
+                    held.hold(slot * calls + at, value)?;
+                } else if set.insert(value) {
                     aside += width_of(size_of::<i64>() * 2);
                     states[slot * calls + at].update(&[Value::BigInt(value)])?;
                 }
@@ -4800,6 +4812,9 @@ impl<'a> Aggregate<'a> {
             aside += rows::footprint(&stored.0);
             set.insert(stored);
             states[slot * calls + at].update(&args.0)?;
+        }
+        if held.values.len() >= HELD_DISTINCT {
+            aside += held.give(seen, states)?;
         }
         Ok(aside)
     }
@@ -5867,6 +5882,9 @@ pub(crate) struct Building {
     /// Exact totals only for groups whose SMALLINT sum does not fit in 64 bits.
     overflow: HashMap<usize, (i128, i128)>,
     seen: Vec<DistinctSet>,
+    /// The values the BIGINT sets in `seen` have been offered and not yet given. See
+    /// [`HeldDistinct`].
+    held_distinct: HeldDistinct,
     groups: usize,
     given: Vec<Key>,
     hashes: Vec<u64>,
@@ -5916,6 +5934,8 @@ impl Building {
     /// Folds in the totals [`PlaceSums`] still owes the accumulators, which everything that reads
     /// them or moves the groups asks for first.
     fn settle(&mut self) -> Result<()> {
+        let aside = self.held_distinct.give(&mut self.seen, &mut self.states)?;
+        self.containers.grow(aside)?;
         self.place_sums.fold_places(&self.coded_map, &mut self.states)?;
         self.place_sums.settle(&mut self.states)
     }
@@ -6114,6 +6134,106 @@ const FEW_DISTINCT: usize = 16;
 struct FewDistinct {
     len: usize,
     values: [i64; FEW_DISTINCT],
+}
+
+/// How many BIGINT sets a table holds before the values offered to them are held and given in the
+/// order of the sets.
+const DIRECT_SETS: usize = 1 << 10;
+
+/// How many held values are given to their sets at once.
+const HELD_DISTINCT: usize = 1 << 16;
+
+/// The values offered to the BIGINT distinct sets of a table, held so that they are given to the
+/// sets in the order the sets are in rather than the order the rows came.
+///
+/// A row goes to whichever group its key is, so the rows of a chunk visit the sets in no order at
+/// all. Each visit reads the set where it sits in `seen`, the values it points at and the
+/// accumulator beside it, three lines in three arrays far bigger than the cache. TPC-H q16 counts
+/// the distinct suppliers of 18,314 groups and those reads were about 160 cycles a row, most of the
+/// `count(DISTINCT ps_suppkey)` and a fifth of the query. Held, a row is a push onto the end of one
+/// vector, and giving them out is a sort by set and one pass that walks the three arrays from the
+/// front to the back.
+///
+/// The sort keeps the values of one set in the order they came, so each set and its accumulator see
+/// exactly what they would have seen one row at a time and the answers are the same, even for a
+/// call like `list(DISTINCT x)` whose answer depends on that order.
+#[derive(Debug, Default)]
+struct HeldDistinct {
+    /// Each value and the index in `seen` of the set it is offered to, in the order the rows came.
+    values: Vec<(u32, i64)>,
+    /// Where the sort puts them, kept so that giving them out allocates nothing.
+    spare: Vec<(u32, i64)>,
+}
+
+impl HeldDistinct {
+    fn hold(&mut self, set: usize, value: i64) -> Result<()> {
+        let set = u32::try_from(set).map_err(|_| Error::internal("too many distinct sets"))?;
+        if self.values.capacity() == 0 {
+            // A chunk's worth past the point they are given out, which is where they are given.
+            self.values.reserve(HELD_DISTINCT + VECTOR_SIZE);
+        }
+        self.values.push((set, value));
+        Ok(())
+    }
+
+    /// Gives every held value to its set and counts the new ones in their accumulators, and
+    /// answers what the sets took for the values that were new to them.
+    fn give(&mut self, seen: &mut [DistinctSet], states: &mut [Accumulator]) -> Result<u64> {
+        if self.values.is_empty() {
+            return Ok(0);
+        }
+        by_set(&mut self.values, &mut self.spare, seen.len());
+        let mut aside = 0;
+        for &(set, value) in &self.values {
+            let at = set as usize;
+            let (Some(DistinctSet::BigInt(values)), Some(state)) =
+                (seen.get_mut(at), states.get_mut(at))
+            else {
+                return Err(Error::internal("a held distinct value has no set"));
+            };
+            if values.insert(value) {
+                aside += width_of(size_of::<i64>() * 2);
+                state.update(&[Value::BigInt(value)])?;
+            }
+        }
+        self.values.clear();
+        Ok(aside)
+    }
+}
+
+/// Sorts held values by their set and keeps the order they came in within each set.
+///
+/// A byte of the set at a time from the lowest, each pass a count and a scatter, which is stable,
+/// so the order within a set is the order of the rows. There are only as many passes as the number
+/// of sets has bytes, two for the 18,314 of TPC-H q16.
+fn by_set(values: &mut Vec<(u32, i64)>, spare: &mut Vec<(u32, i64)>, sets: usize) {
+    let bits = usize::BITS - sets.leading_zeros();
+    let mut shift = 0;
+    while shift < bits.min(u32::BITS) {
+        let mut starts = [0_usize; 256];
+        for &(set, _) in values.iter() {
+            starts[(set >> shift) as usize & 0xff] += 1;
+        }
+        if starts.contains(&values.len()) {
+            shift += 8;
+            continue;
+        }
+        let mut next = 0;
+        for start in &mut starts {
+            let count = *start;
+            *start = next;
+            next += count;
+        }
+        // Every place is written below, so what the spare held from the pass before stays.
+        spare.resize(values.len(), (0, 0));
+        for &held in values.iter() {
+            let digit = (held.0 >> shift) as usize & 0xff;
+            spare[starts[digit]] = held;
+            starts[digit] += 1;
+        }
+        std::mem::swap(values, spare);
+        shift += 8;
+    }
 }
 
 impl BigIntDistinct {
@@ -8657,19 +8777,19 @@ mod tests {
     use std::sync::Arc;
 
     use rudb_common::{Field, LogicalType, Memory, Value};
-    use rudb_kernels::NOWHERE;
+    use rudb_kernels::{Accumulator, NOWHERE};
     use rudb_pipeline::Sink;
     use rudb_plan::{Plan, Slice};
     use rudb_vector::{Chunk, Data, Selection, Vector};
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
-        Distinct, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
-        FixedPartition, FixedRecord, FixedRun, FixedRuns, PARTITION_FROM, RADIX_PARTITIONS,
-        RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, closed_runs, cut_runs, drop_unkept, encoded_count_partition,
-        first_kept, fixed_partition, interior, packed_run_totals, run_total, slot_runs_of,
-        spread_runs, spread_slots,
+        Distinct, DistinctSet, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
+        FixedPartition, FixedRecord, FixedRun, FixedRuns, HeldDistinct, PARTITION_FROM,
+        RADIX_PARTITIONS, RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
+        bigint_distinct_partition, by_set, closed_runs, cut_runs, drop_unkept,
+        encoded_count_partition, first_kept, fixed_partition, interior, packed_run_totals,
+        run_total, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -9458,6 +9578,47 @@ mod tests {
         wide.combine(4, &back, 0, &coming, &mut overflow).expect("back under the limit");
         assert!(overflow.is_empty(), "the group left the map when its total fitted again");
         assert_eq!(wide.totals(4, &overflow), (i128::from(i64::MAX) + i128::from(i64::MIN) + 2, 0));
+    }
+
+    /// Held values come back in the order of their sets, and in the order they came within a set.
+    #[test]
+    fn held_distinct_values_sort_by_set_and_keep_their_order() {
+        let mut values: Vec<(u32, i64)> = (0..5000_i64)
+            .map(|at| (u32::try_from(at * 7919 % 1500).expect("a small set"), at))
+            .collect();
+        let mut expected = values.clone();
+        expected.sort_by_key(|&(set, _)| set);
+        let mut spare = Vec::new();
+        by_set(&mut values, &mut spare, 1500);
+        assert_eq!(values, expected);
+    }
+
+    /// Giving held values to their sets answers what offering them a row at a time answers.
+    #[test]
+    fn held_distinct_values_count_what_a_row_at_a_time_counts() {
+        let sets = 2000;
+        let mut direct: Vec<BigIntDistinct> =
+            (0..sets).map(|_| BigIntDistinct::default()).collect();
+        let mut counted = vec![0_i64; sets];
+        let mut seen: Vec<DistinctSet> =
+            (0..sets).map(|_| DistinctSet::BigInt(BigIntDistinct::default())).collect();
+        let mut states: Vec<Accumulator> = (0..sets)
+            .map(|_| Accumulator::folding("count", &LogicalType::BigInt).expect("a count"))
+            .collect();
+        let mut held = HeldDistinct::default();
+        for row in 0..40_000_usize {
+            let set = row * 31 % sets;
+            let value = i64::try_from(row * 17 % 23).expect("small");
+            if direct[set].insert(value) {
+                counted[set] += 1;
+            }
+            held.hold(set, value).expect("a set that fits");
+        }
+        held.give(&mut seen, &mut states).expect("every value has a set");
+        assert!(held.values.is_empty());
+        for (set, state) in states.iter().enumerate() {
+            assert_eq!(state.counted(), Some(counted[set]));
+        }
     }
 
     #[test]
