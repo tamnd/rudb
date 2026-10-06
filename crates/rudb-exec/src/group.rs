@@ -6238,21 +6238,40 @@ impl HeldDistinct {
             return Ok(0);
         }
         by_set(&mut self.values, &mut self.spare, seen.len());
-        let mut aside = 0;
-        for &(set, value) in &self.values {
+        // A set's values sit together after the sort, so the set and its accumulator are found once
+        // for the run of them rather than once a value. A COUNT is told how many were new once at
+        // the end of the run, which is what it would have counted one value at a time.
+        let mut fresh = 0;
+        let mut rest = self.values.as_slice();
+        while let Some(&(set, _)) = rest.first() {
+            let run = rest.iter().position(|held| held.0 != set).unwrap_or(rest.len());
+            let (here, after) = rest.split_at(run);
+            rest = after;
             let at = set as usize;
             let (Some(DistinctSet::BigInt(values)), Some(state)) =
                 (seen.get_mut(at), states.get_mut(at))
             else {
                 return Err(Error::internal("a held distinct value has no set"));
             };
-            if values.insert(value) {
-                aside += width_of(size_of::<i64>() * 2);
-                state.update(&[Value::BigInt(value)])?;
+            let before = values.len();
+            if state.counted().is_some() {
+                for &(_, value) in here {
+                    values.insert(value);
+                }
+                let new = values.len() - before;
+                state.count_more(i64::try_from(new).unwrap_or(i64::MAX));
+                fresh += new;
+            } else {
+                for &(_, value) in here {
+                    if values.insert(value) {
+                        fresh += 1;
+                        state.update(&[Value::BigInt(value)])?;
+                    }
+                }
             }
         }
         self.values.clear();
-        Ok(aside)
+        Ok(width_of(size_of::<i64>() * 2).saturating_mul(width_of(fresh)))
     }
 }
 
