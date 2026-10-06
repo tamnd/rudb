@@ -216,21 +216,22 @@ fn a_child_with_no_link_is_reduced_through_the_parents_key_map() {
 /// A child whose link was over the budget still has its backward adjacency, and that names the
 /// parent whose key map turns the keys of a build side that is not the parent into the child rows
 /// they reach. This is the shape of TPC-H q20, where `lineitem` is joined to pairs of `partsupp`
-/// and the link from `l_partkey` to `part` did not fit. Here the key is scattered and the note is
-/// wide, so the link costs more than a tenth of the table and the adjacency less than all of it.
+/// and the link from `l_partkey` to `part` did not fit. Here the key is scattered and the other
+/// column is wide, so the link costs more than a tenth of the table and the adjacency less than all
+/// of it.
 #[test]
 fn a_child_with_only_its_adjacency_is_reduced_through_it() {
     let (database, path) = open("adjacency");
     database.execute("CREATE TABLE customer (c_custkey INTEGER, c_name VARCHAR)").expect("creates");
-    database.execute("CREATE TABLE visits (v_custkey INTEGER, v_note VARCHAR)").expect("creates");
+    database.execute("CREATE TABLE visits (v_custkey INTEGER, v_day BIGINT)").expect("creates");
     database.execute("CREATE TABLE picked (p_key INTEGER)").expect("creates");
     database
         .execute("INSERT INTO customer SELECT i, 'c' || i FROM range(1, 30001) AS r(i)")
         .expect("loads");
     database
         .execute(
-            "INSERT INTO visits SELECT 1 + i * 7919 % 30000, md5(i::VARCHAR) FROM range(0, \
-             200000) AS r(i)",
+            "INSERT INTO visits SELECT 1 + i * 7919 % 30000, i * 2654435761 % 1000000007 FROM \
+             range(0, 200000) AS r(i)",
         )
         .expect("loads");
     database.execute("INSERT INTO picked VALUES (1), (2), (30000)").expect("loads");
@@ -242,7 +243,7 @@ fn a_child_with_only_its_adjacency_is_reduced_through_it() {
         "SELECT count(*) FROM rudb_links() WHERE note LIKE '%link was measured and not kept%'",
     );
     assert_eq!(refused, [[Value::BigInt(1)]], "the link should be over the budget");
-    let sql = "SELECT count(*), max(v_note) FROM visits WHERE v_custkey IN (SELECT p_key FROM \
+    let sql = "SELECT count(*), max(v_day) FROM visits WHERE v_custkey IN (SELECT p_key FROM \
                picked)";
     let reduced = rows(&database, sql);
     assert_eq!(reduced[0][0], Value::BigInt(20));
