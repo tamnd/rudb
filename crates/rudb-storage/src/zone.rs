@@ -634,8 +634,11 @@ fn unpacked(vector: &Vector, packed: &Packed<'_>) -> Walked {
     let mut high: Option<i128> = None;
     let mut total = 0_i128;
     let nullable = vector.validity().has_nulls(vector.len());
+    // A packed column keeps its nulls in its own mask, so the bit is the answer `is_null_at` gives,
+    // without the call and the match on the form it makes to get there for every row.
+    let live = vector.validity().live();
     for row in 0..vector.len() {
-        if nullable && vector.is_null_at(row) {
+        if nullable && !live.at(row) {
             continue;
         }
         let value = base + i128::from(packed.code(row));
@@ -827,8 +830,10 @@ fn summed(vector: &Vector, data: &Data) -> (bool, Option<i128>) {
             let held: &[_] = $values;
             let mut total = 0_i128;
             if vector.validity().has_nulls(vector.len()) {
+                // A flat column keeps its nulls in its own mask. See `extremes`.
+                let (live, len) = (vector.validity().live(), vector.len());
                 for (index, &value) in held.iter().enumerate() {
-                    if !vector.is_null_at(index) {
+                    if index < len && live.at(index) {
                         total += i128::from(value);
                     }
                 }
@@ -926,8 +931,11 @@ fn extremes<T: Copy + PartialOrd>(values: &[T], vector: &Vector) -> (Option<T>, 
     let mut low: Option<T> = None;
     let mut high: Option<T> = None;
     if vector.validity().has_nulls(vector.len()) {
+        // The column is flat, so its own mask is the answer `is_null_at` gives, read here as a bit
+        // rather than through a call that matches on the form of the vector for every row.
+        let (live, len) = (vector.validity().live(), vector.len());
         for (index, &value) in values.iter().enumerate() {
-            if !vector.is_null_at(index) {
+            if index < len && live.at(index) {
                 widen(value, &mut low, &mut high);
             }
         }

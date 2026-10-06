@@ -48,7 +48,7 @@ use rudb_common::{Cause, Error, Field, LogicalType, Result, Value, slow};
 use crate::buffer::Buffer;
 use crate::fsst::SymbolTable;
 use crate::string::{INLINE_LIMIT, StringColumn, StringView};
-use crate::validity::Validity;
+use crate::validity::{Live, Validity};
 
 /// How many values are in a full vector.
 ///
@@ -2118,6 +2118,21 @@ impl Vector {
                 Some(&rid) => source.is_null_at(rid as usize),
             },
             _ => false,
+        }
+    }
+
+    /// The mask that answers [`Self::is_null_at`] on its own, or `None` for a dictionary, a run and
+    /// a gather, which keep their nulls in what they point at.
+    ///
+    /// For a loop over every row. The answer a row gets from the mask is the one `is_null_at`
+    /// gives for a row before [`Self::len`], read as a bit rather than through a call that matches
+    /// on the form for every row, and that call was about 5% of a `cast_info` load.
+    #[must_use]
+    #[inline]
+    pub fn own_nulls(&self) -> Option<Live<'_>> {
+        match self.body {
+            Body::Dictionary { .. } | Body::Runs { .. } | Body::Gathered { .. } => None,
+            _ => Some(self.validity.live()),
         }
     }
 

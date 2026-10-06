@@ -55,7 +55,7 @@ use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
 use rudb_vector::string::StringColumn;
-use rudb_vector::validity::Validity;
+use rudb_vector::validity::{Live, Validity};
 use rudb_vector::{Buffer, Chunk, Data, Packed, Runs, TextSource, Vector, search_below};
 
 mod anchor;
@@ -4119,8 +4119,13 @@ impl Writer {
                             visit(start.saturating_add(row as u64), Some(value as u64));
                         }
                     } else {
+                        let (own, len) = (vector.own_nulls(), vector.len());
                         for (row, &value) in block.iter().enumerate() {
-                            let bits = (!vector.is_null_at(row)).then_some(value as u64);
+                            let null = match own {
+                                Some(live) => row >= len || !live.at(row),
+                                None => vector.is_null_at(row),
+                            };
+                            let bits = (!null).then_some(value as u64);
                             visit(start.saturating_add(row as u64), bits);
                         }
                     }
@@ -13642,7 +13647,18 @@ fn push_validity(out: &mut Vec<u8>, flat: &Vector) {
         Validity::Mask(_) => 2,
     };
     out.push(flag);
-    if flag == 2 {
+    if flag == 2
+        && let Some(Live::Mask(mask)) = flat.own_nulls()
+    {
+        // The mask is the rows' own, low row in the low bit like the bytes here, so they are its
+        // words cut into bytes with the bits past the last row cleared.
+        let len = flat.len();
+        for at in 0..len.div_ceil(8) {
+            let byte = (mask.word(at / 8) >> (at % 8 * 8)) as u8;
+            let rows = (len - at * 8).min(8);
+            out.push(if rows == 8 { byte } else { byte & ((1 << rows) - 1) });
+        }
+    } else if flag == 2 {
         for group in (0..flat.len()).step_by(8) {
             let mut bits = 0_u8;
             for bit in 0..8 {

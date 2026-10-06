@@ -30,6 +30,7 @@
 //! `reads_lineitem_faster_a_chunk_at_a_time` in the reader measures it again.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use rudb_common::{Error, Result};
 
@@ -332,10 +333,29 @@ impl Records {
 
     /// Field `column` of record `row`, or `None` when the record is shorter than that.
     #[must_use]
+    #[inline]
     pub fn field(&self, row: usize, column: usize) -> Option<Span> {
         let start = if row == 0 { 0 } else { self.ends[row - 1] };
         let at = start + column;
         if at < self.ends[row] { Some(self.spans[at]) } else { None }
+    }
+
+    /// Field `column` of each record in `rows`, in order, each the way [`Self::field`] answers it.
+    ///
+    /// One record's end is the next one's start, so walking them carries the start along rather
+    /// than reading it back for every row the way a call to [`Self::field`] per row does.
+    #[inline]
+    pub(crate) fn column(
+        &self,
+        column: usize,
+        rows: Range<usize>,
+    ) -> impl Iterator<Item = Option<Span>> + '_ {
+        let mut start = if rows.start == 0 { 0 } else { self.ends[rows.start - 1] };
+        self.ends[rows].iter().map(move |&end| {
+            let at = start + column;
+            start = end;
+            if at < end { self.spans.get(at).copied() } else { None }
+        })
     }
 
     /// Moves every range down by `by` bytes, for a buffer that has just had that many bytes taken
