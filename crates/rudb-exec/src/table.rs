@@ -950,19 +950,7 @@ const KEYS: usize = 4;
 /// seventeen places with the null one, and the four keys take 3,468 places together.
 const COMBOS: usize = 4096;
 
-/// The most places the direct map covers when the key is several columns.
-///
-/// Wider than [`COMBOS`], which bounds what one column may bring, because a key of several small
-/// columns multiplies past it long before any of them is wide. TPC-H q1 grouped a step further, by
-/// its two flags and by `l_discount` and `l_tax`, is three and two dictionary values and two
-/// columns packed four bits wide, so 4 x 3 x 17 x 17 places counting each column's null place, which
-/// is 3,468. Refused at 2,048 it was hashed, and with four key columns compared a row the grouping
-/// cost about 680 instructions a row for a few hundred groups. The map is carried from one chunk to
-/// the next for as long as the pages are packed the same way, so it is cleared once a row group and
-/// sixteen thousand places of `u32` is 64 KB, which stays in the second level cache.
-const PRODUCT: usize = 1 << 14;
-
-/// The most places the direct map covers when the whole key is one dictionary.
+/// The most places the direct map covers, for a key of one column or of several.
 ///
 /// Larger than [`COMBOS`] by a factor of a hundred and twenty eight, and the reason is that one
 /// column's places are not a product. Every place in a one column map is a value that column's
@@ -977,10 +965,18 @@ const PRODUCT: usize = 1 << 14;
 /// this wide answers two rows in three from a load, and the profile in that document has the probe
 /// and the comparison it replaces at 21.5% of the query.
 ///
+/// A key of several columns used to be held to sixteen thousand places so that the map stayed in the
+/// second level cache, and most of a product is places no row lands in. TPC-H q16 is the case that
+/// bound got wrong. Its key is `p_brand`, `p_type` and `p_size`, which is 26, 151 and 48 places, and
+/// its 118,274 rows at SF1 make 18,314 groups. Hashed, the three columns were about 360 cycles a row
+/// to find a group in, two strings compared on every probe. A map of 188 thousand places is
+/// 750 KB, more than the second level cache holds, but a place read out of the third level is a
+/// tenth of that, and q16 ran 14 percent fewer instructions with it. See spec/perf/128.
+///
 /// Two hundred and sixty two thousand places is a megabyte of `u32` per thread, which is the bound
 /// worth stating: the map is per thread and is not charged against the memory budget, so this is a
 /// number about what the engine may hold quietly rather than about what any chunk needs.
-const WIDE_COMBOS: usize = 1 << 18;
+pub(crate) const WIDE_COMBOS: usize = 1 << 18;
 
 /// Where one key column's place in the combined index comes from.
 ///
@@ -1521,9 +1517,7 @@ pub(crate) fn coded_within<'a>(
     if keys.is_empty() || keys.len() > KEYS {
         return None;
     }
-    // One column's places are the values it holds and several columns' places are their product,
-    // which is why the two get different room. See [`WIDE_COMBOS`].
-    let room = if keys.len() == 1 { WIDE_COMBOS } else { PRODUCT };
+    let room = WIDE_COMBOS;
     // The columns with places of their own first, because what they take out of the room is what
     // a window is allowed to be.
     let mut found = [None; KEYS];

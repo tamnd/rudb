@@ -2643,6 +2643,10 @@ impl<'a> Aggregate<'a> {
             slot_runs: Vec::new(),
             coded_spent: 0,
             coded_read: 0,
+            // One map as wide as the room is cleared before a row pays for it, but only by the
+            // table before the split. There are sixty four partitions, and each clearing one of its
+            // own up front would be up to sixty four megabytes cleared for nothing.
+            coded_free: if share.before_the_split() { crate::table::WIDE_COMBOS } else { 0 },
             coded_map: Places::default(),
             same: Vec::new(),
             leaders: Vec::new(),
@@ -2714,6 +2718,7 @@ impl<'a> Aggregate<'a> {
             slot_runs,
             coded_spent,
             coded_read,
+            coded_free,
             coded_map,
             same,
             leaders,
@@ -2808,7 +2813,10 @@ impl<'a> Aggregate<'a> {
             codes.same_as(coded_on)
                 || !codes.reads_values()
                 || coded_spent.saturating_add(codes.combos() - grown.unwrap_or(0))
-                    <= coded_read.saturating_mul(WINDOW_RATE).saturating_add(WINDOW_SLACK)
+                    <= coded_read
+                        .saturating_mul(WINDOW_RATE)
+                        .saturating_add(WINDOW_SLACK)
+                        .saturating_add(*coded_free)
         });
         // Every other way of finding a row's group would open one for a row the filter dropped, so the
         // keys are cut to the kept rows the way they used to be before any of them is looked at.
@@ -5913,6 +5921,12 @@ pub(crate) struct Building {
     coded_spent: usize,
     /// How many rows this table has folded, which is what pays for a map read by value.
     coded_read: usize,
+    /// How many places a map read by value may clear on top of what the rows pay for.
+    ///
+    /// TPC-H q16 is grouped by two dictionaries and `p_size`, read by value, for 188 thousand
+    /// places, and a thread at SF1 folds about twenty thousand rows. Paid for by the rows alone the
+    /// map came after nearly all of them, and they were hashed.
+    coded_free: usize,
     /// One flag per row of the last chunk, true where the row's key is the key of the row before.
     ///
     /// See [`repeats`](crate::table::repeats), which fills it, and the run path in
@@ -10618,6 +10632,24 @@ mod tests {
         assert!(!building.coded_on.is_empty(), "the last chunk was answered by the map");
         assert!(building.coded_map.len() > 32 * 1_024, "the map covers every value");
         assert_eq!(building.coded_spent, building.coded_map.len(), "no place was cleared twice");
+    }
+
+    /// The table an instance fills before it partitions takes one map as wide as the room before
+    /// any row has paid for it, so a key of many more places than a chunk has rows is read by the
+    /// map from its first chunk. A partition's table pays for its map out of its rows.
+    #[test]
+    fn the_table_before_the_split_takes_its_first_wide_map_at_once() {
+        let plan = parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[count_star()::BIGINT]");
+        let (aggregate, _out) = aggregate(&plan);
+        let part: Vec<i32> = (0..2_048).map(|row| row * 50).collect();
+        for (share, mapped) in [(Share::Whole, true), (Share::Passing, true), (Share::Local, false)]
+        {
+            let mut local = aggregate.local();
+            let mut building = aggregate.starting(share);
+            let rows = aggregate.read(&chunk(&part), &mut local.expressions).expect("a chunk");
+            aggregate.fold(&rows, &mut building, None, None).expect("folded");
+            assert_eq!(!building.coded_on.is_empty(), mapped, "{share:?}");
+        }
     }
 
     /// Only the table an instance fills before it partitions covers the aggregate's whole key range,
