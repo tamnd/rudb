@@ -81,9 +81,12 @@ impl Horizons {
     /// Begins a statement on `worker` reading or writing `reads` and returns its snapshot, the last
     /// commit timestamp `clock` held.
     ///
-    /// The slot gets a value read before it is published and the statement one read after, so a
-    /// collector that missed the slot read `clock` before the statement did and its horizon is no
-    /// later than the statement's snapshot.
+    /// The slot holds the snapshot itself: a value of `clock` is published and then read again,
+    /// until the two agree. So a collector that missed the slot read `clock` before the statement
+    /// read it the second time, and every commit it can see is at or below the snapshot. One that
+    /// read the slot finds the snapshot, or a value below it that is being replaced, which holds
+    /// back more and never less. [`Self::snapshots`] needs the snapshot exactly, where the horizon
+    /// alone would do with any value at or below it.
     ///
     /// # Panics
     ///
@@ -92,8 +95,13 @@ impl Horizons {
         let slot = &self.slots[worker];
         *slot.reads.lock().unwrap_or_else(PoisonError::into_inner) = reads;
         slot.epoch.store(self.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
-        slot.snapshot.store(clock.load(Ordering::SeqCst), Ordering::SeqCst);
-        clock.load(Ordering::SeqCst)
+        loop {
+            let snapshot = clock.load(Ordering::SeqCst);
+            slot.snapshot.store(snapshot, Ordering::SeqCst);
+            if clock.load(Ordering::SeqCst) == snapshot {
+                return snapshot;
+            }
+        }
     }
 
     /// Begins a statement of a transaction that already has its snapshot, which keeps holding
@@ -136,6 +144,25 @@ impl Horizons {
             }
         }
         oldest
+    }
+
+    /// The snapshots of the statements reading `table`, in order, which is what interval pruning
+    /// holds an undo record to, see `UndoSpace::collect`. Read after `clock`, a statement missing
+    /// from them has a snapshot at or past what `clock` held.
+    #[must_use]
+    pub fn snapshots(&self, table: u32) -> Vec<u64> {
+        let mut snapshots = self
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let snapshot = slot.snapshot.load(Ordering::SeqCst);
+                (snapshot != IDLE
+                    && slot.reads.lock().unwrap_or_else(PoisonError::into_inner).holds(table))
+                .then_some(snapshot)
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_unstable();
+        snapshots
     }
 
     /// Moves the epoch on and returns the one it was, which the caller tags what it just did
@@ -181,6 +208,8 @@ mod tests {
         assert_eq!(horizons.oldest(&clock, 4), 20, "a table nobody reads is at the clock");
         horizons.resume(2, 5);
         assert_eq!(horizons.oldest(&clock, 4), 5, "a transaction holds back every table");
+        assert_eq!(horizons.snapshots(1), vec![5, 10]);
+        assert_eq!(horizons.snapshots(3), vec![5, 20]);
         horizons.end(2);
         horizons.end(0);
         assert_eq!(horizons.oldest(&clock, 1), 20);

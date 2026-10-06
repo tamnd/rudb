@@ -391,6 +391,14 @@ impl Heads for StripeDirectory {
             stripe.unlink(rid.slot(), record, older);
         }
     }
+
+    fn prune(&self, table: u32, rid: u64, spare: &mut dyn FnMut(UndoRef) -> bool) -> Vec<UndoRef> {
+        let rid = Rid::from_u64(rid);
+        match self.find(rid.stripe()) {
+            Some(Stripe::Hot(stripe)) if table == self.table => stripe.prune(rid.slot(), spare),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// A worker's inserts into a table: slots leased from the open hot stripe, moving to the next one
