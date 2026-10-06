@@ -9342,13 +9342,9 @@ impl Reader {
             for sequence in sequences {
                 let needs = sequence.needs();
                 let maybe = |row: usize| sketch.is_none_or(|words| words[row] & needs == needs);
-                let Some(one) = string::holds_in_where(&bytes[cur.at..], sequence, maybe)? else {
+                if !string::holds_in_where(&bytes[cur.at..], sequence, maybe, &mut held)? {
                     return Ok(None);
-                };
-                if one.len() != rows {
-                    return Err(invalid("compressed text page holds the wrong number of rows"));
                 }
-                held.iter_mut().zip(one).for_each(|(held, one)| *held |= one);
             }
             // Every row is written and the count moves only past the kept ones, so there is no
             // branch a row. With `NOT LIKE` nearly every row is kept, and a filtered collect paid a

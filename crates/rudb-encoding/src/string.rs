@@ -349,47 +349,89 @@ pub fn decode_coded(bytes: &[u8]) -> Result<Option<(Flat, Vec<u32>)>> {
 ///
 /// As [`decode`].
 pub fn holds_in(bytes: &[u8], sequence: &Sequence) -> Result<Option<Vec<bool>>> {
-    holds_in_where(bytes, sequence, |_| true)
-}
-
-/// [`holds_in`], walking only the values `maybe` does not rule out and answering no for the rest.
-///
-/// For a caller that holds a sketch of each value, see [`crate::sequence::grams`]. A value ruled out
-/// is stepped over by its length and never walked.
-///
-/// # Errors
-///
-/// As [`decode`].
-pub fn holds_in_where(
-    bytes: &[u8],
-    sequence: &Sequence,
-    mut maybe: impl FnMut(usize) -> bool,
-) -> Result<Option<Vec<bool>>> {
     if bytes.first() != Some(&Kind::Fsst.tag()) {
         return Ok(None);
     }
     let mut reader = Reader::new(bytes);
     reader.u8()?;
-    let count = reader.u32()? as usize;
-    let runs = read_compressed(&mut reader, count)?;
-    let mut coded = sequence.over(&runs.table);
-    let mut held = Vec::with_capacity(count);
-    let mut payload = runs.payload;
-    for &run in &runs.lengths {
-        let Some((codes, rest)) = payload.split_at_checked(run) else {
-            return Err(Error::internal("a compressed run is past the end of its chunk"));
-        };
-        payload = rest;
-        let row = held.len();
-        held.push(maybe(row) && coded.holds(codes)?);
+    let mut held = vec![false; reader.u32()? as usize];
+    holds_in_where(bytes, sequence, |_| true, &mut held)?;
+    Ok(Some(held))
+}
+
+/// [`holds_in`], walking only the values `maybe` does not rule out, and marking the ones that hold
+/// the pieces in `held`, which has a place for every value. A place already marked stays marked,
+/// so a caller with several patterns passes the same places to each. False for a chunk that is not
+/// compressed, which leaves `held` as it was.
+///
+/// For a caller that holds a sketch of each value, see [`crate::sequence::grams`]. A value ruled out
+/// is stepped over by its length and never walked. With the sketch on q13 one comment in forty is
+/// walked, so what each of the others costs is the whole of the scan: the lengths are read as they
+/// were decoded, with no second array of them and no pass to add them up first, and the codes of a
+/// value are only cut out for one that is walked.
+///
+/// # Errors
+///
+/// As [`decode`], and when `held` is not as long as the chunk.
+pub fn holds_in_where(
+    bytes: &[u8],
+    sequence: &Sequence,
+    mut maybe: impl FnMut(usize) -> bool,
+    held: &mut [bool],
+) -> Result<bool> {
+    if bytes.first() != Some(&Kind::Fsst.tag()) {
+        return Ok(false);
     }
+    let mut reader = Reader::new(bytes);
+    reader.u8()?;
+    let count = reader.u32()? as usize;
+    if count != held.len() {
+        return Err(Error::internal(format!(
+            "a string chunk holds {count} values and was asked about {}",
+            held.len()
+        )));
+    }
+    let (table, used) = SymbolTable::deserialize(reader.rest())?;
+    reader.skip(used)?;
+    let lengths = decode_integers(&mut reader)?;
+    if lengths.len() != count {
+        return Err(Error::internal(format!(
+            "a string chunk says it holds {count} values and has {} lengths",
+            lengths.len()
+        )));
+    }
+    let payload = reader.rest();
+    let limit = payload.len() as u64;
+    let mut coded = None;
+    // A length past the payload, a negative one among them, is caught once the loop is done. Each
+    // one under the limit keeps the sum from wrapping before then, and a value is cut out with a
+    // checked slice, so a wrong length never reads past the payload.
+    let mut wrong = false;
+    let mut at = 0_u64;
+    for (row, (&length, held)) in lengths.iter().zip(held.iter_mut()).enumerate() {
+        let from = at;
+        wrong |= length as u64 > limit;
+        at = at.wrapping_add(length as u64);
+        if maybe(row) {
+            let Some(codes) = payload.get(from as usize..at as usize) else {
+                return Err(Error::internal("a compressed run is past the end of its chunk"));
+            };
+            *held |= coded.get_or_insert_with(|| sequence.over(&table)).holds(codes)?;
+        }
+    }
+    if wrong || at > limit {
+        return Err(Error::internal(format!(
+            "a compressed chunk says it holds more than its {limit} bytes"
+        )));
+    }
+    reader.skip(at as usize)?;
     if reader.remaining() != 0 {
         return Err(Error::internal(format!(
             "{} bytes left over after decoding a string chunk",
             reader.remaining()
         )));
     }
-    Ok(Some(held))
+    Ok(true)
 }
 
 /// Which values of a compressed chunk are one of `literals`, compared on the codes, or `None` for
