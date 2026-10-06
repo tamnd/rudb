@@ -175,6 +175,11 @@ fn kth_zero(words: &[u64], start: usize, k: u64) -> Option<usize> {
     let mut word = start / 64;
     let mut zeros = !*words.get(word)? & (u64::MAX << (start % 64));
     loop {
+        // The first zero, which is every second search a parent makes, is the lowest bit set and
+        // needs no select.
+        if left == 0 && zeros != 0 {
+            return Some(word * 64 + zeros.trailing_zeros() as usize);
+        }
         let here = u64::from(zeros.count_ones());
         if left < here {
             // Under sixty four, since it is under the count of one word.

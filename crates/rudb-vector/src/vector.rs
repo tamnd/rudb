@@ -3818,6 +3818,107 @@ impl Vector {
         self.copied(indices.iter().map(|&index| index as usize).collect(), true)
     }
 
+    /// The rows of each of `runs`, a start and a length, laid end to end.
+    ///
+    /// [`Self::gather`] of every row the runs cover, without writing those rows out first. A packed
+    /// column with no nulls reads each run straight through, where a gather reads each row on its
+    /// own and asks a prefetch for the row sixteen on. The lines of one order sit together in
+    /// `lineitem`, so a walk from a line to the other lines of its order reads runs of about five.
+    /// In TPC-H q21 that walk reads three columns at about 780 thousand rows, and the gather took
+    /// about forty instructions a value. Anything else goes through the rows.
+    ///
+    /// # Errors
+    ///
+    /// If a run goes past the end, or whatever the gather raises.
+    pub fn gather_runs(&self, runs: &[(u32, u32)]) -> Result<Self> {
+        let mut rows = 0;
+        for &(start, length) in runs {
+            if start as usize + length as usize > self.len {
+                return Err(Error::internal("a run is past the end of its vector"));
+            }
+            rows += length as usize;
+        }
+        if let Some(unpacked) = self.unpacked_runs(runs, rows) {
+            return Ok(unpacked);
+        }
+        let mut at = Vec::with_capacity(rows);
+        for &(start, length) in runs {
+            at.extend(start..start + length);
+        }
+        self.gather(&at)
+    }
+
+    /// [`Self::gather_runs`] of a packed column with no nulls whose ends fit an `i64`, `None` for
+    /// anything else. Every run is inside the column, which the caller checked.
+    fn unpacked_runs(&self, runs: &[(u32, u32)], rows: usize) -> Option<Self> {
+        fn each<T: Copy + Default>(
+            packed: &Packed<'_>,
+            runs: &[(u32, u32)],
+            rows: usize,
+            value: impl Fn(u64) -> T,
+        ) -> Vec<T> {
+            // Everything the loop reads held in locals and the answer written into room it already
+            // has. Through the closures of a range's map, the base, the words and the width were
+            // loaded again for every value and the vector asked whether it had room, about thirty
+            // instructions a value for what `code_at` does in ten.
+            let words = packed.words;
+            let width = packed.width as usize;
+            let mask = u64::MAX >> (u64::BITS - packed.width);
+            let mut out = vec![T::default(); rows];
+            let mut at = 0;
+            for &(start, length) in runs {
+                let length = length as usize;
+                let mut bit = (packed.offset + start as usize) * width;
+                for slot in &mut out[at..at + length] {
+                    let word = bit / u64::BITS as usize;
+                    let low = words.get(word).copied().unwrap_or(0);
+                    let high = words.get(word + 1).copied().unwrap_or(0);
+                    let both = u128::from(high) << u64::BITS | u128::from(low);
+                    *slot = value((both >> (bit % u64::BITS as usize)) as u64 & mask);
+                    bit += width;
+                }
+                at += length;
+            }
+            out
+        }
+        let Body::Packed { words, width, base, offset } = &self.body else {
+            return None;
+        };
+        if self.validity.has_nulls(self.len) || *width == 0 {
+            return None;
+        }
+        let packed = Packed { words, width: *width, base: *base, offset: *offset };
+        let low = i64::try_from(packed.base()).ok()?;
+        i64::try_from(packed.ceiling()).ok()?;
+        // The same reasoning as `unpacked_at`: both ends fit, so the add does not wrap and the
+        // narrowing keeps every value.
+        #[expect(clippy::cast_possible_wrap, reason = "a code is below the span, which fits")]
+        let value = move |code: u64| low.wrapping_add(code as i64);
+        #[expect(clippy::cast_possible_truncation, reason = "the layout holds every value")]
+        let data = match self.ty.physical() {
+            rudb_common::PhysicalType::Int64 => {
+                Data::Int64(Buffer::from_vec(each(&packed, runs, rows, value)))
+            }
+            rudb_common::PhysicalType::Int32 => {
+                Data::Int32(Buffer::from_vec(each(&packed, runs, rows, move |code| {
+                    value(code) as i32
+                })))
+            }
+            rudb_common::PhysicalType::Int16 => {
+                Data::Int16(Buffer::from_vec(each(&packed, runs, rows, move |code| {
+                    value(code) as i16
+                })))
+            }
+            _ => return None,
+        };
+        Some(Self {
+            ty: self.ty.clone(),
+            len: rows,
+            validity: Validity::AllValid,
+            body: Body::flat(data),
+        })
+    }
+
     /// A gather off a flat run of fixed width values, every position inside it.
     ///
     /// That is what a join hands out on both of its sides, and the general copy below made a run of
@@ -8561,6 +8662,52 @@ mod tests {
                 Value::Integer(72)
             ]
         );
+    }
+
+    /// Runs of a packed column, cut at rows that do and do not start a word, read what a gather
+    /// of the same rows reads, and a column with nulls goes through the gather.
+    #[test]
+    fn a_gather_of_runs_reads_what_a_gather_of_their_rows_reads() {
+        let words: Vec<u64> =
+            (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        let runs = [(0, 3), (5, 1), (63, 2), (70, 0), (100, 64), (299, 1)];
+        let rows: Vec<u32> =
+            runs.iter().flat_map(|&(start, length)| start..start + length).collect();
+        for width in [1, 7, 13, 32, 33, 50] {
+            for ty in [LogicalType::BigInt, LogicalType::Integer] {
+                let base = if ty == LogicalType::BigInt { -1_000 } else { 0 };
+                let width = if ty == LogicalType::Integer { width.min(31) } else { width };
+                let whole = Vector::packed(ty, words.clone(), width, base, 300)
+                    .expect("enough words for 300 codes");
+                for at in [0, 1] {
+                    let cut = whole.slice(at, 300 - at).expect("a cut inside the column");
+                    let runs: Vec<(u32, u32)> = runs
+                        .iter()
+                        .filter(|&&(start, length)| start + length <= 299)
+                        .copied()
+                        .collect();
+                    let rows: Vec<u32> = rows.iter().filter(|&&row| row < 299).copied().collect();
+                    let got = cut.gather_runs(&runs).expect("runs inside the column");
+                    assert_eq!(got.form(), Form::Flat);
+                    let want = cut.gather(&rows).expect("rows inside the column");
+                    assert_eq!(
+                        got.iter().collect::<Vec<_>>(),
+                        want.iter().collect::<Vec<_>>(),
+                        "width {width} cut at {at}"
+                    );
+                }
+            }
+        }
+        let values: Vec<i32> = (0..64).map(|row| 10 + row).collect();
+        let flat = Vector::flat(LogicalType::Integer, Data::Int32(values.into())).unwrap();
+        let packed =
+            flat.bit_packed().unwrap().with_validity(Validity::from_iter(64, |row| row % 3 != 0));
+        let taken = packed.gather_runs(&[(2, 2), (62, 1)]).unwrap();
+        assert_eq!(
+            taken.iter().collect::<Vec<_>>(),
+            vec![Value::Integer(12), Value::Null, Value::Integer(72)]
+        );
+        assert!(packed.gather_runs(&[(60, 5)]).is_err());
     }
 
     /// The pair a comparison kernel asks for before it reads a bit. A literal inside the range has a

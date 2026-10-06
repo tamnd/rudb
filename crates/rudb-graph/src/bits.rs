@@ -484,25 +484,50 @@ fn bits(at: usize) -> u64 {
 
 /// Where the `nth` set bit of a word is, counting from zero.
 ///
-/// A byte at a time to the byte that holds it and then the lowest set bit cleared until it is
-/// reached, which is at most eight steps and seven, where clearing bits across the whole word was
-/// up to sixty three. `pdep` does this in one instruction on x86 and there is no portable way to
-/// say so yet. A word with `nth` ones or fewer answers 64, as the loop over the word did.
+/// Without a branch on the bits: the ones up to each byte are counted in all eight bytes at once,
+/// the bytes whose count is at most `nth` say which byte holds the bit, and a table answers inside
+/// that byte. `pdep` does this in one instruction, but it is microcoded on the AMD cores before Zen
+/// 3 and takes hundreds of cycles there. This replaced a loop a byte at a time that cleared bits
+/// inside the byte it stopped at, whose branches went one way or the other on every word. On TPC-H
+/// q21 the walk from a line to the other lines of its order finds each order's run this way, and
+/// the loop was a tenth of the query. A word with `nth` ones or fewer answers 64, as the loop did.
 pub(crate) fn nth_set(word: u64, nth: u32) -> u32 {
-    let mut left = nth;
-    for (at, byte) in (0_u32..).zip(word.to_le_bytes()) {
-        let ones = byte.count_ones();
-        if left < ones {
-            let mut byte = byte;
-            for _ in 0..left {
-                byte &= byte - 1;
-            }
-            return at * 8 + byte.trailing_zeros();
-        }
-        left -= ones;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    if nth >= word.count_ones() {
+        return 64;
     }
-    64
+    let mut sums = word - ((word >> 1) & 0x5555_5555_5555_5555);
+    sums = (sums & 0x3333_3333_3333_3333) + ((sums >> 2) & 0x3333_3333_3333_3333);
+    // Each byte holds the ones of every byte up to and including it, at most 64, so the high bit
+    // of each is clear and the subtraction below borrows across no byte.
+    sums = ((sums + (sums >> 4)) & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(ONES);
+    let within = ((u64::from(nth) * ONES | HIGH) - sums) & HIGH;
+    // The bytes whose count is at most `nth` are the ones below the byte with the bit, and there
+    // are at most seven of them, since the whole word has more.
+    let place = within.count_ones() * 8;
+    #[expect(clippy::cast_possible_truncation, reason = "each is one byte of a word")]
+    let (before, byte) = (((sums << 8) >> place) as u8, (word >> place) as u8);
+    place + u32::from(IN_BYTE[((nth - u32::from(before)) as usize) << 8 | usize::from(byte)])
 }
+
+/// The bit of the `rank`th one of byte `byte` at `rank << 8 | byte`, and 8 where it has no such one.
+const IN_BYTE: [u8; 2048] = {
+    let mut table = [8_u8; 2048];
+    let mut byte = 0;
+    while byte < 256 {
+        let (mut rank, mut bit) = (0_usize, 0_u8);
+        while bit < 8 {
+            if byte >> bit & 1 == 1 {
+                table[rank << 8 | byte] = bit;
+                rank += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
 
 fn malformed(message: impl Into<String>) -> Error {
     Error::invalid_input(format!("invalid rudb bit vector: {}", message.into()))
