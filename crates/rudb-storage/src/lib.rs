@@ -12,6 +12,7 @@
 pub mod arena;
 pub mod count;
 pub mod deletes;
+pub mod freezer;
 pub mod grams;
 pub mod horizon;
 pub mod hot;
@@ -29,6 +30,7 @@ pub mod zone;
 
 pub use count::{Counting, Counts, Partial};
 pub use deletes::{DeleteVector, Refusal, Write};
+pub use freezer::{Encoder, Freezer, Pass};
 pub use grams::Grams;
 pub use horizon::{Horizons, Killed, Reads};
 pub use hot::{HotStripe, Lease, Width};
