@@ -161,6 +161,8 @@ pub enum LogicalType {
     Time,
     /// `TIME WITH TIME ZONE`.
     TimeTz,
+    /// `TIME_NS`, nanoseconds since midnight.
+    TimeNs,
     /// `TIMESTAMP`, microseconds since the epoch.
     Timestamp,
     /// `TIMESTAMP_S`, seconds since the epoch.
@@ -171,6 +173,8 @@ pub enum LogicalType {
     TimestampNs,
     /// `TIMESTAMP WITH TIME ZONE`.
     TimestampTz,
+    /// `TIMESTAMPTZ_NS`, nanoseconds since the epoch in UTC.
+    TimestampTzNs,
     /// `INTERVAL`, the months, days and microseconds triple.
     Interval,
     /// `T[]`, a variable length list.
@@ -413,11 +417,13 @@ impl LogicalType {
             Self::BigInt
             | Self::Time
             | Self::TimeTz
+            | Self::TimeNs
             | Self::Timestamp
             | Self::TimestampS
             | Self::TimestampMs
             | Self::TimestampNs
-            | Self::TimestampTz => PhysicalType::Int64,
+            | Self::TimestampTz
+            | Self::TimestampTzNs => PhysicalType::Int64,
             Self::HugeInt | Self::Uuid => PhysicalType::Int128,
             Self::UTinyInt => PhysicalType::UInt8,
             Self::USmallInt => PhysicalType::UInt16,
@@ -558,11 +564,13 @@ impl LogicalType {
             Self::Date
                 | Self::Time
                 | Self::TimeTz
+                | Self::TimeNs
                 | Self::Timestamp
                 | Self::TimestampS
                 | Self::TimestampMs
                 | Self::TimestampNs
                 | Self::TimestampTz
+                | Self::TimestampTzNs
                 | Self::Interval
         )
     }
@@ -723,6 +731,16 @@ impl LogicalType {
             _ if self.is_numeric() && other.is_numeric() => {
                 Some(promote_numeric(self.clone(), other.clone()))
             }
+            // The nanosecond instant takes in a date and the coarser wall clocks and nothing else,
+            // so it and a `TIMESTAMP WITH TIME ZONE` need a cast to meet.
+            (
+                Self::TimestampTzNs,
+                Self::Date | Self::Timestamp | Self::TimestampS | Self::TimestampMs,
+            )
+            | (
+                Self::Date | Self::Timestamp | Self::TimestampS | Self::TimestampMs,
+                Self::TimestampTzNs,
+            ) => Some(Self::TimestampTzNs),
             // A date and a timestamp meet at the wider one, which is the timestamp, and the same
             // holds for the timestamp units. `rank_temporal` is what says which is wider.
             _ if self.is_temporal() && other.is_temporal() => {
@@ -847,11 +865,13 @@ impl fmt::Display for LogicalType {
             Self::Date => f.write_str("DATE"),
             Self::Time => f.write_str("TIME"),
             Self::TimeTz => f.write_str("TIME WITH TIME ZONE"),
+            Self::TimeNs => f.write_str("TIME_NS"),
             Self::Timestamp => f.write_str("TIMESTAMP"),
             Self::TimestampS => f.write_str("TIMESTAMP_S"),
             Self::TimestampMs => f.write_str("TIMESTAMP_MS"),
             Self::TimestampNs => f.write_str("TIMESTAMP_NS"),
             Self::TimestampTz => f.write_str("TIMESTAMP WITH TIME ZONE"),
+            Self::TimestampTzNs => f.write_str("TIMESTAMPTZ_NS"),
             Self::Interval => f.write_str("INTERVAL"),
             Self::List(inner) => write!(f, "{inner}[]"),
             Self::Array(inner, length) => write!(f, "{inner}[{length}]"),
@@ -1573,11 +1593,13 @@ fn alias(upper: &str) -> Option<LogicalType> {
         "JSON" => LogicalType::Json,
         "DATE" => LogicalType::Date,
         "TIMETZ" => LogicalType::TimeTz,
+        "TIME_NS" => LogicalType::TimeNs,
         "DATETIME" | "TIMESTAMP_US" => LogicalType::Timestamp,
         "TIMESTAMP_S" => LogicalType::TimestampS,
         "TIMESTAMP_MS" => LogicalType::TimestampMs,
         "TIMESTAMP_NS" => LogicalType::TimestampNs,
         "TIMESTAMPTZ" => LogicalType::TimestampTz,
+        "TIMESTAMPTZ_NS" => LogicalType::TimestampTzNs,
         "INTERVAL" => LogicalType::Interval,
         _ => return None,
     })
@@ -1771,11 +1793,13 @@ mod tests {
             LogicalType::Date,
             LogicalType::Time,
             LogicalType::TimeTz,
+            LogicalType::TimeNs,
             LogicalType::Timestamp,
             LogicalType::TimestampS,
             LogicalType::TimestampMs,
             LogicalType::TimestampNs,
             LogicalType::TimestampTz,
+            LogicalType::TimestampTzNs,
             LogicalType::Interval,
             LogicalType::list(LogicalType::Integer),
             LogicalType::list(LogicalType::list(LogicalType::Varchar)),

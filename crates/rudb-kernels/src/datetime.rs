@@ -984,9 +984,10 @@ const MONTH_NAMES: [&str; 12] = [
 pub(crate) fn read_off(name: &str, when: &Value) -> Result<Value> {
     let infinite = match when {
         Value::Date(day) => infinite_day(*day),
-        Value::Timestamp(stamp) | Value::TimestampTz(stamp) | Value::TimestampNs(stamp) => {
-            infinite_stamp(*stamp)
-        }
+        Value::Timestamp(stamp)
+        | Value::TimestampTz(stamp)
+        | Value::TimestampNs(stamp)
+        | Value::TimestampTzNs(stamp) => infinite_stamp(*stamp),
         _ => false,
     };
     if infinite || when.is_null() {
@@ -1010,8 +1011,17 @@ pub(crate) fn read_off(name: &str, when: &Value) -> Result<Value> {
             _ => Value::Date(days_from_civil(year, month, days_in_month(year, month))),
         });
     }
+    // A nanosecond time is a count within its day, so every part of it is the count itself.
+    if let Value::TimeNs(ticks) = when {
+        return Ok(Value::BigInt(match name {
+            "nanosecond" => ticks % 60_000_000_000,
+            "epoch_ns" => *ticks,
+            "epoch_us" => ticks / 1_000,
+            _ => ticks / 1_000_000,
+        }));
+    }
     // A nanosecond timestamp keeps the nanoseconds the other types never had.
-    if let Value::TimestampNs(ticks) = when {
+    if let Value::TimestampNs(ticks) | Value::TimestampTzNs(ticks) = when {
         return Ok(Value::BigInt(match name {
             "nanosecond" => ticks.rem_euclid(MICROS_PER_DAY * 1_000) % 60_000_000_000,
             "epoch_ns" => *ticks,

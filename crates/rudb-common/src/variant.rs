@@ -107,6 +107,8 @@ pub fn write(value: &Value, out: &mut Vec<u8>) {
         Value::TimestampS(held) => fixed(out, kind::TIMESTAMP_SEC, &held.to_le_bytes()),
         Value::TimestampMs(held) => fixed(out, kind::TIMESTAMP_MILIS, &held.to_le_bytes()),
         Value::TimestampNs(held) => fixed(out, kind::TIMESTAMP_NANOS, &held.to_le_bytes()),
+        Value::TimeNs(held) => fixed(out, kind::TIME_NANOS, &held.to_le_bytes()),
+        Value::TimestampTzNs(held) => fixed(out, kind::TIMESTAMP_NANOS_TZ, &held.to_le_bytes()),
         Value::Interval { months, days, micros } => {
             out.push(kind::INTERVAL);
             out.extend(months.to_le_bytes());
@@ -359,16 +361,14 @@ pub fn decode(bytes: &[u8]) -> Value {
         kind::UUID => Value::Uuid(i128::from_le_bytes(take(p, 0))),
         kind::DATE => Value::Date(i32::from_le_bytes(take(p, 0))),
         kind::TIME_MICROS => Value::Time(i64::from_le_bytes(take(p, 0))),
-        kind::TIME_NANOS => Value::Time(i64::from_le_bytes(take(p, 0)) / 1000),
+        kind::TIME_NANOS => Value::TimeNs(i64::from_le_bytes(take(p, 0))),
         kind::TIME_MICROS_TZ => Value::TimeTz(i64::from_le_bytes(take(p, 0))),
         kind::TIMESTAMP_SEC => Value::TimestampS(i64::from_le_bytes(take(p, 0))),
         kind::TIMESTAMP_MILIS => Value::TimestampMs(i64::from_le_bytes(take(p, 0))),
         kind::TIMESTAMP_MICROS => Value::Timestamp(i64::from_le_bytes(take(p, 0))),
         kind::TIMESTAMP_NANOS => Value::TimestampNs(i64::from_le_bytes(take(p, 0))),
         kind::TIMESTAMP_MICROS_TZ => Value::TimestampTz(i64::from_le_bytes(take(p, 0))),
-        kind::TIMESTAMP_NANOS_TZ => {
-            Value::TimestampTz(i64::from_le_bytes(take(p, 0)).div_euclid(1000))
-        }
+        kind::TIMESTAMP_NANOS_TZ => Value::TimestampTzNs(i64::from_le_bytes(take(p, 0))),
         kind::INTERVAL => Value::Interval {
             months: i32::from_le_bytes(take(p, 0)),
             days: i32::from_le_bytes(take(p, 4)),

@@ -1138,6 +1138,12 @@ fn read_value(text: &str, ty: &LogicalType) -> Result<Value> {
         LogicalType::TimestampNs => {
             text.parse().map(Value::TimestampNs).map_err(|_| whole("a nanosecond count"))
         }
+        LogicalType::TimeNs => {
+            text.parse().map(Value::TimeNs).map_err(|_| whole("a nanosecond count"))
+        }
+        LogicalType::TimestampTzNs => {
+            text.parse().map(Value::TimestampTzNs).map_err(|_| whole("a nanosecond count"))
+        }
         LogicalType::Interval => {
             let parts = read_braced(text)?;
             let [months, days, micros] = parts.as_slice() else {

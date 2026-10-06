@@ -309,6 +309,8 @@ impl<'a> One<'a> {
                 | T::TimestampS
                 | T::TimestampMs
                 | T::TimestampNs
+                | T::TimeNs
+                | T::TimestampTzNs
                 | T::TimestampTz,
             ) => Some(Self::Null { exact: true, sum: Some(0) }),
             (Value::Boolean(v), T::Boolean) => int(i128::from(*v), Some(i128::from(*v))),
@@ -323,6 +325,8 @@ impl<'a> One<'a> {
             | (Value::TimestampS(v), T::TimestampS)
             | (Value::TimestampMs(v), T::TimestampMs)
             | (Value::TimestampNs(v), T::TimestampNs)
+            | (Value::TimeNs(v), T::TimeNs)
+            | (Value::TimestampTzNs(v), T::TimestampTzNs)
             | (Value::TimestampTz(v), T::TimestampTz) => int(i128::from(*v), Some(i128::from(*v))),
             (Value::UTinyInt(v), T::UTinyInt) => int(i128::from(*v), Some(i128::from(*v))),
             (Value::USmallInt(v), T::USmallInt) => int(i128::from(*v), Some(i128::from(*v))),

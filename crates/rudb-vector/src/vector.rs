@@ -3127,7 +3127,9 @@ impl Vector {
                 | Value::Timestamp(x)
                 | Value::TimestampS(x)
                 | Value::TimestampMs(x)
-                | Value::TimestampNs(x) => Some(i128::from(*x)),
+                | Value::TimestampNs(x)
+                | Value::TimeNs(x)
+                | Value::TimestampTzNs(x) => Some(i128::from(*x)),
                 Value::HugeInt(x) | Value::Uuid(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
                 _ => None,
             },
@@ -3232,7 +3234,9 @@ impl Vector {
                     | Value::Timestamp(x)
                     | Value::TimestampS(x)
                     | Value::TimestampMs(x)
-                    | Value::TimestampNs(x) => *x,
+                    | Value::TimestampNs(x)
+                    | Value::TimeNs(x)
+                    | Value::TimestampTzNs(x) => *x,
                     _ => return false,
                 };
                 out.resize(self.len, held);
@@ -5785,6 +5789,10 @@ fn value_from(ty: &LogicalType, data: &Data, index: usize) -> Value {
         LogicalType::TimestampNs => {
             signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampNs)
         }
+        LogicalType::TimeNs => signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimeNs),
+        LogicalType::TimestampTzNs => {
+            signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampTzNs)
+        }
         LogicalType::TimestampTz => {
             signed().and_then(|x| i64::try_from(x).ok()).map(Value::TimestampTz)
         }
@@ -6161,7 +6169,9 @@ fn push_value(data: &mut Data, value: &Value) -> Result<()> {
             | Value::TimestampTz(x)
             | Value::TimestampS(x)
             | Value::TimestampMs(x)
-            | Value::TimestampNs(x) => v.push(*x),
+            | Value::TimestampNs(x)
+            | Value::TimeNs(x)
+            | Value::TimestampTzNs(x) => v.push(*x),
             Value::Decimal { unscaled, .. } => decimal!(v, i64, unscaled),
             other => return Err(Error::internal(format!("{other:?} is not a 64 bit value"))),
         },
@@ -7870,7 +7880,9 @@ mod tests {
             | Value::Timestamp(x)
             | Value::TimestampS(x)
             | Value::TimestampMs(x)
-            | Value::TimestampNs(x) => Some(i128::from(*x)),
+            | Value::TimestampNs(x)
+            | Value::TimeNs(x)
+            | Value::TimestampTzNs(x) => Some(i128::from(*x)),
             Value::HugeInt(x) | Value::Decimal { unscaled: x, .. } => Some(*x),
             _ => None,
         }

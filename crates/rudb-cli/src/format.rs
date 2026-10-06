@@ -345,6 +345,8 @@ fn type_name(ty: &LogicalType) -> String {
         LogicalType::TimestampS => "timestamp_s".to_string(),
         LogicalType::TimestampMs => "timestamp_ms".to_string(),
         LogicalType::TimestampNs => "timestamp_ns".to_string(),
+        LogicalType::TimeNs => "time_ns".to_string(),
+        LogicalType::TimestampTzNs => "timestamptz_ns".to_string(),
         LogicalType::TimestampTz => "timestamp with time zone".to_string(),
         LogicalType::Interval => "interval".to_string(),
         LogicalType::List(inner) | LogicalType::Array(inner, _) => {

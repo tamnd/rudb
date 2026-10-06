@@ -2924,15 +2924,18 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
 /// because the sentence for an ambiguous call is #395.
 fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, LogicalType)> {
     use LogicalType::{
-        BigInt, Date, Double, HugeInt, Integer, Interval, Null, SmallInt, Time, TimeTz, Timestamp,
-        TimestampMs, TimestampNs, TimestampS, TimestampTz, TinyInt, UBigInt, UHugeInt, USmallInt,
-        UTinyInt,
+        BigInt, Date, Double, HugeInt, Integer, Interval, Null, SmallInt, Time, TimeNs, TimeTz,
+        Timestamp, TimestampMs, TimestampNs, TimestampS, TimestampTz, TimestampTzNs, TinyInt,
+        UBigInt, UHugeInt, USmallInt, UTinyInt,
     };
     // The second, millisecond and nanosecond timestamps have no arithmetic of their own. Upstream
     // casts each of them to a plain timestamp and answers as it would for one, so `NS + INTERVAL`
     // is a `TIMESTAMP` and `NS - NS` is an interval.
     let precise = |ty: &LogicalType| matches!(ty, TimestampS | TimestampMs | TimestampNs);
-    if matches!((name, arguments), ("nanosecond" | "epoch_ns", [TimestampNs])) {
+    if matches!(
+        (name, arguments),
+        ("nanosecond" | "epoch_ns", [TimestampNs | TimeNs | TimestampTzNs])
+    ) {
         return Some((arguments.to_vec(), BigInt));
     }
     // The nanoseconds are what `%n` writes, so this one keeps them too.
@@ -2968,7 +2971,10 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         // `rudb-bind` fills it in from the constant.
         (
             "date_part",
-            [LogicalType::List(element), Date | Timestamp | TimestampTz | Time | TimeTz | Interval],
+            [
+                LogicalType::List(element),
+                Date | Timestamp | TimestampTz | Time | TimeTz | TimeNs | Interval,
+            ],
         ) if matches!(**element, LogicalType::Varchar | Null) => Some((
             vec![LogicalType::List(Box::new(LogicalType::Varchar)), arguments[1].clone()],
             LogicalType::Struct(Vec::new()),
@@ -3116,7 +3122,7 @@ fn temporal(name: &str, arguments: &[LogicalType]) -> Option<(Vec<LogicalType>, 
         // overload.
         ("dayname" | "monthname", [Null]) => Some((vec![Date], LogicalType::Varchar)),
         ("last_day", [Null]) => Some((vec![Date], Date)),
-        ("nanosecond" | "epoch_ns", [TimestampNs]) => kept(BigInt),
+        ("nanosecond" | "epoch_ns", [TimestampNs | TimeNs | TimestampTzNs]) => kept(BigInt),
         (
             "nanosecond" | "epoch_ms" | "epoch_us" | "epoch_ns",
             [Date | Timestamp | TimestampTz | Time | TimeTz | Interval],

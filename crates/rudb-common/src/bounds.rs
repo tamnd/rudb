@@ -156,7 +156,7 @@ pub fn scale_of(ty: &LogicalType) -> Option<u8> {
         LogicalType::TimestampMs => 3,
         LogicalType::Time | LogicalType::TimeTz => MICROS,
         LogicalType::Timestamp | LogicalType::TimestampTz => MICROS,
-        LogicalType::TimestampNs => 9,
+        LogicalType::TimestampNs | LogicalType::TimeNs | LogicalType::TimestampTzNs => 9,
         _ => return None,
     })
 }
@@ -208,7 +208,9 @@ impl Bound {
             }
             Value::TimestampS(seconds) => Self::Scaled { unscaled: i128::from(*seconds), scale: 0 },
             Value::TimestampMs(millis) => Self::Scaled { unscaled: i128::from(*millis), scale: 3 },
-            Value::TimestampNs(nanos) => Self::Scaled { unscaled: i128::from(*nanos), scale: 9 },
+            Value::TimestampNs(nanos) | Value::TimeNs(nanos) | Value::TimestampTzNs(nanos) => {
+                Self::Scaled { unscaled: i128::from(*nanos), scale: 9 }
+            }
             Value::Varchar(text) => Self::Bytes(text.as_bytes().to_vec()),
             Value::Blob(bytes) => Self::Bytes(bytes.clone()),
             _ => return None,
@@ -271,6 +273,12 @@ impl Bound {
             }
             (Self::Scaled { unscaled, scale }, LogicalType::TimestampNs) => {
                 return fit!(&restated(*unscaled, *scale, 9)?, TimestampNs);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimeNs) => {
+                return fit!(&restated(*unscaled, *scale, 9)?, TimeNs);
+            }
+            (Self::Scaled { unscaled, scale }, LogicalType::TimestampTzNs) => {
+                return fit!(&restated(*unscaled, *scale, 9)?, TimestampTzNs);
             }
             (Self::Bytes(bytes), LogicalType::Varchar) => {
                 Value::Varchar(String::from_utf8(bytes.clone()).ok()?)

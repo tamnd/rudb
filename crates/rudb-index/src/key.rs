@@ -58,7 +58,9 @@ pub fn push(value: &Value, out: &mut Vec<u8>) -> bool {
         | Value::TimestampTz(v)
         | Value::TimestampS(v)
         | Value::TimestampMs(v)
-        | Value::TimestampNs(v) => signed(out, *v),
+        | Value::TimestampNs(v)
+        | Value::TimeNs(v)
+        | Value::TimestampTzNs(v) => signed(out, *v),
         Value::UTinyInt(v) => out.extend_from_slice(&u64::from(*v).to_be_bytes()),
         Value::USmallInt(v) => out.extend_from_slice(&u64::from(*v).to_be_bytes()),
         Value::UInteger(v) => out.extend_from_slice(&u64::from(*v).to_be_bytes()),

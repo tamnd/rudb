@@ -260,6 +260,8 @@ mod tag {
     pub(super) const BIGNUM: u8 = 32;
     pub(super) const NUMERIC: u8 = 33;
     pub(super) const VARIANT: u8 = 34;
+    pub(super) const TIME_NS: u8 = 35;
+    pub(super) const TIMESTAMP_TZ_NS: u8 = 36;
 }
 
 /// Writes one value.
@@ -301,6 +303,8 @@ fn put(out: &mut Sink<'_>, value: &Value, ty: &LogicalType) -> Result<()> {
         Value::TimestampS(held) => fixed(out, tag::TIMESTAMP_S, &held.to_le_bytes()),
         Value::TimestampMs(held) => fixed(out, tag::TIMESTAMP_MS, &held.to_le_bytes()),
         Value::TimestampNs(held) => fixed(out, tag::TIMESTAMP_NS, &held.to_le_bytes()),
+        Value::TimeNs(held) => fixed(out, tag::TIME_NS, &held.to_le_bytes()),
+        Value::TimestampTzNs(held) => fixed(out, tag::TIMESTAMP_TZ_NS, &held.to_le_bytes()),
         Value::Interval { months, days, micros } => {
             out.put(&[tag::INTERVAL])?;
             out.put(&months.to_le_bytes())?;
@@ -456,6 +460,8 @@ fn get(reader: &mut BufReader<File>, ty: &LogicalType, reuse: Option<Value>) -> 
         tag::TIMESTAMP_S => Value::TimestampS(i64::from_le_bytes(take(reader)?)),
         tag::TIMESTAMP_MS => Value::TimestampMs(i64::from_le_bytes(take(reader)?)),
         tag::TIMESTAMP_NS => Value::TimestampNs(i64::from_le_bytes(take(reader)?)),
+        tag::TIME_NS => Value::TimeNs(i64::from_le_bytes(take(reader)?)),
+        tag::TIMESTAMP_TZ_NS => Value::TimestampTzNs(i64::from_le_bytes(take(reader)?)),
         tag::INTERVAL => Value::Interval {
             months: i32::from_le_bytes(take(reader)?),
             days: i32::from_le_bytes(take(reader)?),

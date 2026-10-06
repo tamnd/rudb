@@ -928,9 +928,10 @@ fn value_text(
             }
             out.push('}');
         }
-        (Value::TimestampTz(micros), _) if zone.is_some() => {
+        (Value::TimestampTz(_) | Value::TimestampTzNs(_), _) if zone.is_some() => {
             let zone = zone.unwrap_or_default();
-            string_text(&value.to_string_at_offset(zone.offset_seconds_at(*micros)), out);
+            let micros = value.zoned_micros().unwrap_or(0);
+            string_text(&value.to_string_at_offset(zone.offset_seconds_at(micros)), out);
         }
         _ => match cast_value(value, &LogicalType::Varchar, false)? {
             Value::Varchar(text) => string_text(&text, out),

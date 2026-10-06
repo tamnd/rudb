@@ -2515,7 +2515,9 @@ pub fn order(left: &Value, right: &Value) -> Result<Ordering> {
         | (Value::TimestampTz(a), Value::TimestampTz(b))
         | (Value::TimestampS(a), Value::TimestampS(b))
         | (Value::TimestampMs(a), Value::TimestampMs(b))
-        | (Value::TimestampNs(a), Value::TimestampNs(b)) => Ok(a.cmp(b)),
+        | (Value::TimestampNs(a), Value::TimestampNs(b))
+        | (Value::TimeNs(a), Value::TimeNs(b))
+        | (Value::TimestampTzNs(a), Value::TimestampTzNs(b)) => Ok(a.cmp(b)),
         (
             Value::Interval { months: am, days: ad, micros: au },
             Value::Interval { months: bm, days: bd, micros: bu },

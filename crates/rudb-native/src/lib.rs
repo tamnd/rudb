@@ -2684,6 +2684,8 @@ fn weight(ty: &LogicalType) -> usize {
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
         | LogicalType::TimestampNs
+        | LogicalType::TimeNs
+        | LogicalType::TimestampTzNs
         | LogicalType::Double
         | LogicalType::Decimal { .. } => 8,
         LogicalType::Integer | LogicalType::UInteger | LogicalType::Date | LogicalType::Float => 4,
@@ -10288,8 +10290,8 @@ fn write_at(file: &File, offset: u64, bytes: &[u8]) -> Result<()> {
 /// A tag is a number in a file somebody else wrote, so a tag that has been used is used forever and
 /// the only thing that may happen to this list is that it grows. 1 to 13 are the tags the format
 /// had when it could store thirteen types, and 14 to 27 are the rest, in the order they were added
-/// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list and 30 is the `numeric`
-/// of PostgreSQL.
+/// rather than in an order that means anything. 28 is `BIGNUM`, 29 is a list, 30 is the `numeric`
+/// of PostgreSQL, 31 is `VARIANT`, 32 is `TIME_NS` and 33 is `TIMESTAMPTZ_NS`.
 fn type_tag(ty: &LogicalType) -> Result<u8> {
     match ty {
         LogicalType::SmallInt => Ok(1),
@@ -10317,12 +10319,14 @@ fn type_tag(ty: &LogicalType) -> Result<u8> {
         LogicalType::Blob => Ok(23),
         LogicalType::Bit => Ok(24),
         LogicalType::BigNum => Ok(28),
-        LogicalType::Variant => Ok(29),
         LogicalType::TimestampS => Ok(25),
         LogicalType::TimestampMs => Ok(26),
         LogicalType::TimestampNs => Ok(27),
         LogicalType::List(element) => type_tag(element).map(|_| 29),
         LogicalType::Numeric => Ok(30),
+        LogicalType::Variant => Ok(31),
+        LogicalType::TimeNs => Ok(32),
+        LogicalType::TimestampTzNs => Ok(33),
         _ => Err(Error::not_implemented(format!("native storage for {ty}"))),
     }
 }
@@ -10387,11 +10391,13 @@ fn tag_type(tag: u8) -> Result<LogicalType> {
         23 => Ok(LogicalType::Blob),
         24 => Ok(LogicalType::Bit),
         28 => Ok(LogicalType::BigNum),
-        29 => Ok(LogicalType::Variant),
         25 => Ok(LogicalType::TimestampS),
         26 => Ok(LogicalType::TimestampMs),
         27 => Ok(LogicalType::TimestampNs),
         30 => Ok(LogicalType::Numeric),
+        31 => Ok(LogicalType::Variant),
+        32 => Ok(LogicalType::TimeNs),
+        33 => Ok(LogicalType::TimestampTzNs),
         _ => Err(invalid("column type tag is unknown")),
     }
 }
@@ -13398,7 +13404,9 @@ fn cascade(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Data> {
         | LogicalType::TimestampTz
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => Data::Int64(wanted::<i64>(bytes, rows)?.into()),
+        | LogicalType::TimestampNs
+        | LogicalType::TimeNs
+        | LogicalType::TimestampTzNs => Data::Int64(wanted::<i64>(bytes, rows)?.into()),
         // A decimal is an integer of unscaled units, so the cascade reads back into whichever
         // integer the declared width says the column is stored as.
         LogicalType::Decimal { .. } => match ty.physical() {
@@ -13425,7 +13433,9 @@ fn plain_width(ty: &LogicalType) -> Option<usize> {
         | LogicalType::TimestampTz
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => 8,
+        | LogicalType::TimestampNs
+        | LogicalType::TimeNs
+        | LogicalType::TimestampTzNs => 8,
         LogicalType::Decimal { .. } => match ty.physical() {
             PhysicalType::Int16 => 2,
             PhysicalType::Int32 => 4,
@@ -13802,7 +13812,9 @@ fn encode(vector: &Vector, settling: &mut Settling) -> Result<Vec<u8>> {
             | LogicalType::TimestampTz
             | LogicalType::TimestampS
             | LogicalType::TimestampMs
-            | LogicalType::TimestampNs,
+            | LogicalType::TimestampNs
+            | LogicalType::TimeNs
+            | LogicalType::TimestampTzNs,
             Data::Int64(values),
         ) => {
             for value in &**values {
@@ -15392,7 +15404,9 @@ fn cascade_at(ty: &LogicalType, rows: usize, bytes: &[u8], positions: &[u32]) ->
         | LogicalType::TimestampTz
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => Data::Int64(values.into()),
+        | LogicalType::TimestampNs
+        | LogicalType::TimeNs
+        | LogicalType::TimestampTzNs => Data::Int64(values.into()),
         LogicalType::Decimal { .. } => match ty.physical() {
             PhysicalType::Int16 => Data::Int16(wanted::<i16>(&values)?.into()),
             PhysicalType::Int32 => Data::Int32(wanted::<i32>(&values)?.into()),
@@ -15637,7 +15651,9 @@ fn decode(
         | LogicalType::TimestampTz
         | LogicalType::TimestampS
         | LogicalType::TimestampMs
-        | LogicalType::TimestampNs => {
+        | LogicalType::TimestampNs
+        | LogicalType::TimeNs
+        | LogicalType::TimestampTzNs => {
             let values =
                 cur.take(rows.checked_mul(8).ok_or_else(|| invalid("page size overflow"))?)?;
             Data::Int64(
