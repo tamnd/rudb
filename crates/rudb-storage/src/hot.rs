@@ -32,6 +32,12 @@
 //! into a slot leased before the seal is refused too. Once no write of the stripe is in flight
 //! and the clock has passed every commit stamped on it, its rows as of the clock are final, and
 //! [`HotStripe::settled`] says which slots the frozen stripe starts out with deleted.
+//!
+//! A thaw goes the other way, `07-the-head.md` section 7.9: [`HotStripe::thawing`] makes a sealed
+//! stripe with every slot of the frozen one, the caller decodes the values into it, and
+//! [`HotStripe::take_deletes`] turns the frozen stripe's delete vector into `deleted` stamps and
+//! row locks. Every row is created at 1, before any snapshot, and a row of the base is deleted at
+//! 1 too, so the stripe answers every reader the way the frozen one did.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
@@ -59,6 +65,10 @@ const ROWS: usize = PART_ROWS as usize;
 
 /// What `deleted` holds for a live row.
 const LIVE: u64 = u64::MAX;
+
+/// The stamp of a thawed row's insert, and of a delete in its delete vector's base: a commit
+/// before every snapshot.
+const BEFORE_ALL: u64 = 1;
 
 /// A stripe that takes inserts.
 const OPEN: u8 = 0;
@@ -275,6 +285,10 @@ pub struct HotStripe {
     touched: AtomicU64,
     /// The deletes since its freeze began, which the frozen stripe keeps as its own.
     pending: OnceLock<Arc<Mutex<DeleteVector>>>,
+    /// Whether a thaw made it, which leaves it to the thaw rule to freeze it back.
+    thawed: bool,
+    /// Writes of its rows in place committed, which the thaw rule reads as a rate.
+    writes: AtomicU64,
 }
 
 impl HotStripe {
@@ -311,7 +325,75 @@ impl HotStripe {
             changed: AtomicU64::new(0),
             touched: AtomicU64::new(now_ms()),
             pending: OnceLock::new(),
+            thawed: false,
+            writes: AtomicU64::new(0),
         }
+    }
+
+    /// Stripe `id` of table `table` made from a frozen stripe of `rows` slots, step 2 of a thaw:
+    /// sealed, with every slot leased and created at 1 and each column null. The caller writes
+    /// the values with [`Self::write`] and [`Self::write_text`], and then
+    /// [`Self::take_deletes`] before anyone else sees it.
+    ///
+    /// # Panics
+    ///
+    /// If `rows` is more than a hot stripe holds.
+    #[must_use]
+    pub fn thawing(
+        id: u32,
+        table: u32,
+        widths: &[Width],
+        undos: Arc<UndoSpace>,
+        rows: u32,
+    ) -> Self {
+        let mut stripe = Self::with_undo(id, widths, undos).in_table(table);
+        stripe.thawed = true;
+        if rows > 0 {
+            let slots = stripe.lease(rows).expect("a frozen stripe fits in a hot one");
+            for slot in slots {
+                let (part, at) = place(slot);
+                cells(stripe.created.get(part))[at].store(BEFORE_ALL, Ordering::Relaxed);
+            }
+        }
+        stripe.state.store(SEALED, Ordering::SeqCst);
+        stripe
+    }
+
+    /// The last step of making a thawed stripe: every delete in `deletes`, the frozen stripe's,
+    /// becomes the row's `deleted` stamp. The base is deleted at 1, a committed delete keeps its
+    /// timestamp, and an uncommitted one keeps its transaction's id and takes the row lock for
+    /// it, so the transaction commits or aborts it here as if it had deleted the row in place.
+    /// `checkpoint`, the frozen stripe's, is the newest change the base stands for.
+    pub fn take_deletes(&self, deletes: &DeleteVector, checkpoint: u64) {
+        let stamp = |slot: u32, ts: u64| {
+            let (part, at) = place(slot);
+            self.deleted.get_or(part, || AtomicU64::new(LIVE))[at].store(ts, Ordering::Release);
+        };
+        for slot in deletes.base().slots() {
+            stamp(slot, BEFORE_ALL);
+        }
+        self.changed.fetch_max(checkpoint, Ordering::SeqCst);
+        for &(slot, ts) in deletes.entries() {
+            stamp(slot, ts);
+            if ts & UNCOMMITTED == 0 {
+                self.changed.fetch_max(ts, Ordering::SeqCst);
+            } else {
+                let (part, at) = place(slot);
+                self.lock.get_or(part, || AtomicU64::new(0))[at].store(ts, Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether a thaw made it.
+    #[must_use]
+    pub fn is_thawed(&self) -> bool {
+        self.thawed
+    }
+
+    /// Writes of its rows in place committed so far.
+    #[must_use]
+    pub fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
     }
 
     /// The same stripe, in table `table`, which is what its undo records are held to the horizon
@@ -635,6 +717,7 @@ impl HotStripe {
             return;
         }
         self.stamped(ts);
+        self.writes.fetch_add(1, Ordering::Relaxed);
         let (part, at) = place(slot);
         self.walk_own(slot, me, |record| record.stamp(ts));
         if let Some(deleted) = self.deleted.get(part) {
@@ -863,6 +946,12 @@ impl HotStripe {
     #[cfg(test)]
     pub(crate) fn touch(&self, ms: u64) {
         self.touched.store(ms, Ordering::Relaxed);
+    }
+
+    /// Counts `n` more writes in place, for a test of the thaw rule.
+    #[cfg(test)]
+    pub(crate) fn add_writes(&self, n: u64) {
+        self.writes.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Notes a commit at `ts` to a row of it.

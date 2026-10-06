@@ -21,6 +21,7 @@ pub mod park;
 pub mod sieve;
 pub mod stripes;
 pub mod tally;
+pub mod temper;
 pub mod undo;
 pub mod zone;
 
@@ -35,5 +36,6 @@ pub use park::Wait;
 pub use sieve::{Blocked, Sieve};
 pub use stripes::{Freeze, FrozenStripe, Inserter, Rid, Stripe, StripeDirectory, to_freeze};
 pub use tally::{TALLY_VALUES, Tally};
+pub use temper::{Costs, Picked, Rate, Temper, Turns};
 pub use undo::{Collected, Heads, Row, SpillLimits, Spilled, UndoBuffer, UndoSpace};
 pub use zone::{Probe, Range, Zone};
