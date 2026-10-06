@@ -118,3 +118,85 @@ fn a_serializable_transaction_reads_and_writes_as_any_other_alone() {
     assert!(refused.to_string().contains("read-only mode"), "{refused}");
     alice.execute("ROLLBACK").expect("rolls back");
 }
+
+/// Two accounts by key, both connections in serializable transactions, and the read and the write
+/// by key prepared on each so they take the point path.
+fn keyed() -> (Database, Connection, Connection) {
+    let database = Database::new();
+    let one = database.connect();
+    let two = database.connect();
+    one.execute("CREATE TABLE accounts (id BIGINT PRIMARY KEY, balance BIGINT)").expect("creates");
+    one.execute("INSERT INTO accounts VALUES (1, 10), (2, 20)").expect("inserts");
+    for connection in [&one, &two] {
+        connection.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").expect("begins");
+    }
+    (database, one, two)
+}
+
+/// Reads the balance of `id` by its key, on the point path, `None` when no row holds it.
+fn balance(connection: &Connection, id: i64) -> Option<i64> {
+    let read = connection.prepare("SELECT balance FROM accounts WHERE id = ?").expect("prepares");
+    assert_ne!(read.explain(), "PIPELINE", "a read by key at serializable takes the point path");
+    let result = read.execute(&[Value::BigInt(id)]).expect("reads");
+    (!result.is_empty()).then(|| match result.value_at(0, 0) {
+        Value::BigInt(balance) => balance,
+        other => panic!("{other:?}"),
+    })
+}
+
+/// Adds `by` to the balance of `id` by its key, on the point path.
+fn add(connection: &Connection, id: i64, by: i64) {
+    let write = connection
+        .prepare("UPDATE accounts SET balance = balance + ? WHERE id = ?")
+        .expect("prepares");
+    assert_ne!(write.explain(), "PIPELINE", "a write by key at serializable takes the point path");
+    write.execute(&[Value::BigInt(by), Value::BigInt(id)]).expect("updates");
+}
+
+#[test]
+fn reads_and_writes_by_key_on_keys_apart_both_commit() {
+    let (_database, one, two) = keyed();
+    assert_eq!(balance(&one, 1), Some(10));
+    assert_eq!(balance(&two, 2), Some(20));
+    add(&one, 1, 1);
+    add(&two, 2, 2);
+    one.execute("COMMIT").expect("the first commits");
+    two.execute("COMMIT").expect("the second read no key the first wrote");
+    assert_eq!(count(&one, "SELECT sum(balance)::BIGINT FROM accounts"), Value::BigInt(33));
+}
+
+#[test]
+fn a_key_read_that_another_commit_wrote_fails_the_commit() {
+    let (_database, one, two) = keyed();
+    // Each makes sure the two balances add up to enough, then takes from its own: write skew.
+    for connection in [&one, &two] {
+        assert_eq!(balance(connection, 1).zip(balance(connection, 2)), Some((10, 20)));
+    }
+    add(&one, 1, -25);
+    add(&two, 2, -25);
+    one.execute("COMMIT").expect("the first commits");
+    let error = two.execute("COMMIT").expect_err("the second read the key the first wrote");
+    assert!(error.to_string().contains("could not serialize access"), "{error}");
+    assert_eq!(count(&one, "SELECT sum(balance)::BIGINT FROM accounts"), Value::BigInt(5));
+}
+
+#[test]
+fn a_key_read_and_found_missing_fails_the_commit_when_another_adds_it() {
+    let (_database, one, two) = keyed();
+    assert_eq!(balance(&one, 3), None);
+    add(&one, 1, 1);
+    two.execute("INSERT INTO accounts VALUES (3, 30)").expect("inserts");
+    two.execute("COMMIT").expect("commits");
+    let error = one.execute("COMMIT").expect_err("the key it found missing is there now");
+    assert!(error.to_string().contains("could not serialize access"), "{error}");
+}
+
+#[test]
+fn a_serializable_transaction_that_wrote_nothing_always_commits() {
+    let (_database, one, two) = keyed();
+    assert_eq!(balance(&one, 1), Some(10));
+    assert_eq!(count(&one, "SELECT sum(balance)::BIGINT FROM accounts"), Value::BigInt(30));
+    add(&two, 1, 5);
+    two.execute("COMMIT").expect("commits");
+    one.execute("COMMIT").expect("what it read is what was there at its snapshot");
+}

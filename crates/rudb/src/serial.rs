@@ -13,8 +13,11 @@
 //!
 //! What a read notes is never less than the query read and is often more. A filter is every row it
 //! picks however few of them the query went on to use, a join or a `LIMIT` above it cuts nothing,
-//! and a scan with no filter straight over it reads the whole table. A transaction that is not
-//! serializable notes nothing and pays nothing.
+//! and a scan with no filter straight over it reads the whole table. A read or a write of one row by
+//! its key notes the key, so the point path keeps its speed. A transaction that is not serializable
+//! notes nothing and pays nothing, and neither does the commit of one that wrote nothing, which is
+//! serializable at its snapshot as it is: every commit that wrote is placed at its commit, where
+//! its reads still hold.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -67,7 +70,17 @@ impl Reads {
     /// Notes a read of every row of the table `oid`, for what reads a table without a plan.
     pub(crate) fn note_table(&self, oid: i64) {
         if let Some(reads) = self.held().as_mut() {
-            reads.push(Read { oid, picked: None });
+            reads.push(Read { oid, picked: Pick::All });
+        }
+    }
+
+    /// Notes a read of the rows of `table` whose columns `key` hold `values`, which a lookup by
+    /// key reads. The values are ones [`rudb_catalog::looks_up`] takes for their columns.
+    pub(crate) fn note_key(&self, table: &Table, key: &[usize], values: &[Value]) {
+        if let Some(reads) = self.held().as_mut() {
+            let fields = key.iter().map(|&at| table.columns()[at].clone()).collect();
+            let keyed = Keyed { fields, values: values.to_vec() };
+            reads.push(Read { oid: table.oid(), picked: Pick::Key(keyed) });
         }
     }
 
@@ -80,8 +93,22 @@ impl Reads {
 #[derive(Debug)]
 pub(crate) struct Read {
     pub(crate) oid: i64,
-    /// The rows the read picked, or `None` for every row.
-    picked: Option<Picked>,
+    picked: Pick,
+}
+
+/// The rows of a table a read picked.
+#[derive(Debug)]
+enum Pick {
+    All,
+    Rows(Picked),
+    Key(Keyed),
+}
+
+/// The rows whose key columns hold the values, what a read by key picks.
+#[derive(Debug)]
+struct Keyed {
+    fields: Vec<Field>,
+    values: Vec<Value>,
 }
 
 /// The rows of a table a read picked: the columns the scan read, then the filters and projects the
@@ -139,9 +166,9 @@ fn reading(plan: &Plan, catalog: &Catalog, change: bool) -> Vec<Read> {
                 above.truncate(last + 1);
                 let plan = Arc::clone(shared.get_or_insert_with(|| Arc::new(plan.clone())));
                 let fields = plan.field_list(columns).to_vec();
-                Some(Picked { plan, index, fields, steps: above })
+                Pick::Rows(Picked { plan, index, fields, steps: above })
             }
-            _ => None,
+            _ => Pick::All,
         };
         reads.push(Read { oid, picked });
     }
@@ -257,39 +284,29 @@ fn picks_any(read: &Read, table: &Table, rows: &[u64]) -> Result<bool> {
     if rows.is_empty() {
         return Ok(false);
     }
-    let Some(picked) = &read.picked else { return Ok(true) };
-    let Some(columns) = columns(picked, table) else { return Ok(true) };
-    let types: Vec<_> = picked.fields.iter().map(|field| field.ty.clone()).collect();
+    let Some(fields) = read.picked.fields() else { return Ok(true) };
+    let Some(columns) = columns(fields, table) else { return Ok(true) };
+    let types: Vec<_> = fields.iter().map(|field| field.ty.clone()).collect();
     let chunk = table.rows().rows_at(&types, &columns, rows)?;
     // A filter that cannot be worked out over the rows is taken to pick them.
-    Ok(picked.pick(chunk).is_none_or(|kept| !kept.is_empty()))
+    Ok(read.picked.pick(chunk).is_none_or(|kept| !kept.is_empty()))
 }
 
 /// The rows of `table` that `read` picks, as text and sorted, for comparing two tables whose rows
 /// are not numbered alike. `None` stands for rows the filter could not be worked out over.
 fn rows_picked(read: &Read, table: &Table) -> Result<Option<Vec<String>>> {
-    let all: Vec<usize>;
-    let (columns, picked) = match &read.picked {
-        Some(picked) => match columns(picked, table) {
-            Some(columns) => (columns, Some(picked)),
+    let columns = match read.picked.fields() {
+        Some(fields) => match columns(fields, table) {
+            Some(columns) => columns,
             None => return Ok(None),
         },
-        None => {
-            all = (0..table.columns().len()).collect();
-            (all, None)
-        }
+        None => (0..table.columns().len()).collect(),
     };
     let rows = table.rows();
     let mut out = Vec::new();
     for at in 0..rows.chunk_count() {
         let chunk = rows.read(at, &columns)?.settled()?;
-        let chunk = match picked {
-            Some(picked) => match picked.pick(chunk) {
-                Some(kept) => kept,
-                None => return Ok(None),
-            },
-            None => chunk,
-        };
+        let Some(chunk) = read.picked.pick(chunk) else { return Ok(None) };
         for row in 0..chunk.len() {
             out.push(format!("{:?}", chunk.row(row).collect::<Vec<Value>>()));
         }
@@ -298,17 +315,56 @@ fn rows_picked(read: &Read, table: &Table) -> Result<Option<Vec<String>>> {
     Ok(Some(out))
 }
 
-/// Where the columns the read's scan read are in `table`, or `None` when one of them is not there
-/// any more as it was.
-fn columns(picked: &Picked, table: &Table) -> Option<Vec<usize>> {
-    picked
-        .fields
+/// Where the columns a read read are in `table`, or `None` when one of them is not there any more
+/// as it was.
+fn columns(fields: &[Field], table: &Table) -> Option<Vec<usize>> {
+    fields
         .iter()
         .map(|field| {
             let at = table.column_index(&field.name)?;
             (table.columns()[at].ty == field.ty).then_some(at)
         })
         .collect()
+}
+
+impl Pick {
+    /// The columns the read read, or `None` for all of them.
+    fn fields(&self) -> Option<&[Field]> {
+        match self {
+            Self::All => None,
+            Self::Rows(picked) => Some(&picked.fields),
+            Self::Key(keyed) => Some(&keyed.fields),
+        }
+    }
+
+    /// The rows of `chunk`, which holds the columns of [`Self::fields`], that the read picks.
+    /// `None` when that cannot be worked out over them.
+    fn pick(&self, chunk: Chunk) -> Option<Chunk> {
+        match self {
+            Self::All => Some(chunk),
+            Self::Rows(picked) => picked.pick(chunk),
+            Self::Key(keyed) => {
+                let selection = Selection::from_predicate(chunk.len(), |row| {
+                    chunk.row(row).zip(&keyed.values).all(|(held, value)| same_key(&held, value))
+                });
+                chunk.compact(&selection).ok()
+            }
+        }
+    }
+}
+
+/// Whether a key column holds `value`, with the two integer types alike as the keys have them.
+fn same_key(held: &Value, value: &Value) -> bool {
+    let int = |value: &Value| match *value {
+        Value::Integer(value) => Some(i64::from(value)),
+        Value::BigInt(value) => Some(value),
+        _ => None,
+    };
+    match (int(held), int(value)) {
+        (Some(held), Some(value)) => held == value,
+        (None, None) => held == value && !held.is_null(),
+        _ => false,
+    }
 }
 
 impl Picked {

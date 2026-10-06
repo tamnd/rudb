@@ -53,15 +53,13 @@ pub(crate) struct Open {
     pub(crate) aborted: bool,
     /// Whether it was begun `READ ONLY`.
     pub(crate) read_only: bool,
-    /// Whether it was begun `ISOLATION LEVEL SERIALIZABLE`.
-    pub(crate) serializable: bool,
     /// What it took when it first touched the database, and what it has written since.
     pub(crate) snapshot: Option<Snapshot>,
 }
 
 impl Open {
-    pub(crate) fn new(read_only: bool, serializable: bool) -> Self {
-        Self { aborted: false, read_only, serializable, snapshot: None }
+    pub(crate) fn new(read_only: bool) -> Self {
+        Self { aborted: false, read_only, snapshot: None }
     }
 }
 
