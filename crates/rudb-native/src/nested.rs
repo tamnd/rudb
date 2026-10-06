@@ -19,6 +19,7 @@ pub(super) fn to_bytes(vector: &Vector) -> Result<Vector> {
         return Err(Error::internal("a list page was asked of a column that is not a list"));
     };
     let mut rows = Vec::with_capacity(vector.len());
+    // row at a time: a list page is written from the values of each list, which have no flat layout.
     for row in 0..vector.len() {
         rows.push(match vector.try_value_at(row)? {
             Value::Null => Value::Null,
@@ -39,6 +40,7 @@ pub(super) fn from_bytes(ty: &LogicalType, bytes: &Vector) -> Result<Vector> {
         return Err(Error::internal("a list page was read as a column that is not a list"));
     };
     let mut rows = Vec::with_capacity(bytes.len());
+    // row at a time: a list page is read back into the values of each list, which have no flat layout.
     for row in 0..bytes.len() {
         rows.push(match bytes.try_value_at(row)? {
             Value::Null => Value::Null,

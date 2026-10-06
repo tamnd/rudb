@@ -530,6 +530,7 @@ fn lengths(
         Kind::Null => return Ok(()),
         Kind::Display { numeric } => {
             let start = rows.start;
+            // row at a time: the types with no encoder of their own are written from their display text.
             for i in (0..lens.len()).filter(|&i| live.at(start + i)) {
                 let text = vector.value_at(start + i).to_string();
                 try_stage(lens, staged, i, |out| {

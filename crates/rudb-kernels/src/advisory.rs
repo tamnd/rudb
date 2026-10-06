@@ -93,6 +93,7 @@ pub(crate) fn call<V: AsRef<Vector>>(
     };
     let void = || Value::Varchar(String::new());
     let mut values = Vec::with_capacity(rows);
+    // row at a time: each row takes or gives back a lock, which is a call into the lock table per row.
     for row in 0..rows {
         let mode = match action {
             Action::UnlockAll => {
