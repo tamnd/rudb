@@ -18,6 +18,7 @@ const SETUP: &[&str] = &[
 
 const SET: &str = "UPDATE t SET f0 = ? WHERE id = ?";
 const ADD: &str = "UPDATE t SET n = n + ? WHERE id = ?";
+const DELETE: &str = "DELETE FROM t WHERE id = ?";
 
 /// One database and two connections to it, `a` and `b`.
 struct Side {
@@ -216,10 +217,64 @@ fn held_rows(pair: &Pair) {
     assert_eq!(pair.row(A, 20), row_of("v20", 61));
 }
 
+/// A delete by key, which takes the row out where it is: a row there and one not, a key put back
+/// after its row went, in a transaction and its rollback, and a row another transaction holds.
+fn deleted_rows(pair: &Pair) {
+    use Who::{A, B};
+    let id = Value::BigInt;
+    assert_eq!(pair.short.a.prepare(DELETE).expect("prepares").explain(), "DeleteOne t(id)");
+    assert!(pair.update(A, DELETE, &[id(100)]));
+    assert!(pair.update(A, DELETE, &[id(100)]));
+    assert_eq!(pair.row(B, 100), Vec::<Vec<Value>>::new());
+    assert!(!pair.run(A, "INSERT INTO t VALUES (101, 'x', 1, 1, 1.0)"));
+    assert!(pair.run(A, "INSERT INTO t VALUES (100, 'back', 1, 1, 1.0)"));
+    assert_eq!(pair.row(B, 100), row_of("back", 1));
+    pair.same(A);
+
+    pair.run(A, "BEGIN");
+    assert!(pair.update(A, DELETE, &[id(200)]));
+    assert!(pair.run(A, "INSERT INTO t VALUES (9100, 'y', 1, 1, 1.0)"));
+    assert!(pair.update(A, DELETE, &[id(9100)]));
+    assert!(pair.update(A, ADD, &[id(1), id(199)]));
+    assert_eq!(pair.row(A, 200), Vec::<Vec<Value>>::new());
+    assert_eq!(pair.row(B, 200), row_of("v200", 600));
+    assert!(pair.update(B, DELETE, &[id(201)]));
+    pair.same(A);
+    assert!(pair.run(A, "COMMIT"));
+    pair.same(B);
+    assert_eq!(pair.row(B, 199), row_of("v199", 598));
+
+    pair.run(A, "BEGIN");
+    assert!(pair.update(A, DELETE, &[id(300)]));
+    assert_eq!(pair.row(A, 300), Vec::<Vec<Value>>::new());
+    pair.run(A, "ROLLBACK");
+    assert_eq!(pair.row(A, 300), row_of("v300", 900));
+
+    for side in [&pair.short, &pair.planned] {
+        for who in [&side.a, &side.b] {
+            who.execute("SET lock_timeout = '0'").expect("sets");
+        }
+    }
+    pair.run(A, "BEGIN");
+    assert!(pair.update(A, SET, &[text("a400"), id(400)]));
+    assert!(pair.update(A, DELETE, &[id(500)]));
+    assert!(!pair.update(B, DELETE, &[id(400)]));
+    assert!(!pair.update(B, SET, &[text("b500"), id(500)]));
+    assert!(pair.run(A, "COMMIT"));
+    assert!(pair.update(B, DELETE, &[id(400)]));
+    pair.same(B);
+}
+
 #[test]
 fn a_write_by_key_inside_a_transaction_does_what_the_plan_does() {
     let pair = Pair::new(Database::new(), Database::new());
     own_rows(&pair);
+}
+
+#[test]
+fn a_delete_by_key_does_what_the_plan_does() {
+    let pair = Pair::new(Database::new(), Database::new());
+    deleted_rows(&pair);
 }
 
 #[test]
@@ -248,6 +303,7 @@ fn a_write_by_key_inside_a_transaction_is_logged_and_read_back() {
     pair.planned.db.execute("CHECKPOINT").expect("checkpoints");
     own_rows(&pair);
     held_rows(&pair);
+    deleted_rows(&pair);
     let Pair { short: a, planned: b } = pair;
     std::mem::forget(a);
     std::mem::forget(b);
@@ -255,7 +311,7 @@ fn a_write_by_key_inside_a_transaction_is_logged_and_read_back() {
     let (short_db, planned_db) = (open(&short), open(&planned));
     let seen = rows(&short_db.execute(all).expect("reads"));
     assert_eq!(seen, rows(&planned_db.execute(all).expect("reads")));
-    assert_eq!(seen.len(), 5000);
+    assert_eq!(seen.len(), 4996);
     drop((short_db, planned_db));
     for path in [short, planned] {
         let _ = std::fs::remove_file(&path);
