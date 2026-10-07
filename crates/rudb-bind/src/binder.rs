@@ -384,6 +384,10 @@ pub(crate) struct Binder<'a> {
     /// Whether a `DEFAULT` binds as a null that the statement replaces afterwards, which is what an
     /// `UPDATE` does with `SET c = DEFAULT`.
     pub(crate) default_as_null: bool,
+    /// Whether the select list of the next block keeps a parameter of no type as it is, so that
+    /// the `INSERT` or the `UPDATE` above it gives the parameter the type of its column. In other
+    /// blocks PostgreSQL makes such a column a `text`.
+    pub(crate) unknowns_kept: bool,
     /// Set while an aggregate's own arguments are being bound, so nesting is caught.
     pub(crate) in_aggregate: bool,
     /// Whether an aggregate of `USING KEY` is being bound, where one inside another is refused in
@@ -525,6 +529,7 @@ impl<'a> Binder<'a> {
             insert_inputs: None,
             copy_into: None,
             default_as_null: false,
+            unknowns_kept: false,
             in_aggregate: false,
             folding: false,
             in_filter: false,
@@ -703,11 +708,14 @@ impl<'a> Binder<'a> {
     /// definition ends up outermost, which is the order they have to be filled in.
     fn bind_materialized(&mut self, ast: &Ast, written: &ast::Query) -> Result<(NodeRef, Scope)> {
         let depth = self.materialized.len();
+        // A parameter of no type in a definition is a `text`, whatever the body keeps.
+        let unknowns_kept = std::mem::replace(&mut self.unknowns_kept, false);
         let held = ast.cte_list(written.ctes).to_vec();
         let mut definitions = Vec::with_capacity(held.len());
         for &index in &held {
             definitions.push(self.bind_definition(ast, index)?);
         }
+        self.unknowns_kept = unknowns_kept;
         let (mut node, scope) = self.bind_body(ast, written)?;
         for (at, definition) in definitions.into_iter().enumerate().rev() {
             let entry = &self.materialized[depth + at];
@@ -1506,7 +1514,10 @@ impl<'a> Binder<'a> {
         left: ast::QueryRef,
         right: ast::QueryRef,
     ) -> Result<(NodeRef, Scope)> {
+        // A parameter of no type in one side takes the type of the column of the other side.
+        self.unknowns_kept = true;
         let (left_node, left_scope) = self.bind_query(ast, left)?;
+        self.unknowns_kept = true;
         let (right_node, right_scope) = self.bind_query(ast, right)?;
         let merged = if operator.by_name {
             match_by_name(&left_scope, &right_scope)?
@@ -1643,6 +1654,7 @@ impl<'a> Binder<'a> {
         query: &ast::Query,
     ) -> Result<(NodeRef, Scope)> {
         let written = ast.select(select);
+        let unknowns_kept = std::mem::replace(&mut self.unknowns_kept, false);
         self.want_ascending |= !written.group_by.is_empty() || written.group_by_all;
         // A window belongs to the block that wrote it, and a block can be bound inside another one
         // without a subquery in between, so the outer block's runs are put aside for the duration
@@ -1769,6 +1781,7 @@ impl<'a> Binder<'a> {
         self.clause = "SELECT clause";
         self.unnest_here = true;
         self.alias_clause(AliasClause::Select);
+        self.unknowns_kept = unknowns_kept;
         let (mut exprs, mut names, origins) =
             self.bind_targets(ast, &targets, &input, &mut above)?;
         self.unnest_here = false;
@@ -2034,6 +2047,7 @@ impl<'a> Binder<'a> {
         input: &Scope,
         above: &mut Vec<PendingSubquery>,
     ) -> Result<Targets> {
+        let unknowns_kept = std::mem::replace(&mut self.unknowns_kept, false);
         let mut exprs = Vec::with_capacity(targets.len());
         let mut names = Vec::with_capacity(targets.len());
         // The table column of each target that is a plain column, taken before the target is moved
@@ -2117,7 +2131,11 @@ impl<'a> Binder<'a> {
                 if name.len == 1 && same_name(ast.name(name).last().unwrap_or_default(), "unnest"));
             let expr = self.bind_expr(ast, target.expr, input);
             self.unnest_root = false;
-            let expr = expr?;
+            let mut expr = expr?;
+            // PostgreSQL makes a result column of a parameter of no type a `text`.
+            if self.session.postgres().is_some() && !unknowns_kept && self.is_placeholder(expr) {
+                expr = self.cast_to(expr, &LogicalType::Varchar);
+            }
             self.lift_over_aggregate(before, above, input)?;
             if let Some(taking) = self.unnest_struct.take() {
                 // A struct is a column per field, named by the fields whatever the target's alias.
@@ -2144,6 +2162,10 @@ impl<'a> Binder<'a> {
                     Some(Origin::typed(VOID))
                 }
                 _ if plain => origin,
+                // A parameter is of the type that the client declared for it, as in PostgreSQL.
+                ast::Expr::Parameter { name } => {
+                    self.parameters.declared_type(ast.string(name)).map(Origin::typed)
+                }
                 // A cast keeps the type it wrote, with the typmod, and is no table column.
                 ast::Expr::Cast { ty, .. } => {
                     rudb_pgtypes::declared_type(ast.string(ty)).map(Origin::typed)

@@ -67,6 +67,8 @@ pub struct Prepared {
     /// The last description, with the stamp and the declared types it was found with. A client of
     /// the extended protocol asks for one before each execution.
     described: Arc<Mutex<Option<Described>>>,
+    /// The PostgreSQL type that the client declared for each parameter, in the order of `names`.
+    types: Vec<Option<DeclaredType>>,
 }
 
 /// A description that [`Prepared::describe`] keeps.
@@ -897,7 +899,25 @@ impl Prepared {
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
         let described = Arc::default();
-        Ok(Self { shared, sql, ast, names, short, numbered, described })
+        Ok(Self { shared, sql, ast, names, short, numbered, described, types: Vec::new() })
+    }
+
+    /// Gives the parameters the PostgreSQL types that the client declared, in the order of
+    /// [`Prepared::parameters`], with `None` for no type. A parameter alone in the select list is
+    /// a column of its declared type, so `SELECT $1` of a `name` is a `name` and not a `text`.
+    pub fn declare(&mut self, types: Vec<Option<DeclaredType>>) {
+        self.types = types;
+        *self.described.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// `parameters` with the declared types.
+    fn typed(&self, mut parameters: Parameters) -> Parameters {
+        for (name, ty) in self.names.iter().zip(&self.types) {
+            if let Some(ty) = ty {
+                parameters.declare(name.clone(), *ty);
+            }
+        }
+        parameters
     }
 
     /// The statement as it was written.
@@ -948,7 +968,7 @@ impl Prepared {
         {
             return Ok(held.description.clone());
         }
-        let described = self.shared.describe(&self.ast, &self.names, declared)?;
+        let described = self.shared.describe(&self.ast, &self.names, declared, &self.types)?;
         let parameters = self
             .names
             .iter()
@@ -1024,7 +1044,7 @@ impl Prepared {
             {
                 return done;
             }
-            self.run(&Parameters::positional(values.to_vec()))
+            self.run(&self.typed(Parameters::positional(values.to_vec())))
         });
         result.map_err(|error| self.shared.process_error(error))
     }
@@ -1043,6 +1063,7 @@ impl Prepared {
         for (name, value) in values {
             parameters.set(*name, value.clone());
         }
+        let parameters = self.typed(parameters);
         let result = self.shared.in_transaction(&self.sql, || self.run(&parameters));
         result.map_err(|error| self.shared.process_error(error))
     }

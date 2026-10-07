@@ -590,7 +590,16 @@ impl Binder<'_> {
                  parameters, use PREPARE to prepare a statement, followed by EXECUTE",
             ));
         };
-        Ok(self.add_constant(value.clone()))
+        let constant = self.add_constant(value.clone());
+        // A null has no type, and in PostgreSQL it is a null of the type of its parameter.
+        if value.is_null()
+            && self.session.postgres().is_some()
+            && let Some(ty) = self.parameters.declared_type(name)
+            && let Some(ty) = rudb_pgtypes::logical_type(ty.oid)
+        {
+            return Ok(self.cast_to(constant, &ty));
+        }
+        Ok(constant)
     }
 
     fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {

@@ -1093,7 +1093,7 @@ impl Extended {
 fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Statement, Problem> {
     let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
     let command = setting::parse(&sql);
-    let prepared = match rudb::statements(&sql).map_err(engine)?.len() {
+    let mut prepared = match rudb::statements(&sql).map_err(engine)?.len() {
         0 => None,
         1 if command.is_some() => None,
         1 => Some(runner.connection.prepare(&sql).map_err(engine)?),
@@ -1118,13 +1118,27 @@ fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Stat
     let slots = numbers.unwrap_or_else(|| (0..names.len()).collect());
     let count = slots.iter().map(|slot| slot + 1).max().unwrap_or(0).max(types.len());
     types.resize(count, 0);
+    // A parameter of the type `unknown` has no type, as in `parse_analyze_varparams`.
+    for oid in &mut types {
+        if *oid == rudb_pgtypes::oid::UNKNOWN {
+            *oid = 0;
+        }
+    }
+    // Only a type that the engine reads a value of, so that Describe and Execute give one type.
+    if let Some(prepared) = &mut prepared {
+        let declared = slots.iter().map(|slot| {
+            let oid = types[*slot];
+            logical_type(oid).map(|_| rudb_common::DeclaredType { oid, typmod: -1 })
+        });
+        prepared.declare(declared.collect());
+    }
     let positional = count == slots.len()
         && slots.iter().enumerate().all(|(i, s)| {
             // The slots are distinct and below `count`, so they are a permutation of it.
             *s < count && !slots[..i].contains(s)
         });
     let control = Control::of(&sql);
-    let statement = Statement {
+    let mut statement = Statement {
         sql,
         control,
         command,
@@ -1141,7 +1155,16 @@ fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Stat
     // PostgreSQL binds a query and a change to the data at `Parse`, so a name that is not there
     // is an error of `Parse` and not of `Execute`.
     if statement.prepared.as_ref().is_some_and(Prepared::binds_at_parse) {
-        statement.describe()?;
+        // The values of `Bind` are read as the types that `Parse` finds, so the statement runs
+        // with those types, and a null value is a null of its type.
+        let found = statement.found()?.to_vec();
+        if let Some(prepared) = &mut statement.prepared {
+            let types = statement.slots.iter().map(|slot| {
+                let oid = found[*slot];
+                logical_type(oid).map(|_| rudb_common::DeclaredType { oid, typmod: -1 })
+            });
+            prepared.declare(types.collect());
+        }
         // A parameter that the query does not use and that `Parse` gave no type has no type at
         // all, as `check_variable_parameters` finds after the analysis.
         if let Some(unused) = (0..statement.types.len())

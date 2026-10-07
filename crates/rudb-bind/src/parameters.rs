@@ -21,6 +21,9 @@ pub struct Parameters {
     relations: Vec<(String, Written)>,
     capture: Option<Capture>,
     placeholders: Option<Placeholders>,
+    /// The PostgreSQL type that the client declared for a parameter, such as `name` or `oid`,
+    /// which a value of its logical type does not tell.
+    types: Vec<(String, DeclaredType)>,
 }
 
 /// What a statement takes and gives, found by binding it with no values, which is what a client
@@ -180,6 +183,7 @@ impl Parameters {
             relations: Vec::new(),
             capture: None,
             placeholders: None,
+            types: Vec::new(),
         }
     }
 
@@ -219,6 +223,19 @@ impl Parameters {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.iter().find(|(held, _)| same(held, name)).map(|(_, value)| value)
+    }
+
+    /// Gives one parameter the PostgreSQL type that the client declared for it.
+    pub fn declare(&mut self, name: impl Into<String>, ty: DeclaredType) {
+        let name = name.into();
+        self.types.retain(|(held, _)| !same(held, &name));
+        self.types.push((name, ty));
+    }
+
+    /// The PostgreSQL type that the client declared for one parameter, if it declared one.
+    #[must_use]
+    pub fn declared_type(&self, name: &str) -> Option<DeclaredType> {
+        self.types.iter().find(|(held, _)| same(held, name)).map(|(_, ty)| *ty)
     }
 
     /// Gives the data changing definition at `cte` in the statement the rows it produced.
@@ -278,6 +295,7 @@ impl Parameters {
             && self.relations.is_empty()
             && self.capture.is_none()
             && self.placeholders.is_none()
+            && self.types.is_empty()
     }
 
     /// How many were provided.

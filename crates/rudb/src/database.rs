@@ -5999,6 +5999,7 @@ impl Shared {
         ast: &Ast,
         names: &[String],
         declared: &[Option<LogicalType>],
+        types: &[Option<DeclaredType>],
     ) -> Result<Described> {
         let declared = names
             .iter()
@@ -6014,7 +6015,12 @@ impl Shared {
                 | ast::Statement::Delete(_)]
         );
         if bound {
-            let parameters = Parameters::describing(placeholders.clone());
+            let mut parameters = Parameters::describing(placeholders.clone());
+            for (name, ty) in names.iter().zip(types) {
+                if let Some(ty) = ty {
+                    parameters.declare(name.clone(), *ty);
+                }
+            }
             rudb_bind::bind_statement_with(ast, &self.read(), &parameters, &self.session())?;
         }
         Ok(placeholders.described())
