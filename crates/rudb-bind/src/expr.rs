@@ -3809,17 +3809,9 @@ impl Binder<'_> {
                 types.push(None);
                 continue;
             }
-            let Some(mut oid) = postgres_oid(ty) else {
+            let Some(oid) = written_oid(ast, written, ty) else {
                 return Ok(());
             };
-            // A cast names the PostgreSQL type, which can be one that rudb holds in the same way,
-            // as `varchar` and `text`.
-            if let ast::Expr::Cast { ty: name, .. } = ast.expr(written)
-                && let Some(declared) = rudb_pgtypes::declared_type(ast.string(name))
-                && rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(ty)
-            {
-                oid = declared.oid;
-            }
             types.push(Some(oid));
         }
         let common = match rudb_pgtypes::common_type(&types) {
@@ -5246,9 +5238,25 @@ fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) ->
     Error::binder(message)
 }
 
+/// The PostgreSQL type of a value of the type `ty` that `written` wrote, or `None` for a type such
+/// as a struct or a map, which PostgreSQL sends as text.
+///
+/// A cast names the PostgreSQL type, which can be one that rudb holds in the same way, as
+/// `varchar` and `text`.
+pub(crate) fn written_oid(ast: &Ast, written: ast::ExprRef, ty: &LogicalType) -> Option<u32> {
+    let oid = postgres_oid(ty)?;
+    if let ast::Expr::Cast { ty: name, .. } = ast.expr(written)
+        && let Some(declared) = rudb_pgtypes::declared_type(ast.string(name))
+        && rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(ty)
+    {
+        return Some(declared.oid);
+    }
+    Some(oid)
+}
+
 /// The PostgreSQL type of a rudb type that has one of its own, or `None` for a type such as a
 /// struct or a map, which PostgreSQL sends as text.
-fn postgres_oid(ty: &LogicalType) -> Option<u32> {
+pub(crate) fn postgres_oid(ty: &LogicalType) -> Option<u32> {
     match ty {
         LogicalType::Varchar => Some(rudb_pgtypes::oid::TEXT),
         LogicalType::List(element) => {

@@ -17,9 +17,9 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    AggregateTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules,
-    JoinColumns, LogicalType, Origin, Result, Semantics, Session, ShowBehavior, Span, SqlState,
-    Stat, StateKey, UnknownTypes, Value, ValuesNames,
+    AggregateTypes, CommonTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field,
+    FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session, ShowBehavior,
+    Span, SqlState, Stat, StateKey, UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -35,7 +35,7 @@ use rudb_plan::{
     SetOpKind, Share, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
-use crate::expr::describe;
+use crate::expr::{describe, postgres_oid, written_oid};
 use crate::fold;
 use crate::parameters::{Parameters, Written};
 use crate::scope::{Joined, Scope, Visible};
@@ -1480,6 +1480,17 @@ impl<'a> Binder<'a> {
             let types = defaults.iter().map(|(ty, _)| ty.clone()).collect();
             return self.values_node(ast, query, &bound, types);
         }
+        if self.semantics.common_types() == CommonTypes::Postgres {
+            for at in 0..width {
+                let column: Vec<ast::ExprRef> =
+                    written.iter().map(|&row| ast.expr_list(row)[at]).collect();
+                let mut values: Vec<ExprRef> = bound.iter().map(|row| row[at]).collect();
+                self.common_type(ast, &column, &mut values, Some("VALUES"))?;
+                for (row, value) in bound.iter_mut().zip(values) {
+                    row[at] = value;
+                }
+            }
+        }
         let mut types = Vec::with_capacity(width);
         for at in 0..width {
             let mut ty = self.plan.expr_type(bound[0][at]).clone();
@@ -1563,15 +1574,28 @@ impl<'a> Binder<'a> {
     ) -> Result<(NodeRef, Scope)> {
         // A parameter of no type in one side takes the type of the column of the other side.
         self.unknowns_kept = true;
-        let (left_node, left_scope) = self.bind_query(ast, left)?;
+        let (left_node, mut left_scope) = self.bind_query(ast, left)?;
         self.unknowns_kept = true;
-        let (right_node, right_scope) = self.bind_query(ast, right)?;
-        let merged = if operator.by_name {
+        let (right_node, mut right_scope) = self.bind_query(ast, right)?;
+        let mut common = Vec::new();
+        if !operator.by_name
+            && left_scope.len() == right_scope.len()
+            && self.semantics.common_types() == CommonTypes::Postgres
+        {
+            let sides = [(left, left_node, &mut left_scope), (right, right_node, &mut right_scope)];
+            common = self.set_op_types(ast, operator.op, sides)?;
+        }
+        let mut merged = if operator.by_name {
             match_by_name(&left_scope, &right_scope)?
         } else {
             match_by_position(&left_scope, &right_scope, operator.op)
                 .map_err(|error| error.with_fallback_span(first_column(ast, right)))?
         };
+        for (column, ty) in merged.iter_mut().zip(common) {
+            if let Some(ty) = ty {
+                column.ty = ty;
+            }
+        }
         let left_node = self.conform(left_node, &left_scope, &merged, |column| column.left)?;
         let right_node = self.conform(right_node, &right_scope, &merged, |column| column.right)?;
         let index = self.fresh_index();
@@ -1614,6 +1638,96 @@ impl<'a> Binder<'a> {
         }
         node = self.apply_limit(ast, query, node, &mut scope)?;
         Ok((node, scope))
+    }
+
+    /// The types of the columns of a set operation in a PostgreSQL session, the rule of
+    /// `transformSetOperationTree`, with one entry for each column.
+    ///
+    /// The two columns at a position take the type of `select_common_type`, and two categories
+    /// are error 42804 `UNION types integer and boolean cannot be matched` at the column of the
+    /// side that does not match. A string literal that a plain `SELECT` writes as its column has
+    /// no type of its own, so it is read with the input function of the common type, and its error
+    /// is at the literal. The entry is the common type when the two sides hold different types,
+    /// and `None` when they hold the same one or when the rule leaves the column to the pin.
+    fn set_op_types(
+        &mut self,
+        ast: &Ast,
+        op: SetOp,
+        mut sides: [(ast::QueryRef, NodeRef, &mut Scope); 2],
+    ) -> Result<Vec<Option<LogicalType>>> {
+        let width = sides[0].2.len();
+        let mut common = Vec::with_capacity(width);
+        'column: for at in 0..width {
+            let mut written = [None; 2];
+            let mut types = [None; 2];
+            for (side, (query, _, scope)) in sides.iter().enumerate() {
+                let ty = &scope.columns[at].ty;
+                written[side] = written_column(ast, *query, at, scope.len());
+                let unknown = match written[side].map(|expr| ast.expr(expr)) {
+                    // A parameter of no type takes the type of the other side in `conform`.
+                    Some(ast::Expr::Parameter { .. }) => {
+                        common.push(None);
+                        continue 'column;
+                    }
+                    Some(ast::Expr::Literal { kind: LiteralKind::String, .. }) => true,
+                    _ => *ty == LogicalType::Null,
+                };
+                if unknown {
+                    continue;
+                }
+                let oid = match written[side] {
+                    Some(expr) => written_oid(ast, expr, ty),
+                    None => postgres_oid(ty),
+                };
+                let Some(oid) = oid else {
+                    common.push(None);
+                    continue 'column;
+                };
+                types[side] = Some(oid);
+            }
+            let oid = rudb_pgtypes::common_type(&types).map_err(|mismatch| {
+                let first = rudb_pgtypes::format_type(mismatch.first);
+                let other = rudb_pgtypes::format_type(mismatch.other);
+                let (query, _, _) = &sides[mismatch.at];
+                let span = written[mismatch.at]
+                    .map_or_else(|| first_column(ast, *query), |expr| ast.leftmost_span(expr));
+                Error::binder(format!("{} types {first} and {other} cannot be matched", op.name()))
+                    .state(SqlState::DATATYPE_MISMATCH)
+                    .with_span(span)
+            })?;
+            let Some(target) = rudb_pgtypes::logical_type(oid) else {
+                common.push(None);
+                continue;
+            };
+            for (side, (_, node, scope)) in sides.iter_mut().enumerate() {
+                let Some(expr) = written[side] else { continue };
+                if scope.columns[at].ty == target {
+                    continue;
+                }
+                let Some(value) = self.read_literal(ast, expr, oid) else { continue };
+                let value = self.cast_to(value?, &target);
+                // The literal is the column of the projection of its `SELECT`, which takes the
+                // value read in its place. Under an `ORDER BY` or a `LIMIT` the side is cast to
+                // the type in `conform`, which gives the same value.
+                let binding = scope.columns[at].binding;
+                let Node::Project { index, exprs, .. } = *self.plan.node(*node) else { continue };
+                if index != binding.table {
+                    continue;
+                }
+                let mut list = self.plan.expr_list(exprs).to_vec();
+                list[binding.column as usize] = value;
+                let list = self.plan.add_expr_list(&list);
+                if let Node::Project { exprs, .. } = self.plan.node_mut(*node) {
+                    *exprs = list;
+                }
+                scope.columns[at].ty = target.clone();
+            }
+            // Two nulls are the common type too, which is `text`.
+            let (one, other) = (&sides[0].2.columns[at].ty, &sides[1].2.columns[at].ty);
+            let same = one == other && *one != LogicalType::Null;
+            common.push(if same { None } else { Some(target) });
+        }
+        Ok(common)
     }
 
     /// Projects one side of a set operation onto the columns the operation comes out with.
@@ -5917,6 +6031,26 @@ fn first_column(ast: &Ast, query: ast::QueryRef) -> Span {
     first.map_or_else(|| ast.query_span(query), |expr| ast.expr_span(expr))
 }
 
+/// The expression that a side of a set operation writes as its column `at`, when the side is a
+/// plain `SELECT` whose targets are its columns one for one.
+fn written_column(
+    ast: &Ast,
+    query: ast::QueryRef,
+    at: usize,
+    width: usize,
+) -> Option<ast::ExprRef> {
+    let ast::QueryBody::Select(select) = ast.query(query).body else {
+        return None;
+    };
+    let targets = ast.target_list(ast.select(select).targets);
+    let starred =
+        targets.iter().any(|target| matches!(ast.expr(target.expr), ast::Expr::Star { .. }));
+    if starred || targets.len() != width {
+        return None;
+    }
+    Some(targets[at].expr)
+}
+
 /// What was written between the two sides of a set operation.
 #[derive(Clone, Copy)]
 struct Operator {
@@ -5945,11 +6079,7 @@ struct Merged {
 /// The names are the left side's, so `SELECT a FROM t UNION SELECT b FROM u` comes out as `a`.
 fn match_by_position(left: &Scope, right: &Scope, op: SetOp) -> Result<Vec<Merged>> {
     if left.len() != right.len() {
-        let context = match op {
-            SetOp::Union => "UNION",
-            SetOp::Except => "EXCEPT",
-            SetOp::Intersect => "INTERSECT",
-        };
+        let context = op.name();
         return Err(Error::binder(format!(
             "Set operations can only apply to expressions with the same number of result columns, but left side has {} and right side has {}",
             left.len(),

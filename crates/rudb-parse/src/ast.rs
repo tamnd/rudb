@@ -868,6 +868,18 @@ pub enum SetOp {
     Intersect,
 }
 
+impl SetOp {
+    /// The keyword of the operator.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Union => "UNION",
+            Self::Except => "EXCEPT",
+            Self::Intersect => "INTERSECT",
+        }
+    }
+}
+
 /// Whether a set operator or an aggregate keeps duplicates.
 ///
 /// `Unstated` is not the same as `All` even though the two agree for `UNION`, because they disagree

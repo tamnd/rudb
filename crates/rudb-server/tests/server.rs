@@ -2842,3 +2842,93 @@ fn a_cast_between_timestamptz_and_a_type_without_a_zone_reads_the_time_zone_sett
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
+    let dirs = Dirs::new("set-op-type");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values and the errors of the PostgreSQL 19 oracle. A string literal that a `SELECT`
+    // writes as a column is read with the input function of the type of the other side.
+    for (sql, value) in [
+        ("select string_agg(column1::text, ',') from (values (1), ('2')) v", "1,2"),
+        ("select pg_typeof(column1) from (values (1), (2.5)) v limit 1", "numeric"),
+        (
+            "select pg_typeof(x) from (values (now()), ('2024-01-01')) v(x) limit 1",
+            "timestamp with time zone",
+        ),
+        ("select pg_typeof(column1) from (values (null), (null)) v", "text"),
+        ("select string_agg(x::text, ',' order by x) from (select 1 x union select '2') s", "1,2"),
+        ("select pg_typeof(x) from (select 1 as x union all select 2.5) s limit 1", "numeric"),
+        ("select pg_typeof(x) from (select null as x union select null) s", "text"),
+        (
+            "select string_agg(x::text, ',' order by x) from (select 1 x union select 2.5 union select '3') s",
+            "1,2.5,3",
+        ),
+        ("select 1 intersect select '1'", "1"),
+        ("select '1' intersect select 1::int2", "1"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    for (sql, code, message, position) in [
+        ("values (1), ('x')", "22P02", "invalid input syntax for type integer: \"x\"", "14"),
+        (
+            "values (1, 'a'), ('2', 3)",
+            "22P02",
+            "invalid input syntax for type integer: \"a\"",
+            "12",
+        ),
+        ("values (1), (true)", "42804", "VALUES types integer and boolean cannot be matched", "14"),
+        (
+            "values ('1'::varchar), (2)",
+            "42804",
+            "VALUES types character varying and integer cannot be matched",
+            "25",
+        ),
+        (
+            "select 1 union select 'x'",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+            "23",
+        ),
+        ("select 'a' union select 1", "22P02", "invalid input syntax for type integer: \"a\"", "8"),
+        (
+            "select 1, 'a' union select 2, 3",
+            "22P02",
+            "invalid input syntax for type integer: \"a\"",
+            "11",
+        ),
+        (
+            "select 1 except select '1.5'",
+            "22P02",
+            "invalid input syntax for type integer: \"1.5\"",
+            "24",
+        ),
+        (
+            "select 1 union select true",
+            "42804",
+            "UNION types integer and boolean cannot be matched",
+            "23",
+        ),
+        (
+            "select 1 union all select 'x'::text",
+            "42804",
+            "UNION types integer and text cannot be matched",
+            "27",
+        ),
+        (
+            "select 1 union (select true union select false)",
+            "42804",
+            "UNION types integer and boolean cannot be matched",
+            "24",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}
