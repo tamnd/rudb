@@ -140,6 +140,16 @@ impl Assembly {
             }
             return Ok(());
         }
+        // An untyped null has no run of data to lay anything in, and a piece of it can arrive as a
+        // selection over one, which flattens to a constant rather than to a run. Every row it
+        // claims is null whatever form it came in, which is what leaving them at `NOWHERE` says.
+        if matches!(self.data, Data::Empty) {
+            for &row in positions {
+                self.at[row as usize] = NOWHERE;
+                self.live[row as usize] = false;
+            }
+            return Ok(());
+        }
         // flatten: the copy loop that does the interleave reads a run of data, and a piece can
         // arrive constant, dictionary encoded or bit packed. Flattening is itself a typed loop per
         // layout, so writing the piece out once here is what stops it being read a value at a time
@@ -1391,6 +1401,17 @@ mod tests {
             Vector::from_values(LogicalType::BigInt, &[Value::BigInt(7)]).expect("a vector");
         let built = agrees(&LogicalType::BigInt, 3, &[(vec![1], piece)]);
         assert_eq!(values(&built), vec![Value::Null, Value::BigInt(7), Value::Null]);
+    }
+
+    #[test]
+    fn a_selection_over_an_untyped_null_is_placed_as_nulls() {
+        // What a filter hands a join for a `NULL AS x` column, and what used to stop the join with
+        // an internal error, because the flatten of it is a constant and not a run of data.
+        let untyped = Vector::from_values(LogicalType::Null, &[Value::Null, Value::Null])
+            .expect("an untyped null");
+        let selected = Vector::dictionary(vec![1, 0], untyped).expect("a selection");
+        let built = agrees(&LogicalType::Null, 3, &[(vec![2, 0], selected)]);
+        assert_eq!(values(&built), vec![Value::Null; 3]);
     }
 
     #[test]

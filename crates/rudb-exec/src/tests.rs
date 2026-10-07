@@ -991,8 +991,12 @@ fn the_types_table_is_one_row_per_name_and_modifier_signature() {
     // three sizes and the two catalog oids, which is checked by diffing the two tables rather than
     // in here, and what this holds is that the operator produces a row per signature rather than a
     // row per name.
+    // The built in rows are listed once for each attached database, as the pin lists them, and
+    // only the first database has the oids.
     let rows = run("TableFunction duckdb_types args=[] #0 [type_name::VARCHAR, type_oid::BIGINT]");
-    assert_eq!(rows.len(), 99);
+    assert_eq!(rows.len(), 99 * catalog().databases().len());
+    assert!(rows[99..].iter().all(|row| row[1] == Value::Null), "one database has the oids");
+    let rows = &rows[..99];
     let mut names: Vec<&Value> = rows.iter().map(|row| &row[0]).collect();
     names.dedup();
     assert_eq!(names.len(), 79);
@@ -1010,6 +1014,7 @@ fn the_types_table_says_what_this_engine_stores_rather_than_what_the_pin_does() 
     let rows =
         run("TableFunction duckdb_types args=[] #0 [type_name::VARCHAR, type_size::BIGINT, \
          type_category::VARCHAR]");
+    let rows = &rows[..99];
     let size = |name: &str| {
         rows.iter().find(|row| row[0] == text(name)).map(|row| row[1].clone()).expect(name)
     };
