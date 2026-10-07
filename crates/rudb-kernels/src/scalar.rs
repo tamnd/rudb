@@ -1214,6 +1214,9 @@ fn binary(
     if name == "__rudb_stamp_seconds" {
         return stamp_seconds_of(left, right, returns);
     }
+    if let Some(subtract) = widened(name) {
+        return widened_of(subtract, left, right, returns, rows, written);
+    }
     if name == "__rudb_mean" {
         return mean_of(left, right, returns, rows);
     }
@@ -1375,6 +1378,51 @@ fn stamp_seconds_of(
     let opened = opened_integer(count)?;
     let count = opened.as_ref().unwrap_or(count);
     by_form!(stamp, count, stamp_seconds_runs, stamp, count, returns)
+}
+
+/// Whether `name` is `__rudb_widened_subtract` rather than `__rudb_widened_add`, and `None` for
+/// any other name.
+fn widened(name: &str) -> Option<bool> {
+    match name {
+        "__rudb_widened_add" => Some(false),
+        "__rudb_widened_subtract" => Some(true),
+        _ => None,
+    }
+}
+
+/// `a + b` or `a - b` of two decimals of at most 18 digits, answered at the wider type `returns`
+/// the binder would have cast both of them to.
+///
+/// The prepared expression writes the call this way when the casts are the only reason the sides
+/// would have been 128 bits wide. Two flat 64 bit runs are added or subtracted in 128 bits a row at
+/// a time, which cannot overflow, and anything else is cast and handed to `+` or `-` as it was
+/// written, so the two always agree.
+fn widened_of(
+    subtract: bool,
+    left: &Vector,
+    right: &Vector,
+    returns: &LogicalType,
+    rows: usize,
+    written: Written<'_>,
+) -> Result<Option<Vector>> {
+    if let (Some(Data::Int64(one)), Some(Data::Int64(other))) = (left.data(), right.data())
+        && let (Some(one), Some(other)) = (one.get(..rows), other.get(..rows))
+        && matches!(returns, LogicalType::Decimal { width: 19.., .. })
+    {
+        let base = nulls_of(left).and(&nulls_of(right), rows);
+        let pairs = one.iter().zip(other);
+        let mut out: Vec<i128> = if subtract {
+            pairs.map(|(&x, &y)| i128::from(x) - i128::from(y)).collect()
+        } else {
+            pairs.map(|(&x, &y)| i128::from(x) + i128::from(y)).collect()
+        };
+        blank(&mut out, &base);
+        let validity = if rows == 0 { Validity::AllValid } else { base.normalize(rows) };
+        return finish(returns, Data::Int128(out.into()), validity);
+    }
+    let (left, right) = (cast::cast(left, returns, false)?, cast::cast(right, returns, false)?);
+    let name = if subtract { "-" } else { "+" };
+    binary(name, &Hoisted::Nothing, &left, &right, returns, rows, written)
 }
 
 /// `__rudb_mean(total, count)`, an average put back together from a `sum` and a `count` of the same
@@ -4232,6 +4280,11 @@ pub fn call_values(
     if let ("__rudb_zero_to_null", [value]) = (name, args) {
         return Ok(if approximate(value) == Some(0.0) { Value::Null } else { value.clone() });
     }
+    if let (Some(subtract), [one, other]) = (widened(name), args) {
+        let one = cast::cast_value(one, returns, false)?;
+        let other = cast::cast_value(other, returns, false)?;
+        return call_values(if subtract { "-" } else { "+" }, &[one, other], returns, written);
+    }
     if let ("__rudb_stamp_seconds", [stamp, count]) = (name, args) {
         if stamp.is_null() || count.is_null() {
             return Ok(Value::Null);
@@ -6604,6 +6657,33 @@ mod tests {
             .expect("one day count");
         let one = Vector::constant(LogicalType::Date, Value::Date(0), 1);
         agrees("+", &[one, far], &LogicalType::Date);
+    }
+
+    /// The 64 bit sides of a widened decimal sum or difference give what casting both and calling
+    /// `+` or `-` gives, at the ends of 18 digits, with a null on either side, and in a form other
+    /// than flat.
+    #[test]
+    fn a_widened_decimal_sum_is_the_sum_of_the_casts() {
+        let narrow = LogicalType::Decimal { width: 18, scale: 4 };
+        let wide = LogicalType::Decimal { width: 19, scale: 4 };
+        let most = 999_999_999_999_999_999_i64;
+        let side = |values: Vec<i64>, valid: &[bool]| {
+            Vector::flat(narrow.clone(), Data::Int64(values.into()))
+                .expect("a decimal run")
+                .with_validity(Validity::from_run(valid))
+        };
+        let left = side(vec![most, -most, 12_345, 0, 7], &[true, true, true, false, true]);
+        let right = side(vec![-most, most, -9, 4, 0], &[true, true, true, true, false]);
+        let constant = Vector::constant(narrow.clone(), left.value_at(0), 5);
+        for (name, written) in [("__rudb_widened_add", "+"), ("__rudb_widened_subtract", "-")] {
+            for args in [[left.clone(), right.clone()], [constant.clone(), right.clone()]] {
+                agrees(name, &args, &wide);
+                let cast = |side: &Vector| cast::cast(side, &wide, false).expect("widens");
+                let expected = call(written, &[cast(&args[0]), cast(&args[1])], &wide, None);
+                let answer = call(name, &args, &wide, None).expect("answers");
+                assert_eq!(format!("{answer:?}"), format!("{:?}", expected.expect("answers")));
+            }
+        }
     }
 
     /// The seconds and the days under the benchmark view's times can come out of a scan packed, and
