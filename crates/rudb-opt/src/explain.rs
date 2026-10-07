@@ -64,7 +64,7 @@ use rudb_plan::{
 };
 use rudb_seam::{Registries, SeamId, Settings};
 
-use crate::estimate::{CARDINALITY, DISTINCT, Facts, rows_stat, rows_stat_into};
+use crate::estimate::{CARDINALITY, DISTINCT, Facts, rows_stat, rows_stat_into, rows_stats};
 use crate::pass::Context;
 
 /// Whether `EXPLAIN` was asked what the planner knew.
@@ -192,9 +192,10 @@ pub fn analyzed(
 pub fn record_estimates(plan: &Plan, facts: &Facts, document: &mut Document) {
     let shape = Shape::of(plan);
     let mut estimated = vec![Stat::Unknown; shape.operators() as usize];
+    let rows = rows_stats(plan, facts);
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         if let Some(id) = shape.operator_of(node) {
-            estimated[id as usize] = rows_stat(plan, node, facts);
+            estimated[id as usize] = rows[node as usize];
         }
     }
     // A filter the scan below applies is a node with no operator of its own, and the scan's operator
@@ -208,7 +209,7 @@ pub fn record_estimates(plan: &Plan, facts: &Facts, document: &mut Document) {
             continue;
         }
         if let Some(id) = shape.operator_of(input) {
-            estimated[id as usize] = rows_stat(plan, node, facts);
+            estimated[id as usize] = rows[node as usize];
         }
     }
     for operator in &mut document.operators {

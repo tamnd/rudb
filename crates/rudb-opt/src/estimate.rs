@@ -34,6 +34,7 @@
 //! part `spec/09-optimizer.md` section 9.3 actually specifies and it needs the facts that
 //! M3's storage layer collects, so it waits for them.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -424,7 +425,46 @@ pub fn side(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<Side> {
 /// ordering arrives and asks the same question about the same subtree a thousand times.
 #[must_use]
 pub fn rows_stat(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
-    rows_stat_into(plan, node, stats, &mut Vec::new())
+    let slot = node as usize;
+    let held = HELD.with_borrow(|held| held.as_ref().and_then(|held| held.get(slot).copied()));
+    if let Some(Some(known)) = held {
+        return known;
+    }
+    let found = rows_stat_into(plan, node, stats, &mut Vec::new());
+    HELD.with_borrow_mut(|held| {
+        if let Some(at) = held.as_mut().and_then(|held| held.get_mut(slot)) {
+            *at = Some(found);
+        }
+    });
+    found
+}
+
+/// [`rows_stat`] of every node of `plan`, each subtree walked once.
+///
+/// What writing the estimates onto a finished query wants, and it was a tenth of TPC-H q2 at SF1
+/// before this: asking for each node in turn walks the whole subtree under it again, and the
+/// filters over a join of five tables are asked about once for every node above them. The answers
+/// are kept by node while this runs and dropped when it returns. That is safe because `plan` is
+/// borrowed for the whole of it and so cannot change, and because what [`rows_stat`] answers is a
+/// function of the plan and the facts and of nothing else.
+#[must_use]
+pub fn rows_stats(plan: &Plan, stats: &Facts) -> Vec<Stat<u64>> {
+    struct Forget(Option<Vec<Option<Stat<u64>>>>);
+    impl Drop for Forget {
+        fn drop(&mut self) {
+            HELD.set(self.0.take());
+        }
+    }
+    let _forget = Forget(HELD.replace(Some(vec![None; plan.node_count()])));
+    (0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX))
+        .map(|node| rows_stat(plan, node, stats))
+        .collect()
+}
+
+thread_local! {
+    /// The answers [`rows_stat`] has given by node while [`rows_stats`] runs, and nothing at any
+    /// other time.
+    static HELD: RefCell<Option<Vec<Option<Stat<u64>>>>> = const { RefCell::new(None) };
 }
 
 /// [`rows_stat`] with the distinct counts read at this node collected into `reads`.
@@ -2012,7 +2052,7 @@ mod tests {
     use rudb_common::stat::{Class, Direction, Provenance, Stat};
     use rudb_plan::Plan;
 
-    use super::{Facts, Key, Side, matched_sides, rows, rows_stat, unfiltered};
+    use super::{Facts, HELD, Key, Side, matched_sides, rows, rows_stat, rows_stats, unfiltered};
 
     /// A one column scan of the named table, which is what most of these sit on.
     fn scan(table: &str, index: u32) -> String {
@@ -2667,6 +2707,30 @@ mod tests {
         let tables = &[("lineitem", 6_000_000), ("part", 200_000), ("supplier", 10_000)];
         assert_eq!(estimate(text, tables), Some(1_200_000));
         assert_eq!(whole(text, tables), Some(6_000_000));
+    }
+
+    #[test]
+    fn every_node_at_once_answers_what_each_node_alone_does() {
+        // The answers kept while every node is asked about are the answers asked one at a time,
+        // and none of them is still kept once it returns, or the next plan on the thread reads a
+        // node of this one.
+        let text = concat!(
+            "Join INNER on=[(#0.0::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+            "  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+            "    Get memory.main.lineitem AS lineitem #0 [a::INTEGER]\n",
+            "    Filter (#1.0::INTEGER = 3::INTEGER)::BOOLEAN\n",
+            "      Get memory.main.part AS part #1 [a::INTEGER]\n",
+            "  Get memory.main.supplier AS supplier #2 [a::INTEGER]\n"
+        );
+        let stats = facts(&[("lineitem", 6_000_000), ("part", 200_000), ("supplier", 10_000)]);
+        let plan = Plan::parse(text).expect("the plan parses");
+        let each: Vec<_> = (0..u32::try_from(plan.node_count()).expect("a few nodes"))
+            .map(|node| rows_stat(&plan, node, &stats))
+            .collect();
+        assert_eq!(rows_stats(&plan, &stats), each);
+        assert!(HELD.with_borrow(Option::is_none));
+        let other = Plan::parse(&scan("supplier", 0)).expect("the plan parses");
+        assert_eq!(rows_stat(&other, other.root(), &stats).value().copied(), Some(10_000));
     }
 
     #[test]
