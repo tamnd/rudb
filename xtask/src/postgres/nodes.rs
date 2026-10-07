@@ -231,8 +231,10 @@ fn read_errcodes(text: &str, headers: &mut Headers) -> Result<(), String> {
 
 /// Reads the type OIDs of `pg_type.dat` as `Oid` defines, with the names that `genbki.pl` gives
 /// them in `pg_type_d.h`: the `oid_symbol` of the entry, or else the type name in upper case and
-/// `OID`, and the name, `ARRAY` and `OID` for the array type.
+/// `OID`, and the name, `ARRAY` and `OID` for the array type. `InvalidOid` of `postgres_ext.h`
+/// comes first, because it is the type OID for no type.
 fn read_types(text: &str, headers: &mut Headers) -> Result<(), String> {
+    headers.defines.push(Define { name: "InvalidOid".to_string(), value: DefineValue::Oid(0) });
     for entry in super::dat_entries("pg_type.dat", text)? {
         let name = entry.get("typname").ok_or("pg_type.dat: an entry with no typname")?;
         let oid = |key: &str| {

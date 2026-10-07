@@ -1,7 +1,9 @@
 //! The actions of the expressions: `a_expr`, `b_expr` and `c_expr`, the function calls and the
 //! functions with a special syntax, the window clauses, `CASE`, the arrays, the column references
-//! and the subscripts, and the XML expressions.
+//! and the subscripts, the XML expressions, and the SQL/JSON expressions with the functions of
+//! `json.rs`.
 
+use super::json::{behaviors, is_json, query_function};
 use super::*;
 use crate::error::Error;
 use crate::generated::glue::rules;
@@ -659,6 +661,26 @@ impl rules::a_expr for Parser<'_> {
         Ok(Some(makeNotExpr(Some(is_normalized(v1, Some((v4, at4)), at2)), at2)))
     }
 
+    fn a_expr_68(
+        &mut self,
+        v1: Option<Node>,
+        v3: i32,
+        v4: bool,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        Ok(Some(is_json(v1, v3, v4, at1)))
+    }
+
+    fn a_expr_69(
+        &mut self,
+        v1: Option<Node>,
+        v4: i32,
+        v5: bool,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        Ok(Some(makeNotExpr(Some(is_json(v1, v4, v5, at1)), at1)))
+    }
+
     fn a_expr_70(&mut self, at1: i32) -> Result<Option<Node>, Error> {
         // `DEFAULT` can be any `a_expr` here, and the analysis gives an error where it is not
         // allowed. The analysis also sets the other fields.
@@ -1010,6 +1032,25 @@ impl rules::func_expr for Parser<'_> {
         n.over = v5;
         Ok(v1)
     }
+
+    fn func_expr_2(
+        &mut self,
+        v1: Option<Node>,
+        v2: Option<Node>,
+        v3: Option<Box<WindowDef>>,
+    ) -> Result<Option<Node>, Error> {
+        let mut v1 = v1;
+        let constructor = match v1.as_mut() {
+            Some(Node::JsonObjectAgg(n)) => &mut n.constructor,
+            Some(Node::JsonArrayAgg(n)) => &mut n.constructor,
+            _ => return Err(Error::internal("a cast of a node of the wrong type")),
+        };
+        if let Some(n) = constructor {
+            n.agg_filter = v2;
+            n.over = v3;
+        }
+        Ok(v1)
+    }
 }
 
 impl rules::func_expr_common_subexpr for Parser<'_> {
@@ -1316,11 +1357,178 @@ impl rules::func_expr_common_subexpr for Parser<'_> {
         Ok(Some(call(SystemFuncName("json_object"), v3, at1).into()))
     }
 
+    fn func_expr_common_subexpr_49(
+        &mut self,
+        v3: List,
+        v4: bool,
+        v5: bool,
+        v6: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonObjectConstructor {
+            exprs: v3,
+            absent_on_null: v4,
+            unique: v5,
+            output: castNode(v6)?,
+            location: at1,
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_50(
+        &mut self,
+        v3: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonObjectConstructor {
+            exprs: List::new(),
+            absent_on_null: false,
+            unique: false,
+            output: castNode(v3)?,
+            location: at1,
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_51(
+        &mut self,
+        v3: List,
+        v4: bool,
+        v5: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonArrayConstructor {
+            exprs: v3,
+            absent_on_null: v4,
+            output: castNode(v5)?,
+            location: at1,
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_52(
+        &mut self,
+        v3: Option<Node>,
+        v4: Option<Node>,
+        v5: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonArrayQueryConstructor {
+            query: v3,
+            format: castNode(v4)?,
+            // PostgreSQL marks this value with `XXX`.
+            absent_on_null: true,
+            output: castNode(v5)?,
+            location: at1,
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_53(
+        &mut self,
+        v3: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonArrayConstructor {
+            exprs: List::new(),
+            absent_on_null: true,
+            output: castNode(v3)?,
+            location: at1,
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_54(
+        &mut self,
+        v3: Option<Node>,
+        v4: bool,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonParseExpr { expr: castNode(v3)?, unique_keys: v4, output: None, location: at1 };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_55(
+        &mut self,
+        v3: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        Ok(Some(JsonScalarExpr { expr: v3, output: None, location: at1 }.into()))
+    }
+
+    fn func_expr_common_subexpr_56(
+        &mut self,
+        v3: Option<Node>,
+        v4: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonSerializeExpr { expr: castNode(v3)?, output: castNode(v4)?, location: at1 };
+        Ok(Some(n.into()))
+    }
+
     fn func_expr_common_subexpr_57(&mut self, at1: i32) -> Result<Option<Node>, Error> {
         Ok(Some(
             MergeSupportFunc { msftype: TEXTOID, location: at1, ..MergeSupportFunc::default() }
                 .into(),
         ))
+    }
+
+    fn func_expr_common_subexpr_58(
+        &mut self,
+        v3: Option<Node>,
+        v5: Option<Node>,
+        v6: List,
+        v7: Option<Node>,
+        v8: i32,
+        v9: i32,
+        v10: List,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let (on_empty, on_error) = behaviors(v10)?;
+        let n = JsonFuncExpr {
+            output: castNode(v7)?,
+            wrapper: JsonWrapper(v8),
+            quotes: JsonQuotes(v9),
+            on_empty,
+            on_error,
+            ..query_function(JsonExprOp::JSON_QUERY_OP, v3, v5, v6, at1)?
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_59(
+        &mut self,
+        v3: Option<Node>,
+        v5: Option<Node>,
+        v6: List,
+        v7: Option<Node>,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let n = JsonFuncExpr {
+            output: None,
+            on_error: castNode(v7)?,
+            ..query_function(JsonExprOp::JSON_EXISTS_OP, v3, v5, v6, at1)?
+        };
+        Ok(Some(n.into()))
+    }
+
+    fn func_expr_common_subexpr_60(
+        &mut self,
+        v3: Option<Node>,
+        v5: Option<Node>,
+        v6: List,
+        v7: Option<Node>,
+        v8: List,
+        at1: i32,
+    ) -> Result<Option<Node>, Error> {
+        let (on_empty, on_error) = behaviors(v8)?;
+        let n = JsonFuncExpr {
+            output: castNode(v7)?,
+            on_empty,
+            on_error,
+            ..query_function(JsonExprOp::JSON_VALUE_OP, v3, v5, v6, at1)?
+        };
+        Ok(Some(n.into()))
     }
 }
 

@@ -2,6 +2,8 @@
 //! and the arguments of C. A function that gives a pointer to a node type in C gives the node by
 //! value here, and the caller makes it a [`Node`] or a box as the C casts it.
 
+use super::castNode;
+use crate::error::Error;
 use crate::nodes::*;
 
 /// `makeInteger`.
@@ -107,4 +109,64 @@ pub(crate) fn makeFuncCall(
 /// `makeGroupingSet`.
 pub(crate) fn makeGroupingSet(kind: GroupingSetKind, content: List, location: i32) -> GroupingSet {
     GroupingSet { kind, content, location }
+}
+
+/// `makeJsonFormat`.
+pub(crate) fn makeJsonFormat(
+    format_type: JsonFormatType,
+    encoding: JsonEncoding,
+    location: i32,
+) -> JsonFormat {
+    JsonFormat { format_type, encoding, location }
+}
+
+/// `makeJsonValueExpr`.
+pub(crate) fn makeJsonValueExpr(
+    raw_expr: Option<Node>,
+    formatted_expr: Option<Node>,
+    format: Option<Box<JsonFormat>>,
+) -> JsonValueExpr {
+    JsonValueExpr { raw_expr, formatted_expr, format }
+}
+
+/// `makeJsonBehavior`.
+pub(crate) fn makeJsonBehavior(
+    btype: JsonBehaviorType,
+    expr: Option<Node>,
+    location: i32,
+) -> JsonBehavior {
+    JsonBehavior { btype, expr, location, ..JsonBehavior::default() }
+}
+
+/// `makeJsonKeyValue`.
+pub(crate) fn makeJsonKeyValue(key: Option<Node>, value: Option<Node>) -> Result<Node, Error> {
+    Ok(JsonKeyValue { key, value: castNode(value)? }.into())
+}
+
+/// `makeJsonIsPredicate`.
+pub(crate) fn makeJsonIsPredicate(
+    expr: Option<Node>,
+    format: JsonFormat,
+    item_type: JsonValueType,
+    unique_keys: bool,
+    exprBaseType: u32,
+    location: i32,
+) -> Node {
+    let format = Some(Box::new(format));
+    JsonIsPredicate { expr, format, item_type, unique_keys, exprBaseType, location }.into()
+}
+
+/// `makeJsonTablePathSpec`.
+pub(crate) fn makeJsonTablePathSpec(
+    string: Option<Str>,
+    name: Option<Str>,
+    string_location: i32,
+    name_location: i32,
+) -> JsonTablePathSpec {
+    JsonTablePathSpec {
+        string: Some(makeStringConst(string, string_location)),
+        name,
+        name_location,
+        location: string_location,
+    }
 }

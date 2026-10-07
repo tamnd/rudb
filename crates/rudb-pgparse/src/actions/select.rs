@@ -411,13 +411,6 @@ impl rules::OptTempTableName for Parser<'_> {
     }
 }
 
-impl rules::distinct_clause for Parser<'_> {
-    fn distinct_clause_1(&mut self) -> Result<List, Error> {
-        // `list_make1(NIL)`: a list with one `NULL`, which is not `NIL`.
-        Ok(list_make1(None))
-    }
-}
-
 impl rules::sortby for Parser<'_> {
     fn sortby_1(
         &mut self,
@@ -900,24 +893,12 @@ impl rules::opt_alias_clause_for_join_using for Parser<'_> {
 }
 
 impl rules::func_alias_clause for Parser<'_> {
-    fn func_alias_clause_1(&mut self, v1: Option<Box<Alias>>) -> Result<List, Error> {
-        Ok(list_make2(v1.map(NodeType::into_node), None))
-    }
-
-    fn func_alias_clause_2(&mut self, v3: List) -> Result<List, Error> {
-        Ok(list_make2(None, listNode(v3)))
-    }
-
     fn func_alias_clause_3(&mut self, v2: Option<Str>, v4: List) -> Result<List, Error> {
         Ok(list_make2(Some(makeAlias(v2, List::new()).into()), listNode(v4)))
     }
 
     fn func_alias_clause_4(&mut self, v1: Option<Str>, v3: List) -> Result<List, Error> {
         Ok(list_make2(Some(makeAlias(v1, List::new()).into()), listNode(v3)))
-    }
-
-    fn func_alias_clause_5(&mut self) -> Result<List, Error> {
-        Ok(list_make2(None, None))
     }
 }
 
