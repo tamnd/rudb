@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.39
+
+This release fixes the release gate again, continues the PostgreSQL work inside PG2 (#2490) and PG5 (#2493), and adds system functions of the DuckDB pin.
+
+The tag for 0.8.38 failed `cargo xtask ci` in the row loop check, because `pg_sleep` (#2713) loops over rows and did not say why. #2720 adds the comments that the row loop and flatten checks ask for, so this release should be the first one since 0.8.1 with archives and crates.
+
+#2719 removes a false commit conflict. Before, a transaction that wrote rows failed at `COMMIT` when another transaction deleted other rows of the same table after its snapshot, and PostgreSQL commits both. Now a table with a key finds the rows the transaction changed again by their key, and the commit writes a checkpoint in place of its log records. A table with no key still gets the conflict.
+
+#2717 adds `current_query()`, `txid_current()`, `version()`, `sleep_ms()` and the `format_type`, `pg_get_viewdef` and `pg_get_constraintdef` macros of `pg_catalog`, and keeps the schema of a view in the `sql` column of `duckdb_views()`.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.38
 
 This release fixes the release itself, continues the PostgreSQL work inside PG2 (#2490), and has engine speed work.
