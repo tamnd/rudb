@@ -94,6 +94,26 @@ pub struct DateFormat {
 impl DateFormat {
     pub const ISO_MDY: DateFormat = DateFormat { style: DateStyle::Iso, order: DateOrder::Mdy };
 
+    /// The format of the value of the `DateStyle` setting as the server shows it, such as
+    /// `ISO, MDY`.
+    #[must_use]
+    pub fn of_setting(text: &str) -> DateFormat {
+        let (style, order) = text.split_once(", ").unwrap_or(("ISO", "MDY"));
+        DateFormat {
+            style: match style {
+                "SQL" => DateStyle::Sql,
+                "Postgres" => DateStyle::Postgres,
+                "German" => DateStyle::German,
+                _ => DateStyle::Iso,
+            },
+            order: match order {
+                "DMY" => DateOrder::Dmy,
+                "YMD" => DateOrder::Ymd,
+                _ => DateOrder::Mdy,
+            },
+        }
+    }
+
     fn day_first(self) -> bool {
         self.order == DateOrder::Dmy
     }
@@ -106,6 +126,19 @@ pub enum IntervalStyle {
     PostgresVerbose,
     SqlStandard,
     Iso8601,
+}
+
+impl IntervalStyle {
+    /// The style of the value of the `IntervalStyle` setting, such as `sql_standard`.
+    #[must_use]
+    pub fn of_setting(text: &str) -> IntervalStyle {
+        match text {
+            "postgres_verbose" => IntervalStyle::PostgresVerbose,
+            "sql_standard" => IntervalStyle::SqlStandard,
+            "iso_8601" => IntervalStyle::Iso8601,
+            _ => IntervalStyle::Postgres,
+        }
+    }
 }
 
 /// The rules of a time zone: the offset east of UTC in seconds and the abbreviation, at an instant

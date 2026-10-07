@@ -2113,9 +2113,8 @@ pub(crate) fn postgres_output(value: &Vector, settings: &[Value]) -> Result<Vect
 /// [`postgres_output`] on one value, which the folding of a constant and a call row by row reach.
 pub(crate) fn postgres_output_value(value: &Value, settings: &[Value]) -> Result<Value> {
     let oid = settings.first().map_or(Ok(0), output_oid)?;
-    let Some(ty) = rudb_pgtypes::logical_type(oid) else {
-        return Err(Error::internal(format!("no type for the output of the type {oid}")));
-    };
+    // A record has no one rudb type, and its value has the types of its fields.
+    let ty = rudb_pgtypes::logical_type(oid).unwrap_or_else(|| value.logical_type());
     let vector = Vector::from_values(ty, std::slice::from_ref(value))?;
     Ok(postgres_output(&vector, settings)?.value_at(0))
 }

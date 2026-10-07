@@ -141,7 +141,7 @@ pub use datetime::{
     timestamp_to_unix, timestamptz_in, timestamptz_out, timestamptz_to_char, timetz_in, timetz_out,
     timetz_recv, to_date, to_timestamp,
 };
-pub use declared::{declared_type, session_type};
+pub use declared::{declared_type, session_type, type_name};
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
@@ -158,6 +158,7 @@ pub use numeric::{
 };
 pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,
+    soft_input_error,
 };
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,

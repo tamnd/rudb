@@ -7,8 +7,11 @@
 //! type that only rudb has, gives `None`, and the caller then uses the type that the logical type
 //! maps to.
 
-use rudb_common::{DeclaredType, LogicalType};
+use std::ops::Range;
 
+use rudb_common::{DeclaredType, LogicalType, SqlState};
+
+use crate::error::TypeError;
 use crate::generated::oids as oid;
 use crate::reg::RegKind;
 use crate::types::{Oid, TypeInfo};
@@ -22,8 +25,11 @@ const NUMERIC_MAX_PRECISION: i32 = 1000;
 const NUMERIC_MIN_SCALE: i32 = -1000;
 const NUMERIC_MAX_SCALE: i32 = 1000;
 
-/// `MaxAttrSize` in characters for `varchar(n)` and `bpchar(n)`, and `VARBITMAXLEN` for `bit(n)`.
+/// `MaxAttrSize` in characters for `varchar(n)` and `bpchar(n)`.
 const MAX_LENGTH: i32 = 10 * 1024 * 1024;
+
+/// `VARBITMAXLEN` for `bit(n)` and `varbit(n)`.
+const MAX_BITS: i32 = i32::MAX - 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
@@ -32,6 +38,9 @@ enum Token {
     /// A name in double quotes, with its case kept.
     Quoted(String),
     Number(i32),
+    /// A string in single quotes, which only the type modifiers of a type that is not built in
+    /// can have.
+    Literal,
     Open,
     Close,
     Comma,
@@ -41,31 +50,49 @@ enum Token {
 }
 
 fn lex(text: &str) -> Option<Vec<Token>> {
+    lex_spanned(text).ok().map(|tokens| tokens.into_iter().map(|(token, _)| token).collect())
+}
+
+/// Where the lexer stopped: the byte where a token starts that is not one of the tokens of a type
+/// name, and whether it is a quoted name with no closing quote.
+struct LexError {
+    at: usize,
+    unterminated: bool,
+}
+
+/// The tokens of a type name, each with the bytes of the text it was read from.
+fn lex_spanned(text: &str) -> Result<Vec<(Token, Range<usize>)>, LexError> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         let byte = bytes[at];
-        match byte {
-            b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' => at += 1,
+        let start = at;
+        let token = match byte {
+            b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' => {
+                at += 1;
+                continue;
+            }
             b'(' | b')' | b',' | b'.' | b'[' | b']' => {
-                tokens.push(match byte {
+                at += 1;
+                match byte {
                     b'(' => Token::Open,
                     b')' => Token::Close,
                     b',' => Token::Comma,
                     b'.' => Token::Dot,
                     b'[' => Token::OpenBracket,
                     _ => Token::CloseBracket,
-                });
-                at += 1;
+                }
             }
             b'"' => {
                 let mut name = String::new();
                 at += 1;
                 loop {
-                    let end = at + text[at..].find('"')?;
-                    name.push_str(&text[at..end]);
-                    at = end + 1;
+                    let Some(len) = text[at..].find('"') else {
+                        return Err(LexError { at: start, unterminated: true });
+                    };
+                    name.push_str(&text[at..at + len]);
+                    at += len + 1;
                     if bytes.get(at) == Some(&b'"') {
                         name.push('"');
                         at += 1;
@@ -73,29 +100,44 @@ fn lex(text: &str) -> Option<Vec<Token>> {
                         break;
                     }
                 }
-                tokens.push(Token::Quoted(name));
+                Token::Quoted(name)
+            }
+            b'\'' => {
+                at += 1;
+                loop {
+                    let Some(len) = text[at..].find('\'') else {
+                        return Err(LexError { at: start, unterminated: false });
+                    };
+                    at += len + 1;
+                    if bytes.get(at) == Some(&b'\'') {
+                        at += 1;
+                    } else {
+                        break;
+                    }
+                }
+                Token::Literal
             }
             b'-' | b'+' | b'0'..=b'9' => {
-                let start = at;
                 at += 1;
                 while bytes.get(at).is_some_and(u8::is_ascii_digit) {
                     at += 1;
                 }
-                tokens.push(Token::Number(text[start..at].parse().ok()?));
+                let number = text[start..at].parse();
+                Token::Number(number.map_err(|_| LexError { at: start, unterminated: false })?)
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' | 0x80.. => {
-                let start = at;
                 while bytes.get(at).is_some_and(|&b| {
                     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
                 }) {
                     at += 1;
                 }
-                tokens.push(Token::Word(text[start..at].to_ascii_lowercase()));
+                Token::Word(text[start..at].to_ascii_lowercase())
             }
-            _ => return None,
-        }
+            _ => return Err(LexError { at: start, unterminated: false }),
+        };
+        tokens.push((token, start..at));
     }
-    Some(tokens)
+    Ok(tokens)
 }
 
 struct Parser {
@@ -399,7 +441,7 @@ fn length_typmod(n: i32) -> Option<i32> {
 }
 
 fn bit_typmod(n: i32) -> Option<i32> {
-    (1..=MAX_LENGTH).contains(&n).then_some(n)
+    (1..=MAX_BITS).contains(&n).then_some(n)
 }
 
 fn numeric(p: i32, s: i32) -> Option<i32> {
@@ -417,6 +459,521 @@ fn time_typmod(p: Option<i32>) -> Option<i32> {
     match p {
         None => Some(-1),
         Some(p) => clamp_time(p),
+    }
+}
+
+/// The words that `gram.y` reserves, and the words that name a column but not a type, which
+/// cannot start the name of a type.
+const NOT_TYPE_NAMES: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "between",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "coalesce",
+    "collate",
+    "column",
+    "constraint",
+    "create",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "extract",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "greatest",
+    "group",
+    "grouping",
+    "having",
+    "in",
+    "initially",
+    "inout",
+    "intersect",
+    "into",
+    "json_array",
+    "json_arrayagg",
+    "json_exists",
+    "json_object",
+    "json_objectagg",
+    "json_query",
+    "json_scalar",
+    "json_serialize",
+    "json_table",
+    "json_value",
+    "lateral",
+    "leading",
+    "least",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "merge_action",
+    "none",
+    "normalize",
+    "not",
+    "null",
+    "nullif",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "out",
+    "overlay",
+    "placing",
+    "position",
+    "precision",
+    "primary",
+    "references",
+    "returning",
+    "row",
+    "select",
+    "session_user",
+    "setof",
+    "some",
+    "substring",
+    "symmetric",
+    "system_user",
+    "table",
+    "then",
+    "to",
+    "trailing",
+    "treat",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "values",
+    "variadic",
+    "when",
+    "where",
+    "window",
+    "with",
+    "xmlattributes",
+    "xmlconcat",
+    "xmlelement",
+    "xmlexists",
+    "xmlforest",
+    "xmlnamespaces",
+    "xmlparse",
+    "xmlpi",
+    "xmlroot",
+    "xmlserialize",
+    "xmltable",
+];
+
+/// The type that the text of a type name names, as `parseTypeString` reads it for
+/// `pg_input_is_valid` and for the input of `regtype`. A built-in type is what [`declared_type`]
+/// gives, and an array name such as `_int4` and a pseudo-type such as `void` are found too.
+///
+/// # Errors
+///
+/// The error of PostgreSQL for a name that is not a type: `42601` for text that is not a type
+/// name, `42704` for a name that no type has, `22023` for a type modifier out of range, and
+/// `42601` for a type modifier on a type that takes none.
+pub fn type_name(text: &str) -> Result<DeclaredType, TypeError> {
+    if let Some(declared) = declared_type(text) {
+        return Ok(declared);
+    }
+    let context = || Some(format!("invalid type name \"{text}\""));
+    let syntax = |near: Option<&str>| TypeError {
+        context: context(),
+        ..TypeError::new(
+            SqlState::SYNTAX_ERROR,
+            near.map_or_else(
+                || "syntax error at end of input".to_owned(),
+                |near| format!("syntax error at or near \"{near}\""),
+            ),
+        )
+    };
+    let tokens = match lex_spanned(text) {
+        Ok(tokens) => tokens,
+        Err(LexError { at, unterminated: true }) => {
+            return Err(TypeError {
+                context: context(),
+                ..TypeError::new(
+                    SqlState::SYNTAX_ERROR,
+                    format!("unterminated quoted identifier at or near \"{}\"", &text[at..]),
+                )
+            });
+        }
+        Err(LexError { at, .. }) => {
+            let end = text[at..].chars().next().map_or(at, |c| at + c.len_utf8());
+            return Err(syntax(Some(&text[at..end])));
+        }
+    };
+    if tokens.is_empty() || matches!(&tokens[0].0, Token::Word(word) if word == "setof") {
+        return Err(TypeError::new(
+            SqlState::SYNTAX_ERROR,
+            format!("invalid type name \"{text}\""),
+        ));
+    }
+    let mut reader = NameReader { text, tokens: &tokens, at: 0 };
+    let written = reader.read().map_err(|near| syntax(near.map(|near| &text[near])))?;
+    written.resolve()
+}
+
+/// A type name as the grammar reads it, before the name is looked up.
+struct WrittenType {
+    /// The names, with a schema first when there is one. A type that the grammar spells in words,
+    /// such as `character varying`, has its name in `pg_type` here.
+    names: Vec<String>,
+    /// Whether the grammar spells the type in words.
+    keyword: bool,
+    /// The type modifiers, with `None` for one that is not a number.
+    modifiers: Vec<Option<i32>>,
+    array: bool,
+}
+
+/// Reads a type name from its tokens. An error is the bytes of the token where the grammar stops,
+/// or `None` at the end of the text.
+struct NameReader<'a> {
+    text: &'a str,
+    tokens: &'a [(Token, Range<usize>)],
+    at: usize,
+}
+
+impl NameReader<'_> {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.at).map(|(token, _)| token)
+    }
+
+    fn here(&self) -> Option<Range<usize>> {
+        self.tokens.get(self.at).map(|(_, span)| span.clone())
+    }
+
+    fn eat(&mut self, token: &Token) -> bool {
+        let found = self.peek() == Some(token);
+        self.at += usize::from(found);
+        found
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        let found = matches!(self.peek(), Some(Token::Word(held)) if held == word);
+        self.at += usize::from(found);
+        found
+    }
+
+    fn expect(&mut self, token: &Token) -> Result<(), Option<Range<usize>>> {
+        if self.eat(token) { Ok(()) } else { Err(self.here()) }
+    }
+
+    /// An integer with no sign, the `Iconst` of the grammar. A sign is an error at the sign.
+    fn iconst(&mut self) -> Result<i32, Option<Range<usize>>> {
+        match (self.peek(), self.here()) {
+            (Some(&Token::Number(n)), Some(span)) => {
+                if matches!(self.text.as_bytes()[span.start], b'-' | b'+') {
+                    return Err(Some(span.start..span.start + 1));
+                }
+                self.at += 1;
+                Ok(n)
+            }
+            (_, span) => Err(span),
+        }
+    }
+
+    /// `'(' Iconst ')'` when the next token is `(`.
+    fn precision(&mut self) -> Result<Vec<Option<i32>>, Option<Range<usize>>> {
+        if !self.eat(&Token::Open) {
+            return Ok(Vec::new());
+        }
+        let n = self.iconst()?;
+        self.expect(&Token::Close)?;
+        Ok(vec![Some(n)])
+    }
+
+    /// One expression of a list of type modifiers. A number can have a sign, and a name or a
+    /// string is kept as `None`.
+    fn signed(&mut self) -> Result<Option<i32>, Option<Range<usize>>> {
+        match self.peek() {
+            Some(&Token::Number(n)) => {
+                self.at += 1;
+                Ok(Some(n))
+            }
+            Some(Token::Word(_) | Token::Quoted(_) | Token::Literal) => {
+                self.at += 1;
+                Ok(None)
+            }
+            _ => Err(self.here()),
+        }
+    }
+
+    /// `'(' expr_list ')'` when the next token is `(`.
+    fn modifiers(&mut self) -> Result<Vec<Option<i32>>, Option<Range<usize>>> {
+        let mut modifiers = Vec::new();
+        if !self.eat(&Token::Open) {
+            return Ok(modifiers);
+        }
+        loop {
+            modifiers.push(self.signed()?);
+            if self.eat(&Token::Close) {
+                return Ok(modifiers);
+            }
+            self.expect(&Token::Comma)?;
+        }
+    }
+
+    fn read(&mut self) -> Result<WrittenType, Option<Range<usize>>> {
+        let Some(first) = self.peek().cloned() else { return Err(None) };
+        let start = self.here();
+        self.at += 1;
+        let keyword = |name: &str, modifiers| WrittenType {
+            names: vec![name.to_owned()],
+            keyword: true,
+            modifiers,
+            array: false,
+        };
+        let mut written = match &first {
+            Token::Word(word) => match word.as_str() {
+                "int" | "integer" => keyword("int4", Vec::new()),
+                "smallint" => keyword("int2", Vec::new()),
+                "bigint" => keyword("int8", Vec::new()),
+                "real" => keyword("float4", Vec::new()),
+                "boolean" => keyword("bool", Vec::new()),
+                "json" => keyword("json", Vec::new()),
+                "double" => {
+                    if !self.eat_word("precision") {
+                        return Err(self.here());
+                    }
+                    keyword("float8", Vec::new())
+                }
+                "float" => keyword("float", self.precision()?),
+                "decimal" | "dec" | "numeric" => keyword("numeric", self.modifiers()?),
+                "character" | "char" | "nchar" | "national" | "varchar" => {
+                    if word == "national" && !(self.eat_word("character") || self.eat_word("char"))
+                    {
+                        return Err(self.here());
+                    }
+                    let varying = word == "varchar" || self.eat_word("varying");
+                    keyword(if varying { "varchar" } else { "bpchar" }, self.precision()?)
+                }
+                "bit" => {
+                    let varying = self.eat_word("varying");
+                    keyword(if varying { "varbit" } else { "bit" }, self.modifiers()?)
+                }
+                "time" | "timestamp" => {
+                    let precision = self.precision()?;
+                    let zone = self.eat_word("with");
+                    if (zone || self.eat_word("without"))
+                        && !(self.eat_word("time") && self.eat_word("zone"))
+                    {
+                        return Err(self.here());
+                    }
+                    let name = match (word.as_str(), zone) {
+                        ("time", false) => "time",
+                        ("time", true) => "timetz",
+                        (_, false) => "timestamp",
+                        (_, true) => "timestamptz",
+                    };
+                    keyword(name, precision)
+                }
+                "interval" => {
+                    let mut precision = self.precision()?;
+                    while matches!(
+                        self.peek(),
+                        Some(Token::Word(word)) if matches!(
+                            word.as_str(),
+                            "year" | "month" | "day" | "hour" | "minute" | "second" | "to"
+                        )
+                    ) {
+                        self.at += 1;
+                    }
+                    if precision.is_empty() {
+                        precision = self.precision()?;
+                    }
+                    keyword("interval", precision)
+                }
+                word if NOT_TYPE_NAMES.contains(&word) => return Err(start),
+                word => self.generic(word.to_owned())?,
+            },
+            Token::Quoted(name) => self.generic(name.clone())?,
+            _ => return Err(start),
+        };
+        // The array brackets, any number of them, or `ARRAY` with at most one bound.
+        if self.eat_word("array") {
+            if self.eat(&Token::OpenBracket) {
+                self.iconst()?;
+                self.expect(&Token::CloseBracket)?;
+            }
+            written.array = true;
+        } else {
+            while self.eat(&Token::OpenBracket) {
+                if matches!(self.peek(), Some(Token::Number(_))) {
+                    self.iconst()?;
+                }
+                self.expect(&Token::CloseBracket)?;
+                written.array = true;
+            }
+        }
+        match self.here() {
+            None => Ok(written),
+            near => Err(near),
+        }
+    }
+
+    /// A name that is not spelled in words, with the names after it and its type modifiers.
+    fn generic(&mut self, first: String) -> Result<WrittenType, Option<Range<usize>>> {
+        let mut names = vec![first];
+        while self.eat(&Token::Dot) {
+            match self.peek().cloned() {
+                Some(Token::Word(name) | Token::Quoted(name)) => {
+                    self.at += 1;
+                    names.push(name);
+                }
+                _ => return Err(self.here()),
+            }
+        }
+        Ok(WrittenType { names, keyword: false, modifiers: self.modifiers()?, array: false })
+    }
+}
+
+impl WrittenType {
+    /// The type that the names name, with the errors of the lookup and of the type modifiers.
+    fn resolve(self) -> Result<DeclaredType, TypeError> {
+        let shown = self.names.join(".");
+        let name = match &self.names[..] {
+            [name] => name,
+            [schema, name] if schema == "pg_catalog" => name,
+            [_, _] => return Err(undefined(&shown, self.array)),
+            [_, _, _] => {
+                return Err(TypeError::new(
+                    SqlState::FEATURE_NOT_SUPPORTED,
+                    format!("cross-database references are not implemented: {shown}"),
+                ));
+            }
+            _ => {
+                return Err(TypeError::new(
+                    SqlState::SYNTAX_ERROR,
+                    format!("improper qualified name (too many dotted names): {shown}"),
+                ));
+            }
+        };
+        if self.keyword && name == "float" {
+            return match self.modifiers[..] {
+                [Some(p)] if p < 1 => {
+                    Err(invalid_modifier("precision for type float must be at least 1 bit"))
+                }
+                [Some(p)] if p > 53 => {
+                    Err(invalid_modifier("precision for type float must be less than 54 bits"))
+                }
+                _ => Err(invalid_modifier("invalid type modifier")),
+            };
+        }
+        let info = TypeInfo::by_name(name).ok_or_else(|| undefined(&shown, self.array))?;
+        check_modifiers(info.oid, &shown, &self.modifiers)?;
+        let oid = match self.array && !info.is_array() {
+            false => info.oid,
+            true if info.array != 0 => info.array,
+            true => {
+                return Err(TypeError::new(
+                    SqlState::UNDEFINED_OBJECT,
+                    format!("could not find array type for data type {shown}"),
+                ));
+            }
+        };
+        Ok(DeclaredType { oid, typmod: -1 })
+    }
+}
+
+/// `42704`, with the name as it is written and `[]` for an array.
+fn undefined(shown: &str, array: bool) -> TypeError {
+    let brackets = if array { "[]" } else { "" };
+    TypeError::new(SqlState::UNDEFINED_OBJECT, format!("type \"{shown}{brackets}\" does not exist"))
+}
+
+fn invalid_modifier(message: &str) -> TypeError {
+    TypeError::new(SqlState::INVALID_PARAMETER_VALUE, message.to_owned())
+}
+
+/// The errors of the `typmodin` function of the type `oid` for these type modifiers, as
+/// `numerictypmodin`, `anychar_typmodin`, `anybit_typmodin` and `anytime_typmodin` give them.
+fn check_modifiers(oid: Oid, shown: &str, modifiers: &[Option<i32>]) -> Result<(), TypeError> {
+    if modifiers.is_empty() {
+        return Ok(());
+    }
+    let one = || match modifiers {
+        [Some(n)] => Ok(*n),
+        _ => Err(invalid_modifier("invalid type modifier")),
+    };
+    let length = |kind: &str, max: i32| {
+        let n = one()?;
+        if n < 1 {
+            return Err(invalid_modifier(&format!("length for type {kind} must be at least 1")));
+        }
+        if n > max {
+            return Err(invalid_modifier(&format!("length for type {kind} cannot exceed {max}")));
+        }
+        Ok(())
+    };
+    match oid {
+        oid::NUMERIC => {
+            let (p, s) = match modifiers {
+                [Some(p)] => (*p, 0),
+                [Some(p), Some(s)] => (*p, *s),
+                _ => return Err(invalid_modifier("invalid NUMERIC type modifier")),
+            };
+            if !(1..=NUMERIC_MAX_PRECISION).contains(&p) {
+                return Err(invalid_modifier(&format!(
+                    "NUMERIC precision {p} must be between 1 and {NUMERIC_MAX_PRECISION}"
+                )));
+            }
+            if !(NUMERIC_MIN_SCALE..=NUMERIC_MAX_SCALE).contains(&s) {
+                return Err(invalid_modifier(&format!(
+                    "NUMERIC scale {s} must be between {NUMERIC_MIN_SCALE} and {NUMERIC_MAX_SCALE}"
+                )));
+            }
+            Ok(())
+        }
+        oid::VARCHAR => length("varchar", MAX_LENGTH),
+        oid::BPCHAR => length("char", MAX_LENGTH),
+        oid::BIT => length("bit", MAX_BITS),
+        oid::VARBIT => length("varbit", MAX_BITS),
+        oid::TIME | oid::TIMETZ | oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::INTERVAL => {
+            let p = one()?;
+            if p < 0 {
+                let (name, zone) = match oid {
+                    oid::TIME => ("TIME", ""),
+                    oid::TIMETZ => ("TIME", " WITH TIME ZONE"),
+                    oid::TIMESTAMP => ("TIMESTAMP", ""),
+                    oid::TIMESTAMPTZ => ("TIMESTAMP", " WITH TIME ZONE"),
+                    _ => ("INTERVAL", ""),
+                };
+                return Err(invalid_modifier(&format!(
+                    "{name}({p}){zone} precision must not be negative"
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(TypeError::new(
+            SqlState::SYNTAX_ERROR,
+            format!("type modifier is not allowed for type \"{shown}\""),
+        )),
     }
 }
 
@@ -477,6 +1034,61 @@ mod tests {
             ["hugeint", "blob", "my_type", "public.t", "varchar(0)", "int(3)", "_int4", "x y"]
         {
             assert_eq!(declared_type(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_type_name_has_the_errors_of_postgresql() {
+        let found = |text| type_name(text).map(|declared| declared.oid).unwrap();
+        assert_eq!(found("INT4"), oid::INT4);
+        assert_eq!(found("pg_catalog.int4"), oid::INT4);
+        assert_eq!(found("_int4"), oid::INT4_ARRAY);
+        assert_eq!(found("int4[3]"), oid::INT4_ARRAY);
+        assert_eq!(found("int4 array[2]"), oid::INT4_ARRAY);
+        assert_eq!(found("interval year to month"), oid::INTERVAL);
+        assert_eq!(found("double precision"), oid::FLOAT8);
+        assert_eq!(found("timestamp(2) with time zone"), oid::TIMESTAMPTZ);
+        assert_eq!(found("void"), oid::VOID);
+        assert_eq!(found("record"), oid::RECORD);
+        let error = |text| {
+            let error = type_name(text).unwrap_err();
+            (error.sqlstate.as_str().to_owned(), error.message, error.context)
+        };
+        let context = |text: &str| Some(format!("invalid type name \"{text}\""));
+        for (text, code, message) in [
+            ("nosuch", "42704", "type \"nosuch\" does not exist"),
+            ("public.nosuch", "42704", "type \"public.nosuch\" does not exist"),
+            ("pg_catalog.nosuch[]", "42704", "type \"pg_catalog.nosuch[]\" does not exist"),
+            ("\"INT4\"", "42704", "type \"INT4\" does not exist"),
+            ("nosuch(3)", "42704", "type \"nosuch\" does not exist"),
+            ("a.b.c", "0A000", "cross-database references are not implemented: a.b.c"),
+            ("a.b.c.d", "42601", "improper qualified name (too many dotted names): a.b.c.d"),
+            ("int4(3)", "42601", "type modifier is not allowed for type \"int4\""),
+            ("numeric(1001)", "22023", "NUMERIC precision 1001 must be between 1 and 1000"),
+            ("numeric(2,-1001)", "22023", "NUMERIC scale -1001 must be between -1000 and 1000"),
+            ("numeric(1,2,3)", "22023", "invalid NUMERIC type modifier"),
+            ("character varying(0)", "22023", "length for type varchar must be at least 1"),
+            ("varchar(10485761)", "22023", "length for type varchar cannot exceed 10485760"),
+            ("char(0)", "22023", "length for type char must be at least 1"),
+            ("bit(0)", "22023", "length for type bit must be at least 1"),
+            ("float(54)", "22023", "precision for type float must be less than 54 bits"),
+            ("float(0)", "22023", "precision for type float must be at least 1 bit"),
+            ("", "42601", "invalid type name \"\""),
+            ("setof int4", "42601", "invalid type name \"setof int4\""),
+        ] {
+            assert_eq!(error(text), (code.to_owned(), message.to_owned(), None), "{text}");
+        }
+        for (text, message) in [
+            ("int4(", "syntax error at end of input"),
+            ("int4 int4", "syntax error at or near \"int4\""),
+            ("int4;", "syntax error at or near \";\""),
+            ("1", "syntax error at or near \"1\""),
+            ("int4)", "syntax error at or near \")\""),
+            ("select", "syntax error at or near \"select\""),
+            ("time(-1)", "syntax error at or near \"-\""),
+            ("\"unterminated", "unterminated quoted identifier at or near \"\"unterminated\""),
+        ] {
+            assert_eq!(error(text), ("42601".to_owned(), message.to_owned(), context(text)));
         }
     }
 }

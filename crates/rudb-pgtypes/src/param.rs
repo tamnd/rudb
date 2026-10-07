@@ -18,7 +18,7 @@ use crate::datetime::{
     UNIX_TO_POSTGRES_DAYS, date_in, date_recv, interval_in, interval_recv, time_in, time_recv,
     timestamp_in, timestamp_recv, timestamp_to_unix, timestamptz_in,
 };
-use crate::declared::declared_type;
+use crate::declared::type_name;
 use crate::error::TypeError;
 use crate::generated::oids;
 use crate::number::{int2_in, int4_in, int8_in, oid_in};
@@ -27,7 +27,7 @@ use crate::reg::{RegInput, RegKind, reg_in};
 use crate::scalar::{bool_in, bytea_in, char_in, name_in, uuid_in};
 use crate::string::{bpchar_in, varchar_in};
 use crate::types::{Oid, PgType, TypeInfo, format_type};
-use crate::{float4_in, float8_in, jsonb_in, jsonb_recv};
+use crate::{float4_in, float8_in, json_in, jsonb_in, jsonb_recv};
 
 /// What the text input of a parameter depends on: `DateStyle`, `TimeZone` and `IntervalStyle`.
 #[derive(Debug)]
@@ -169,6 +169,45 @@ pub fn column_value(
     })
 }
 
+/// The error that the input function of the type named `type_name` gives for `text`, or `None`
+/// when `text` is a value of the type. This is `pg_input_error_info` and `pg_input_is_valid`,
+/// which catch the errors of the input of a value and not the errors of the name of the type.
+///
+/// # Errors
+///
+/// The error of a name that is not a type, as [`type_name`] gives it, and `0A000` for a type whose
+/// input rudb does not have yet.
+pub fn soft_input_error(
+    text: &str,
+    type_name: &str,
+    settings: &InputSettings<'_>,
+) -> Result<Option<TypeError>, TypeError> {
+    let declared = self::type_name(type_name)?;
+    match declared.oid {
+        oids::VOID => return Ok(None),
+        oids::RECORD => {
+            return Ok(Some(TypeError::new(
+                SqlState::FEATURE_NOT_SUPPORTED,
+                "input of anonymous composite types is not implemented".to_owned(),
+            )));
+        }
+        oid if logical_type(oid).is_none() && oid != oids::JSON => {
+            return Err(TypeError::new(
+                SqlState::FEATURE_NOT_SUPPORTED,
+                format!("the input of type {} is not supported yet", format_type(oid)),
+            ));
+        }
+        _ => {}
+    }
+    let ty = PgType { oid: declared.oid, typmod: declared.typmod };
+    match column_value(ty, false, text.as_bytes(), settings) {
+        Ok(_) => Ok(None),
+        // A name of another kind than a type needs the catalog, which is not an error of the text.
+        Err(error) if error.sqlstate == SqlState::FEATURE_NOT_SUPPORTED => Err(error),
+        Err(error) => Ok(Some(error)),
+    }
+}
+
 /// A `char(n)` value as rudb keeps it, with no trailing spaces. The encoder of the rows pads it.
 fn bpchar_value(text: &str, typmod: i32) -> Result<Value, TypeError> {
     bpchar_in(text, typmod)?;
@@ -195,6 +234,7 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         }
         oids::NAME => Value::Varchar(name_in(text).to_owned()),
         oids::NUMERIC => Value::Numeric(numeric_in(text, -1)?.to_bytes()),
+        oids::JSON => Value::Varchar(json_in(text)?.to_owned()),
         oids::JSONB => Value::Varchar(jsonb_in(text)?),
         oids::DATE => date(date_in(text, cx)?),
         oids::TIME => Value::Time(time_in(text, -1, cx)?),
@@ -259,11 +299,7 @@ fn reg_value(kind: RegKind, text: &str) -> Result<u32, TypeError> {
         RegInput::Name(name) => name,
     };
     if kind == RegKind::Type {
-        // The type grammar reads the SQL names, and `pg_type` has the names such as `_int4`.
-        let found = declared_type(name).map(|declared| declared.oid);
-        return found.or_else(|| TypeInfo::by_name(name).map(|info| info.oid)).ok_or_else(|| {
-            TypeError::new(SqlState::UNDEFINED_OBJECT, format!("type \"{name}\" does not exist"))
-        });
+        return type_name(name).map(|declared| declared.oid);
     }
     Err(TypeError::new(
         SqlState::FEATURE_NOT_SUPPORTED,
@@ -366,6 +402,67 @@ mod tests {
         let refused = "invalid input syntax for type integer: \"1.5\"";
         assert_eq!(read(oids::INT4, "1.5"), Err(refused.to_owned()));
         assert_eq!(read(oids::BOOL, "yes"), Ok(Value::Boolean(true)));
+    }
+
+    #[test]
+    fn a_soft_input_error_is_the_error_of_the_input_of_the_text() {
+        let zone = FixedZone::utc();
+        let settings = InputSettings {
+            datetime: DateTimeInput {
+                order: DateOrder::Mdy,
+                zone: &zone,
+                zones: &NoZones,
+                abbrevs: ZoneAbbrevs::postgres_default(),
+                now: 0,
+            },
+            interval_style: IntervalStyle::Postgres,
+        };
+        let soft = |text, name| {
+            soft_input_error(text, name, &settings)
+                .unwrap()
+                .map(|e| (e.sqlstate.as_str().to_owned(), e.message, e.detail))
+        };
+        for (text, name) in [
+            ("12", "int4"),
+            ("abc ", "char(3)"),
+            ("anything", "void"),
+            ("1 2", "int2vector"),
+            ("{1,2}", "int4[]"),
+            ("\"\\u0000\"", "json"),
+            ("2024-01-13", "date"),
+        ] {
+            assert_eq!(soft(text, name), None, "{text} {name}");
+        }
+        let error = |code: &str, message: &str| Some((code.to_owned(), message.to_owned(), None));
+        assert_eq!(
+            soft("x", "int4"),
+            error("22P02", "invalid input syntax for type integer: \"x\"")
+        );
+        assert_eq!(soft("abcd", "char(3)"), error("22001", "value too long for type character(3)"));
+        assert_eq!(soft("1", "numeric(2,5)").map(|e| e.0), Some("22003".to_owned()));
+        assert_eq!(
+            soft("(1)", "record"),
+            error("0A000", "input of anonymous composite types is not implemented")
+        );
+        assert_eq!(
+            soft("{\"a\":", "json"),
+            Some((
+                "22P02".to_owned(),
+                "invalid input syntax for type json".to_owned(),
+                Some("The input string ended unexpectedly.".to_owned())
+            ))
+        );
+        assert_eq!(
+            soft("1", "_int4"),
+            Some((
+                "22P02".to_owned(),
+                "malformed array literal: \"1\"".to_owned(),
+                Some("Array value must start with \"{\" or dimension information.".to_owned())
+            ))
+        );
+        let hard = |text, name| soft_input_error(text, name, &settings).unwrap_err().sqlstate;
+        assert_eq!(hard("1", "nosuch"), SqlState::UNDEFINED_OBJECT);
+        assert_eq!(hard("1", "inet"), SqlState::FEATURE_NOT_SUPPORTED);
     }
 
     fn read(oid: Oid, binary: bool, data: &[u8]) -> Result<Value, TypeError> {
