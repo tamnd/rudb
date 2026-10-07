@@ -5696,6 +5696,9 @@ struct Resident {
     used: Arc<AtomicBool>,
 }
 
+/// A column laid end to end for a link join, with the flag that says whether it is still held.
+type Whole = (Arc<Vector>, Arc<AtomicBool>);
+
 /// Every column's pages of one reader, with how many each column holds and the floor under that.
 #[derive(Debug)]
 struct Shelf {
@@ -5714,7 +5717,7 @@ struct Shelf {
     kept: AtomicUsize,
     /// Each column laid end to end the way a link join gathers out of it, once a statement has done
     /// that and asked for it to be held. See [`Reader::hold_whole`].
-    wholes: Vec<Mutex<Option<(Arc<Vector>, Arc<AtomicBool>)>>>,
+    wholes: Vec<Mutex<Option<Whole>>>,
 }
 
 impl Shelf {
