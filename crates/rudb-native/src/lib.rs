@@ -5712,6 +5712,9 @@ struct Shelf {
     /// How many stripes of one column are kept whatever the budget says. See
     /// [`CACHED_STRIPES_PER_COLUMN`] for what sets it and [`Reader::keep_stripes`] for who raises it.
     kept: AtomicUsize,
+    /// Each column laid end to end the way a link join gathers out of it, once a statement has done
+    /// that and asked for it to be held. See [`Reader::hold_whole`].
+    wholes: Vec<Mutex<Option<(Arc<Vector>, Arc<AtomicBool>)>>>,
 }
 
 impl Shelf {
@@ -5782,7 +5785,8 @@ struct Held {
     shelf: Weak<Shelf>,
     column: usize,
     stripe: usize,
-    /// The part of the column in [`Shelf::parts`] when this is a decoded part rather than a page.
+    /// The part of the column in [`Shelf::parts`] when this is a decoded part rather than a page,
+    /// and [`WHOLE`] when it is the column in [`Shelf::wholes`].
     part: Option<usize>,
     bytes: usize,
     used: Arc<AtomicBool>,
@@ -5938,6 +5942,16 @@ impl PagePool {
             }
         }
         for (shelf, entry) in gone {
+            if entry.part == Some(WHOLE) {
+                let Some(Ok(mut held)) = shelf.wholes.get(entry.column).map(Mutex::lock) else {
+                    continue;
+                };
+                if held.as_ref().is_some_and(|(_, used)| Arc::ptr_eq(used, &entry.used)) {
+                    let _vector = held.take();
+                    drop(held);
+                }
+                continue;
+            }
             if let Some(part) = entry.part {
                 let Some(Ok(mut held)) = shelf.slot(entry.column, part).map(Mutex::lock) else {
                     continue;
@@ -5967,6 +5981,9 @@ impl PagePool {
         }
     }
 }
+
+/// The part a [`Held`] names when what it holds is a whole column rather than one part of it.
+const WHOLE: usize = usize::MAX;
 
 /// Stripes of one column a reader keeps the bytes of, when nobody has asked for more.
 ///
@@ -7965,6 +7982,7 @@ impl Reader {
             places: places.len(),
             held: (0..table_fields).map(|_| AtomicUsize::new(0)).collect(),
             kept: AtomicUsize::new(CACHED_STRIPES_PER_COLUMN),
+            wholes: (0..table_fields).map(|_| Mutex::new(None)).collect(),
         };
         let sieves = (0..table_fields).map(|_| OnceLock::new()).collect();
         let part_ranges = (0..table_fields).map(|_| OnceLock::new()).collect();
@@ -8130,6 +8148,46 @@ impl Reader {
     #[must_use]
     pub fn parts(&self) -> usize {
         self.places.len()
+    }
+
+    /// `column` laid end to end, when a statement before this one did that and the pool still holds
+    /// it. See [`Self::hold_whole`].
+    #[must_use]
+    pub fn held_whole(&self, column: usize) -> Option<Arc<Vector>> {
+        let held = self.cache.wholes.get(column)?.lock().ok()?;
+        let (vector, used) = held.as_ref()?;
+        used.store(true, Atomic::Relaxed);
+        Some(Arc::clone(vector))
+    }
+
+    /// Holds `vector` as the whole of `column` for the statements after this one, under the pool's
+    /// budget the way a decoded part is held.
+    ///
+    /// A link join whose children reach most of its parent's parts reads each projected column of
+    /// the parent whole, lays the parts end to end and packs the result over the column's range, so
+    /// that a gather is one load into something that fits in cache. That is a function of the file
+    /// and not of the query, and it was being done again by every statement: on TPC-H q09 the
+    /// `ps_supplycost` of every `partsupp` row, 39 million instructions a run out of 366. The parts
+    /// it was built from stay held as they were, since a scan reads those.
+    pub fn hold_whole(&self, column: usize, vector: &Arc<Vector>) {
+        if !self.pool.keeps() || self.last_for(column) {
+            return;
+        }
+        let Some(Ok(mut held)) = self.cache.wholes.get(column).map(Mutex::lock) else { return };
+        if held.is_some() {
+            return;
+        }
+        let used = Arc::new(AtomicBool::new(false));
+        *held = Some((Arc::clone(vector), Arc::clone(&used)));
+        drop(held);
+        self.pool.admit(Held {
+            shelf: Arc::downgrade(&self.cache),
+            column,
+            stripe: 0,
+            part: Some(WHOLE),
+            bytes: vector.footprint(),
+            used,
+        });
     }
 
     /// The share of a sample of a string column's rows that `function` keeps, one of the `LIKE`
@@ -19003,6 +19061,57 @@ mod tests {
         assert_eq!(second.value_at(63, 0), Value::Integer(63));
         assert!(matches!(*slot(0), PartSlot::Held { .. }), "the second read holds it");
         drop((a, catalog));
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A whole column handed to the reader is there for the next statement, goes when the pool
+    /// needs the room, and is not held at all by the last statement or by a pool that keeps nothing.
+    #[test]
+    fn a_whole_column_is_held_for_the_statements_after() {
+        let path = path("whole-column");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let values: Vec<Value> = (0..64).map(Value::Integer).collect();
+        let whole = Arc::new(Vector::from_values(LogicalType::Integer, &values).expect("integers"));
+        writer.append(&Chunk::new(vec![(*whole).clone()]).expect("rows")).expect("one part");
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let a = catalog.table("a").expect("a");
+        assert!(a.held_whole(0).is_none(), "nothing is held before it is handed over");
+        a.hold_whole(0, &whole);
+        let held = a.held_whole(0).expect("held for the next statement");
+        assert!(Arc::ptr_eq(&held, &whole), "the same column, not a copy of it");
+        assert_eq!(pool.bytes(), whole.footprint(), "and counted against the budget");
+        drop(held);
+
+        // Over budget with nothing read since, so the clock lets it go.
+        pool.budget.store(0, Atomic::Relaxed);
+        let slot = a.cache.wholes[0].lock().expect("the slot");
+        slot.as_ref().expect("held").1.store(false, Atomic::Relaxed);
+        drop(slot);
+        pool.admit(Held {
+            shelf: Arc::downgrade(&a.cache),
+            column: 0,
+            stripe: 0,
+            part: Some(WHOLE),
+            bytes: 1,
+            used: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(a.held_whole(0).is_none(), "a pool past its budget lets the column go");
+
+        let nothing = PagePool::new(0);
+        let b = Catalog::open_in(&path, &nothing).expect("again").table("a").expect("a");
+        b.hold_whole(0, &whole);
+        assert!(b.held_whole(0).is_none(), "a pool that keeps nothing holds no column");
+        let last = PagePool::new(usize::MAX);
+        last.last_statement();
+        let c = Catalog::open_in(&path, &last).expect("again").table("a").expect("a");
+        c.hold_whole(0, &whole);
+        assert!(c.held_whole(0).is_none(), "nor does the last statement");
+        drop((a, b, c, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
 
