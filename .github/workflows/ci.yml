@@ -38,6 +38,10 @@ env:
   # Every runner in this workflow is x86-64 except the macos one, which the test job handles.
   RUSTFLAGS: -D warnings -C target-cpu=x86-64-v3
   RUSTDOCFLAGS: -D warnings
+  # The test binaries, about three hundred of them, each link the whole workspace, and with full
+  # debug info they filled the disk of a hosted runner in October 2026. Line tables keep the file
+  # and line of a panic and of a backtrace at a fraction of the size. Release builds are untouched.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # Cheapest checks first, so a formatting mistake costs seconds rather than a full matrix.
