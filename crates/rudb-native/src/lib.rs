@@ -101,12 +101,12 @@ const GONE_ROWS: &[u8; 8] = b"RUDBGR10";
 /// so a build that cannot lay those over the table refuses the file rather than read old values.
 const GONE_PATCHED: &[u8; 8] = b"RUDBGR11";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
-/// How many parts [`Reader::matched`] runs a pattern over, spread evenly across the table.
-///
-/// Four parts of the native format are thirty two thousand rows, which puts a pattern that keeps
-/// one row in ten thousand at about three rows of the sample, and costs a few milliseconds once
-/// per pattern per open table.
+/// How many parts [`Reader::placed`] reads whole, spread evenly across the table.
 const SAMPLED_PARTS: usize = 4;
+/// How many parts [`Reader::matched`] takes a stride of rows of, spread evenly across the table.
+const STRATA: usize = 64;
+/// How many rows [`Reader::matched`] reads in all over [`STRATA`] parts.
+const STRATA_ROWS: usize = 16_384;
 /// How many parts a table can have for [`Reader::picked`] to run a condition over the whole of it.
 ///
 /// Thirty two parts are a quarter of a million rows, which holds every dimension table of JOB with
@@ -8135,9 +8135,9 @@ impl Reader {
     /// fifth of the rows. That is wrong both ways and JOB shows both: `'%Downey%Robert%'` keeps a
     /// handful of the four million names and `'%(co-production)%'` keeps a tenth of the companies,
     /// and in 6d the fifth made `name` look dearer than `cast_info` and put it after. So the pattern
-    /// is run over `SAMPLED_PARTS` parts spread across the table, read the way a sparse scan reads
-    /// them so no page is kept for it, and a pattern nothing in the sample matched is charged half a
-    /// row of the sample rather than none. The answer is kept for as long as the reader is, so a
+    /// is run over a stride of rows of [`STRATA`] parts spread across the table, see [`Self::sample`],
+    /// read the way a sparse scan reads them so no page is kept for it, and a pattern nothing in the
+    /// sample matched is charged half a row of the sample rather than none. The answer is kept for as long as the reader is, so a
     /// statement run again asks the file nothing.
     #[must_use]
     pub fn matched(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
@@ -8149,12 +8149,10 @@ impl Reader {
         if field.ty != LogicalType::Varchar {
             return None;
         }
-        let parts = self.parts();
-        let taken = parts.min(SAMPLED_PARTS);
+        let taken = self.sampled_parts();
         let (mut rows, mut kept) = (0_usize, 0_usize);
         for at in 0..taken {
-            let part = (at * parts + parts / 2) / taken;
-            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let Some(chunk) = self.sample(at, taken, column)? else { continue };
             let passed = passing(chunk.column(0).ok()?, function, pattern)?;
             rows += passed.len();
             kept += passed.iter().filter(|&&passed| passed).count();
@@ -8166,6 +8164,36 @@ impl Reader {
         let share = (kept as f64).max(0.5) / rows as f64;
         self.matched.lock().ok()?.insert(key, share);
         Some(share)
+    }
+
+    /// How many parts [`Self::sample`] is taken over.
+    fn sampled_parts(&self) -> usize {
+        self.parts().min(STRATA)
+    }
+
+    /// The `at`th of `taken` parts spread evenly over the table, read at a stride of its rows so
+    /// that the whole sample is about [`STRATA_ROWS`] rows, or whole where that is every row.
+    ///
+    /// A stride of many parts rather than a few parts whole, because a table laid out by the column
+    /// holds each value in a narrow stretch of it. In JOB `name` is in the order of the names, and
+    /// four parts whole held no name that starts with a B, so `n.name LIKE 'B%'` was put at 63 rows
+    /// and keeps 343,399.
+    fn sample(&self, at: usize, taken: usize, column: usize) -> Option<Option<Chunk>> {
+        let parts = self.parts();
+        let part = (at * parts + parts / 2) / taken;
+        let held = self.places.get(part)?.rows as usize;
+        let step = (held * taken).div_ceil(STRATA_ROWS).max(1);
+        if step == 1 {
+            return self.read_sparse(part, &[column]).ok().map(Some);
+        }
+        let positions: Vec<u32> = (step / 2..held)
+            .step_by(step)
+            .map(|row| u32::try_from(row).ok())
+            .collect::<Option<_>>()?;
+        if positions.is_empty() {
+            return Some(None);
+        }
+        self.read_rows(part, &[column], &positions, false).ok().map(Some)
     }
 
     /// The values of `key` in every row of the table `function` keeps, run as [`Self::matched`]
@@ -8233,12 +8261,10 @@ impl Reader {
             return Some(share);
         }
         self.table.fields.get(column)?;
-        let parts = self.parts();
-        let taken = parts.min(SAMPLED_PARTS);
+        let taken = self.sampled_parts();
         let (mut rows, mut kept) = (0_usize, 0_usize);
         for at in 0..taken {
-            let part = (at * parts + parts / 2) / taken;
-            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let Some(chunk) = self.sample(at, taken, column)? else { continue };
             let held = chunk.column(0).ok()?;
             rows += held.len();
             kept += (0..held.len())
