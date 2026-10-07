@@ -716,16 +716,21 @@ impl Binder<'_> {
             }
             // With nothing in scope here or outside, the pin says the `FROM` clause is missing.
             if scope.len() == 0 && self.outer_scopes.iter().all(|outer| outer.len() == 0) {
-                return Err(Error::binder(match parts {
-                    [word] => format!(
+                return Err(match parts {
+                    [word] => Error::binder(format!(
                         "Referenced column \"{word}\" was not found because the FROM clause is \
                          missing"
-                    ),
-                    _ => format!(
-                        "Referenced table \"{}\" not found!",
-                        parts[..parts.len() - 1].join(".")
-                    ),
-                }));
+                    ))
+                    .state(SqlState::UNDEFINED_COLUMN)
+                    .pg(format!("column \"{word}\" does not exist")),
+                    _ => {
+                        let table = parts[..parts.len() - 1].join(".");
+                        let last = parts[parts.len() - 2];
+                        Error::binder(format!("Referenced table \"{table}\" not found!"))
+                            .state(SqlState::UNDEFINED_TABLE)
+                            .pg(format!("missing FROM-clause entry for table \"{last}\""))
+                    }
+                });
             }
             return scope.resolve(compare, parts).map(|_| unreachable!());
         };

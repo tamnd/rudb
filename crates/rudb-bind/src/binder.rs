@@ -18,7 +18,7 @@ use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name
 use rudb_common::bounds::Zones;
 use rudb_common::{
     DeclaredType, Error, Field, LogicalType, Origin, Result, Semantics, Session, ShowBehavior,
-    Span, Stat, StateKey, Value,
+    Span, SqlState, Stat, StateKey, Value,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -2233,13 +2233,14 @@ impl<'a> Binder<'a> {
     pub(crate) fn output_name(&self, ast: &Ast, target: ast::ExprRef, input: &Scope) -> String {
         if let ast::Expr::Column { name } = ast.expr(target) {
             let parts: Vec<&str> = ast.name(name).collect();
-            if let Ok(found) = input.resolve(self.semantics.identifier_compare(), &parts) {
+            let compare = self.semantics.identifier_compare();
+            if let Ok(found) = input.resolve(compare, &parts) {
                 // A column found by its second name is headed by that name, so `t.range` over
                 // `range(2) t` is a column called `range` on the pin while `SELECT *` calls it `t`.
                 let written = parts.last().copied().unwrap_or_default();
                 if let Some(also) = &found.also
-                    && !same_name(&found.name, written)
-                    && same_name(also, written)
+                    && !compare.same(&found.name, written)
+                    && compare.same(also, written)
                 {
                     return also.clone();
                 }
@@ -2305,7 +2306,12 @@ impl<'a> Binder<'a> {
                 let [written] = parts.as_slice() else { return Ok(None) };
                 let mut found = None;
                 for target in targets {
-                    if target.alias != NONE && same_name(ast.string(target.alias), written) {
+                    if target.alias != NONE
+                        && self
+                            .semantics
+                            .identifier_compare()
+                            .same(ast.string(target.alias), written)
+                    {
                         if found.is_some() {
                             return Ok(None);
                         }
@@ -4448,14 +4454,15 @@ impl<'a> Binder<'a> {
 
         // NATURAL is USING over whatever both sides happen to call the same thing, which is why it
         // is resolved here and never reaches the plan as its own idea.
+        let compare = self.semantics.identifier_compare();
         let merged: Vec<String> = if natural {
             let mut names = Vec::new();
             for (at, column) in scope.columns.iter().enumerate().take(split) {
                 if !column.hidden
                     && scope.columns[split..]
                         .iter()
-                        .any(|right| !right.hidden && same_name(&right.name, &column.name))
-                    && !names.iter().any(|held: &String| same_name(held, &column.name))
+                        .any(|right| !right.hidden && compare.same(&right.name, &column.name))
+                    && !names.iter().any(|held: &String| compare.same(held, &column.name))
                 {
                     let _ = at;
                     names.push(column.name.clone());
@@ -4470,7 +4477,7 @@ impl<'a> Binder<'a> {
             // copy was the last column in it.
             let mut names: Vec<String> = Vec::new();
             for name in ast.name(using) {
-                if !names.iter().any(|held| same_name(held, name)) {
+                if !names.iter().any(|held| compare.same(held, name)) {
                     names.push(name.to_string());
                 }
             }
@@ -4482,20 +4489,22 @@ impl<'a> Binder<'a> {
         for name in &merged {
             let left_at = scope.columns[..split]
                 .iter()
-                .position(|column| !column.hidden && same_name(&column.name, name))
+                .position(|column| !column.hidden && compare.same(&column.name, name))
                 .ok_or_else(|| {
                     Error::binder(format!(
                         "column \"{name}\" specified in USING clause does not exist in left table"
                     ))
+                    .state(SqlState::UNDEFINED_COLUMN)
                 })?;
             let right_at = scope.columns[split..]
                 .iter()
-                .position(|column| !column.hidden && same_name(&column.name, name))
+                .position(|column| !column.hidden && compare.same(&column.name, name))
                 .map(|at| at + split)
                 .ok_or_else(|| {
                     Error::binder(format!(
                         "column \"{name}\" specified in USING clause does not exist in right table"
                     ))
+                    .state(SqlState::UNDEFINED_COLUMN)
                 })?;
             let left_column = &scope.columns[left_at];
             let (left_binding, left_type) = (left_column.binding, left_column.ty.clone());

@@ -17,8 +17,8 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
-    Bound as ColumnBound, Clustering, DeclaredType, Error, Field, InsertColumns, LogicalType,
-    Result, Session, SqlState, Stat, Value, Width,
+    Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
+    LogicalType, Result, Session, SqlState, Stat, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -645,7 +645,8 @@ pub(crate) fn bind_one(
                 let held = catalog.resolve_owner(&parts)?;
                 if let Some(column) = column
                     && !catalog.table(&held).is_ok_and(|table| {
-                        table.columns().iter().any(|field| same_name(&field.name, column))
+                        let compare = session.semantics().identifier_compare();
+                        table.columns().iter().any(|field| compare.same(&field.name, column))
                     })
                 {
                     return Err(Error::binder(format!(
@@ -1434,12 +1435,13 @@ fn create_table(
             Some(text)
         });
     }
+    let compare = session.semantics().identifier_compare();
     let mut checks = Vec::new();
     for &expr in ast.expr_list(written.checks) {
         let text = check_text(ast, expr, &columns, catalog, parameters, session)?;
         if !generated.is_empty() {
             for used in columns_in(&text)? {
-                let place = columns.iter().position(|field| same_name(&field.name, &used));
+                let place = columns.iter().position(|field| compare.same(&field.name, &used));
                 if place.is_some_and(is_generated) {
                     return Err(Error::binder(
                         "Constraints on generated columns are not supported yet",
@@ -1453,12 +1455,15 @@ fn create_table(
     for (at, &names) in ast.name_list(written.keys).iter().enumerate() {
         let mut places = Vec::new();
         for wanted in ast.name(names) {
-            let Some(place) = columns.iter().position(|field| same_name(&field.name, wanted))
+            let Some(place) = columns.iter().position(|field| compare.same(&field.name, wanted))
             else {
                 return Err(Error::catalog(format!(
                     "table \"{}\" does not have a column named \"{wanted}\"",
                     name.table
-                )));
+                ))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!("column \"{wanted}\" named in key does not exist"))
+                .unplaced());
             };
             if is_generated(place) {
                 return Err(Error::binder(
@@ -1484,7 +1489,7 @@ fn create_table(
         let parts: Vec<&str> = ast.name(table).collect();
         let wanted: Vec<&str> = ast.name(wanted).collect();
         for column in &names {
-            let place = columns.iter().position(|field| same_name(&field.name, column));
+            let place = columns.iter().position(|field| compare.same(&field.name, column));
             if place.is_some_and(is_generated) {
                 return Err(Error::binder(format!(
                     "Failed to create foreign key: referenced column \"{column}\" is a generated \
@@ -1493,7 +1498,7 @@ fn create_table(
             }
         }
         let key = (names.as_slice(), parts.as_slice(), wanted.as_slice());
-        foreign.push(foreign_key(catalog, &name, (&columns, &keys), key)?);
+        foreign.push(foreign_key((catalog, compare), &name, (&columns, &keys), key)?);
     }
     Ok(Bound::CreateTable(CreateTable {
         name,
@@ -1650,17 +1655,20 @@ fn constraint(held: ast::Constraint) -> rudb_catalog::Constraint {
 /// The referenced table is the one being made when the name is its own, and then its columns and
 /// keys are the ones this statement declares.
 fn foreign_key(
-    catalog: &Catalog,
+    (catalog, compare): (&Catalog, IdentifierCompare),
     made: &QualifiedName,
     (columns, keys): (&[Field], &[rudb_catalog::Key]),
     (names, parts, wanted): (&[&str], &[&str], &[&str]),
 ) -> Result<rudb_catalog::ForeignKey> {
     let mut places = Vec::with_capacity(names.len());
     for &wanted in names {
-        let Some(place) = columns.iter().position(|field| same_name(&field.name, wanted)) else {
+        let Some(place) = columns.iter().position(|field| compare.same(&field.name, wanted)) else {
             return Err(Error::binder(format!(
                 "Failed to create foreign key: referencing column \"{wanted}\" does not exist"
-            )));
+            ))
+            .state(SqlState::UNDEFINED_COLUMN)
+            .pg(format!("column \"{wanted}\" referenced in foreign key constraint does not exist"))
+            .unplaced());
         };
         places.push(place);
     }
@@ -1692,12 +1700,18 @@ fn foreign_key(
     } else {
         let mut referenced = Vec::with_capacity(wanted.len());
         for &column in wanted {
-            let Some(place) = fields.iter().position(|field| same_name(&field.name, column)) else {
+            let Some(place) = fields.iter().position(|field| compare.same(&field.name, column))
+            else {
                 return Err(Error::binder(format!(
                     "Failed to create foreign key: referenced table \"{}\" does not have a column \
                      named \"{column}\"",
                     table.table
-                )));
+                ))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!(
+                    "column \"{column}\" referenced in foreign key constraint does not exist"
+                ))
+                .unplaced());
             };
             referenced.push(place);
         }
@@ -1773,7 +1787,10 @@ fn check_text(
             let column = error.message().split('"').nth(1).unwrap_or_default();
             Err(Error::binder(format!(
                 "Table does not contain column \"{column}\" referenced in check constraint!"
-            )))
+            ))
+            .state(SqlState::UNDEFINED_COLUMN)
+            .pg(format!("column \"{column}\" does not exist"))
+            .unplaced())
         }
         Err(error) => Err(error),
         Ok(_) if !binder.windows.is_empty() => {
@@ -1792,6 +1809,7 @@ fn generated_columns(
     columns: &mut [Field],
     (catalog, parameters, session): (&Catalog, &Parameters, &Session),
 ) -> Result<Vec<Option<String>>> {
+    let compare = session.semantics().identifier_compare();
     let mut texts = vec![None; defs.len()];
     let mut uses = vec![Vec::new(); defs.len()];
     for (at, def) in defs.iter().enumerate() {
@@ -1827,10 +1845,14 @@ fn generated_columns(
             }
         }
         for used in columns_in(&text)? {
-            let Some(place) = columns.iter().position(|field| same_name(&field.name, &used)) else {
+            let Some(place) = columns.iter().position(|field| compare.same(&field.name, &used))
+            else {
                 return Err(Error::binder(format!(
                     "Column \"{used}\" referenced by generated column does not exist"
-                )));
+                ))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!("column \"{used}\" does not exist"))
+                .unplaced());
             };
             uses[at].push(place);
         }
@@ -2038,17 +2060,32 @@ fn alter(
     }
     let table = catalog.table(&name)?;
     let fields = table.columns();
+    let compare = session.semantics().identifier_compare();
     let place = |column: ast::StrRef| {
-        fields.iter().position(|field| same_name(&field.name, ast.string(column)))
+        fields.iter().position(|field| compare.same(&field.name, ast.string(column)))
     };
     let missing = |column: ast::StrRef| {
         let names: Vec<String> = fields.iter().map(|field| format!("\"{}\"", field.name)).collect();
+        let column = ast.string(column);
         Error::binder(format!(
-            "Table \"{}\" does not have a column with name \"{}\"\n\nDid you mean: {}",
+            "Table \"{}\" does not have a column with name \"{column}\"\n\nDid you mean: {}",
             name.table,
-            ast.string(column),
             names.join(", ")
         ))
+        .state(SqlState::UNDEFINED_COLUMN)
+        .pg(format!("column \"{column}\" of relation \"{}\" does not exist", name.table))
+        .unplaced()
+    };
+    // The catalog takes a name only when no column has the same bytes, so the session's rule is
+    // checked here.
+    let taken = |column: &str| {
+        if fields.iter().any(|field| compare.same(&field.name, column)) {
+            return Err(Error::catalog(format!("Column with name \"{column}\" already exists!"))
+                .state(SqlState::DUPLICATE_COLUMN)
+                .pg(format!("column \"{column}\" of relation \"{}\" already exists", name.table))
+                .unplaced());
+        }
+        Ok(())
     };
     let found = |column: ast::StrRef| place(column).ok_or_else(|| missing(column));
     let checks = table.checks();
@@ -2056,7 +2093,10 @@ fn alter(
     let alteration = match written.action {
         ast::AlterAction::Rename { .. } => unreachable!("a rename is handled above"),
         ast::AlterAction::RenameColumn { column, to } => {
-            let at = found(column)?;
+            // PostgreSQL leaves the table out of this one.
+            let at = place(column).ok_or_else(|| {
+                missing(column).pg(format!("column \"{}\" does not exist", ast.string(column)))
+            })?;
             let (old, to) = (fields[at].name.as_str(), ast.string(to));
             if in_foreign_key(catalog, &name, table, at) {
                 // The doubled quotes are the pin's, which quotes a name that is already quoted.
@@ -2072,6 +2112,7 @@ fn alter(
                 .filter(|_| table.has_generated())
                 .map(|at| table.generated(at).map(|text| rename_in(text, old, to)).transpose())
                 .collect::<Result<Vec<_>>>()?;
+            taken(to)?;
             let to = to.to_string();
             rudb_catalog::Alteration::RenameColumn { column: at, to, checks, generated }
         }
@@ -2079,6 +2120,7 @@ fn alter(
             if quiet && place(column.name).is_some() {
                 return nothing(Some(name));
             }
+            taken(ast.string(column.name))?;
             let ty = session_type(catalog, session, ast.string(column.ty))?;
             let declared = pg_declared(ast.string(column.ty), &ty);
             let field = Field {
@@ -2124,7 +2166,9 @@ fn alter(
                         continue;
                     }
                     if let Some(text) = table.generated(other)
-                        && columns_in(text)?.iter().any(|used| same_name(used, &fields[read].name))
+                        && columns_in(text)?
+                            .iter()
+                            .any(|used| compare.same(used, &fields[read].name))
                     {
                         also.push(other);
                         reached.push(other);
