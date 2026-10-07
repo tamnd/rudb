@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod build;
 #[cfg(test)]
 mod corpus;
 pub mod deparse;
@@ -20,6 +21,7 @@ pub mod matcher;
 pub mod parameters;
 mod reloptions;
 pub mod rules;
+pub mod shape;
 pub mod token;
 pub mod tokenize;
 pub mod transform;

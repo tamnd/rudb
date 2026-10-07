@@ -33,6 +33,7 @@ mod generated;
 mod lexer;
 pub mod nodes;
 mod parser;
+pub mod transform;
 
 pub use error::{Error, Notice, Severity};
 pub use filter::Tokens;
