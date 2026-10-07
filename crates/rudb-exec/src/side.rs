@@ -72,7 +72,7 @@ impl Build {
                 "a join cannot gather {rows} rows, which is more than a position can name"
             )));
         }
-        let columns = laid_out(types, chunks, threads)?;
+        let columns = laid_out(types, chunks, true, threads)?;
         Ok(Self { columns, rows })
     }
 
@@ -166,11 +166,18 @@ impl Build {
 pub(crate) fn laid_out(
     types: &[LogicalType],
     chunks: &[Chunk],
+    constants: bool,
     threads: &Lease<'_>,
 ) -> Result<Vec<Vector>> {
     let rows: usize = chunks.iter().map(Chunk::len).sum();
-    let decoded = decoded(types, chunks, threads)?;
+    let held: Vec<Option<Vector>> = (0..types.len())
+        .map(|index| if constants { constant(&types[index], chunks, index) } else { Ok(None) })
+        .collect::<Result<_>>()?;
+    let decoded = decoded(types, chunks, &held, threads)?;
     let one = |index: usize, spread: &Spread<'_>| -> Result<Vector> {
+        if let Some(constant) = &held[index] {
+            return Ok(constant.clone());
+        }
         if let Some(coded) = coded(chunks, index)? {
             return Ok(coded);
         }
@@ -221,11 +228,12 @@ const SPREAD_ROWS: usize = 1 << 16;
 fn decoded(
     types: &[LogicalType],
     chunks: &[Chunk],
+    held: &[Option<Vector>],
     threads: &Lease<'_>,
 ) -> Result<Vec<Vec<Option<Vector>>>> {
     let mut pieces: Vec<(usize, usize)> = Vec::new();
     for (index, ty) in types.iter().enumerate() {
-        if nested(ty) {
+        if nested(ty) || held[index].is_some() {
             continue;
         }
         for (at, chunk) in chunks.iter().enumerate() {
@@ -362,6 +370,32 @@ fn coded(chunks: &[Chunk], index: usize) -> Result<Option<Vector>> {
     } else {
         vector
     }))
+}
+
+/// Column `index` as the one value it is in every piece, when it is.
+///
+/// A side joined to a single row carries that row's columns as constants, and laying them out
+/// copied the value once a row through the general copy of a value. On TPC-H q21 the side of
+/// late lines joined to `nation` carried `n_nationkey` and `n_name` that way, and writing
+/// `'SAUDI ARABIA'` 156,739 times was a fifth of the join to `orders` over them. A probe gathers
+/// a constant as a constant, so it stays one all the way up.
+fn constant(ty: &LogicalType, chunks: &[Chunk], index: usize) -> Result<Option<Vector>> {
+    if nested(ty) {
+        return Ok(None);
+    }
+    let mut value: Option<&Value> = None;
+    let mut rows = 0;
+    for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+        let column = chunk.column(index)?;
+        let Some(here) = column.constant_value() else { return Ok(None) };
+        let nulls = column.validity().has_nulls(column.len());
+        if (nulls && !here.is_null()) || value.is_some_and(|held| held != here) {
+            return Ok(None);
+        }
+        value = Some(here);
+        rows += chunk.len();
+    }
+    Ok(value.map(|value| Vector::constant(ty.clone(), value.clone(), rows)))
 }
 
 /// Whether a flat piece holds fewer values than it has rows, which is what an untyped null is.

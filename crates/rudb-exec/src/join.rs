@@ -2945,7 +2945,7 @@ fn lookup(
     let Some(types) = keyed.first().map(Chunk::types) else {
         return Lookup::build(&[], 0, nulls, threads, cancel);
     };
-    let keys = laid_out(&types, &keyed, threads)?;
+    let keys = laid_out(&types, &keyed, false, threads)?;
     drop(keyed);
     let lookup = Lookup::build(&keys, rows, nulls, threads, cancel)?;
     scratch.grow(lookup.footprint())?;
@@ -2967,7 +2967,11 @@ fn laid_keys(keying: Keying<'_>, rows: &Build) -> Option<Vec<Vector>> {
         .exprs
         .iter()
         .map(|&expr| match *keying.plan.expr(expr) {
-            Expr::Column(binding) => rows.column(keying.schema.position_of(binding)?).cloned(),
+            // A constant is kept as one in the side, and the table is built over keys a row each.
+            Expr::Column(binding) => match rows.column(keying.schema.position_of(binding)?) {
+                Some(key) if key.constant_value().is_some() => key.flatten().ok(),
+                key => key.cloned(),
+            },
             _ => None,
         })
         .collect()
