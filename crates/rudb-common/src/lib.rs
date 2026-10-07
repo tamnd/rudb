@@ -59,8 +59,8 @@ pub use error::{Error, ErrorCode, Fields, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
-    DefaultNullOrder, IdentifierCase, IdentifierCompare, InsertColumns, PreparedStatement,
-    Semantics, Session, SessionTimeZone, ShowBehavior, Variable,
+    DefaultNullOrder, IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns,
+    PreparedStatement, Semantics, Session, SessionTimeZone, ShowBehavior, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

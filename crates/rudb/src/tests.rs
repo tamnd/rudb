@@ -13603,7 +13603,7 @@ fn a_postgres_session_names_columns_in_ddl_and_joins_by_their_bytes() {
         "column \"a\" specified in USING clause does not exist in left table"
     );
     assert_eq!(failure("SELECT * FROM l JOIN r USING (\"A\")").0, "42703");
-    assert_eq!(run("SELECT * FROM l NATURAL JOIN r").names(), ["A", "b", "a"]);
+    assert_eq!(run("SELECT * FROM l NATURAL JOIN r").names(), ["b", "A", "a"]);
     run("CREATE TABLE p (\"A\" int, a int, PRIMARY KEY (\"A\"))");
     run("INSERT INTO p VALUES (1, 2)");
     assert_eq!(
@@ -13634,6 +13634,95 @@ fn a_postgres_session_names_columns_in_ddl_and_joins_by_their_bytes() {
     }
     run("ALTER TABLE q RENAME COLUMN \"B\" TO \"C\"");
     assert_eq!(run("SELECT * FROM q").names(), ["b", "C"]);
+}
+
+#[test]
+fn a_join_puts_its_merged_columns_where_each_dialect_does() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let rows = |connection: &crate::Connection, sql: &str| {
+        let result = connection.execute(sql).expect(sql);
+        let rows: Vec<Vec<Value>> = result.rows().map(|row| row.to_vec()).collect();
+        (result.names().to_vec(), rows)
+    };
+    let int = Value::Integer;
+    let setup = [
+        "CREATE TABLE l (x int, b int, c int)",
+        "CREATE TABLE r (c int, y int, b int)",
+        "INSERT INTO l VALUES (1, 2, 3), (9, 9, 9)",
+        "INSERT INTO r VALUES (3, 4, 2), (8, 8, 8)",
+        "CREATE TABLE a (k bigint, v int)",
+        "CREATE TABLE w (k int, u int)",
+        "INSERT INTO a VALUES (2, 20)",
+        "INSERT INTO w VALUES (2, 200)",
+    ];
+    // The rows and the types are the ones of the PostgreSQL 19 oracle. The merged columns come
+    // first, `l.*` keeps the order of its table, and each merged column has the common type of
+    // its two copies.
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    for sql in setup {
+        connection.execute(sql).expect(sql);
+    }
+    assert_eq!(
+        rows(&connection, "SELECT * FROM l JOIN r USING (c, b)"),
+        (
+            vec!["c".into(), "b".into(), "x".into(), "y".into()],
+            vec![vec![int(3), int(2), int(1), int(4)]]
+        )
+    );
+    assert_eq!(rows(&connection, "SELECT * FROM l NATURAL JOIN r").0, ["b", "c", "x", "y"]);
+    assert_eq!(
+        rows(&connection, "SELECT * FROM l RIGHT JOIN r USING (b) ORDER BY 1").1,
+        [
+            vec![int(2), int(1), int(3), int(3), int(4)],
+            vec![int(8), Value::Null, Value::Null, int(8), int(8)]
+        ]
+    );
+    assert_eq!(
+        rows(&connection, "SELECT l.*, r.* FROM l JOIN r USING (b)").0,
+        ["x", "b", "c", "c", "y", "b"]
+    );
+    assert_eq!(
+        rows(&connection, "SELECT * FROM (l JOIN r USING (b)) JOIN l l2 USING (x)").0,
+        ["x", "b", "c", "c", "y", "b", "c"]
+    );
+    for sql in [
+        "SELECT k FROM w JOIN a USING (k)",
+        "SELECT k FROM w LEFT JOIN a USING (k)",
+        "SELECT k FROM a RIGHT JOIN w USING (k)",
+    ] {
+        assert_eq!(rows(&connection, sql).1, [vec![Value::BigInt(2)]], "{sql}");
+    }
+    assert_eq!(
+        rows(&connection, "SELECT k, a.k, w.k FROM w JOIN a USING (k)").1,
+        [vec![Value::BigInt(2), Value::BigInt(2), int(2)]]
+    );
+    let error = connection.execute("SELECT * FROM a JOIN w USING (k, k)").expect_err("twice");
+    assert_eq!(error.message(), "column name \"k\" appears more than once in USING clause");
+    assert_eq!(error.reported_state().as_str(), "42701");
+
+    // DuckDB keeps each merged column in the place and at the type of its left copy, and takes a
+    // name given two times as one name.
+    let db = Database::new();
+    let connection = db.connect();
+    for sql in setup {
+        connection.execute(sql).expect(sql);
+    }
+    assert_eq!(rows(&connection, "SELECT * FROM l JOIN r USING (c, b)").0, ["x", "b", "c", "y"]);
+    assert_eq!(
+        rows(&connection, "SELECT * FROM l RIGHT JOIN r USING (b) ORDER BY 1 NULLS LAST").0,
+        ["x", "b", "c", "c", "y"]
+    );
+    assert_eq!(rows(&connection, "SELECT k FROM w JOIN a USING (k)").1, [vec![int(2)]]);
+    assert_eq!(rows(&connection, "SELECT * FROM a JOIN w USING (k, k)").0, ["k", "v", "u"]);
 }
 
 #[test]
