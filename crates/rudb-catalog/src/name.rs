@@ -11,10 +11,16 @@
 //! one is a different function with a different cost that is worth having only when there is a test
 //! that fails without it.
 
-/// Whether two identifiers name the same object.
+use rudb_common::IdentifierCompare;
+
+/// Whether two identifiers name the same object, under the rule of DuckDB.
+///
+/// A lookup that a session makes takes the rule of the session from
+/// [`rudb_common::Semantics::identifier_compare`] instead. A PostgreSQL session compares the
+/// bytes.
 #[must_use]
 pub fn same_name(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
+    IdentifierCompare::CaseInsensitive.same(left, right)
 }
 
 /// A three part name, as it is written in SQL and as the plan's `Get` operator carries it.

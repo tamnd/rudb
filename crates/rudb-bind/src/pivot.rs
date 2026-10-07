@@ -47,8 +47,11 @@ impl Binder<'_> {
     pub(crate) fn bind_pivot(&mut self, ast: &Ast, index: u32) -> Result<(NodeRef, Scope)> {
         let pivot = ast.pivot(index);
         let (node, scope) = self.bind_source(ast, pivot.source)?;
-        let names: Vec<String> =
-            scope.star(None)?.iter().map(|column| column.name.clone()).collect();
+        let names: Vec<String> = scope
+            .star(self.semantics.identifier_compare(), None)?
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
         let held = format!("__pivot_source_{}", self.pivot_sources.len());
         let (inner, filter) = if pivot.unpivot {
             self.unpivot_query(ast, &pivot, &names, &held, &scope)?

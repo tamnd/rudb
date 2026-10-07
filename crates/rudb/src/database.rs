@@ -4788,13 +4788,7 @@ impl Shared {
             return Some(result.and_then(|result| settled.map(|()| result)));
         };
         let column = |written: &str| {
-            let mut found = fields
-                .iter()
-                .enumerate()
-                .filter(|(_, field)| field.name.eq_ignore_ascii_case(written))
-                .map(|(at, _)| at);
-            let at = found.next()?;
-            found.next().is_none().then_some(at)
+            upsert.insert.compare.find(fields.iter().map(|field| field.name.as_str()), written)
         };
         // A value of the column at `at`, as the plan's cast to it would leave it.
         let typed = |value: Value, at: usize| {
@@ -6105,11 +6099,9 @@ impl Shared {
             // A statement with its values written in takes the short ways of a prepared one, so an
             // update of one row by its key does not bind and plan a write of the whole table.
             if ast.parameters().is_empty()
-                && let Some(answer) = crate::prepared::Short::written(&ast).run(
-                    self,
-                    crate::prepared::Given::Positional(&[]),
-                    sql,
-                )
+                && let Some(answer) =
+                    crate::prepared::Short::written(&ast, session.semantics().identifier_compare())
+                        .run(self, crate::prepared::Given::Positional(&[]), sql)
             {
                 return answer;
             }
@@ -8251,7 +8243,9 @@ fn upsert_target(
         let mut named = upsert
             .key
             .iter()
-            .map(|column| fields.iter().position(|field| field.name.eq_ignore_ascii_case(column)))
+            .map(|column| {
+                upsert.insert.compare.find(fields.iter().map(|field| field.name.as_str()), column)
+            })
             .collect::<Option<Vec<_>>>()?;
         named.sort_unstable();
         named.dedup();
@@ -8265,7 +8259,10 @@ fn upsert_target(
     // A `DO UPDATE` of a column of the key moves the row to another key, which is the plan's.
     let rekeys = match &upsert.action {
         crate::prepared::Action::Update(changes) => changes.iter().any(|(column, _)| {
-            guard.columns.iter().any(|&at| table.columns()[at].name.eq_ignore_ascii_case(column))
+            guard
+                .columns
+                .iter()
+                .any(|&at| upsert.insert.compare.same(&table.columns()[at].name, column))
         }),
         _ => false,
     };
@@ -8384,7 +8381,7 @@ fn direct_targets(
     } else {
         let mut targets = Vec::with_capacity(direct.columns.len());
         for column in &direct.columns {
-            let at = fields.iter().position(|field| field.name.eq_ignore_ascii_case(column))?;
+            let at = direct.compare.find(fields.iter().map(|field| field.name.as_str()), column)?;
             if targets.contains(&at) {
                 return None;
             }
@@ -8532,18 +8529,13 @@ fn lookup_target(
     // A column is qualified by the alias when the table has one, and by its bare name otherwise.
     let qualifies = |qualifier: &[String]| match qualifier {
         [] => true,
-        [one] => one.eq_ignore_ascii_case(lookup.alias.as_deref().unwrap_or(&name.table)),
+        [one] => lookup.compare.same(one, lookup.alias.as_deref().unwrap_or(&name.table)),
         _ => false,
     };
     let column = |written: &[String]| {
         let (column, qualifier) = written.split_last()?;
-        let mut found = fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.name.eq_ignore_ascii_case(column))
-            .map(|(at, _)| at);
-        let at = found.next()?;
-        (qualifies(qualifier) && found.next().is_none()).then_some(at)
+        let at = lookup.compare.find(fields.iter().map(|field| field.name.as_str()), column)?;
+        qualifies(qualifier).then_some(at)
     };
     let mut columns = Vec::new();
     let mut names = Vec::new();
@@ -8599,14 +8591,10 @@ fn point_write_target(
     let table = catalog.table(&target.name).ok()?;
     let fields = table.columns();
     for (column, _) in &write.sets {
-        let mut found = fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| field.name.eq_ignore_ascii_case(column))
-            .map(|(at, _)| at);
-        let at = found.next()?;
+        let names = fields.iter().map(|field| field.name.as_str());
+        let at = write.lookup.compare.find(names, column)?;
         // A `GENERATED ALWAYS` column is refused, which the plan does.
-        if found.next().is_some() || table.identity(at) == Some(rudb_catalog::Identity::Always) {
+        if table.identity(at) == Some(rudb_catalog::Identity::Always) {
             return None;
         }
         target.sets.push(at);

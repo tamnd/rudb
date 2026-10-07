@@ -13464,6 +13464,106 @@ fn a_postgres_session_inserts_fewer_values_than_columns() {
 }
 
 #[test]
+fn a_postgres_session_compares_identifiers_by_their_bytes() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let run = |sql: &str| connection.execute(sql).expect(sql);
+    let row = |sql: &str| run(sql).rows().next().expect("a row").to_vec();
+    let failure = |sql: &str| {
+        let error = connection.execute(sql).expect_err(sql);
+        let postgres = error.fields().and_then(|fields| fields.postgres.clone());
+        (error.reported_state().as_str().to_owned(), postgres)
+    };
+    // A quoted name keeps its case and an unquoted name folds to lower case, so these are three
+    // columns and `A` is the column `a`.
+    run("CREATE TABLE t (\"A\" int, a int, \"Bb\" int)");
+    run("INSERT INTO t VALUES (1, 2, 3)");
+    let all = [Value::Integer(1), Value::Integer(2), Value::Integer(3)];
+    assert_eq!(row("SELECT * FROM t"), all);
+    assert_eq!(row("SELECT \"A\", a, \"Bb\" FROM t"), all);
+    assert_eq!(row("SELECT A, x.\"A\" FROM t AS x"), [Value::Integer(2), Value::Integer(1)]);
+    run("INSERT INTO t (\"Bb\", a) VALUES (6, 5)");
+    assert_eq!(row("SELECT \"A\", a FROM t WHERE \"Bb\" = 6"), [Value::Null, Value::Integer(5)]);
+    let column = |text: &str| Some(text.to_owned());
+    assert_eq!(
+        failure("SELECT bb FROM t"),
+        ("42703".into(), column("column \"bb\" does not exist"))
+    );
+    assert_eq!(
+        failure("SELECT t.bb FROM t"),
+        ("42703".into(), column("column t.bb does not exist"))
+    );
+    assert_eq!(
+        failure("SELECT q.a FROM t"),
+        ("42P01".into(), column("missing FROM-clause entry for table \"q\""))
+    );
+    assert_eq!(
+        failure("SELECT s.x FROM (SELECT 1 AS \"X\") s"),
+        ("42703".into(), column("column s.x does not exist"))
+    );
+    assert_eq!(
+        failure("INSERT INTO t (bb) VALUES (1)"),
+        ("42703".into(), column("column \"bb\" of relation \"t\" does not exist"))
+    );
+    assert_eq!(
+        failure("INSERT INTO t (\"a\", a) VALUES (1, 2)"),
+        ("42701".into(), column("column \"a\" specified more than once"))
+    );
+    assert_eq!(
+        failure("CREATE TABLE u (a int, \"a\" int)"),
+        ("42701".into(), column("column \"a\" specified more than once"))
+    );
+    let names = run("SELECT 1 AS \"Q\", 2 AS q, 3 AS Z").names().to_vec();
+    assert_eq!(names, ["Q", "q", "z"]);
+    // The short ways of a write and a read by key take the same rule as the plan.
+    run("CREATE TABLE k (id int PRIMARY KEY, \"V\" int, v int)");
+    run("INSERT INTO k (id, v, \"V\") VALUES (1, 20, 10)");
+    run("UPDATE k SET v = v + 1 WHERE id = 1");
+    run("INSERT INTO k VALUES (1, 0, 0) ON CONFLICT (id) DO UPDATE SET \"V\" = k.\"V\" + 2");
+    assert_eq!(
+        row("SELECT \"V\", v FROM k WHERE id = 1"),
+        [Value::Integer(12), Value::Integer(21)]
+    );
+    assert_eq!(
+        failure("UPDATE k SET \"Id\" = 1 WHERE id = 1"),
+        ("42703".into(), column("column \"Id\" of relation \"k\" does not exist"))
+    );
+    assert_eq!(
+        failure("UPDATE k SET v = 1, v = 2 WHERE id = 1"),
+        ("42601".into(), column("multiple assignments to same column \"v\""))
+    );
+    assert_eq!(
+        failure("INSERT INTO k VALUES (1, 0, 0) ON CONFLICT (\"ID\") DO NOTHING"),
+        ("42703".into(), column("column \"ID\" does not exist"))
+    );
+    assert_eq!(failure("SELECT \"ID\" FROM k WHERE id = 1").0, "42703");
+}
+
+#[test]
+fn a_duckdb_session_compares_identifiers_without_case() {
+    let db = Database::new();
+    let connection = db.connect();
+    let run = |sql: &str| connection.execute(sql).expect(sql);
+    run("CREATE TABLE t (\"Bb\" int)");
+    run("INSERT INTO t (bb) VALUES (3)");
+    assert_eq!(
+        run("SELECT BB, t.bB FROM t").rows().next().expect("a row"),
+        [Value::Integer(3), Value::Integer(3)]
+    );
+    let error = connection.execute("CREATE TABLE u (a int, \"A\" int)").expect_err("one name");
+    assert_eq!(error.message(), "Column with name A already exists!");
+}
+
+#[test]
 fn a_result_knows_the_table_column_of_each_plain_column() {
     let db = Database::new();
     let connection = db.connect();

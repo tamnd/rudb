@@ -642,6 +642,7 @@ impl Binder<'_> {
         parts: &[&str],
         scope: &Scope,
     ) -> Result<ExprRef> {
+        let compare = self.semantics.identifier_compare();
         // A lambda parameter beats a column of the same name, so `lambda l: l + 1` over a table with
         // a column `l` reads the element. The innermost lambda that has the name is the one meant.
         if let [word] = parts
@@ -657,14 +658,14 @@ impl Binder<'_> {
         let alias = ast.and_then(|ast| Some((ast, self.alias_for(parts)?)));
         if let [word] = parts
             && alias.is_none()
-            && !scope.names(word)
-            && !self.outer_scopes.iter().any(|outer| outer.names(word))
+            && !scope.names(compare, word)
+            && !self.outer_scopes.iter().any(|outer| outer.names(compare, word))
             && let Some(folded) = self.context_keyword(word)
         {
             return Ok(folded);
         }
         let clause = self.aliases.as_ref().map(|aliases| aliases.clause);
-        if let Some(found) = scope.resolve_optional(parts)? {
+        if let Some(found) = scope.resolve_optional(compare, parts)? {
             // In a `HAVING` an alias beats a column the block does not group by, so `SELECT sum(x)
             // AS x FROM t HAVING x > 6` compares the sum.
             if let Some((ast, alias)) = alias
@@ -680,7 +681,7 @@ impl Binder<'_> {
         }
         let mut found = None;
         for (at, outer) in self.outer_scopes.iter().enumerate().rev() {
-            if let Some(visible) = outer.resolve_optional(parts)? {
+            if let Some(visible) = outer.resolve_optional(compare, parts)? {
                 found = Some((at, visible.binding, visible.ty.clone()));
                 break;
             }
@@ -726,7 +727,7 @@ impl Binder<'_> {
                     ),
                 }));
             }
-            return scope.resolve(parts).map(|_| unreachable!());
+            return scope.resolve(compare, parts).map(|_| unreachable!());
         };
         // A LATERAL entry may not aggregate over what its left neighbour gave it. There is one row
         // of the left per evaluation of the entry, so `sum(o.k)` would be a sum of one value and
@@ -1402,7 +1403,9 @@ impl Binder<'_> {
                     ));
                 };
                 let parts: Vec<&str> = ast.name(name).collect();
-                let found = scope.resolve(&parts).map(|found| found.name.clone());
+                let found = scope
+                    .resolve(self.semantics.identifier_compare(), &parts)
+                    .map(|found| found.name.clone());
                 let field =
                     found.unwrap_or_else(|_| parts.last().copied().unwrap_or_default().into());
                 if names.iter().any(|earlier: &String| earlier.eq_ignore_ascii_case(&field)) {

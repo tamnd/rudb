@@ -250,7 +250,7 @@ impl Binder<'_> {
         let mut excluded_used = vec![false; excluded.len()];
         let mut replaced = vec![false; replacements.len()];
         let mut picked = Vec::new();
-        let starred = input.star(table.as_deref())?;
+        let starred = input.star(self.semantics.identifier_compare(), table.as_deref())?;
         // A bare star walks the hidden copies of a joined-on column too. On the pin the column goes
         // where the first copy `EXCLUDE` does not name is, and a `RENAME` reaches it through that
         // copy's name, so `* EXCLUDE (a.k)` over `a JOIN b USING (k)` has `k` after `x`, and a bare
@@ -346,7 +346,11 @@ impl Binder<'_> {
             }
             return Ok(Picks { entries, regex: None });
         }
-        let every = input.star(None)?.into_iter().cloned().collect::<Vec<_>>();
+        let every = input
+            .star(self.semantics.identifier_compare(), None)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let value = self.columns_argument(ast, inner, input)?;
         // The pin quotes the argument as it was bound, so a star in it is the names it stood for.
         let names: Vec<String> =
