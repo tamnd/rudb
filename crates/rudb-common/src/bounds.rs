@@ -573,6 +573,17 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// The share of the store's parts that `tests` cannot rule out, part by part rather than
+    /// stripe by stripe as [`Self::surviving`] does.
+    ///
+    /// What a scan with that filter opens. `name` in the IMDb load is laid out partly by gender, so
+    /// `gender = 'f'` rules out 216 of its 520 parts, which no stripe's ends show. `None` where the
+    /// store cannot say.
+    fn opened(&self, tests: &[Test]) -> Option<f64> {
+        let _ = tests;
+        None
+    }
+
     /// The table, the key column and the generation of the parent every row of this column was
     /// found in exactly once, when the store linked the column and proved it.
     ///

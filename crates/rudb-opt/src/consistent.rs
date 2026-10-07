@@ -63,7 +63,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rudb_common::bounds::{Bound, Reach, Zones};
+use rudb_common::bounds::{Bound, Reach, Test, Zones};
 use rudb_common::rules::Rule;
 use rudb_common::{Field, LogicalType, Result};
 use rudb_functions::FILE_ROW_NUMBER;
@@ -148,6 +148,28 @@ struct Relation {
 
 /// A column of one relation, as a position in the list of relations and a position in its scan.
 type Place = (usize, u32);
+
+/// The share of the parts of `relation` its own filters cannot rule out by the ends of the parts,
+/// which are the parts its scan reads. One where the store cannot say.
+fn opened(plan: &Plan, relation: &Relation) -> f64 {
+    let Some(zones) = plan.zones(relation.index) else { return 1.0 };
+    let Node::Get { columns, .. } = *plan.node(relation.get) else { return 1.0 };
+    let names = plan.field_list(columns);
+    let mut tests = Vec::new();
+    for &predicate in &relation.local {
+        for (position, op, value) in crate::bounds::of(plan, relation.get, predicate) {
+            let Some(column) = names.get(position).and_then(|field| zones.column(&field.name))
+            else {
+                return 1.0;
+            };
+            tests.push(Test { column, op, value });
+        }
+    }
+    if tests.is_empty() {
+        return 1.0;
+    }
+    zones.opened(&tests).map_or(1.0, |share| share.clamp(0.0, 1.0))
+}
 
 /// An order of the relations, each with its place in the list of relations and the relation it
 /// hangs from, if any.
@@ -429,7 +451,18 @@ fn rewrite(
                         .collect()
                 })
                 .unwrap_or_default();
-            Weight { rows, width, kept, reach, gathered, skew, domain: Vec::new(), named, placed }
+            Weight {
+                rows,
+                width,
+                kept,
+                opened: opened(plan, relation),
+                reach,
+                gathered,
+                skew,
+                domain: Vec::new(),
+                named,
+                placed,
+            }
         })
         .collect();
     let weights = with_domains(weights);
@@ -972,6 +1005,9 @@ struct Weight {
     width: u64,
     /// The share of its rows its own filters are estimated to keep, one when it has none.
     kept: f64,
+    /// The share of its parts its own filters do not rule out by their ends, one when they rule
+    /// out none or the store cannot say. See [`Zones::opened`].
+    opened: f64,
     /// How the values of each of its key columns sit across its parts, by class, where the store
     /// could say.
     reach: Vec<(u32, Reach)>,
@@ -1057,7 +1093,8 @@ impl Weight {
                 let share = self.local(*class, share);
                 Some(reach.touched(share * reach.values as f64))
             })
-            .fold(1.0, f64::min);
+            .fold(1.0, f64::min)
+            * self.opened;
         // The rest of the columns at the rows the keys keep, each at what [`PICK`] says reading a
         // column at one row picked out of a part costs, and at no more than reading them at every
         // row of the parts touched. Priced at a unit a row, the names of the 285,237 people
@@ -2058,6 +2095,7 @@ mod tests {
             rows,
             width,
             kept,
+            opened: 1.0,
             reach: Vec::new(),
             gathered: Vec::new(),
             skew: Vec::new(),
@@ -2320,6 +2358,20 @@ mod tests {
         assert!(people > whole * 0.4, "{people} {whole}");
         let few = name.read(&Standing::from([(1, 10.0 / 4_167_491.0)]), &classes);
         assert!(few < whole / 4.0, "{few} {whole}");
+    }
+
+    /// JOB 19a: `gender = 'f'` rules out 216 of the 520 parts of `name` by their ends, so a read of
+    /// the people a join left only opens the other 304.
+    #[test]
+    fn a_read_opens_only_the_parts_its_own_filters_leave() {
+        let mut name = weight(4_167_491, 4, 0.3);
+        name.domain = vec![(1, 4_167_491)];
+        let classes = BTreeSet::from([1]);
+        let people = Standing::from([(1, 0.068)]);
+        let every = name.read(&people, &classes);
+        name.opened = 304.0 / 520.0;
+        let opened = name.read(&people, &classes);
+        assert!(opened < every * 0.65, "{opened} {every}");
     }
 
     /// JOB 13a: `info_type` keeps one type of 113, and `movie_info_idx` holds five of them. The one

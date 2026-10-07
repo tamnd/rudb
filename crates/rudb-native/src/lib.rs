@@ -8137,8 +8137,8 @@ impl Reader {
     /// and in 6d the fifth made `name` look dearer than `cast_info` and put it after. So the pattern
     /// is run over a stride of rows of [`STRATA`] parts spread across the table, see [`Self::sample`],
     /// read the way a sparse scan reads them so no page is kept for it, and a pattern nothing in the
-    /// sample matched is charged half a row of the sample rather than none. The answer is kept for as long as the reader is, so a
-    /// statement run again asks the file nothing.
+    /// sample matched is charged half a row of the sample rather than none. The answer is kept for
+    /// as long as the reader is, so a statement run again asks the file nothing.
     #[must_use]
     pub fn matched(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
         let key = (column, function.to_owned(), pattern.to_owned());

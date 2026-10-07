@@ -189,6 +189,17 @@ impl Zones for Stripes {
         (parts > 0 && total > 0).then(|| (held as f64 / parts as f64, rows / total as f64))
     }
 
+    #[expect(clippy::cast_precision_loss, reason = "a count of parts is a share here")]
+    fn opened(&self, tests: &[Test]) -> Option<f64> {
+        let parts = self.reader.parts();
+        if parts == 0 || tests.is_empty() {
+            return None;
+        }
+        let probes = probes(tests);
+        let opened = (0..parts).filter(|&part| !self.reader.skips(part, &probes)).count();
+        Some(opened as f64 / parts as f64)
+    }
+
     fn total_link(&self, column: usize) -> Option<(String, usize, u64)> {
         crate::graph::total_parent(&self.reader, column)
     }
