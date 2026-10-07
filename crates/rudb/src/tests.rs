@@ -10746,6 +10746,30 @@ fn set_schema_and_search_path_follow_the_pin() {
     assert_eq!(values("SELECT current_schema()"), ["main"]);
 }
 
+/// `pg_catalog` and `information_schema` can head the path on their own, since the pin finds them
+/// in `system`, and they read back as they were written.
+#[test]
+fn the_schemas_of_system_can_be_set_as_the_search_path() {
+    let db = database();
+    let values = |sql: &str| -> Vec<String> {
+        db.query(sql)
+            .unwrap()
+            .rows()
+            .map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    db.execute("SET search_path = pg_catalog").unwrap();
+    assert_eq!(
+        values("SELECT current_setting('search_path'), current_schema(), current_schemas(true)"),
+        ["pg_catalog|pg_catalog|[main, pg_catalog, main, main, pg_catalog]"]
+    );
+    assert_eq!(values("SELECT count(*) FROM pg_class WHERE false"), ["0"]);
+    db.execute("SET search_path = 'PG_CATALOG'").unwrap();
+    assert_eq!(values("SELECT current_setting('search_path')"), ["PG_CATALOG"]);
+    db.execute("SET schema = 'information_schema'").unwrap();
+    assert_eq!(values("SELECT current_schema()"), ["information_schema"]);
+}
+
 /// `CREATE TYPE` gives another name to a type, which columns and casts read through, and a type
 /// made from another one holds it in place the way the pin says.
 #[test]
