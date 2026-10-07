@@ -203,10 +203,16 @@ impl Scope {
                 // The column name is in double quotes and the candidates under it are in single
                 // ones, which reads like a mistake and is what the pin prints:
                 // `Ambiguous reference to column name "a" (use: 't.a' or 'u.a')`.
+                let written = match table {
+                    Some(table) => format!("{table}.{column}"),
+                    None => column.to_string(),
+                };
                 Err(Error::binder(format!(
                     "Ambiguous reference to column name \"{column}\" (use: '{}')",
                     candidates.join("' or '")
-                )))
+                ))
+                .state(SqlState::AMBIGUOUS_COLUMN)
+                .pg(format!("column reference \"{written}\" is ambiguous")))
             }
         }
     }
@@ -232,8 +238,12 @@ impl Scope {
             return Err(match qualifier {
                 Some(table) => {
                     Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
+                        .state(SqlState::UNDEFINED_TABLE)
+                        .pg(format!("missing FROM-clause entry for table \"{table}\""))
                 }
-                None => Error::binder("* is not allowed in a query without a FROM clause"),
+                None => Error::binder("* is not allowed in a query without a FROM clause")
+                    .state(SqlState::SYNTAX_ERROR)
+                    .pg("SELECT * with no tables specified is not valid"),
             });
         }
         Ok(matched)
@@ -257,7 +267,9 @@ impl Scope {
                 "table \"{what}\" has {} columns available but {} columns specified",
                 self.columns.len(),
                 names.len()
-            )));
+            ))
+            .state(SqlState::INVALID_COLUMN_REFERENCE)
+            .unplaced());
         }
         self.rename_prefix(names);
         Ok(())

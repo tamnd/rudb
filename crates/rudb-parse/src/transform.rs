@@ -322,9 +322,9 @@ impl<'a> Transform<'a> {
         self.ast.push_expr(expr, self.current_span)
     }
 
-    /// Push a from item and return its index.
+    /// Push a from item that covers the current span and return its index.
     fn push_source(&mut self, source: Source) -> SourceRef {
-        self.ast.push_source(source)
+        self.ast.push_source(source, self.current_span)
     }
 
     /// Push a query and return its index.
@@ -4104,7 +4104,8 @@ impl<'a> Transform<'a> {
                 }
             }
         }
-        Ok(self.push_source(Source::Table { name, alias, columns }))
+        let span = self.span(base);
+        Ok(self.ast.push_source(Source::Table { name, alias, columns }, span))
     }
 
     /// The definition `recurring.name` reads, which is one whose own query is being transformed.

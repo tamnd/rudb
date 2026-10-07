@@ -387,7 +387,9 @@ impl Binder<'_> {
             return Err(Error::binder(format!(
                 "Subquery returns {} columns - expected 1",
                 scope.len()
-            )));
+            ))
+            .state(SqlState::SYNTAX_ERROR)
+            .pg("subquery must return only one column"));
         };
         let mut binding = column.binding;
         let mut ty = column.ty.clone();
@@ -716,7 +718,9 @@ impl Binder<'_> {
                 if clause == Some(AliasClause::Having) && !self.in_aggregate {
                     return Err(Error::binder(format!(
                         "column \"{word}\" must appear in the GROUP BY clause or be used in an aggregate function"
-                    )));
+                    ))
+                    .state(SqlState::UNDEFINED_COLUMN)
+                    .pg(format!("column \"{word}\" does not exist")));
                 }
             }
             // With nothing in scope here or outside, the pin says the `FROM` clause is missing.
@@ -2194,10 +2198,13 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         let (node, inner, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
         let [column] = inner.columns.as_slice() else {
+            let many = if inner.len() > 1 { "many" } else { "few" };
             return Err(Error::binder(format!(
                 "Subquery returns {} columns - expected 1",
                 inner.len()
-            )));
+            ))
+            .state(SqlState::SYNTAX_ERROR)
+            .pg(format!("subquery has too {many} columns")));
         };
         let candidate_type = column.ty.clone();
         let candidate_name = column.name.clone();

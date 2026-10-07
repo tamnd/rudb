@@ -929,7 +929,10 @@ impl<'a> Binder<'a> {
         if other.len() != scope.len() {
             return Err(Error::binder(
                 "Set operations can only apply to expressions with the same number of result columns",
-            ));
+            )
+            .state(SqlState::SYNTAX_ERROR)
+            .pg("each UNION query must have the same number of columns")
+            .with_span(first_column(ast, right)));
         }
         let (recursive, over) = self.project_onto(recursive, &other, &fields, &name)?;
         let mut args = Vec::with_capacity(args.len());
@@ -1427,11 +1430,17 @@ impl<'a> Binder<'a> {
         let width = first.len as usize;
         for (at, row) in written.iter().enumerate() {
             if row.len as usize != width {
-                return Err(Error::binder(format!(
+                let error = Error::binder(format!(
                     "VALUES lists must all be the same length, expected {width} columns but row {} has {}",
                     at + 1,
                     row.len
-                )));
+                ))
+                .state(SqlState::SYNTAX_ERROR)
+                .pg("VALUES lists must all be the same length");
+                return Err(match ast.expr_list(*row).first() {
+                    Some(&first) => error.with_span(ast.expr_span(first)),
+                    None => error,
+                });
             }
         }
         // A row of a `VALUES` cannot see a column, because there is nothing under it to see.
@@ -1560,7 +1569,8 @@ impl<'a> Binder<'a> {
         let merged = if operator.by_name {
             match_by_name(&left_scope, &right_scope)?
         } else {
-            match_by_position(&left_scope, &right_scope)?
+            match_by_position(&left_scope, &right_scope, operator.op)
+                .map_err(|error| error.with_fallback_span(first_column(ast, right)))?
         };
         let left_node = self.conform(left_node, &left_scope, &merged, |column| column.left)?;
         let right_node = self.conform(right_node, &right_scope, &merged, |column| column.right)?;
@@ -2302,7 +2312,10 @@ impl<'a> Binder<'a> {
                     return Err(Error::binder(format!(
                         "{clause} term out of range - should be between 1 and {}",
                         targets.len()
-                    )));
+                    ))
+                    .state(SqlState::INVALID_COLUMN_REFERENCE)
+                    .pg(format!("{clause} position {position} is not in select list"))
+                    .with_span(ast.expr_span(item)));
                 }
                 Ok(Some(targets[position - 1].expr))
             }
@@ -2483,7 +2496,10 @@ impl<'a> Binder<'a> {
                     return Err(Error::binder(format!(
                         "ORDER BY term out of range - should be between 1 and {}",
                         output.len()
-                    )));
+                    ))
+                    .state(SqlState::INVALID_COLUMN_REFERENCE)
+                    .pg(format!("ORDER BY position {position} is not in select list"))
+                    .with_span(ast.expr_span(item)));
                 }
                 Ok(Some(position - 1))
             }
@@ -2796,9 +2812,10 @@ impl<'a> Binder<'a> {
         source: ast::SourceRef,
     ) -> Result<(NodeRef, Scope)> {
         match ast.source(source) {
-            ast::Source::Table { name, alias, columns } => {
-                self.bind_table(ast, name, alias, columns)
-            }
+            // An error about the table points at its name, as it does in both dialects.
+            ast::Source::Table { name, alias, columns } => self
+                .bind_table(ast, name, alias, columns)
+                .map_err(|error| error.with_fallback_span(ast.source_span(source))),
             ast::Source::Function { name, args, alias, columns, pragma } => {
                 self.bind_table_function(ast, name, args, alias, columns, pragma)
             }
@@ -2921,6 +2938,9 @@ impl<'a> Binder<'a> {
         let resolved = match catalog.resolve(&parts) {
             Ok(resolved) => resolved,
             Err(missing) => {
+                let missing = missing
+                    .state(SqlState::UNDEFINED_TABLE)
+                    .pg(format!("relation \"{}\" does not exist", parts.join(".")));
                 return self.bind_replacement_scan(ast, &parts, alias, columns, missing);
             }
         };
@@ -4839,18 +4859,25 @@ impl<'a> Binder<'a> {
         let AggregateCall { name, args, distinct, filter, sorted } = *written;
         let exporting = std::mem::take(&mut self.exporting);
         if self.in_filter {
-            return Err(Error::binder("aggregate functions are not allowed in FILTER"));
+            return Err(Error::binder("aggregate functions are not allowed in FILTER")
+                .state(SqlState::GROUPING_ERROR));
         }
         if self.in_aggregate && self.folding {
             return Err(Error::binder("Aggregate functions are not supported here"));
         }
         if self.in_aggregate {
-            return Err(Error::binder("aggregate function calls cannot be nested"));
+            return Err(Error::binder("aggregate function calls cannot be nested")
+                .state(SqlState::GROUPING_ERROR));
         }
         if self.aggregation.is_none() {
             // A join condition is the `WHERE` clause here too, the way it is for a window.
             let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
-            return Err(Error::binder(format!("{clause} cannot contain aggregates!")));
+            let error = Error::binder(format!("{clause} cannot contain aggregates!"))
+                .state(SqlState::GROUPING_ERROR);
+            return Err(match postgres_clause(self.clause) {
+                Some(place) => error.pg(format!("aggregate functions are not allowed in {place}")),
+                None => error,
+            });
         }
         // The predicate goes first, which is the order the messages come out in upstream: a call
         // whose argument and whose filter both name columns that are not there is refused over the
@@ -5647,6 +5674,19 @@ impl<'a> Binder<'a> {
             .map_or_else(|| "a column".to_string(), |column| format!("\"{}\"", column.name))
     }
 
+    /// The name of a column with the name of its table, as `t.a`, or the column name alone when
+    /// the column has no table.
+    fn qualified_name_of(&self, binding: ColumnBinding, scope: &Scope) -> String {
+        std::iter::once(scope)
+            .chain(self.outer_scopes.iter().rev())
+            .flat_map(|visible| visible.columns.iter())
+            .find(|column| column.binding == binding)
+            .map_or_else(String::new, |column| match column.table.as_str() {
+                "" => column.name.clone(),
+                table => format!("{table}.{}", column.name),
+            })
+    }
+
     /// Rewrites a bound expression into one the aggregate's output can answer.
     ///
     /// A subexpression that is one of the group expressions becomes a reference to that group. A
@@ -5698,14 +5738,23 @@ impl<'a> Binder<'a> {
                 let read = self.ungrouped_correlation(binding).unwrap_or(binding);
                 let name = self.name_of(read, scope);
                 // The pin words it differently in a `HAVING`, where it gives no hint.
-                if self.clause == "HAVING clause" {
-                    return Err(Error::binder(format!(
+                let error = if self.clause == "HAVING clause" {
+                    Error::binder(format!(
                         "column {name} must appear in the GROUP BY clause or be used in an aggregate function"
-                    )));
-                }
-                Err(Error::binder(format!(
-                    "column {name} must appear in the GROUP BY clause or must be part of an aggregate function.\nEither add it to the GROUP BY list, or use ANY_VALUE({name}) if the exact value of {name} is not important."
-                )))
+                    ))
+                } else {
+                    Error::binder(format!(
+                        "column {name} must appear in the GROUP BY clause or must be part of an aggregate function.\nEither add it to the GROUP BY list, or use ANY_VALUE({name}) if the exact value of {name} is not important."
+                    ))
+                };
+                // PostgreSQL names the column with its table, and points at the column.
+                let qualified = self.qualified_name_of(read, scope);
+                Err(error
+                    .state(SqlState::GROUPING_ERROR)
+                    .pg(format!(
+                        "column \"{qualified}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                    ))
+                    .with_fallback_span(self.plan.expr_span(expr)))
             }
             Expr::Constant(_)
             | Expr::Aggregate { .. }
@@ -5827,6 +5876,37 @@ fn mirror_target(paths: &[String]) -> Option<(String, FileStamp)> {
     Some((canonical.to_str()?.to_string(), stamp))
 }
 
+/// How PostgreSQL names the clause that the binder is in, in an error about what the clause cannot
+/// contain. This is `ParseExprKindName` and the special cases of `check_agglevels_and_constraints`.
+/// A clause that PostgreSQL does not have gives `None`.
+fn postgres_clause(clause: &str) -> Option<&'static str> {
+    Some(match clause {
+        "WHERE clause" => "WHERE",
+        "JOIN condition" => "JOIN conditions",
+        "GROUP BY clause" => "GROUP BY",
+        "LIMIT clause" => "LIMIT",
+        "VALUES clause" => "VALUES",
+        "table function arguments" => "functions in FROM",
+        _ => return None,
+    })
+}
+
+/// The place of the first column that a query writes, or the place of the query when it writes no
+/// column. PostgreSQL points there for an error about the columns of one side of a set operation.
+fn first_column(ast: &Ast, query: ast::QueryRef) -> Span {
+    let first = match ast.query(query).body {
+        ast::QueryBody::Select(select) => {
+            ast.target_list(ast.select(select).targets).first().map(|target| target.expr)
+        }
+        ast::QueryBody::SetOp { left, .. } => return first_column(ast, left),
+        ast::QueryBody::Values(rows) => {
+            ast.rows(rows).first().and_then(|&row| ast.expr_list(row).first().copied())
+        }
+        _ => None,
+    };
+    first.map_or_else(|| ast.query_span(query), |expr| ast.expr_span(expr))
+}
+
 /// What was written between the two sides of a set operation.
 #[derive(Clone, Copy)]
 struct Operator {
@@ -5853,13 +5933,20 @@ struct Merged {
 /// Matches the two sides of an ordinary set operation, which is first column to first column.
 ///
 /// The names are the left side's, so `SELECT a FROM t UNION SELECT b FROM u` comes out as `a`.
-fn match_by_position(left: &Scope, right: &Scope) -> Result<Vec<Merged>> {
+fn match_by_position(left: &Scope, right: &Scope, op: SetOp) -> Result<Vec<Merged>> {
     if left.len() != right.len() {
+        let context = match op {
+            SetOp::Union => "UNION",
+            SetOp::Except => "EXCEPT",
+            SetOp::Intersect => "INTERSECT",
+        };
         return Err(Error::binder(format!(
             "Set operations can only apply to expressions with the same number of result columns, but left side has {} and right side has {}",
             left.len(),
             right.len()
-        )));
+        ))
+        .state(SqlState::SYNTAX_ERROR)
+        .pg(format!("each {context} query must have the same number of columns")));
     }
     let mut merged = Vec::with_capacity(left.len());
     for (at, (held, other)) in left.columns.iter().zip(&right.columns).enumerate() {

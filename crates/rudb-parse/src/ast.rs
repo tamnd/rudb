@@ -1650,6 +1650,9 @@ pub struct Ast {
     pub expr_spans: Vec<Span>,
     /// The from-item arena.
     pub sources: Vec<Source>,
+    /// Source ranges parallel to `sources`. For a table, the range is its name, which is where an
+    /// error about the table points.
+    pub source_spans: Vec<Span>,
     /// Interned text. Identifiers keep the case they were written in, because DuckDB does not fold
     /// it at any point, including for quoted identifiers.
     pub strings: Vec<String>,
@@ -1762,6 +1765,11 @@ impl Ast {
     /// The source range of a query.
     pub fn query_span(&self, query: QueryRef) -> Span {
         self.query_spans[query as usize]
+    }
+
+    /// The source range of a from item.
+    pub fn source_span(&self, source: SourceRef) -> Span {
+        self.source_spans[source as usize]
     }
 
     /// The text behind a [`StrRef`], or the empty string for `NONE`.

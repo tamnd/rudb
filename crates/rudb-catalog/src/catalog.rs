@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use rudb_common::sequence::Counter;
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, SqlState, Value};
 
 use crate::macros::Macro;
 use crate::name::{QualifiedName, same_name};
@@ -2414,8 +2414,13 @@ fn missing(wanted: Entry, name: &str) -> Error {
 /// It went the other way round in v1.5.1, where the sentence named the type being created. That
 /// reads backwards and upstream changed it, which is the argument for pinning the reference to the
 /// vendored commit rather than to whatever is released.
+///
+/// PostgreSQL says `relation` for both, because a table and a view share one namespace there.
 fn taken(found: Entry, name: &str) -> Error {
     Error::catalog(format!("{found} with name \"{name}\" already exists!"))
+        .state(SqlState::DUPLICATE_TABLE)
+        .pg(format!("relation \"{name}\" already exists"))
+        .unplaced()
 }
 
 #[cfg(test)]

@@ -13943,6 +13943,95 @@ fn a_postgres_session_hints_the_nearest_column_names() {
 }
 
 #[test]
+fn a_postgres_session_words_binder_errors_as_postgres() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    connection.execute("CREATE TABLE t (a int, b text, c numeric)").expect("t");
+    connection.execute("CREATE TABLE u (a int, d int)").expect("u");
+    // The SQLSTATE, the text and the position that the PostgreSQL 19 oracle sends for each one.
+    let cases: [(&str, &str, &str, Option<u32>); 15] = [
+        ("VALUES (1, 2), (3)", "42601", "VALUES lists must all be the same length", Some(17)),
+        ("SELECT a FROM t, u", "42702", "column reference \"a\" is ambiguous", Some(8)),
+        ("SELECT * FROM nope", "42P01", "relation \"nope\" does not exist", Some(15)),
+        (
+            "SELECT a FROM t GROUP BY b",
+            "42803",
+            "column \"t.a\" must appear in the GROUP BY clause or be used in an aggregate function",
+            Some(8),
+        ),
+        (
+            "SELECT sum(a) FROM t WHERE sum(a) > 1",
+            "42803",
+            "aggregate functions are not allowed in WHERE",
+            Some(28),
+        ),
+        (
+            "SELECT * FROM t ORDER BY 5",
+            "42P10",
+            "ORDER BY position 5 is not in select list",
+            Some(26),
+        ),
+        (
+            "SELECT a FROM t GROUP BY 4",
+            "42P10",
+            "GROUP BY position 4 is not in select list",
+            Some(26),
+        ),
+        (
+            "SELECT 1 UNION SELECT 'a', 2",
+            "42601",
+            "each UNION query must have the same number of columns",
+            Some(23),
+        ),
+        ("SELECT x.* FROM t", "42P01", "missing FROM-clause entry for table \"x\"", Some(8)),
+        (
+            "SELECT max(max(a)) FROM t",
+            "42803",
+            "aggregate function calls cannot be nested",
+            Some(12),
+        ),
+        ("SELECT 1 IN (SELECT 1, 2)", "42601", "subquery has too many columns", Some(10)),
+        ("SELECT (SELECT a, b FROM t)", "42601", "subquery must return only one column", Some(8)),
+        ("CREATE TABLE t (z int)", "42P07", "relation \"t\" already exists", None),
+        ("DROP TABLE nope", "42P01", "table \"nope\" does not exist", None),
+        (
+            "SELECT * FROM generate_series(1, 2) AS g(a, b)",
+            "42P10",
+            "table \"g\" has 1 columns available but 2 columns specified",
+            None,
+        ),
+    ];
+    for (sql, state, text, position) in cases {
+        let error = connection.execute(sql).expect_err(sql);
+        let fields = error.fields();
+        let sent = fields.and_then(|fields| fields.postgres.clone());
+        let placed = !fields.is_some_and(|fields| fields.unplaced);
+        let at = error.span().filter(|_| placed).map(|span| span.start + 1);
+        assert_eq!(
+            (error.reported_state().as_str(), sent.as_deref().unwrap_or(error.message()), at),
+            (state, text, position),
+            "{sql}"
+        );
+    }
+    // The message of the error stays the one of the pin, which a DuckDB client reads.
+    let db = Database::new();
+    let connection = db.connect();
+    let error = connection.execute("SELECT * FROM nope").expect_err("nope");
+    assert_eq!(error.message(), "Table with name nope does not exist!");
+    let error = connection.execute("SELECT * FROM range(3) ORDER BY 5").expect_err("5");
+    assert_eq!(error.message(), "ORDER BY term out of range - should be between 1 and 1");
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
