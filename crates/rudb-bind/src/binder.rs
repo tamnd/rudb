@@ -17,8 +17,8 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    DeclaredType, Error, Field, JoinColumns, LogicalType, Origin, Result, Semantics, Session,
-    ShowBehavior, Span, SqlState, Stat, StateKey, Value,
+    AggregateTypes, DeclaredType, Error, Field, JoinColumns, LogicalType, Origin, Result,
+    Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -1505,9 +1505,10 @@ impl<'a> Binder<'a> {
             slices.push(self.plan.add_expr_list(&items));
         }
         let rows = self.plan.add_rows(&slices);
-        // PostgreSQL counts the columns of `VALUES` from one, and DuckDB counts them from zero.
-        let (prefix, first) =
-            if self.session.postgres().is_some() { ("column", 1) } else { ("col", 0) };
+        let (prefix, first) = match self.semantics.values_names() {
+            ValuesNames::FromZero => ("col", 0),
+            ValuesNames::FromOne => ("column", 1),
+        };
         let fields: Vec<Field> = types
             .iter()
             .enumerate()
@@ -4983,7 +4984,8 @@ impl<'a> Binder<'a> {
         // `numeric_avg` divide the exact sum by the count with `numeric_div`. The sum and the count
         // keep the fast paths that the executor has for them, where a mean as a `numeric` would not.
         let exact = |ty: &LogicalType| ty.is_integer() || matches!(ty, LogicalType::Decimal { .. });
-        if self.session.postgres().is_some()
+        let postgres = self.semantics.aggregate_types() == AggregateTypes::Postgres;
+        if postgres
             && !exporting
             && resolved.name == "avg"
             && unordered
@@ -5004,7 +5006,7 @@ impl<'a> Binder<'a> {
         let column = self.aggregate_call(&name, &cast, distinct, filter, ty);
         // PostgreSQL sums an `int2` or an `int4` into an `int8` and a `float4` into a `float4`,
         // where the pin sums them into a HUGEINT and a DOUBLE.
-        if self.session.postgres().is_some() && !exporting && resolved.name == "sum" {
+        if postgres && !exporting && resolved.name == "sum" {
             match types.first() {
                 Some(LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer) => {
                     return Ok(self.cast_to(column, &LogicalType::BigInt));
@@ -5425,7 +5427,7 @@ impl<'a> Binder<'a> {
         // The mean of an integer or a decimal is the exact sum over the count as a `numeric`, as
         // it is for an aggregate in `bind_aggregate_over_rows`.
         let exact = |ty: &LogicalType| ty.is_integer() || matches!(ty, LogicalType::Decimal { .. });
-        if self.session.postgres().is_some()
+        if self.semantics.aggregate_types() == AggregateTypes::Postgres
             && resolved.name == "avg"
             && parts.inner.is_empty()
             && let [argument] = parts.args[..]

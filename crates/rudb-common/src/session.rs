@@ -181,6 +181,7 @@ impl Eq for Variables {}
 /// The meaning-changing session choices consumed while a query is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Semantics {
+    aggregate_types: AggregateTypes,
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     disable_timestamptz_casts: bool,
@@ -198,12 +199,14 @@ pub struct Semantics {
     scalar_subquery_error_on_multiple_rows: bool,
     show_behavior: ShowBehavior,
     single_arrow_lambdas: bool,
+    values_names: ValuesNames,
     warnings_as_errors: bool,
 }
 
 impl Default for Semantics {
     fn default() -> Self {
         Self {
+            aggregate_types: AggregateTypes::Pin,
             default_descending: false,
             default_null_order: DefaultNullOrder::default(),
             disable_timestamptz_casts: false,
@@ -221,6 +224,7 @@ impl Default for Semantics {
             scalar_subquery_error_on_multiple_rows: true,
             show_behavior: ShowBehavior::Auto,
             single_arrow_lambdas: false,
+            values_names: ValuesNames::FromZero,
             warnings_as_errors: false,
         }
     }
@@ -251,6 +255,16 @@ impl Semantics {
     #[must_use]
     pub fn join_columns(self) -> JoinColumns {
         self.join_columns
+    }
+    /// The result types of `sum` and `avg`.
+    #[must_use]
+    pub fn aggregate_types(self) -> AggregateTypes {
+        self.aggregate_types
+    }
+    /// The names of the columns of a `VALUES` list.
+    #[must_use]
+    pub fn values_names(self) -> ValuesNames {
+        self.values_names
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -407,6 +421,28 @@ pub enum JoinColumns {
     /// of the left side for `NATURAL`. Each merged column has the common type of its two copies
     /// for each kind of join. A name that `USING` gives two times is an error.
     MergedFirst,
+}
+
+/// The result types of `sum` and `avg`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AggregateTypes {
+    /// As in DuckDB: `sum` of an integer is a `HUGEINT`, `sum` of a `FLOAT` is a `DOUBLE`, and
+    /// `avg` of an integer or a decimal is a `DOUBLE`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: `sum` of an `int2` or an `int4` is an `int8`, `sum` of a `float4` is a
+    /// `float4`, and `avg` of an integer or a `numeric` is a `numeric`.
+    Postgres,
+}
+
+/// The names of the columns of a `VALUES` list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ValuesNames {
+    /// `col0`, `col1` and on, as in DuckDB.
+    #[default]
+    FromZero,
+    /// `column1`, `column2` and on, as in PostgreSQL.
+    FromOne,
 }
 
 /// How `SHOW name` chooses between a setting and a table.
@@ -785,6 +821,8 @@ impl Session {
             self.semantics.insert_columns = InsertColumns::Leading;
             self.semantics.identifier_compare = IdentifierCompare::Exact;
             self.semantics.join_columns = JoinColumns::MergedFirst;
+            self.semantics.aggregate_types = AggregateTypes::Postgres;
+            self.semantics.values_names = ValuesNames::FromOne;
         }
         self.postgres = Postgreses(postgres);
     }
