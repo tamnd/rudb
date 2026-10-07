@@ -2466,7 +2466,7 @@ impl Table {
         let seen = self
             .guards()
             .iter()
-            .map(|key| Seen::of(&chunks, key, &self.columns, true))
+            .map(|key| Seen::of(&chunks, &self.name, key, &self.columns, true))
             .collect::<Result<Vec<_>>>()?;
         let types = self.columns.iter().map(|field| field.ty.clone()).collect();
         let mut rows = MemoryTable::new(types);
@@ -3076,7 +3076,7 @@ impl Table {
         }
         let mut added = Vec::with_capacity(guards.len());
         for (held, key) in sets.iter().zip(&guards) {
-            match held.check(chunks, key, &self.columns, committing) {
+            match held.check(chunks, &self.name, key, &self.columns, committing) {
                 Ok(keys) => added.push(keys),
                 Err(error) => {
                     self.hold_keys(sets);
@@ -3117,7 +3117,7 @@ impl Table {
                 Some(Some(then)) => Ok(then.clone()),
                 _ => before.stored_keys(key),
             };
-            let refused = held.refuse_added(then, chunks, key, &self.columns);
+            let refused = held.refuse_added(then, chunks, &self.name, key, &self.columns);
             self.seen[at] = Some(held);
             refused?;
         }
@@ -3132,7 +3132,8 @@ impl Table {
         let fields = key.columns.iter().map(|&at| self.columns[at].clone()).collect::<Vec<_>>();
         let mut seen = Seen::default();
         for chunk in 0..self.rows.chunk_count() {
-            seen.absorb(&self.rows.read(chunk, &key.columns)?, &projected, &fields, true)?;
+            let part = self.rows.read(chunk, &key.columns)?;
+            seen.absorb(&part, &self.name, &projected, &fields, true)?;
         }
         Ok(seen)
     }

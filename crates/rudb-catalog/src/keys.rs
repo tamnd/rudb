@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, SqlState, Value};
 use rudb_vector::Chunk;
 
 use crate::QualifiedName;
@@ -56,6 +56,46 @@ impl Key {
     fn kind(&self) -> &'static str {
         if self.primary { "primary key" } else { "unique" }
     }
+
+    /// The name PostgreSQL gives the constraint when the statement names none: `t_pkey` for a
+    /// primary key and `t_a_b_key` for a unique one, made short enough for a name of 63 bytes the
+    /// way `makeObjectName` makes it.
+    #[must_use]
+    pub fn pg_name(&self, table: &str, columns: &[Field]) -> String {
+        let (middle, label) = if self.primary {
+            (String::new(), "pkey")
+        } else {
+            let names = self.columns.iter().map(|&at| columns[at].name.as_str());
+            (names.collect::<Vec<_>>().join("_"), "key")
+        };
+        let mut room = 63 - label.len() - 1;
+        if !middle.is_empty() {
+            room -= 1;
+        }
+        let (mut first, mut second) = (table.len(), middle.len());
+        while first + second > room {
+            if first > second {
+                first -= 1;
+            } else {
+                second -= 1;
+            }
+        }
+        let first = &table[..floor_boundary(table, first)];
+        let second = &middle[..floor_boundary(&middle, second)];
+        if second.is_empty() {
+            format!("{first}_{label}")
+        } else {
+            format!("{first}_{second}_{label}")
+        }
+    }
+}
+
+/// The longest length up to `at` that ends on a character of `text`.
+fn floor_boundary(text: &str, mut at: usize) -> usize {
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// The encoded keys of every row a table holds, for one [`Key`].
@@ -424,6 +464,35 @@ fn named(chunk: &Chunk, key: &Key, columns: &[Field], row: usize) -> Result<Stri
     Ok(parts.join(", "))
 }
 
+/// The error for the key of `row` in `table`, which is already there: the pin's `message`, with
+/// the text and the fields a PostgreSQL session sends for it.
+fn repeated(
+    message: String,
+    table: &QualifiedName,
+    chunk: &Chunk,
+    key: &Key,
+    columns: &[Field],
+    row: usize,
+) -> Result<Error> {
+    let name = key.pg_name(&table.table, columns);
+    let names = key.columns.iter().map(|&at| identifier(&columns[at].name));
+    let names = names.collect::<Vec<_>>().join(", ");
+    Ok(Error::constraint(message)
+        .state(SqlState::UNIQUE_VIOLATION)
+        .pg(format!("duplicate key value violates unique constraint \"{name}\""))
+        .detail(format!("Key ({names})=({}) already exists.", bare(chunk, key, row)?))
+        .table(&table.schema, &table.table)
+        .constraint_name(name))
+}
+
+/// A column name as PostgreSQL writes it in a key's detail, in quotes when it is not all lower
+/// case letters, digits and underscores.
+fn identifier(name: &str) -> String {
+    let plain = name.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
+        && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_');
+    if plain { name.to_owned() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
+}
+
 /// `1, x`, the way the pin names a key written twice by one statement.
 fn bare(chunk: &Chunk, key: &Key, row: usize) -> Result<String> {
     let mut parts = Vec::with_capacity(key.columns.len());
@@ -542,10 +611,16 @@ impl Seen {
     /// The keys of these rows, refused if one repeats. `fresh` says the rows are all of the table,
     /// which is how an `UPDATE` or a `DELETE` lands, and a repeat there is reported the way the pin
     /// reports a key that was already there.
-    pub(crate) fn of(chunks: &[Chunk], key: &Key, columns: &[Field], fresh: bool) -> Result<Self> {
+    pub(crate) fn of(
+        chunks: &[Chunk],
+        table: &QualifiedName,
+        key: &Key,
+        columns: &[Field],
+        fresh: bool,
+    ) -> Result<Self> {
         let mut seen = Self::default();
         for chunk in chunks {
-            seen.absorb(chunk, key, columns, fresh)?;
+            seen.absorb(chunk, table, key, columns, fresh)?;
         }
         Ok(seen)
     }
@@ -555,6 +630,7 @@ impl Seen {
     pub(crate) fn absorb(
         &mut self,
         chunk: &Chunk,
+        table: &QualifiedName,
         key: &Key,
         columns: &[Field],
         fresh: bool,
@@ -576,18 +652,19 @@ impl Seen {
             repeated
         };
         if let Some(row) = repeated {
-            return Err(if fresh {
-                Error::constraint(format!(
+            let message = if fresh {
+                format!(
                     "Duplicate key \"{}\" violates {} constraint.",
                     named(chunk, key, columns, row)?,
                     key.kind()
-                ))
+                )
             } else {
-                Error::constraint(format!(
+                format!(
                     "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{}\"",
                     bare(chunk, key, row)?
-                ))
-            });
+                )
+            };
+            return Err(self::repeated(message, table, chunk, key, columns, row)?);
         }
         self.fold();
         Ok(())
@@ -605,6 +682,7 @@ impl Seen {
     pub(crate) fn check(
         &self,
         chunks: &[Chunk],
+        table: &QualifiedName,
         key: &Key,
         columns: &[Field],
         committing: bool,
@@ -626,7 +704,7 @@ impl Seen {
                 held
             };
             if let Some(row) = held {
-                return Err(Error::constraint(if committing {
+                let message = if committing {
                     format!(
                         "PRIMARY KEY or UNIQUE constraint violation: duplicate key \"{}\"",
                         bare(chunk, key, row)?
@@ -637,10 +715,11 @@ impl Seen {
                         named(chunk, key, columns, row)?,
                         key.kind()
                     )
-                }));
+                };
+                return Err(repeated(message, table, chunk, key, columns, row)?);
             }
         }
-        Self::of(chunks, key, columns, false)
+        Self::of(chunks, table, key, columns, false)
     }
 
     /// Refuses the first row of `chunks` whose key is held here and was not held in the set
@@ -650,6 +729,7 @@ impl Seen {
         &self,
         before: impl FnOnce() -> Result<Self>,
         chunks: &[Chunk],
+        table: &QualifiedName,
         key: &Key,
         columns: &[Field],
     ) -> Result<()> {
@@ -668,11 +748,12 @@ impl Seen {
                 if then.as_ref().is_some_and(|then| then.contains(encoded, &scratch)) {
                     continue;
                 }
-                return Err(Error::constraint(format!(
+                let message = format!(
                     "Duplicate key \"{}\" violates {} constraint.",
                     named(chunk, key, columns, row)?,
                     key.kind()
-                )));
+                );
+                return Err(repeated(message, table, chunk, key, columns, row)?);
             }
         }
         Ok(())
@@ -769,6 +850,7 @@ mod tests {
     use rudb_vector::{Chunk, Vector};
 
     use super::{Ints, Key, Seen};
+    use crate::QualifiedName;
 
     /// A small generator so the sequences below are the same on every run.
     fn next(state: &mut u64) -> u64 {
@@ -867,7 +949,8 @@ mod tests {
 
     fn add(seen: &mut Seen, chunks: &[Chunk], field: &Field) -> bool {
         let key = Key { columns: vec![0], primary: true };
-        match seen.check(chunks, &key, std::slice::from_ref(field), false) {
+        let table = QualifiedName::new("memory", "main", "t");
+        match seen.check(chunks, &table, &key, std::slice::from_ref(field), false) {
             Ok(added) => {
                 seen.extend(added);
                 true
@@ -976,5 +1059,47 @@ mod tests {
         table.settle();
         assert_eq!(table.runs.len(), 1);
         assert_eq!(table.runs[0].len(), 120_000);
+    }
+
+    /// A key is named the way PostgreSQL names a constraint the statement gave no name, and is
+    /// cut to 63 bytes the same way.
+    #[test]
+    fn a_key_has_the_name_postgres_gives_it() {
+        let columns =
+            [Field::new("a", LogicalType::Integer), Field::new("b", LogicalType::Integer)];
+        let primary = Key { columns: vec![0, 1], primary: true };
+        let unique = Key { columns: vec![0, 1], primary: false };
+        assert_eq!(primary.pg_name("t", &columns), "t_pkey");
+        assert_eq!(unique.pg_name("t", &columns), "t_a_b_key");
+        let long = "x".repeat(70);
+        assert_eq!(primary.pg_name(&long, &columns), format!("{}_pkey", "x".repeat(58)));
+        assert_eq!(unique.pg_name(&long, &columns), format!("{}_a_b_key", "x".repeat(55)));
+        let wide = [Field::new("c".repeat(40), LogicalType::Integer)];
+        let one = Key { columns: vec![0], primary: false };
+        let name = one.pg_name(&"t".repeat(40), &wide);
+        assert_eq!(name, format!("{}_{}_key", "t".repeat(29), "c".repeat(29)));
+    }
+
+    /// A repeated key carries the text, the detail and the fields a PostgreSQL session sends.
+    #[test]
+    fn a_repeated_key_carries_what_postgres_sends() {
+        let field = Field::new("Id", LogicalType::BigInt);
+        let key = Key { columns: vec![0], primary: false };
+        let table = QualifiedName::new("memory", "main", "t");
+        let error = Seen::of(&ints(0, 2), &table, &key, std::slice::from_ref(&field), true)
+            .and_then(|seen| {
+                seen.check(&ints(1, 2), &table, &key, std::slice::from_ref(&field), false)
+            })
+            .expect_err("the key is there");
+        assert_eq!(error.reported_state().as_str(), "23505");
+        let fields = error.fields().expect("fields were set");
+        assert_eq!(
+            fields.postgres.as_deref(),
+            Some("duplicate key value violates unique constraint \"t_Id_key\"")
+        );
+        assert_eq!(fields.detail.as_deref(), Some("Key (\"Id\")=(1) already exists."));
+        assert_eq!(fields.schema.as_deref(), Some("main"));
+        assert_eq!(fields.table.as_deref(), Some("t"));
+        assert_eq!(fields.constraint.as_deref(), Some("t_Id_key"));
     }
 }
