@@ -1838,7 +1838,24 @@ impl Vector {
             return self;
         }
         let mut held = vec![0_u64; words_for(self.len, lanes)];
-        for row in 0..self.len {
+        // Every page of a packed column goes through here as it is decoded, so the codes go 64 at
+        // a time, unpacked together and laid down a word of lanes at a time. A code at a time, read
+        // and then written into a word it shares, was most of what decoding the page cost.
+        let per = (u64::BITS / lanes) as usize;
+        let mut row = 0;
+        if offset % 64 == 0 {
+            let mut codes = [0_u64; 64];
+            while row + 64 <= self.len
+                && unpack_block_at(words, (offset + row) / 64 * width as usize, width, &mut codes)
+            {
+                let into = &mut held[row / per..(row + 64) / per];
+                for (word, codes) in into.iter_mut().zip(codes.chunks_exact(per)) {
+                    *word = codes.iter().rev().fold(0, |word, &code| word << lanes | code);
+                }
+                row += 64;
+            }
+        }
+        for row in row..self.len {
             let code = code_at(words, (offset + row) * width as usize, width);
             write_code(&mut held, row * lanes as usize, lanes, code);
         }
@@ -8611,16 +8628,20 @@ mod tests {
                 Vector::flat(LogicalType::BigInt, Data::Int64(values.clone().into())).unwrap();
             let packed = flat.bit_packed().unwrap();
             assert_eq!(packed.packed_parts().expect("packed").width(), width);
-            let cut = packed.slice(70, 900).unwrap();
-            let lanes = cut.clone().on_lanes();
-            let parts = lanes.packed_parts().expect("still packed");
-            assert_eq!(parts.width(), held, "width {width}");
-            assert_eq!(parts.base(), cut.packed_parts().expect("packed").base());
-            assert_eq!(
-                lanes.iter().collect::<Vec<_>>(),
-                cut.iter().collect::<Vec<_>>(),
-                "width {width} read back differently"
-            );
+            // A cut partway into a block goes a code at a time, and one on a block a block at a
+            // time with the last rows a code at a time.
+            for (at, len) in [(70, 900), (0, 1000), (128, 872)] {
+                let cut = packed.slice(at, len).unwrap();
+                let lanes = cut.clone().on_lanes();
+                let parts = lanes.packed_parts().expect("still packed");
+                assert_eq!(parts.width(), held, "width {width}");
+                assert_eq!(parts.base(), cut.packed_parts().expect("packed").base());
+                assert_eq!(
+                    lanes.iter().collect::<Vec<_>>(),
+                    cut.iter().collect::<Vec<_>>(),
+                    "width {width} from {at} read back differently"
+                );
+            }
         }
     }
 
