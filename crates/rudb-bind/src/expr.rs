@@ -737,7 +737,20 @@ impl Binder<'_> {
                     }
                 });
             }
-            return scope.resolve(compare, parts).map(|_| unreachable!());
+            let Err(error) = scope.resolve(compare, parts) else { unreachable!() };
+            // PostgreSQL names the nearest columns in a hint.
+            let (table, column) = match parts {
+                [column] => (None, *column),
+                [.., table, column] => (Some(*table), *column),
+                [] => return Err(error),
+            };
+            let scopes = std::iter::once(scope).chain(self.outer_scopes.iter().rev());
+            return Err(match crate::scope::nearest(scopes, table, column) {
+                Some(hint) if error.reported_state() == SqlState::UNDEFINED_COLUMN => {
+                    error.hint(hint)
+                }
+                _ => error,
+            });
         };
         // A LATERAL entry may not aggregate over what its left neighbour gave it. There is one row
         // of the left per evaluation of the entry, so `sum(o.k)` would be a sum of one value and
