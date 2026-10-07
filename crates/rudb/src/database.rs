@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -668,6 +668,12 @@ struct Conn {
     /// The PostgreSQL session that speaks through this connection, from
     /// [`crate::Connection::set_postgres`].
     postgres: Mutex<Option<Arc<Postgres>>>,
+    /// When the transaction a `BEGIN` opened began, in microseconds since the epoch, zero for none.
+    /// Kept apart from [`Conn::open`] so that reading the session does not take that lock.
+    begun: AtomicI64,
+    /// When the client sent the statement that runs now, zero when no server records it. See
+    /// [`crate::Connection::set_statement_start`].
+    received: AtomicI64,
     /// The plans of the last queries this connection ran as text, oldest first. See
     /// [`Shared::cached_simple`].
     simple: Mutex<Vec<Arc<Simple>>>,
@@ -712,6 +718,8 @@ impl Conn {
             prepared: Mutex::default(),
             simple: Mutex::default(),
             postgres: Mutex::default(),
+            begun: AtomicI64::new(0),
+            received: AtomicI64::new(0),
         }
     }
 }
@@ -4062,10 +4070,22 @@ impl Shared {
         if postgres.is_some() {
             session.set_postgres(postgres);
         }
+        let begun = self.conn.begun.load(Ordering::Acquire);
+        if begun != 0 {
+            session.set_begun(Some(begun));
+        }
+        let received = self.conn.received.load(Ordering::Acquire);
+        if received != 0 {
+            session.set_statement_start(Some(received));
+        }
         session
     }
 
     /// Records the PostgreSQL session that speaks through this connection.
+    pub(crate) fn set_statement_start(&self, micros: i64) {
+        self.conn.received.store(micros, Ordering::Release);
+    }
+
     pub(crate) fn set_postgres(&self, postgres: Arc<Postgres>) {
         *self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner) = Some(postgres);
     }
@@ -5036,11 +5056,16 @@ impl Shared {
                     ));
                 }
                 *open = Some(Open::new(read_only));
+                // The transaction begins when the client sent the statement, as in PostgreSQL.
+                let received = self.conn.received.load(Ordering::Acquire);
+                let begun = if received == 0 { rudb_bind::micros_now() } else { received };
+                self.conn.begun.store(begun, Ordering::Release);
             }
             ast::Transaction::Commit => {
                 let Some(closed) = open.take() else {
                     return Err(Error::transaction("cannot commit - no transaction is active"));
                 };
+                self.conn.begun.store(0, Ordering::Release);
                 drop(open);
                 let commit = !closed.aborted;
                 self.close_transaction(closed, commit)?;
@@ -5049,6 +5074,7 @@ impl Shared {
                 let Some(closed) = open.take() else {
                     return Err(Error::transaction("cannot rollback - no transaction is active"));
                 };
+                self.conn.begun.store(0, Ordering::Release);
                 drop(open);
                 self.close_transaction(closed, false)?;
             }

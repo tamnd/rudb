@@ -41,7 +41,27 @@ pub struct Session {
     seams: String,
     variables: Variables,
     postgres: Postgreses,
+    begun: Begun,
 }
+
+/// When the open transaction began and when the statement arrived, in microseconds since the
+/// epoch, or none.
+///
+/// Every copy compares equal, so a plan cached against a session is not lost at each statement.
+/// That is safe because a plan that reads the instant is never cached, see `simple_cacheable`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Begun {
+    transaction: Option<i64>,
+    statement: Option<i64>,
+}
+
+impl PartialEq for Begun {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Begun {}
 
 /// What a PostgreSQL session gives the engine to read: its parameters and the text of `version()`.
 ///
@@ -439,6 +459,7 @@ impl Default for Session {
             seams: String::new(),
             variables: Variables::default(),
             postgres: Postgreses::default(),
+            begun: Begun::default(),
         }
     }
 }
@@ -626,6 +647,32 @@ impl Session {
             self.semantics.null_on_division_by_zero = false;
         }
         self.postgres = Postgreses(postgres);
+    }
+
+    /// Records when the open transaction began, in microseconds since the epoch, or none.
+    pub fn set_begun(&mut self, begun: Option<i64>) {
+        self.begun.transaction = begun;
+    }
+
+    /// Records when the client sent the statement, in microseconds since the epoch, or none.
+    pub fn set_statement_start(&mut self, start: Option<i64>) {
+        self.begun.statement = start;
+    }
+
+    /// When the client sent the statement, which `statement_timestamp()` gives. A server records
+    /// it when it reads the message, so all the statements of one simple query have the same one,
+    /// as in PostgreSQL.
+    #[must_use]
+    pub fn statement_start(&self) -> Option<i64> {
+        self.begun.statement
+    }
+
+    /// When the open transaction began. `now()` and `current_timestamp` give this instant in each
+    /// statement of the transaction, as in PostgreSQL and DuckDB. Outside a transaction each
+    /// statement is one, and they give the instant the statement started.
+    #[must_use]
+    pub fn begun(&self) -> Option<i64> {
+        self.begun.transaction
     }
 
     /// The PostgreSQL session that runs the statements. `current_setting()`, `version()` and the

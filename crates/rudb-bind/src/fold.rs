@@ -42,7 +42,8 @@ use rudb_vector::Vector;
 /// land is refused by code that already knew about it rather than folded by code that had never
 /// heard of it. `TRY` refuses an operand that calls any of them. The advisory lock functions of a
 /// PostgreSQL session are here too, because each call takes or releases a lock.
-pub const VOLATILE: [&str; 28] = [
+pub const VOLATILE: [&str; 29] = [
+    "clock_timestamp",
     "current_connection_id",
     "current_query",
     "current_query_id",

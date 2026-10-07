@@ -42,7 +42,7 @@ mod unnest;
 mod vector_types;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
-pub use context::is_session_word;
+pub use context::{is_session_word, micros_now};
 pub use macros::kept_macro;
 pub use parameters::{Capture, Caught, Described, Parameters, Placeholders, Written};
 pub use statement::{
