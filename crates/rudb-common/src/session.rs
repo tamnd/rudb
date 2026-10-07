@@ -186,6 +186,7 @@ pub struct Semantics {
     number_casts: NumberCasts,
     cast_output: CastOutput,
     condition_types: ConditionTypes,
+    common_types: CommonTypes,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -226,6 +227,7 @@ impl Default for Semantics {
             number_casts: NumberCasts::Pin,
             cast_output: CastOutput::Pin,
             condition_types: ConditionTypes::Pin,
+            common_types: CommonTypes::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -360,6 +362,11 @@ impl Semantics {
     #[must_use]
     pub fn condition_types(self) -> ConditionTypes {
         self.condition_types
+    }
+    /// What one type the values of a `CASE`, a `COALESCE` or an `ARRAY` take.
+    #[must_use]
+    pub fn common_types(self) -> CommonTypes {
+        self.common_types
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -681,6 +688,21 @@ pub enum ConditionTypes {
     /// As in PostgreSQL: a boolean, a NULL, or a string literal that the input function of
     /// `boolean` reads. Any other type is `42804 argument of WHERE must be type boolean, not type
     /// integer`.
+    Postgres,
+}
+
+/// What one type the values take that must have one type: the results of a `CASE` and the values
+/// of a `COALESCE`, a `GREATEST`, a `LEAST`, an `ARRAY` and an `IN` list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommonTypes {
+    /// As in DuckDB: the values meet at the type that holds all of them, and a string literal
+    /// among numbers is cast as a string.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the type that `select_common_type` picks from the category and the
+    /// preferred type of each value. A string literal and a NULL take that type, and a string
+    /// literal is read with the input function of the type. Two types in different categories are
+    /// `42804 COALESCE types integer and text cannot be matched`.
     Postgres,
 }
 
@@ -1116,6 +1138,7 @@ impl Session {
             self.semantics.number_casts = NumberCasts::Postgres;
             self.semantics.cast_output = CastOutput::Postgres;
             self.semantics.condition_types = ConditionTypes::Postgres;
+            self.semantics.common_types = CommonTypes::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }

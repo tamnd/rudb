@@ -16,6 +16,10 @@
 //! The row types of the shared catalogs, such as `pg_database`, come from the catalog headers and
 //! not from `pg_type.dat`, so they are not here.
 //!
+//! [`common_type`] is `select_common_type`: the type of the values of a `CASE`, a `COALESCE` or
+//! an `ARRAY`. It reads the preferred types of `pg_type.dat` and the implicit casts of
+//! `pg_cast.dat`, which [`can_coerce_implicitly`] also answers from.
+//!
 //! The text forms of `bool`, `"char"`, `name`, `int2`, `int4`, `int8`, `oid`, `float4`,
 //! `float8`, `bytea` and `uuid`. An input function takes the string and gives the value or a
 //! [`TypeError`]. An output function appends to a buffer, so the row encoder can write a whole row
@@ -92,6 +96,7 @@
 
 mod array;
 mod binary;
+mod coerce;
 mod datetime;
 mod declared;
 mod error;
@@ -115,6 +120,7 @@ pub use array::{
     oidvector_recv, oidvector_send,
 };
 pub use binary::{Recv, name_recv};
+pub use coerce::{Mismatch, can_coerce_implicitly, common_type, is_preferred};
 pub use datetime::{
     Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
     DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
