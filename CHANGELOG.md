@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.40
+
+This release makes the release gate pass again, fixes the row order and checkpoint work that broke it, and continues the PostgreSQL work inside PG2 (#2490) and PG5 (#2493), with join order and link join work.
+
+The tag for 0.8.39 failed `cargo xtask ci` in the tests, because a table lost its declared row order across a checkpoint and a reopen. #2723 writes such a table again whole, and #2725 narrows that to a table whose file entry does not hold the declaration, since #2723 also made every table with appended rows be written again whole, which broke the tests that check a checkpoint extends the file. #2741 fixes the journal load test, which counted the log's segments where it meant its records and has failed since a checkpoint started keeping the segment it writes. #2718, #2726, #2738 and #2740 fix what main had added that the gate or CI also rejects: `if let` match guards that Rust 1.88 does not have, two tuple types clippy finds too complex, two public doc links to private items, and code only the AVX2 build reads, which failed the macOS and arm builds, and #2740 builds `rudb-server` on Unix only so the workspace builds on Windows.
+
+#2722 prices a consistent join order at the parts each scan opens, for J7 (#1851). #2728 runs two sibling walks over the same siblings as one, and #2734 holds a link join's whole parent column across statements. #2742 gathers only the build columns something above a hash join reads, and #2743 adds or subtracts two 18 digit decimals without widening each side first, both for TPC-H q09.
+
+#2724 answers an insert with a `RETURNING` of columns on the short insert path. #2727 and #2730 send the PostgreSQL errors for a duplicate key and for a null in a `NOT NULL` column, with the failing row. #2729 lists prepared statements and catalog dependencies the way the pin does. #2732 adds `pg_get_serial_sequence`, `OWNED BY table.column` and the `DROP SEQUENCE IF EXISTS` notice, #2733 takes a schema only the system has as a search path entry, and #2737 makes identity columns in a PostgreSQL session. #2739 takes the `TRUNCATE` options `RESTART IDENTITY`, `CONTINUE IDENTITY`, `CASCADE` and `RESTRICT` in a PostgreSQL session. #2744 adds `rudb-pgparse`, which makes the PostgreSQL parse tables from a vendored copy of `gram.y`, so this release publishes one new crate.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.39
 
 This release fixes the release gate again, continues the PostgreSQL work inside PG2 (#2490) and PG5 (#2493), and adds system functions of the DuckDB pin.
