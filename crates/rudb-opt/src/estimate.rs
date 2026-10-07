@@ -37,7 +37,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rudb_common::bounds::{Bound, Frequencies, Spread, Test, Zones};
+use rudb_common::bounds::{Bound, Frequencies, Op, Spread, Test, Zones};
 use rudb_common::stat::{Class, Direction, Provenance, Stat, Use};
 use rudb_common::{Field, Value};
 use rudb_plan::{
@@ -732,6 +732,16 @@ fn kept(
             None => pending.push(conjunct),
         }
     }
+    let (listed, ranged, from) = listed(plan, input, &mut pending, reads);
+    if ranged > 0 {
+        fraction *= listed;
+        counted += ranged;
+        source = match source {
+            None => from,
+            Some(held) if Some(held) == from => Some(held),
+            Some(_) => Some(Provenance::Propagation),
+        };
+    }
     let interpolated = spread(plan, input, &pending).map_or(0, |spread| {
         fraction *= spread.fraction;
         spread.read
@@ -757,6 +767,76 @@ fn kept(
         _ => Provenance::Propagation,
     };
     (fraction, from)
+}
+
+/// What fraction of a scan's rows the ranges among `pending` keep, counted out of a synopsis that
+/// lists every value of the column they are on or out of its buckets, with how many conditions that
+/// answered and what answered them. The ones it answered come out of `pending`.
+///
+/// Ahead of [`spread`], because a count of the rows that pass is a fact and an interpolation between
+/// the ends of each part is a guess, and on a column of years a bad one: see
+/// [`Frequencies::rows_passing`]. The conditions on one column go together for the reason they go
+/// to [`spread`] together, so that `year > 2005 AND year < 2010` is one interval and not two
+/// fractions multiplied.
+fn listed(
+    plan: &Plan,
+    input: NodeRef,
+    pending: &mut Vec<ExprRef>,
+    reads: &mut Vec<Stat<u64>>,
+) -> (f64, usize, Option<Provenance>) {
+    let (Some(index), Some(fields)) = (bounds::scanned(plan, input), scanned_fields(plan, input))
+    else {
+        return (1.0, 0, None);
+    };
+    let Some(frequencies) = plan.frequencies(index) else {
+        return (1.0, 0, None);
+    };
+    let rows = frequencies.rows();
+    if rows == 0 {
+        return (1.0, 0, None);
+    }
+    let mut columns: Vec<(usize, Vec<(Op, Bound)>, Vec<ExprRef>)> = Vec::new();
+    for &conjunct in pending.iter() {
+        let tests = bounds::of(plan, input, conjunct);
+        let Some(&(position, ..)) = tests.first() else {
+            continue;
+        };
+        if tests.iter().any(|&(column, ..)| column != position) {
+            continue;
+        }
+        let at = match columns.iter().position(|(held, ..)| *held == position) {
+            Some(at) => at,
+            None => {
+                columns.push((position, Vec::new(), Vec::new()));
+                columns.len() - 1
+            }
+        };
+        columns[at].1.extend(tests.into_iter().map(|(_, op, value)| (op, value)));
+        columns[at].2.push(conjunct);
+    }
+    let mut fraction = 1.0;
+    let mut answered = 0;
+    let mut from = None;
+    for (position, tests, conjuncts) in columns {
+        let Some(column) = fields.get(position).and_then(|field| frequencies.column(&field.name))
+        else {
+            continue;
+        };
+        let stat = frequencies.rows_passing(column, &tests);
+        reads.push(stat);
+        let Some(&held) = stat.read(COMMON) else {
+            continue;
+        };
+        fraction *= share(held, rows);
+        answered += conjuncts.len();
+        pending.retain(|conjunct| !conjuncts.contains(conjunct));
+        from = match (from, stat.provenance()) {
+            (None, read) => read,
+            (Some(held), read) if read == Some(held) => Some(held),
+            _ => Some(Provenance::Propagation),
+        };
+    }
+    (fraction, answered, from)
 }
 
 /// What fraction of a scan's rows these conditions are expected to keep, interpolated between bounds.
@@ -3268,6 +3348,20 @@ mod tests {
         fn remainder(&self, column: usize) -> Option<Remainder> {
             self.tail.filter(|_| column == 1)
         }
+
+        fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {
+            let (Some(Some(list)), None) = (self.held.get(column), self.tail) else {
+                return Stat::Unknown;
+            };
+            let passes = |value: i128| {
+                let value = Bound::Int(value);
+                tests.iter().all(|(op, constant)| {
+                    rudb_common::bounds::certain(*op, constant, Some(&value), Some(&value))
+                })
+            };
+            let rows = list.iter().filter(|&&(value, _)| passes(value)).map(|(_, of)| of).sum();
+            Stat::exact(rows, Provenance::FrequencySynopsis)
+        }
     }
 
     /// The estimate for a plan whose table zero counted its values, and counted its distinct ones.
@@ -3308,6 +3402,32 @@ mod tests {
         let text = format!("Filter (#0.0::INTEGER = 9::INTEGER)::BOOLEAN\n  {}", bounded_scan());
         let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
         assert_eq!(common_stat(&text, 3, &held).value(), Some(&1));
+    }
+
+    #[test]
+    fn a_range_over_a_complete_synopsis_is_the_rows_of_the_values_inside_it() {
+        // JOB `title.production_year > 2000` in small. The years run from one end to the other in
+        // every part and most of the rows are at the recent end, so the bounds said a seventh where
+        // the synopsis has every year and its rows.
+        let text = format!("Filter (#0.0::INTEGER > 3::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        let held = Counted::of(Some(vec![(3, 729_413), (4, 732_044), (5, 38_543)]));
+        assert_eq!(
+            common_stat(&text, 3, &held),
+            Stat::estimated(770_587, Provenance::FrequencySynopsis)
+        );
+        // Two conditions on the column are one interval, and only the middle value is inside it.
+        let both =
+            "(#0.0::INTEGER > 3::INTEGER)::BOOLEAN AND (#0.0::INTEGER < 5::INTEGER)::BOOLEAN";
+        let text = format!("Filter ({both})::BOOLEAN\n  {}", bounded_scan());
+        assert_eq!(common_stat(&text, 3, &held).value(), Some(&732_044));
+    }
+
+    #[test]
+    fn a_range_over_a_synopsis_that_left_values_out_is_not_counted_from_it() {
+        // The values it dropped could be anywhere in the range, so the list is no count of it, and
+        // with no bounds either the range is the fifth any condition nobody can read is.
+        let text = format!("Filter (#0.0::INTEGER > 3::INTEGER)::BOOLEAN\n  {}", bounded_scan());
+        assert_eq!(common_stat(&text, 1002, &dropped(5_000)).value(), Some(&300_000));
     }
 
     /// The counts of a column whose synopsis holds two values and dropped a thousand more.

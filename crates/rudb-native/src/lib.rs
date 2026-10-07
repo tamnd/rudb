@@ -101,12 +101,12 @@ const GONE_ROWS: &[u8; 8] = b"RUDBGR10";
 /// so a build that cannot lay those over the table refuses the file rather than read old values.
 const GONE_PATCHED: &[u8; 8] = b"RUDBGR11";
 const MAX_CATALOG_FREQUENCIES: usize = 64;
-/// How many parts [`Reader::matched`] runs a pattern over, spread evenly across the table.
-///
-/// Four parts of the native format are thirty two thousand rows, which puts a pattern that keeps
-/// one row in ten thousand at about three rows of the sample, and costs a few milliseconds once
-/// per pattern per open table.
+/// How many parts [`Reader::placed`] reads whole, spread evenly across the table.
 const SAMPLED_PARTS: usize = 4;
+/// How many parts [`Reader::matched`] takes a stride of rows of, spread evenly across the table.
+const STRATA: usize = 64;
+/// How many rows [`Reader::matched`] reads in all over [`STRATA`] parts.
+const STRATA_ROWS: usize = 16_384;
 /// How many parts a table can have for [`Reader::picked`] to run a condition over the whole of it.
 ///
 /// Thirty two parts are a quarter of a million rows, which holds every dimension table of JOB with
@@ -192,6 +192,22 @@ const PAIR_FREQUENCIES: &[u8; 8] = b"RUDBPF1\0";
 /// the synopsis bound, which is too small, so the tighter claim lives in a block of its own and a
 /// reader that predates it refuses the directory rather than trusting it.
 const ORDINAL_BOUNDS: &[u8; 8] = b"RUDBFO1\0";
+/// Equal depth buckets over the values of an integer or date column, for the planner's ranges.
+///
+/// The zone maps answer a range by taking the values of a part to be spread evenly between its two
+/// ends, and a column of years is nothing like that. In JOB `title.production_year` runs from 1880
+/// to 2019 in every part with most of its rows in the last twenty years, so `BETWEEN 2005 AND
+/// 2009` came out at 130,221 titles where 574,556 hold it, and the planner read `title` first in
+/// 19a. The synopsis had every year with its rows, but a complete synopsis is cut down to two
+/// entries before it is written so that grouped counts come from the rows, and so the buckets are
+/// a block of their own that only an estimate reads.
+///
+/// Written for a column whose values the close counted every one of, and a value holding a whole
+/// bucket's worth of rows on its own is a bucket of its own, so a heavy year is counted and not
+/// spread.
+const QUANTILES: &[u8; 8] = b"RUDBQH1\0";
+/// How many rows a bucket of [`QUANTILES`] holds before it is closed, as a share of the column.
+const QUANTILE_BUCKETS: u64 = 64;
 /// The clustering declaration, written after the frequencies and only when there is one.
 ///
 /// No format bump for this, which is the convention the frequency section set in #728: a new
@@ -1013,6 +1029,18 @@ struct FrequencySummary {
     /// Zero when `ordinals` holds the rows of every entry. Otherwise it holds the rows of a leading
     /// run of them, and this is how many rows any value outside that run holds at most.
     ordinal_bound: u64,
+    /// What goes in [`QUANTILES`] for this column, built while `entries` still held every value.
+    quantiles: Vec<Bucket>,
+}
+
+/// One stretch of an integer column's values, with the rows and the distinct values inside it. See
+/// [`QUANTILES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Bucket {
+    pub(crate) low: i128,
+    pub(crate) high: i128,
+    pub(crate) rows: u64,
+    pub(crate) values: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1243,6 +1271,9 @@ pub struct Table {
     /// What [`ORDINAL_BOUNDS`] says about each column, read with `get`, and zero for a column whose
     /// synopsis keeps the rows of every entry it lists or keeps no rows at all.
     ordinal_bounds: Vec<u64>,
+    /// What [`QUANTILES`] says about each column, read with `get`, and empty for a column it does
+    /// not name.
+    quantiles: Vec<Vec<Bucket>>,
     pair_frequencies: Vec<PairFrequencySummary>,
     /// String spellings aligned with each column's frequency entries.
     ///
@@ -2914,6 +2945,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 ordinal_bounds: Vec::new(),
+                quantiles: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
                 text_spans: Vec::new(),
@@ -3001,6 +3033,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 ordinal_bounds: Vec::new(),
+                quantiles: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
                 text_spans: Vec::new(),
@@ -3163,6 +3196,7 @@ impl Writer {
                 rows: 0,
                 frequencies: Vec::new(),
                 ordinal_bounds: Vec::new(),
+                quantiles: Vec::new(),
                 pair_frequencies: Vec::new(),
                 frequency_texts: Vec::new(),
                 text_spans: Vec::new(),
@@ -3894,6 +3928,16 @@ impl Writer {
                 (entries, decrements, distinct_count)
             }
         };
+        // Before the list is cut down, and only where it holds every value the column has.
+        let listed = entries.iter().filter(|entry| entry.value != FrequencyValue::Null).count();
+        let quantiles = if decrements == 0
+            && distinct_count == Some(listed as u64)
+            && self.table.fields[column].ty != LogicalType::Timestamp
+        {
+            quantiles(&entries)
+        } else {
+            Vec::new()
+        };
         let mut omitted_max = keep_most_frequent(&mut entries).max(decrements);
         // A complete value-to-count table is also the result of grouping this column.
         // Keep up to two leading frequencies for selectivity and equality predicates,
@@ -3955,6 +3999,7 @@ impl Writer {
                 ordinals,
                 ordinal_entries,
                 ordinal_bound: if worth_keeping { ordinal_bound } else { 0 },
+                quantiles,
             }),
             distinct_count,
         ))
@@ -4371,8 +4416,17 @@ impl Writer {
             dictionary.recharge(profile.as_deref());
         }
         let (numeric, closed) = self.close_columns()?;
-        let (frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
+        let (mut frequencies, distincts): (Vec<Option<FrequencySummary>>, Vec<_>) =
             numeric.into_iter().unzip();
+        self.table.quantiles = frequencies
+            .iter_mut()
+            .map(|held| {
+                held.as_mut().map_or_else(Vec::new, |held| std::mem::take(&mut held.quantiles))
+            })
+            .collect();
+        if self.table.quantiles.iter().all(Vec::is_empty) {
+            self.table.quantiles = Vec::new();
+        }
         let frequencies =
             frequencies.into_iter().map(|held| held.map(Frequencies::Held)).collect::<Vec<_>>();
         // Pair leaders are query results, not reusable column statistics.
@@ -8081,10 +8135,10 @@ impl Reader {
     /// fifth of the rows. That is wrong both ways and JOB shows both: `'%Downey%Robert%'` keeps a
     /// handful of the four million names and `'%(co-production)%'` keeps a tenth of the companies,
     /// and in 6d the fifth made `name` look dearer than `cast_info` and put it after. So the pattern
-    /// is run over `SAMPLED_PARTS` parts spread across the table, read the way a sparse scan reads
-    /// them so no page is kept for it, and a pattern nothing in the sample matched is charged half a
-    /// row of the sample rather than none. The answer is kept for as long as the reader is, so a
-    /// statement run again asks the file nothing.
+    /// is run over a stride of rows of [`STRATA`] parts spread across the table, see [`Self::sample`],
+    /// read the way a sparse scan reads them so no page is kept for it, and a pattern nothing in the
+    /// sample matched is charged half a row of the sample rather than none. The answer is kept for
+    /// as long as the reader is, so a statement run again asks the file nothing.
     #[must_use]
     pub fn matched(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
         let key = (column, function.to_owned(), pattern.to_owned());
@@ -8095,12 +8149,10 @@ impl Reader {
         if field.ty != LogicalType::Varchar {
             return None;
         }
-        let parts = self.parts();
-        let taken = parts.min(SAMPLED_PARTS);
+        let taken = self.sampled_parts();
         let (mut rows, mut kept) = (0_usize, 0_usize);
         for at in 0..taken {
-            let part = (at * parts + parts / 2) / taken;
-            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let Some(chunk) = self.sample(at, taken, column)? else { continue };
             let passed = passing(chunk.column(0).ok()?, function, pattern)?;
             rows += passed.len();
             kept += passed.iter().filter(|&&passed| passed).count();
@@ -8112,6 +8164,36 @@ impl Reader {
         let share = (kept as f64).max(0.5) / rows as f64;
         self.matched.lock().ok()?.insert(key, share);
         Some(share)
+    }
+
+    /// How many parts [`Self::sample`] is taken over.
+    fn sampled_parts(&self) -> usize {
+        self.parts().min(STRATA)
+    }
+
+    /// The `at`th of `taken` parts spread evenly over the table, read at a stride of its rows so
+    /// that the whole sample is about [`STRATA_ROWS`] rows, or whole where that is every row.
+    ///
+    /// A stride of many parts rather than a few parts whole, because a table laid out by the column
+    /// holds each value in a narrow stretch of it. In JOB `name` is in the order of the names, and
+    /// four parts whole held no name that starts with a B, so `n.name LIKE 'B%'` was put at 63 rows
+    /// and keeps 343,399.
+    fn sample(&self, at: usize, taken: usize, column: usize) -> Option<Option<Chunk>> {
+        let parts = self.parts();
+        let part = (at * parts + parts / 2) / taken;
+        let held = self.places.get(part)?.rows as usize;
+        let step = (held * taken).div_ceil(STRATA_ROWS).max(1);
+        if step == 1 {
+            return self.read_sparse(part, &[column]).ok().map(Some);
+        }
+        let positions: Vec<u32> = (step / 2..held)
+            .step_by(step)
+            .map(|row| u32::try_from(row).ok())
+            .collect::<Option<_>>()?;
+        if positions.is_empty() {
+            return Some(None);
+        }
+        self.read_rows(part, &[column], &positions, false).ok().map(Some)
     }
 
     /// The values of `key` in every row of the table `function` keeps, run as [`Self::matched`]
@@ -8179,12 +8261,10 @@ impl Reader {
             return Some(share);
         }
         self.table.fields.get(column)?;
-        let parts = self.parts();
-        let taken = parts.min(SAMPLED_PARTS);
+        let taken = self.sampled_parts();
         let (mut rows, mut kept) = (0_usize, 0_usize);
         for at in 0..taken {
-            let part = (at * parts + parts / 2) / taken;
-            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let Some(chunk) = self.sample(at, taken, column)? else { continue };
             let held = chunk.column(0).ok()?;
             rows += held.len();
             kept += (0..held.len())
@@ -8397,6 +8477,11 @@ impl Reader {
             entries: Vec::clone(&entries),
             omitted_max,
         }))
+    }
+
+    /// One column's [`QUANTILES`] buckets, and none for a column the block does not name.
+    pub(crate) fn quantiles(&self, column: usize) -> &[Bucket] {
+        self.table.quantiles.get(column).map_or(&[], Vec::as_slice)
     }
 
     /// [`Self::frequency_prefix`] as the reader holds it, shared rather than copied.
@@ -10677,6 +10762,44 @@ fn frequency_order(left: FrequencyValue, right: FrequencyValue) -> Ordering {
 /// report as the largest one omitted, and then only the part that survives is sorted. The order that
 /// comes out is the order the sort gave, because the tie break makes the comparison total: two
 /// entries never hold the same value.
+/// The buckets of [`QUANTILES`] over a column's complete counts, in value order.
+///
+/// A bucket takes values until it holds a [`QUANTILE_BUCKETS`]th of the rows, and a value that
+/// holds that many on its own closes the one before it and is a bucket by itself. So there are at
+/// most twice as many buckets as that, and a range is counted exactly up to the two buckets at its
+/// ends.
+fn quantiles(entries: &[FrequencyEntry]) -> Vec<Bucket> {
+    let mut values = entries
+        .iter()
+        .filter_map(|entry| match entry.value {
+            FrequencyValue::Integer(value) => Some((value, entry.count)),
+            FrequencyValue::Null | FrequencyValue::Code(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if values.len() < 2 {
+        return Vec::new();
+    }
+    values.sort_unstable_by_key(|&(value, _)| value);
+    let total = values.iter().map(|&(_, count)| count).fold(0_u64, u64::saturating_add);
+    let depth = total.div_ceil(QUANTILE_BUCKETS).max(1);
+    let mut buckets = Vec::new();
+    let mut open: Option<Bucket> = None;
+    for (value, count) in values {
+        if count >= depth {
+            buckets.extend(open.take());
+            buckets.push(Bucket { low: value, high: value, rows: count, values: 1 });
+            continue;
+        }
+        let bucket = open.get_or_insert(Bucket { low: value, high: value, rows: 0, values: 0 });
+        bucket.high = value;
+        bucket.rows += count;
+        bucket.values += 1;
+        buckets.extend(open.take_if(|bucket| bucket.rows >= depth));
+    }
+    buckets.extend(open);
+    buckets
+}
+
 fn keep_most_frequent(entries: &mut Vec<FrequencyEntry>) -> u64 {
     let order = |left: &FrequencyEntry, right: &FrequencyEntry| {
         right.count.cmp(&left.count).then_with(|| frequency_order(left.value, right.value))
@@ -10766,6 +10889,7 @@ fn code_frequency(
             ordinals: Vec::new(),
             ordinal_entries: Vec::new(),
             ordinal_bound: 0,
+            quantiles: Vec::new(),
         },
         texts,
     ))
@@ -10981,6 +11105,30 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 u16::try_from(column).map_err(|_| invalid("bound column overflows"))?,
             );
             put_u64(&mut out, bound);
+        }
+    }
+    let quantiled = table.quantiles.iter().filter(|buckets| !buckets.is_empty()).count();
+    if quantiled != 0 {
+        out.extend_from_slice(QUANTILES);
+        put_u16(&mut out, u16::try_from(quantiled).map_err(|_| invalid("too many quantiles"))?);
+        for (column, buckets) in table.quantiles.iter().enumerate() {
+            if buckets.is_empty() {
+                continue;
+            }
+            put_u16(
+                &mut out,
+                u16::try_from(column).map_err(|_| invalid("quantile column overflows"))?,
+            );
+            put_u16(
+                &mut out,
+                u16::try_from(buckets.len()).map_err(|_| invalid("too many quantile buckets"))?,
+            );
+            for bucket in buckets {
+                out.extend_from_slice(&bucket.low.to_le_bytes());
+                out.extend_from_slice(&bucket.high.to_le_bytes());
+                put_u64(&mut out, bucket.rows);
+                put_u64(&mut out, bucket.values);
+            }
         }
     }
     if !table.pair_frequencies.is_empty() {
@@ -12229,7 +12377,14 @@ fn decode_summary(
     } else {
         Vec::new()
     };
-    Ok(Some(FrequencySummary { entries, omitted_max, ordinals, ordinal_entries, ordinal_bound: 0 }))
+    Ok(Some(FrequencySummary {
+        entries,
+        omitted_max,
+        ordinals,
+        ordinal_entries,
+        ordinal_bound: 0,
+        quantiles: Vec::new(),
+    }))
 }
 
 /// The entries of one column's frequency synopsis and the bound on what they leave out, without
@@ -12951,6 +13106,8 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
     let mut seen_pair_frequencies = false;
     let mut ordinal_bounds = Vec::new();
     let mut seen_ordinal_bounds = false;
+    let mut quantiles = Vec::new();
+    let mut seen_quantiles = false;
     let mut frequency_texts = vec![Vec::new(); width];
     let mut text_spans = Vec::new();
     let mut seen_frequency_texts = false;
@@ -13046,6 +13203,46 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                     return Err(invalid("ordinal bound is outside the table or repeated"));
                 }
                 ordinal_bounds[column] = bound;
+            }
+        } else if &tag == QUANTILES {
+            if seen_quantiles {
+                return Err(invalid("directory names two quantile blocks"));
+            }
+            seen_quantiles = true;
+            quantiles = vec![Vec::new(); width];
+            let count = cur.u16()? as usize;
+            if count > width {
+                return Err(invalid("quantile count exceeds the columns"));
+            }
+            for _ in 0..count {
+                let column = cur.u16()? as usize;
+                let length = cur.u16()? as usize;
+                if column >= width || length == 0 || !quantiles[column].is_empty() {
+                    return Err(invalid("quantiles name a column twice or out of range"));
+                }
+                let mut buckets: Vec<Bucket> = Vec::with_capacity(length);
+                let mut held = 0_u64;
+                for _ in 0..length {
+                    let low = i128::from_le_bytes(cur.take(16)?.try_into().expect("16 bytes"));
+                    let high = i128::from_le_bytes(cur.take(16)?.try_into().expect("16 bytes"));
+                    let bucket = Bucket { low, high, rows: cur.u64()?, values: cur.u64()? };
+                    let wide = u128::try_from(high.wrapping_sub(low)).unwrap_or(u128::MAX);
+                    if high < low
+                        || bucket.rows == 0
+                        || bucket.values == 0
+                        || bucket.values > bucket.rows
+                        || u128::from(bucket.values - 1) > wide
+                        || buckets.last().is_some_and(|last| last.high >= low)
+                    {
+                        return Err(invalid("a quantile bucket is out of order or empty"));
+                    }
+                    held = held.saturating_add(bucket.rows);
+                    buckets.push(bucket);
+                }
+                if held > rows as u64 {
+                    return Err(invalid("quantiles hold more rows than the table"));
+                }
+                quantiles[column] = buckets;
             }
         } else if &tag == FREQUENCY_TEXTS {
             if seen_frequency_texts {
@@ -13341,6 +13538,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         distincts,
         frequencies,
         ordinal_bounds,
+        quantiles,
         pair_frequencies,
         frequency_texts,
         text_spans,
@@ -16726,6 +16924,7 @@ mod tests {
             distincts: vec![None],
             frequencies: vec![None],
             ordinal_bounds: Vec::new(),
+            quantiles: Vec::new(),
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
             text_spans: Vec::new(),
@@ -19688,6 +19887,40 @@ mod tests {
     }
 
     #[test]
+    fn a_range_of_years_is_counted_out_of_the_buckets_the_close_wrote() {
+        // `title.production_year` in small, a hundred light years, three heavy ones and some nulls.
+        // The synopsis is cut down to two entries on the way out, so the buckets are what counts.
+        let path = path("quantile-years");
+        let mut writer =
+            Writer::create(&path, "title", vec![Field::new("year", LogicalType::Integer)])
+                .expect("new file");
+        let mut values = (1900..2000).map(Value::Integer).collect::<Vec<_>>();
+        for (year, rows) in [(2005, 5_000), (2006, 6_000), (2007, 7_000)] {
+            values.extend(std::iter::repeat_n(Value::Integer(year), rows));
+        }
+        values.extend(std::iter::repeat_n(Value::Null, 300));
+        for part in values.chunks(1_024) {
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::Integer, part).expect("years")])
+                    .expect("one column");
+            writer.append(&chunk).expect("rows");
+        }
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
+        let buckets = reader.quantiles(0).to_vec();
+        assert_eq!(buckets.iter().map(|bucket| bucket.rows).sum::<u64>(), 18_100);
+        assert!(buckets.windows(2).all(|pair| pair[0].high < pair[1].low));
+        assert!(buckets.contains(&Bucket { low: 2006, high: 2006, rows: 6_000, values: 1 }));
+        let common = Common::new(reader);
+        let between = [(Op::GreaterOrEqual, Bound::Int(2005)), (Op::LessOrEqual, Bound::Int(2009))];
+        assert_eq!(
+            common.rows_passing(0, &between),
+            Stat::estimated(18_000, Provenance::Quantiles)
+        );
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    #[test]
     fn narrow_nonzero_count_matches_the_full_reader_across_stripes() {
         let path = path("quick-nonzero");
         let mut writer = Writer::create(
@@ -21706,6 +21939,7 @@ mod tests {
             distincts: vec![None],
             frequencies: vec![None],
             ordinal_bounds: Vec::new(),
+            quantiles: Vec::new(),
             pair_frequencies: Vec::new(),
             frequency_texts: Vec::new(),
             text_spans: Vec::new(),

@@ -63,7 +63,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rudb_common::bounds::{Bound, Reach, Zones};
+use rudb_common::bounds::{Bound, Reach, Test, Zones};
 use rudb_common::rules::Rule;
 use rudb_common::{Field, LogicalType, Result};
 use rudb_functions::FILE_ROW_NUMBER;
@@ -148,6 +148,28 @@ struct Relation {
 
 /// A column of one relation, as a position in the list of relations and a position in its scan.
 type Place = (usize, u32);
+
+/// The share of the parts of `relation` its own filters cannot rule out by the ends of the parts,
+/// which are the parts its scan reads. One where the store cannot say.
+fn opened(plan: &Plan, relation: &Relation) -> f64 {
+    let Some(zones) = plan.zones(relation.index) else { return 1.0 };
+    let Node::Get { columns, .. } = *plan.node(relation.get) else { return 1.0 };
+    let names = plan.field_list(columns);
+    let mut tests = Vec::new();
+    for &predicate in &relation.local {
+        for (position, op, value) in crate::bounds::of(plan, relation.get, predicate) {
+            let Some(column) = names.get(position).and_then(|field| zones.column(&field.name))
+            else {
+                return 1.0;
+            };
+            tests.push(Test { column, op, value });
+        }
+    }
+    if tests.is_empty() {
+        return 1.0;
+    }
+    zones.opened(&tests).map_or(1.0, |share| share.clamp(0.0, 1.0))
+}
 
 /// An order of the relations, each with its place in the list of relations and the relation it
 /// hangs from, if any.
@@ -429,7 +451,18 @@ fn rewrite(
                         .collect()
                 })
                 .unwrap_or_default();
-            Weight { rows, width, kept, reach, gathered, skew, domain: Vec::new(), named, placed }
+            Weight {
+                rows,
+                width,
+                kept,
+                opened: opened(plan, relation),
+                reach,
+                gathered,
+                skew,
+                domain: Vec::new(),
+                named,
+                placed,
+            }
         })
         .collect();
     let weights = with_domains(weights);
@@ -972,6 +1005,9 @@ struct Weight {
     width: u64,
     /// The share of its rows its own filters are estimated to keep, one when it has none.
     kept: f64,
+    /// The share of its parts its own filters do not rule out by their ends, one when they rule
+    /// out none or the store cannot say. See [`Zones::opened`].
+    opened: f64,
     /// How the values of each of its key columns sit across its parts, by class, where the store
     /// could say.
     reach: Vec<(u32, Reach)>,
@@ -1017,7 +1053,16 @@ fn with_domains(mut weights: Vec<Weight>) -> Vec<Weight> {
 }
 
 impl Weight {
-    /// What the scan costs once the relations before it left `standing` of each class's values.
+    /// What the scan costs once the relations before it left `standing` of each class's values,
+    /// read and handed to the join. See [`HAND`].
+    #[expect(clippy::cast_precision_loss, reason = "a count of rows is a weight here")]
+    fn cost(&self, standing: &Standing, classes: &BTreeSet<u32>) -> f64 {
+        let handed = self.fed(standing, classes) * self.kept * self.rows as f64;
+        self.read(standing, classes) + handed * HAND
+    }
+
+    /// What reading the scan costs once the relations before it left `standing` of each class's
+    /// values.
     ///
     /// The key column is read in every part the handed keys do not rule out, and the rest at the
     /// rows they keep. See `Scan::read_deferring` in `rudb-exec`. The parts left are the fewest any
@@ -1030,7 +1075,7 @@ impl Weight {
     /// few units less read last, the order put it there, and `cast_info` was read at 1,687 roles
     /// where `role_type` read first leaves 11.
     #[expect(clippy::cast_precision_loss, reason = "a count of rows is a weight here")]
-    fn cost(&self, standing: &Standing, classes: &BTreeSet<u32>) -> f64 {
+    fn read(&self, standing: &Standing, classes: &BTreeSet<u32>) -> f64 {
         if self.rows <= CHUNK {
             return self.rows as f64 * (1 + self.width) as f64;
         }
@@ -1048,8 +1093,17 @@ impl Weight {
                 let share = self.local(*class, share);
                 Some(reach.touched(share * reach.values as f64))
             })
-            .fold(1.0, f64::min);
-        let scanned = self.rows as f64 * touched * (1.0 + self.width as f64 * fed);
+            .fold(1.0, f64::min)
+            * self.opened;
+        // The rest of the columns at the rows the keys keep, each at what [`PICK`] says reading a
+        // column at one row picked out of a part costs, and at no more than reading them at every
+        // row of the parts touched. Priced at a unit a row, the names of the 285,237 people
+        // `cast_info` left in JOB 6d cost a fifteenth of reading every name, and reading them took
+        // nine tenths of the time of the whole scan.
+        let rows = self.rows as f64;
+        let parts = (rows / PART).ceil().max(1.0);
+        let wide = touched * (fed * PICK).min(1.0);
+        let scanned = rows * (touched + self.width as f64 * wide);
         // Read at the rows the narrowed classes' values are in, which the executor does when each
         // is under one row in `GATHERED`, see `listed_keys` in `rudb-exec`, and at the rows all of
         // them hand down together. A row found that way is found in its part, and the part is
@@ -1068,9 +1122,7 @@ impl Weight {
         else {
             return scanned;
         };
-        let rows = self.rows as f64;
         let found = rows * backoff(shares.map(|(share, _)| share));
-        let parts = (rows / PART).ceil().max(1.0);
         // No more parts than the kept values' own reach puts them in, where the table is laid out
         // by the key and the rows of a value sit together.
         let decoded = (1.0 - (1.0 - 1.0 / parts).powf(found))
@@ -1168,6 +1220,14 @@ impl Weight {
         (named > 0.0).then(|| parts * (share / named).min(1.0))
     }
 
+    /// How many values of `class` it holds, where the store counted.
+    fn own(&self, class: u32) -> Option<u64> {
+        let counted =
+            self.skew.iter().find(|(held, ..)| *held == class).map(|&(.., values)| values);
+        let reach = self.reach.iter().find(|(held, _)| *held == class);
+        counted.or_else(|| reach.map(|(_, reach)| reach.values)).filter(|&own| own > 0)
+    }
+
     /// The share of its own values of `class` that `share` of the class's values keeps.
     ///
     /// The same share when the values kept are spread over the class. Not when a query names them:
@@ -1183,11 +1243,7 @@ impl Weight {
         let Some(&(_, domain)) = self.domain.iter().find(|(held, _)| *held == class) else {
             return share;
         };
-        let counted =
-            self.skew.iter().find(|(held, ..)| *held == class).map(|&(.., values)| values);
-        let reach = self.reach.iter().find(|(held, _)| *held == class);
-        let own = counted.or_else(|| reach.map(|(_, reach)| reach.values));
-        let Some(own) = own.filter(|&own| own > 0 && own < domain) else {
+        let Some(own) = self.own(class).filter(|&own| own < domain) else {
             return share;
         };
         let kept = share * domain as f64;
@@ -1295,6 +1351,23 @@ impl std::ops::Index<&u32> for Standing {
 /// read `name` with its pattern first. Across the JOB queries whose plans this moves, 0.3 ran faster
 /// than both 1 and 0.1, where 0.1 made gathers so cheap that 17c took `cast_info` early again.
 const DECODE: f64 = 0.3;
+
+/// What a row a scan keeps costs the join it is handed to, in the units of [`Weight::cost`]: its
+/// keys go into the sets the tree passes along, and it is held or probed. In JOB 15d the plan read
+/// `movie_keyword` whole first, since that leaves the fifth of the movies it has keywords for. That
+/// handed the join 4.5 million rows, which took 1.5 ms to read and 33 ms more to join than the
+/// 370,000 rows `aka_title` read whole handed over instead. Priced at the read alone, the whole of
+/// `movie_keyword` cost less than reading it at the movies `aka_title` keeps.
+const HAND: f64 = 4.0;
+
+/// What reading a column at one row the keys picked out of a part costs, as rows of a scan of it.
+/// The rows left are read one by one where a scan runs over the column, and a string column is
+/// found in its part a row at a time. In JOB 6d `name` read at 560 rows a part took nine tenths of
+/// the time of reading it whole, which is about 13 rows of a scan a row picked. A charge of the
+/// share of a scan a gather decodes each part at, which is what the spread of the rows first
+/// priced, made `cast_info` read at the 4,512 voice roles of JOB 8a in nine milliseconds cost more
+/// than reading every name in 66, and the plan read `name` whole first at twice the time.
+const PICK: f64 = 12.0;
 
 /// The rows of one part of a native table, which a row gathered out of it decodes.
 const PART: f64 = 8192.0;
@@ -1742,21 +1815,45 @@ fn ears(
 
 /// What is left standing of each of its classes once `ear` is taken.
 ///
-/// The share of its rows it keeps, and no more than the rows it keeps can hold of the class's
-/// values. In JOB 21a `link_type` keeps two kinds of link out of eighteen, and the two are the
-/// common ones, so `movie_link` keeps more than half its rows. Those are 16,000 rows, which name at
-/// most 16,000 of the 2.5 million movies. Taken as half the movies, reading `movie_link` early
-/// narrowed nothing, the order put it after `movie_info`, and 21a went from 23 ms to 330.
+/// The values its kept rows hold. Of the values still standing it holds some, each in as many of
+/// its rows as the rows they reach over those values, and a value is left when any one of its rows
+/// is kept, which for rows kept at random is one less the chance that none of them is. That is
+/// Cardenas' formula with the rows a value has in place of drawing with replacement. A table with
+/// one row a value keeps its share of the values, and a table kept whole keeps every value it has.
+///
+/// The share of the rows was taken for every class before, and for a class the relation did not
+/// narrow that is far too few. In JOB 6d `cast_info` keeps the rows of eleven thousand movies, a
+/// thousandth of its rows, and those name 285,237 people, seven hundredths of them. Taken as a
+/// thousandth, `name` read at the people left looked five times cheaper than it is, and the order
+/// read it last at twice the time of reading it first.
+///
+/// Only the values the relation holds, too. In JOB 21a `link_type` keeps two kinds of link out of
+/// eighteen, and the two are the common ones, so `movie_link` keeps more than half its rows. Those
+/// are 16,000 rows over the few thousand movies it has links for, out of 2.5 million. Taken as half
+/// the movies, reading `movie_link` early narrowed nothing, the order put it after `movie_info`, and
+/// 21a went from 23 ms to 330.
 #[expect(clippy::cast_precision_loss, reason = "counts of rows and values are weights here")]
 fn take(edges: &[BTreeSet<u32>], weights: &[Weight], standing: &mut Standing, ear: usize) {
-    let share = weights[ear].fed(standing, &edges[ear]) * weights[ear].kept;
-    let rows = share * weights[ear].rows as f64;
+    let weight = &weights[ear];
+    let share = weight.fed(standing, &edges[ear]) * weight.kept;
+    let rows = share * weight.rows as f64;
     for &class in &edges[ear] {
-        let values =
-            weights[ear].domain.iter().find(|(held, _)| *held == class).map(|&(_, values)| values);
-        let named = values.map_or(1.0, |values| (rows / values as f64).min(1.0));
+        let values = weight.domain.iter().find(|(held, _)| *held == class);
+        let Some(&(_, values)) = values.filter(|&&(_, values)| values > 0) else {
+            let held = standing.held(class);
+            *held = held.min(share);
+            continue;
+        };
+        let values = values as f64;
+        let before = standing.get(&class).copied().unwrap_or(1.0);
+        let own = weight.own(class).map_or(values, |own| own as f64);
+        let holds = own.min(before * values).max(1.0);
+        let reached = (weight.rows as f64 * weight.reached(class, before)).max(1.0);
+        let each = (reached / holds).max(1.0);
+        let picked = (rows / reached).min(1.0);
+        let left = holds * (1.0 - (1.0 - picked).powf(each)) / values;
         let held = standing.held(class);
-        *held = held.min(share).min(named);
+        *held = held.min(left).min(rows / values);
     }
 }
 
@@ -1872,7 +1969,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ConsistentExtremes, DECODE, GATHER, Reach, Standing, Weight, gyo, take, trail, widens,
+        ConsistentExtremes, DECODE, GATHER, PICK, Reach, Standing, Weight, gyo, take, trail, widens,
     };
     use crate::pass::{Context, Pass};
     use rudb_common::LogicalType;
@@ -1998,6 +2095,7 @@ mod tests {
             rows,
             width,
             kept,
+            opened: 1.0,
             reach: Vec::new(),
             gathered: Vec::new(),
             skew: Vec::new(),
@@ -2104,17 +2202,20 @@ mod tests {
         name.gathered = vec![1];
         let classes = BTreeSet::from([1]);
         let few = Standing::from([(1, 0.00001)]);
-        let cost = name.cost(&few, &classes);
+        let cost = name.read(&few, &classes);
         let parts = (4_000_000.0_f64 / 8192.0).ceil();
         let decoded = 1.0 - (1.0 - 1.0 / parts).powf(40.0);
         let gathered = 4_000_000.0 * decoded * DECODE * 5.0 + 40.0 * GATHER;
         assert!((cost - gathered).abs() < 1.0, "{cost} {gathered}");
         assert!(cost < 2_000_000.0, "{cost}");
-        // Four thousand rows fall in nearly every part, and the scan is cheaper.
+        // Four thousand rows fall in nearly every part, and a gather decodes every part, so the
+        // scan of the key column with the rest read at the rows it keeps is cheaper.
         let spread = Standing::from([(1, 0.001)]);
-        assert!((name.cost(&spread, &classes) - 4_000_000.0 * 1.004).abs() < 1.0);
+        let picked = 4_000_000.0 * (1.0 + 4.0 * 0.001 * PICK);
+        assert!((name.read(&spread, &classes) - picked).abs() < 1.0);
+        // Half the people is past what a gather takes, and the scan reads every row of the rest.
         let many = Standing::from([(1, 0.5)]);
-        assert!((name.cost(&many, &classes) - 12_000_000.0).abs() < 1.0);
+        assert!((name.read(&many, &classes) - 20_000_000.0).abs() < 1.0);
     }
 
     /// JOB 6d's `movie_keyword`: eight keywords of 134,170 reach 35,548 rows, which the average
@@ -2126,9 +2227,9 @@ mod tests {
         movie_keyword.gathered = vec![0];
         let classes = BTreeSet::from([0]);
         let eight = Standing::from([(0, 8.0 / 134_170.0)]);
-        let even = movie_keyword.cost(&eight, &classes);
+        let even = movie_keyword.read(&eight, &classes);
         movie_keyword.skew = vec![(0, 133.0, 134_170)];
-        let skewed = movie_keyword.cost(&eight, &classes);
+        let skewed = movie_keyword.read(&eight, &classes);
         // The even guess finds 270 rows in 553 parts and decodes a third of them. The skewed one
         // finds 35,548, which fall in every part, and so it decodes the whole table.
         let found = 4_523_930.0 * 8.0 * 133.0 / 134_170.0;
@@ -2218,6 +2319,61 @@ mod tests {
         assert!((movies - 30_000.0 * 10.0 / 18.0 / 2_500_000.0).abs() < 1e-12, "{movies}");
     }
 
+    /// JOB 6d: `cast_info` kept at the movies `title` left keeps a thousandth of its rows, and a
+    /// person has nine rows of it, so those rows name seven hundredths of the people and not a
+    /// thousandth. The movies stay the ones that were standing, since every row kept is one of them.
+    #[test]
+    fn a_relation_leaves_standing_the_values_its_kept_rows_hold_and_not_its_share_of_rows() {
+        let mut cast_info = weight(36_244_344, 0, 1.0);
+        cast_info.skew = vec![(1, 11.5, 4_051_810)];
+        cast_info.reach = vec![(
+            0,
+            Reach {
+                parts: 4_425,
+                values: 2_525_975,
+                per_value: 4_421.0,
+                wide: 0,
+                wide_per_value: 0.0,
+            },
+        )];
+        cast_info.domain = vec![(0, 2_528_312), (1, 4_167_491)];
+        let edges = edges(&[&[0, 1]]);
+        let movies = 0.008;
+        let mut standing = Standing::from([(0, movies)]);
+        take(&edges, &[cast_info], &mut standing, 0);
+        let people = standing[&1];
+        assert!((0.06..0.075).contains(&people), "{people}");
+        assert!((standing[&0] - movies).abs() < 1e-9, "{}", standing[&0]);
+    }
+
+    /// JOB 6d: `name` read at the people `cast_info` left. They are seven hundredths of the names
+    /// and in every part, so every part of the names is read, and that costs most of a scan.
+    #[test]
+    fn a_wide_column_read_at_rows_in_every_part_costs_the_parts_and_not_only_the_rows() {
+        let mut name = weight(4_167_491, 4, 1.0);
+        name.domain = vec![(1, 4_167_491)];
+        let classes = BTreeSet::from([1]);
+        let whole = name.read(&Standing::new(), &classes);
+        let people = name.read(&Standing::from([(1, 0.068)]), &classes);
+        assert!(people > whole * 0.4, "{people} {whole}");
+        let few = name.read(&Standing::from([(1, 10.0 / 4_167_491.0)]), &classes);
+        assert!(few < whole / 4.0, "{few} {whole}");
+    }
+
+    /// JOB 19a: `gender = 'f'` rules out 216 of the 520 parts of `name` by their ends, so a read of
+    /// the people a join left only opens the other 304.
+    #[test]
+    fn a_read_opens_only_the_parts_its_own_filters_leave() {
+        let mut name = weight(4_167_491, 4, 0.3);
+        name.domain = vec![(1, 4_167_491)];
+        let classes = BTreeSet::from([1]);
+        let people = Standing::from([(1, 0.068)]);
+        let every = name.read(&people, &classes);
+        name.opened = 304.0 / 520.0;
+        let opened = name.read(&people, &classes);
+        assert!(opened < every * 0.65, "{opened} {every}");
+    }
+
     /// JOB 13a: `info_type` keeps one type of 113, and `movie_info_idx` holds five of them. The one
     /// a query names is one of the five, so it reaches a fifth of them and not one percent.
     #[test]
@@ -2261,11 +2417,13 @@ mod tests {
         movie_info.domain = vec![(0, 113)];
         let standing = Standing::from([(0, 1.0 / 113.0)]);
         let classes = BTreeSet::from([0]);
-        let average = movie_info.cost(&standing, &classes);
+        let average = movie_info.read(&standing, &classes);
         movie_info.named = vec![(0, 1, 0.085, Some(390.0 / 1_812.0))];
-        let counted = movie_info.cost(&standing, &classes);
-        let parts = 390.0 / 1_812.0 * 14_835_720.0;
-        assert!((counted - parts * (1.0 + 4.0 * 0.085)).abs() < 1.0, "{counted}");
+        let counted = movie_info.read(&standing, &classes);
+        // The rows the keys keep are read one by one in every part the named value is in.
+        let touched = 390.0 / 1_812.0;
+        let wide = touched * (0.085_f64 * PICK).min(1.0);
+        assert!((counted - 14_835_720.0 * (touched + 4.0 * wide)).abs() < 1.0, "{counted}");
         assert!(counted > average * 4.0, "{average} {counted}");
     }
 
@@ -2278,9 +2436,9 @@ mod tests {
         movie_info.skew = vec![(0, 1.0, 2_468_825)];
         let standing = Standing::from([(0, 8.0 / 2_468_825.0)]);
         let classes = BTreeSet::from([0]);
-        let scattered = movie_info.cost(&standing, &classes);
+        let scattered = movie_info.read(&standing, &classes);
         movie_info.placed = vec![(0, 1.0)];
-        let together = movie_info.cost(&standing, &classes);
+        let together = movie_info.read(&standing, &classes);
         let parts = (14_835_720.0_f64 / 8192.0).ceil();
         let found = 14_835_720.0 * 8.0 / 2_468_825.0;
         let expected = 14_835_720.0 * (8.0 / parts) * DECODE * 5.0 + found * GATHER;
