@@ -2528,18 +2528,17 @@ fn views(catalog: &Catalog, database: &str) -> Vec<rudb_native::ViewEntry> {
         .sequences()
         .filter(|held| same_name(&held.name().catalog, database))
         .map(kept_sequence);
-    catalog
-        .stored_views_in(database)
-        .map(|view| rudb_native::ViewEntry {
-            name: view.name().table.clone(),
-            sql: view.sql().to_string(),
-            statement: view.statement().to_string(),
-            aliases: view.aliases().to_vec(),
-            columns: view.columns(),
-        })
-        .chain(macros)
-        .chain(sequences)
-        .collect()
+    // First, because a macro is bound again as it is read back and a typed parameter can name one.
+    let types =
+        catalog.types().filter(|held| same_name(&held.name().catalog, database)).map(kept_type);
+    let views = catalog.stored_views_in(database).map(|view| rudb_native::ViewEntry {
+        name: view.name().table.clone(),
+        sql: view.sql().to_string(),
+        statement: view.statement().to_string(),
+        aliases: view.aliases().to_vec(),
+        columns: view.columns(),
+    });
+    types.chain(views).chain(macros).chain(sequences).collect()
 }
 
 /// The kind of entry a sequence is in a file's list of views, after [`KEPT`].
@@ -2565,6 +2564,39 @@ fn kept_sequence(held: &rudb_catalog::Sequence) -> rudb_native::ViewEntry {
         aliases: held.owner().map(|owner| owner.table.clone()).into_iter().collect(),
         columns: Vec::new(),
     }
+}
+
+/// The kind of entry a type `CREATE TYPE` made is in a file's list of views, after [`KEPT`].
+const TYPE: &str = "type ";
+
+/// A made type as an entry of a file's list of views. `sql` holds the type it stands for as it is
+/// written, and `aliases` the other made types its definition named, which go in before it.
+fn kept_type(held: &rudb_catalog::UserType) -> rudb_native::ViewEntry {
+    let name = &held.name().table;
+    rudb_native::ViewEntry {
+        name: format!("{KEPT}{TYPE}{name}"),
+        sql: held.ty().to_string(),
+        statement: format!("CREATE TYPE {} AS {};", rudb_parse::quoted(name), held.ty()),
+        aliases: held.uses().iter().map(|used| used.table.clone()).collect(),
+        columns: Vec::new(),
+    }
+}
+
+/// Puts a type that a file kept back into `database`.
+fn create_kept_type(
+    catalog: &mut Catalog,
+    database: &str,
+    name: &str,
+    kept: &rudb_native::ViewEntry,
+) -> Result<()> {
+    let ty = LogicalType::parse(&kept.sql)?;
+    let held = |table: &str| QualifiedName {
+        catalog: database.to_string(),
+        schema: rudb_catalog::DEFAULT_SCHEMA.to_string(),
+        table: table.to_string(),
+    };
+    let uses = kept.aliases.iter().map(|used| held(used)).collect();
+    catalog.create_type(held(name), ty, uses, false, false)
 }
 
 /// Puts a sequence that a file kept back into `database`, with the table that owns it.
@@ -2618,6 +2650,9 @@ fn create_native_entry(
     }
     if let Some(name) = view.name[KEPT.len_utf8()..].strip_prefix(SEQUENCE) {
         return create_kept_sequence(catalog, database, name, view);
+    }
+    if let Some(name) = view.name[KEPT.len_utf8()..].strip_prefix(TYPE) {
+        return create_kept_type(catalog, database, name, view);
     }
     let aggregating: Vec<bool> = view.sql.chars().map(|flag| flag == '1').collect();
     let made = rudb_bind::kept_macro(&view.statement, database, &aggregating)?;
@@ -6830,12 +6865,6 @@ impl Shared {
                         return Ok(QueryResult::empty());
                     }
                 };
-                // The native file has nowhere to keep a type yet.
-                if holds_a_file(&self.inner, &catalog, &name.catalog) {
-                    return Err(Error::not_implemented(
-                        "CREATE TYPE in a database file, which cannot hold one so far",
-                    ));
-                }
                 catalog.create_type(
                     name,
                     ty,

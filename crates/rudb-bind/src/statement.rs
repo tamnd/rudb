@@ -1168,10 +1168,27 @@ pub(crate) fn written_type(
     catalog: &Catalog,
     text: &str,
 ) -> Result<(LogicalType, Vec<QualifiedName>)> {
+    typed_in(catalog, text, None)
+}
+
+/// [`written_type`] for something made in `home`, where a bare name is looked for in `home`'s
+/// own schema before anywhere else, as the pin does for the columns of a table in another
+/// database.
+fn typed_in(
+    catalog: &Catalog,
+    text: &str,
+    home: Option<&QualifiedName>,
+) -> Result<(LogicalType, Vec<QualifiedName>)> {
     let mut uses = Vec::new();
     let ty = LogicalType::parse_with(text, &mut |parts| {
         let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-        let made = catalog.resolve_type(&parts)?;
+        let at_home = match (home, parts.as_slice()) {
+            (Some(home), [name]) => {
+                catalog.resolve_type(&[home.catalog.as_str(), home.schema.as_str(), name])
+            }
+            _ => None,
+        };
+        let made = at_home.or_else(|| catalog.resolve_type(&parts))?;
         uses.push(made.name().clone());
         Some(made.ty().clone())
     })?;
@@ -1190,12 +1207,22 @@ pub(crate) fn session_type(
     session: &Session,
     text: &str,
 ) -> Result<LogicalType> {
+    column_type(catalog, session, text, None)
+}
+
+/// [`session_type`] for a column of table `home`, see [`typed_in`].
+fn column_type(
+    catalog: &Catalog,
+    session: &Session,
+    text: &str,
+    home: Option<&QualifiedName>,
+) -> Result<LogicalType> {
     if session.postgres().is_some()
         && let Some(ty) = rudb_pgtypes::declared_type(text).and_then(rudb_pgtypes::session_type)
     {
         return Ok(ty);
     }
-    read_type(catalog, text)
+    typed_in(catalog, text, home).map(|(ty, _)| ty)
 }
 
 fn finish(binder: Binder<'_>, root: rudb_plan::NodeRef) -> Result<Plan> {
@@ -1244,7 +1271,7 @@ fn create_table(
             serials.push(serial.is_some());
             let ty = match serial.clone() {
                 Some(ty) => ty,
-                None => session_type(catalog, session, text)?,
+                None => column_type(catalog, session, text, Some(&name))?,
             };
             if ty == LogicalType::Type {
                 return Err(Error::invalid_input("A table cannot be created with a 'TYPE' column"));

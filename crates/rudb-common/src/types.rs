@@ -1501,6 +1501,13 @@ impl TypeParser<'_> {
         }
         match (self.resolve)(&parts) {
             Some(ty) => Ok(ty),
+            // A name of more than three parts cannot be anything, and the pin says so by reading
+            // all but the last as the schema.
+            None if parts.len() > 3 => Err(Error::catalog(format!(
+                "Type with name \"{}\" does not exist because schema \"{}\" does not exist.",
+                parts.join("."),
+                parts[..parts.len() - 1].join(".")
+            ))),
             None => Err(missing_type(parts.last().map_or("", String::as_str))),
         }
     }
