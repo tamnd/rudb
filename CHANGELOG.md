@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.43
+
+This release makes the release gate pass again, so it is the first release since 0.8.34 with archives on GitHub and the first since 0.8.1 on crates.io, and it continues the PostgreSQL session work.
+
+The tags for 0.8.40, 0.8.41 and 0.8.42 failed `cargo xtask ci`, and nothing from them was published. 0.8.40 failed on a lint fixed in #2750, 0.8.41 on a race in the journal's spares fixed in #2770, and 0.8.42 because the linker ran out of disk on the hosted runner while building the test binaries with full debug info. #2814 builds the tests of CI and of the release gate with line tables only, which keeps the file and line of a panic at a fraction of the size. It also writes `is_multiple_of` in `rudb-exec` where clippy 1.98 denies the manual form, and drops a link from public docs in `rudb-graph` to a private const. #2784 points the doc links of `rudb-parse` at the transform module, which rustdoc had found ambiguous.
+
+#2797 to #2812 bring operator errors, string literals next to operators, casts in and out of text, number casts, boolean conditions and FILTER, the common type of CASE, COALESCE, ARRAY, VALUES and set operations, the session TimeZone in a zoned cast, names in FROM, duplicate column names, the ORDER BY of SELECT DISTINCT, ON CONFLICT and index names in a PostgreSQL session in line with PostgreSQL. #2815 adds `to_char`, `to_timestamp` and `to_date` for the date and time types, #2817 adds `to_char` for the number types and `to_number`, and #2818 sends records over the wire and adds `pg_input_is_valid` and `pg_input_error_info`.
+
+#2621 states, beside a disjunction over two tables, the loosest test each branch makes of a column, so the scan of that column can skip what no branch wants. TPC-H q19 goes from 249M to 240M hot user instructions on the clustered database at scale factor 1. #2813 decodes a text block through buffers the thread keeps rather than new ones each block.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.42
 
 This release takes work out of the serial step a consistent join runs before each scan, for J7 (#1851), continues the PostgreSQL session work, and makes packed codes and LIKE prefixes faster to read.
