@@ -292,32 +292,42 @@ fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
     clear
 }
 
-/// Whether nothing above `join` reads a column its input `side` produces, and nothing above it
+/// The columns of `side` that something above `join` reads, or nothing when something above it
 /// reads its columns by position.
 ///
-/// The executor asks this about a join whose driving scan it may reduce to exactly the rows that
-/// match, where the join then has nothing to add but the gathered side's columns. It is
-/// `unread` and `absorbed` together, the same two questions elimination asks, for a join no
+/// A hash join hands every column of the side it gathered up beside the driving row, and most of
+/// them are only there because the side was a scan or a join that needed them for itself. TPC-H
+/// q09 gathers `supplier` joined to `nation` for its 319 thousand line items and only `n_name` is
+/// read above, so the supplier key, its nation key and the nation's own key were each gathered for
+/// every row and dropped by the projection two operators up. The join's own conditions do not
+/// count, because the probe reads its keys and its residual out of the table rather than out of
+/// the columns it hands on.
+///
+/// No column read at all is a join with nothing to add but the gathered side's columns, which the
+/// executor asks about a join whose driving scan it may reduce to exactly the rows that match. That
+/// is `unread` and `absorbed` together, the same two questions elimination asks, for a join no
 /// certificate lets the plan delete because its parent side is filtered.
 ///
 /// Like `unread` it looks only at the nodes the root reaches, because the plan it is asked about is
 /// the one that runs, and a node a pass left behind is a node nothing runs. It also builds its own
 /// consumers out of those nodes, which `unread` has no use for.
-pub fn unread_side(plan: &Plan, join: NodeRef, side: NodeRef) -> bool {
+pub fn read_above(plan: &Plan, join: NodeRef, side: NodeRef) -> Option<Vec<ColumnBinding>> {
     let mut produced = Vec::new();
     indices(plan, side, &mut produced);
     let mut running = vec![false; plan.node_count()];
     mark(plan, plan.root(), &mut running);
     let mut inside = vec![false; plan.node_count()];
     mark(plan, side, &mut inside);
-    let mut clear = true;
+    let mut read = Vec::new();
     for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
         let at = node as usize;
         if node == join || !running.get(at).copied().unwrap_or(false) || inside[at] {
             continue;
         }
         walk::node_columns(plan, node, &mut |_, binding| {
-            clear &= !produced.contains(&binding.table);
+            if produced.contains(&binding.table) && !read.contains(&binding) {
+                read.push(binding);
+            }
         });
     }
     // The consumers of the running nodes only, for the same reason.
@@ -332,7 +342,7 @@ pub fn unread_side(plan: &Plan, join: NodeRef, side: NodeRef) -> bool {
             }
         }
     }
-    clear && absorbed(plan, &above, join)
+    absorbed(plan, &above, join).then_some(read)
 }
 
 /// The operator numbers a subtree's nodes bind their output columns to.
@@ -385,9 +395,9 @@ mod tests {
     use std::sync::Arc;
 
     use rudb_common::rules::{Rule, Rules};
-    use rudb_plan::Plan;
+    use rudb_plan::{ColumnBinding, Plan};
 
-    use super::JoinElimination;
+    use super::{JoinElimination, read_above};
     use crate::link::Linked;
     use crate::pass::{Context, Pass};
 
@@ -433,6 +443,30 @@ mod tests {
         let mut plan = joined("INNER", "#1.1::VARCHAR AS n");
         let text = rewritten(&mut plan, &context(verified()));
         assert!(text.contains("Join INNER"), "the parent's name is in the answer: {text}");
+    }
+
+    #[test]
+    fn only_the_gathered_columns_something_above_reads_are_asked_for() {
+        let read = |projected: &str| {
+            let plan = joined("INNER", projected);
+            let join = plan.node(plan.root()).children().into_iter().flatten().next();
+            let join = join.expect("the projection is over the join");
+            let side = plan.node(join).children().into_iter().flatten().nth(1);
+            read_above(&plan, join, side.expect("the join has a right side"))
+        };
+        assert_eq!(read("#1.1::VARCHAR AS n"), Some(vec![ColumnBinding::new(1, 1)]));
+        assert_eq!(read("#0.0::BIGINT AS k"), Some(Vec::new()), "the key is the join's own");
+    }
+
+    #[test]
+    fn a_join_that_is_the_answer_has_every_column_read() {
+        let text = "Join INNER on=[(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n  \
+             Get memory.main.orders AS orders #0 [o_orderkey::BIGINT, o_custkey::BIGINT]\n  \
+             Get memory.main.customer AS customer #1 [c_custkey::BIGINT, c_name::VARCHAR]\n";
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let side = plan.node(plan.root()).children().into_iter().flatten().nth(1);
+        assert_eq!(read_above(&plan, plan.root(), side.expect("a right side")), None);
     }
 
     #[test]
