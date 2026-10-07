@@ -1681,13 +1681,26 @@ fn search(
 /// kept 1,182 in 4. The three kinds of link keep 2,315 rows of `movie_link` over 951 second
 /// movies, and `title` read at those took under a millisecond.
 ///
+/// Only a relation two of whose classes are held by relations of more than one chunk, since a
+/// relation of one chunk or less is taken as soon as it is an ear, see [`search`]. In JOB 7a
+/// `movie_link` joins `title` and the eighteen rows of `link_type`, so it is an ear once
+/// `link_type` is gone, and a copy of it read first took `cast_info` from 2,196 rows to 53,772.
+/// `complete_cast` is the same, with the four rows of `comp_cast_type` on its other classes.
+///
 /// Only the smallest [`SHADOWS`] of them, since each one doubles the sets the search can reach.
 fn shadowed(edges: &[BTreeSet<u32>], weights: &[Weight]) -> Vec<usize> {
     if edges.len() + SHADOWS > 64 {
         return Vec::new();
     }
+    let sides = |at: usize| {
+        let large = |other: usize| other != at && weights[other].rows > CHUNK;
+        let held = |class: &u32| {
+            (0..edges.len()).any(|other| large(other) && edges[other].contains(class))
+        };
+        edges[at].iter().filter(|class| held(class)).count()
+    };
     let mut found: Vec<usize> = (0..edges.len())
-        .filter(|&at| edges[at].len() > 1 && (CHUNK + 1..=SHADOWED).contains(&weights[at].rows))
+        .filter(|&at| sides(at) > 1 && (CHUNK + 1..=SHADOWED).contains(&weights[at].rows))
         .collect();
     found.sort_by_key(|&at| (weights[at].rows, at));
     found.truncate(SHADOWS);
