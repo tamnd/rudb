@@ -4275,6 +4275,9 @@ pub fn call_values(
     if let Some(value) = crate::json::call(name, args, returns)? {
         return Ok(value);
     }
+    if let ("__rudb_pg_number", [value]) = (name, args) {
+        return cast::postgres_number(value, returns);
+    }
     if name.starts_with("__rudb_pg_")
         && let Some(value) = text::postgres(name, args)?
     {

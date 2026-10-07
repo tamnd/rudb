@@ -1984,17 +1984,10 @@ fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
                 Ok(Value::Decimal { unscaled, width, scale })
             }
             _ if target.is_integer() => {
-                let name = match target {
-                    LogicalType::SmallInt => "smallint",
-                    LogicalType::Integer => "integer",
-                    _ => "bigint",
-                };
+                let name = integer_name(target);
                 let whole = held.to_integer(name).map_err(|error| Error::from(error).unplaced())?;
-                fit(whole, target).ok_or_else(|| {
-                    Error::out_of_range(format!("{name} out of range"))
-                        .state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
-                        .unplaced()
-                })
+                fit(whole, target)
+                    .ok_or_else(|| postgres_out_of_range(&format!("{name} out of range")))
             }
             _ => Err(no_cast(value, target)),
         };
@@ -2015,6 +2008,89 @@ fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
         },
     };
     Ok(Value::Numeric(held.to_bytes()))
+}
+
+/// A cast between two number types in a PostgreSQL session, which the binder writes as
+/// `__rudb_pg_number` for a pair whose cast can fail. It works as the casts of `int.c`, `int8.c`,
+/// `float.c` and `numeric.c` do. An integer or a float that does not fit an integer type is
+/// `smallint`, `integer` or `bigint out of range`, and a float rounds half to even first. A double
+/// that a `real` cannot hold is an overflow or an underflow. A `numeric` goes to a float through its
+/// text and the input function of the float, so its error quotes the text. Each error is `22003`
+/// with no position, as PostgreSQL raises it as the query runs.
+pub(crate) fn postgres_number(value: &Value, target: &LogicalType) -> Result<Value> {
+    use LogicalType as L;
+    let float = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(bytes) if matches!(target, L::Float | L::Double) => {
+            let text = rudb_common::numeric::to_text(bytes);
+            let read = match target {
+                L::Float => rudb_pgtypes::float4_in(&text).map(Value::Float),
+                _ => rudb_pgtypes::float8_in(&text).map(Value::Double),
+            };
+            return read.map_err(|error| Error::from(error).unplaced());
+        }
+        Value::Numeric(_) => return numeric_cast(value, target),
+        Value::Decimal { .. } => {
+            return postgres_number(&numeric_cast(value, &L::Numeric)?, target);
+        }
+        &Value::Float(float) => f64::from(float),
+        &Value::Double(double) => double,
+        _ => match (integral(value), target.is_integer()) {
+            (Some(whole), true) => {
+                let name = integer_name(target);
+                return fit(whole, target)
+                    .ok_or_else(|| postgres_out_of_range(&format!("{name} out of range")));
+            }
+            _ => return cast_value(value, target, false),
+        },
+    };
+    match target {
+        L::Float => {
+            #[expect(clippy::cast_possible_truncation, reason = "float4 rounds the double")]
+            let narrow = float as f32;
+            if narrow.is_infinite() && !float.is_infinite() {
+                return Err(postgres_out_of_range("value out of range: overflow"));
+            }
+            if narrow == 0.0 && float != 0.0 {
+                return Err(postgres_out_of_range("value out of range: underflow"));
+            }
+            Ok(Value::Float(narrow))
+        }
+        _ if target.is_integer() => {
+            // The bounds are powers of two, which a float holds exactly, and NaN fits none.
+            let bits = match target {
+                L::SmallInt => 15,
+                L::Integer => 31,
+                _ => 63,
+            };
+            let bound = 2f64.powi(bits);
+            let rounded = float.round_ties_even();
+            if !(rounded >= -bound && rounded < bound) {
+                return Err(postgres_out_of_range(&format!(
+                    "{} out of range",
+                    integer_name(target)
+                )));
+            }
+            #[expect(clippy::cast_possible_truncation, reason = "the bound check keeps it whole")]
+            let whole = rounded as i128;
+            fit(whole, target).ok_or_else(|| Error::internal("a checked float does not fit"))
+        }
+        _ => cast_value(value, target, false),
+    }
+}
+
+/// The PostgreSQL name of an integer type, as its range error spells it.
+fn integer_name(target: &LogicalType) -> &'static str {
+    match target {
+        LogicalType::SmallInt => "smallint",
+        LogicalType::Integer => "integer",
+        _ => "bigint",
+    }
+}
+
+/// A `22003` of a PostgreSQL cast, with no position.
+fn postgres_out_of_range(message: &str) -> Error {
+    Error::out_of_range(message).state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE).unplaced()
 }
 
 /// The pin's refusal of a `BIGNUM` that does not fit an integer type, which does not name the type.

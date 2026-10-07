@@ -480,6 +480,61 @@ fn a_cast_of_a_string_uses_the_input_function_of_the_type() {
 }
 
 #[test]
+fn a_cast_between_numbers_checks_the_range_as_postgres_does() {
+    let dirs = Dirs::new("number-cast");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values and the errors of the PostgreSQL 19 oracle. A numeric rounds half away from
+    // zero and a float rounds half to even.
+    for (sql, value) in [
+        ("select 3.5::int || ' ' || (-3.5)::int || ' ' || 2.5::int", "4 -4 3"),
+        ("select 2.5::float8::int || ' ' || 3.5::float8::int", "2 4"),
+        ("select 2.5::float4::int || ' ' || (-2.5)::float8::int2", "2 -2"),
+        ("select (-2147483648.4)::float8::int", "-2147483648"),
+        ("select 'NaN'::numeric::float4", "NaN"),
+        ("select '-Infinity'::float8::float4", "-Infinity"),
+        ("select 1e-50::numeric::float8", "1e-50"),
+        ("select 32767::int8::int2", "32767"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    let real = format!("\"1{zeros}\" is out of range for type real", zeros = "0".repeat(300));
+    let tiny = format!("\"0.{zeros}1\" is out of range for type real", zeros = "0".repeat(49));
+    client.query("create table narrow (a int2, b int4, c float4)");
+    client.query("insert into narrow (a) values (2.5)");
+    for (sql, message) in [
+        ("select 2147483648::int", "integer out of range"),
+        ("select -32769::int2", "smallint out of range"),
+        ("select 70000::int::int2", "smallint out of range"),
+        ("select 1e20::numeric::int8", "bigint out of range"),
+        ("select 1e10::float8::int", "integer out of range"),
+        ("select 'NaN'::float8::int", "integer out of range"),
+        ("select 'Infinity'::float8::int8", "bigint out of range"),
+        ("select 32767.5::float8::int2", "smallint out of range"),
+        ("select 9223372036854775807::int8::float4::int8", "bigint out of range"),
+        ("select 1e300::float8::float4", "value out of range: overflow"),
+        ("select 1e-300::float8::float4", "value out of range: underflow"),
+        ("select 1e300::float4", &real),
+        ("select 1e-50::float4", &tiny),
+        ("insert into narrow (a) values (70000)", "smallint out of range"),
+        ("insert into narrow (a) select 40000::int8", "smallint out of range"),
+        ("insert into narrow (b) values (3e10)", "integer out of range"),
+        ("insert into narrow (c) values (1e300)", &real),
+        ("update narrow set a = 99999", "smallint out of range"),
+    ] {
+        let messages = client.query(sql);
+        assert!(tags(&messages).ends_with("EZ"), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some("22003"), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P'), None, "{sql}");
+    }
+    assert_eq!(scalar(&mut client, "select a from narrow"), "3");
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_string_type_with_a_length_cuts_on_a_cast_and_refuses_a_long_value_on_a_store() {
     let dirs = Dirs::new("length");
     let server = Server::start(dirs.config()).unwrap();
