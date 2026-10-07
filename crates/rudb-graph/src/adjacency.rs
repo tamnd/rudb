@@ -54,6 +54,10 @@ const AHEAD: usize = 16;
 /// costs to start, tens of microseconds, is a small part of what it does.
 const SHARED_ROWS: u64 = 1 << 16;
 
+/// The fewest children a bucket of [`Adjacency::buckets`] is expected to get before it is given
+/// room for them ahead, so that a push of a few lists does not make room in every bucket.
+const ROOMY: usize = 64;
+
 /// How many bits of a parent `rid` [`Adjacency::build`] deals the children by, which is about a
 /// thousand ranges, each sorted on its own with eight kilobytes of counters on the IMDb `name`.
 const RANGE_BITS: u32 = 10;
@@ -418,7 +422,7 @@ impl Adjacency {
     ///
     /// If `held` is not a set over the parent table.
     pub fn push(&self, held: &Rids) -> Result<Rids> {
-        self.dealt(|deal| {
+        self.dealt(0, |deal| {
             // A list is asked for from memory when the walk reaches it and read [`AHEAD`] lists
             // later. The lists of a sparse set of parents are a cache line or two each, megabytes
             // apart, and read where the walk found them every one was a wait on memory. On JOB 17f
@@ -464,24 +468,24 @@ impl Adjacency {
             .unwrap_or(usize::MAX)
             .clamp(1, threads.max(1));
         if shares == 1 {
-            return self.dealt(|deal| self.read_lists(lists, deal));
+            return self.dealt(spans.rows, |deal| self.read_lists(lists, deal));
         }
         let per = spans.rows.div_ceil(count(shares));
-        let mut groups: Vec<&[std::ops::Range<usize>]> = Vec::with_capacity(shares);
+        let mut groups: Vec<(&[std::ops::Range<usize>], u64)> = Vec::with_capacity(shares);
         let (mut start, mut held) = (0, 0);
         for (at, list) in lists.iter().enumerate() {
             held += count(list.len());
             if held >= per && groups.len() + 1 < shares {
-                groups.push(&lists[start..=at]);
+                groups.push((&lists[start..=at], held));
                 (start, held) = (at + 1, 0);
             }
         }
-        groups.push(&lists[start..]);
+        groups.push((&lists[start..], held));
         let dealt = std::thread::scope(|scope| {
             let handles: Vec<_> = groups
                 .iter()
-                .map(|&group| {
-                    scope.spawn(move || self.buckets(|deal| self.read_lists(group, deal)))
+                .map(|&(group, rows)| {
+                    scope.spawn(move || self.buckets(rows, |deal| self.read_lists(group, deal)))
                 })
                 .collect();
             handles.into_iter().map(joined).collect::<Result<Vec<_>>>()
@@ -521,12 +525,14 @@ impl Adjacency {
         Ok(())
     }
 
-    /// The child rows of the lists `walk` hands its dealer, as a set over the children.
+    /// The child rows of the lists `walk` hands its dealer, as a set over the children. `rows` is
+    /// how many there are when the caller knows, see [`Self::buckets`].
     fn dealt(
         &self,
+        rows: u64,
         walk: impl FnOnce(&mut dyn FnMut(std::ops::Range<usize>) -> Result<()>) -> Result<()>,
     ) -> Result<Rids> {
-        let buckets = self.buckets(walk)?;
+        let buckets = self.buckets(rows, walk)?;
         let mut words = vec![0_u64; self.words()];
         set_bits(&mut words, 0, std::slice::from_ref(&buckets))?;
         Rids::from_words(self.children, words)
@@ -534,11 +540,20 @@ impl Adjacency {
 
     /// The child rows of the lists `walk` hands its dealer, dealt into one bucket per
     /// [`BUCKET_ROWS`] of them as their place in the bucket.
+    ///
+    /// `rows` is how many children the lists hold, or zero when the caller does not know. Each
+    /// bucket starts with room for a share of them and a quarter over, so that a bucket of a child
+    /// table in no order of its parent is not grown a doubling at a time. Growing them was about an
+    /// eighth of the pushes of the 113 JOB queries at one thread.
     fn buckets(
         &self,
+        rows: u64,
         walk: impl FnOnce(&mut dyn FnMut(std::ops::Range<usize>) -> Result<()>) -> Result<()>,
     ) -> Result<Vec<Vec<u16>>> {
-        let mut buckets: Vec<Vec<u16>> = vec![Vec::new(); self.words().div_ceil(BUCKET_ROWS / 64)];
+        let many = self.words().div_ceil(BUCKET_ROWS / 64);
+        let share = usize::try_from(rows / count(many.max(1))).unwrap_or(0);
+        let room = if share >= ROOMY { share + share / 4 } else { 0 };
+        let mut buckets: Vec<Vec<u16>> = (0..many).map(|_| Vec::with_capacity(room)).collect();
         let mut deal = |list: std::ops::Range<usize>| -> Result<()> {
             for at in list {
                 let child = bitpack::tail_at(&self.rows, self.width, at)?;
