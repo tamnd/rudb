@@ -141,6 +141,11 @@ pub(crate) struct Walking {
     scratch: Vec<Scratch>,
     /// The keys of a chunk, when they read as one block of integers.
     keys: Vec<i64>,
+    /// The parent of each row of a chunk, each parent once for a run of rows with it, and the
+    /// children of each of those for a walk over a link.
+    parents: Vec<Rid>,
+    wanted: Vec<Rid>,
+    ranges: Vec<std::ops::Range<Rid>>,
     /// The siblings of one batch, each once, in the order they were found.
     rids: Vec<u32>,
     /// The same siblings as runs of rows, a first row and a length, which is how a walk over a
@@ -333,21 +338,20 @@ impl Siblings {
             Children::Runs(link) => Some(link),
             Children::Listed(_) => None,
         };
-        let mut last: Option<(i128, Rid)> = None;
+        self.parents(keys, block, local)?;
+        // Every run a walk over a link wants, found in one pass along its bitmap rather than a call
+        // a parent, see [`Link::backward_runs`].
+        if let Some(link) = link {
+            local.ranges.clear();
+            link.backward_runs(&local.wanted, &mut local.cursor, &mut local.ranges)
+                .ok_or_else(|| Error::internal("a link has no run for a parent it holds"))?;
+        }
+        // The next of `ranges`, and the parent of the one taken last with its run.
+        let mut next = 0;
+        let mut taken = (NO_PARENT, 0..0);
         let mut group: Option<(Rid, u32, u32)> = None;
         for row in 0..rows {
-            // A null key matches nothing, and neither does a key the parent does not hold, since
-            // every child with a key has the parent that key names.
-            let key = if block { Some(i128::from(local.keys[row])) } else { keys.signed_at(row) };
-            let Some(key) = key else { continue };
-            let parent = match last {
-                Some((held, parent)) if held == key => parent,
-                _ => {
-                    let parent = self.keys.lookup(key)?.unwrap_or(NO_PARENT);
-                    last = Some((key, parent));
-                    parent
-                }
-            };
+            let parent = local.parents[row];
             if parent == NO_PARENT {
                 continue;
             }
@@ -360,10 +364,15 @@ impl Siblings {
                 }
                 _ => {
                     let run = match link {
-                        Some(link) => {
-                            link.backward_from(parent, &mut local.cursor).ok_or_else(|| {
-                                Error::internal("a link has no run for a parent it holds")
-                            })?
+                        Some(_) => {
+                            if taken.0 != parent {
+                                let run = local.ranges.get(next).cloned().ok_or_else(|| {
+                                    Error::internal("a sibling walk ran out of the runs it found")
+                                })?;
+                                taken = (parent, run);
+                                next += 1;
+                            }
+                            taken.1.clone()
                         }
                         None => {
                             local.found.clear();
@@ -421,6 +430,34 @@ impl Siblings {
         }
         if !local.places.is_empty() || !local.spans.is_empty() {
             self.flush(chunk, local)?;
+        }
+        Ok(())
+    }
+
+    /// The parent of each row of the chunk in `parents`, [`NO_PARENT`] for a row with none, and in
+    /// `wanted` each parent once for every run of rows that have it. A run of rows with one key
+    /// looks its parent up once.
+    fn parents(&self, keys: &Vector, block: bool, local: &mut Walking) -> Result<()> {
+        local.parents.clear();
+        local.wanted.clear();
+        let mut last: Option<(i128, Rid)> = None;
+        for row in 0..local.hit.len() {
+            // A null key matches nothing, and neither does a key the parent does not hold, since
+            // every child with a key has the parent that key names.
+            let key = if block { Some(i128::from(local.keys[row])) } else { keys.signed_at(row) };
+            let parent = match (key, last) {
+                (None, _) => NO_PARENT,
+                (Some(key), Some((held, parent))) if held == key => parent,
+                (Some(key), _) => {
+                    let parent = self.keys.lookup(key)?.unwrap_or(NO_PARENT);
+                    last = Some((key, parent));
+                    parent
+                }
+            };
+            if parent != NO_PARENT && local.wanted.last() != Some(&parent) {
+                local.wanted.push(parent);
+            }
+            local.parents.push(parent);
         }
         Ok(())
     }
@@ -882,6 +919,9 @@ impl Stream for Siblings {
                 Tests::Bare => Vec::new(),
             },
             keys: Vec::new(),
+            parents: Vec::new(),
+            wanted: Vec::new(),
+            ranges: Vec::new(),
             rids: Vec::new(),
             runs: Vec::new(),
             count: 0,

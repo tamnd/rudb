@@ -191,6 +191,41 @@ fn kth_zero(words: &[u64], start: usize, k: u64) -> Option<usize> {
     }
 }
 
+/// Where the run of `parent` is, read on from `at` when the parent is a little past it and found
+/// by two selects otherwise. The parent is one the vector holds.
+#[inline]
+fn run_of(vector: &BitVector, at: Option<At>, parent: Rid) -> Option<At> {
+    if let Some(at) = at
+        && at.parent == parent
+    {
+        return Some(at);
+    }
+    match at.filter(|at| at.parent < parent && parent - at.parent <= Cursor::NEAR) {
+        Some(at) => {
+            let words = vector.words();
+            // Every run ends in a zero, so the parents in between are that many zeros on, and the
+            // ones passed on the way are their children.
+            let start = at.zero + 1;
+            let between = parent - at.parent - 1;
+            let (first, from) = if between == 0 {
+                (start, at.to)
+            } else {
+                let before = kth_zero(words, start, between - 1)?;
+                (before + 1, at.to + count(before - start) - (between - 1))
+            };
+            let zero = kth_zero(words, first, 0)?;
+            Some(At { parent, zero, from, to: from + count(zero - first) })
+        }
+        None => {
+            let zero = vector.select0(parent)?;
+            let to = count(zero) - parent;
+            let from =
+                if parent == 0 { 0 } else { count(vector.select0(parent - 1)?) - (parent - 1) };
+            Some(At { parent, zero, from, to })
+        }
+    }
+}
+
 impl Link {
     /// Builds a link from one parent `rid` per child, with [`NO_PARENT`] for the unmatched.
     ///
@@ -483,38 +518,37 @@ impl Link {
         if parent >= self.parents {
             return None;
         }
-        if let Some(at) = cursor.at
-            && at.parent == parent
-        {
-            return Some(at.from..at.to);
-        }
-        let near = cursor.at.filter(|at| at.parent < parent && parent - at.parent <= Cursor::NEAR);
-        let found = match near {
-            Some(at) => {
-                let words = vector.words();
-                // Every run ends in a zero, so the parents in between are that many zeros on, and
-                // the ones passed on the way are their children.
-                let start = at.zero + 1;
-                let between = parent - at.parent - 1;
-                let (first, from) = if between == 0 {
-                    (start, at.to)
-                } else {
-                    let before = kth_zero(words, start, between - 1)?;
-                    (before + 1, at.to + count(before - start) - (between - 1))
-                };
-                let zero = kth_zero(words, first, 0)?;
-                At { parent, zero, from, to: from + count(zero - first) }
-            }
-            None => {
-                let zero = vector.select0(parent)?;
-                let to = count(zero) - parent;
-                let from =
-                    if parent == 0 { 0 } else { count(vector.select0(parent - 1)?) - (parent - 1) };
-                At { parent, zero, from, to }
-            }
-        };
+        let found = run_of(vector, cursor.at, parent)?;
         cursor.at = Some(found);
         Some(found.from..found.to)
+    }
+
+    /// [`Self::backward_from`] for each of `parents` in turn, the runs appended to `out`.
+    ///
+    /// For a caller with a batch of parents, which rise when the child is read in its own order. One
+    /// call a parent paid for the call, the checks on the cursor and its store each time, and on
+    /// TPC-H q21 that cost more than reading on along the words did. `None` as `backward_from` has
+    /// it, for the packed form or a parent past the end, with `out` holding the runs before it.
+    pub fn backward_runs(
+        &self,
+        parents: &[Rid],
+        cursor: &mut Cursor,
+        out: &mut Vec<std::ops::Range<Rid>>,
+    ) -> Option<()> {
+        let Body::Monotone { vector } = &self.body else { return None };
+        out.reserve(parents.len());
+        let mut at = cursor.at;
+        for &parent in parents {
+            if parent >= self.parents {
+                cursor.at = at;
+                return None;
+            }
+            let found = run_of(vector, at, parent)?;
+            at = Some(found);
+            out.push(found.from..found.to);
+        }
+        cursor.at = at;
+        Some(())
     }
 
     /// The minimum and maximum parent `rid` over one part of the child table, for section 5.5.
@@ -813,6 +847,26 @@ mod tests {
             assert_eq!(link.backward_from(parent, &mut cursor), link.backward(parent), "{parent}");
         }
         assert_eq!(link.backward_from(3_000, &mut cursor), None);
+    }
+
+    #[test]
+    fn a_batch_of_parents_finds_the_runs_one_at_a_time_does() {
+        let mut parents_of = Vec::new();
+        for parent in 0..3_000_u64 {
+            for _ in 0..(parent * 5 + parent / 7) % 9 {
+                parents_of.push(parent);
+            }
+        }
+        let link = Link::build(&parents_of, 3_000).expect("build");
+        let mut asked: Vec<Rid> = (0..3_000).step_by(2).collect();
+        asked.extend([2_000, 2_000, 2_001, 5, 2_999, 0, 1_000, 1_064, 1_129]);
+        let (mut cursor, mut runs) = (Cursor::default(), Vec::new());
+        assert_eq!(link.backward_runs(&asked, &mut cursor, &mut runs), Some(()));
+        let one: Vec<_> = asked.iter().map(|&parent| link.backward(parent).expect("run")).collect();
+        assert_eq!(runs, one);
+        runs.clear();
+        assert_eq!(link.backward_runs(&[4, 3_000], &mut cursor, &mut runs), None);
+        assert_eq!(runs, [link.backward(4).expect("run")]);
     }
 
     /// Checks every child resolves to the parent it was built from, in the link and in a copy of it
