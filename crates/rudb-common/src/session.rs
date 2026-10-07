@@ -34,7 +34,7 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     values: Arc<BTreeMap<String, String>>,
-    time_zone: Tz,
+    time_zone: SessionTimeZone,
     semantics: Semantics,
     rules: Rules,
     links: String,
@@ -775,12 +775,37 @@ pub enum DefaultNullOrder {
 
 /// A parsed session time zone, cheap enough to carry beside a prepared expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionTimeZone(Tz);
+pub struct SessionTimeZone(Clock);
+
+/// The rule of a session time zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clock {
+    /// A zone of the time zone database.
+    Named(Tz),
+    /// One offset at all instants, in seconds east of UTC, and the name of the zone. Only the
+    /// `TimeZone` of PostgreSQL makes one, from a number of hours, an interval, or a POSIX zone
+    /// without daylight saving time.
+    Fixed(i32, &'static str),
+}
 
 impl Default for SessionTimeZone {
     fn default() -> Self {
-        Self(chrono_tz::UTC)
+        Self(Clock::Named(chrono_tz::UTC))
     }
+}
+
+/// The name of a fixed zone as a string that lives as long as the program. A session sets few of
+/// them, and each one is kept once.
+fn kept(name: String) -> &'static str {
+    static ALL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let mut all = ALL.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(kept) = all.get(name.as_str()) {
+        return kept;
+    }
+    let kept: &'static str = Box::leak(name.into_boxed_str());
+    all.insert(kept);
+    kept
 }
 
 /// Seconds in 400 Gregorian years, after which the calendar and every rule written in it repeat.
@@ -815,8 +840,12 @@ fn leap(year: i32) -> bool {
 impl SessionTimeZone {
     /// The offset chrono holds for a moment it can turn into a date.
     fn listed_offset(self, seconds: i64) -> i32 {
+        let zone = match self.0 {
+            Clock::Named(zone) => zone,
+            Clock::Fixed(offset, _) => return offset,
+        };
         let Some(utc) = Utc.timestamp_opt(seconds, 0).single() else { return 0 };
-        self.0.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
+        zone.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
     }
 
     /// The same moment of a year that the zone tables list, which has the offset the real moment
@@ -851,24 +880,44 @@ impl SessionTimeZone {
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
         if let Ok(zone) = name.parse::<Tz>() {
-            return Some(Self(zone));
+            return Some(Self(Clock::Named(zone)));
         }
         chrono_tz::TZ_VARIANTS
             .iter()
             .find(|zone| zone.name().eq_ignore_ascii_case(name))
-            .map(|zone| Self(*zone))
+            .map(|zone| Self(Clock::Named(*zone)))
+    }
+
+    /// The zone of a value of the `TimeZone` parameter of PostgreSQL, which a cast between a
+    /// `timestamptz` and a type without a zone reads in a PostgreSQL session in place of the zone
+    /// of the database.
+    ///
+    /// A fixed offset, such as `-3` or `INTERVAL '+05:30'`, is that offset at all instants, with
+    /// the canonical name that PostgreSQL gives it. `None` for a value that is not a zone, which
+    /// the check of the parameter does not let through.
+    #[must_use]
+    pub fn of_postgres(value: &str) -> Option<Self> {
+        match crate::guc::zone(value).ok()? {
+            (crate::guc::Zone::Named(zone), _) => Some(Self(Clock::Named(zone))),
+            (crate::guc::Zone::Fixed { offset, .. }, name) => {
+                Some(Self(Clock::Fixed(offset, kept(name))))
+            }
+        }
     }
 
     /// Whether the zone is UTC, where every wall clock is its instant and nothing needs moving.
     #[must_use]
     pub fn is_utc(self) -> bool {
-        matches!(self.0, chrono_tz::UTC | chrono_tz::Etc::UTC)
+        matches!(self.0, Clock::Named(chrono_tz::UTC | chrono_tz::Etc::UTC) | Clock::Fixed(0, _))
     }
 
     /// The canonical IANA name of the zone.
     #[must_use]
     pub fn name(self) -> &'static str {
-        self.0.name()
+        match self.0 {
+            Clock::Named(zone) => zone.name(),
+            Clock::Fixed(_, name) => name,
+        }
     }
 
     /// The UTC offset in seconds at an instant expressed as Unix microseconds.
@@ -903,13 +952,15 @@ impl SessionTimeZone {
     /// `None` when the instant is past the end of the `i64`.
     #[must_use]
     pub fn instant_of_local(self, micros: i64) -> Option<i64> {
+        let zone = match self.0 {
+            Clock::Named(zone) => zone,
+            Clock::Fixed(offset, _) => return micros.checked_sub(i64::from(offset) * 1_000_000),
+        };
         let seconds = self.listed(micros.div_euclid(1_000_000));
         let local = Utc.timestamp_opt(seconds, 0).single()?.naive_utc();
-        let offset = match self.0.offset_from_local_datetime(&local) {
+        let offset = match zone.offset_from_local_datetime(&local) {
             LocalResult::Single(offset) | LocalResult::Ambiguous(_, offset) => offset.fix(),
-            LocalResult::None => {
-                self.0.offset_from_utc_datetime(&(local - TimeDelta::days(1))).fix()
-            }
+            LocalResult::None => zone.offset_from_utc_datetime(&(local - TimeDelta::days(1))).fix(),
         };
         micros.checked_sub(i64::from(offset.local_minus_utc()) * 1_000_000)
     }
@@ -919,7 +970,7 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             values: Arc::new(BTreeMap::new()),
-            time_zone: chrono_tz::UTC,
+            time_zone: SessionTimeZone::default(),
             semantics: Semantics::default(),
             rules: Rules::new(),
             links: String::new(),
@@ -947,7 +998,7 @@ impl Session {
 
     /// Sets the time zone after it has been validated by the setting layer.
     pub fn set_time_zone(&mut self, name: &str) {
-        self.time_zone = SessionTimeZone::named(name).map_or(chrono_tz::UTC, |zone| zone.0);
+        self.time_zone = SessionTimeZone::named(name).unwrap_or_default();
     }
 
     /// The canonical IANA name of the session time zone.
@@ -959,7 +1010,7 @@ impl Session {
     /// The parsed zone used by prepared expressions.
     #[must_use]
     pub fn session_time_zone(&self) -> SessionTimeZone {
-        SessionTimeZone(self.time_zone)
+        self.time_zone
     }
 
     /// Sets the direction used by an order item that names none.
@@ -1114,8 +1165,15 @@ impl Session {
     ///
     /// A PostgreSQL session also takes the rules of PostgreSQL for division: `/` of two integers
     /// is an integer, and a zero divisor is an error for every type. It takes the rule of
-    /// PostgreSQL for the values of an `INSERT`, and it compares identifiers byte for byte.
+    /// PostgreSQL for the values of an `INSERT`, and it compares identifiers byte for byte. Its
+    /// `TimeZone` is the zone of the session, see [`SessionTimeZone::of_postgres`].
     pub fn set_postgres(&mut self, postgres: Option<Arc<Postgres>>) {
+        if let Some(postgres) = &postgres
+            && let Some(zone) = postgres.settings.get("TimeZone")
+            && let Some(zone) = SessionTimeZone::of_postgres(&zone)
+        {
+            self.time_zone = zone;
+        }
         if postgres.is_some() {
             self.semantics.integer_division = true;
             self.semantics.ieee_floating_point_ops = false;
@@ -1248,7 +1306,26 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::Session;
+    use super::{Session, SessionTimeZone};
+
+    #[test]
+    fn a_time_zone_of_postgresql_is_a_named_zone_or_a_fixed_offset() {
+        let zone = SessionTimeZone::of_postgres("America/New_York").unwrap();
+        assert_eq!(zone.name(), "America/New_York");
+        // 2024-07-01 12:00 UTC, in summer time.
+        let noon = 1_719_835_200_000_000;
+        assert_eq!(zone.offset_seconds_at(noon), -4 * 3600);
+        let zone = SessionTimeZone::of_postgres("interval '+05:30'").unwrap();
+        assert_eq!(zone.name(), "<+05:30>-05:30");
+        assert_eq!(zone.offset_seconds_at(noon), 19_800);
+        assert_eq!(zone.local_of_instant(noon), Some(noon + 19_800_000_000));
+        assert_eq!(zone.instant_of_local(noon + 19_800_000_000), Some(noon));
+        assert!(!zone.is_utc());
+        let zone = SessionTimeZone::of_postgres("-3").unwrap();
+        assert_eq!(zone.offset_seconds_at(noon), -3 * 3600);
+        assert!(SessionTimeZone::of_postgres("0").unwrap().is_utc());
+        assert_eq!(SessionTimeZone::of_postgres("Mars/Olympus"), None);
+    }
 
     #[test]
     fn a_session_hands_back_what_was_put_in_and_says_nothing_about_a_name_it_has_not_got() {
