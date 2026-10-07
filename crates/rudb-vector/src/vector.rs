@@ -3933,9 +3933,43 @@ impl Vector {
             // cache line of its own. On q04, where the lineitems of an order are a run, nearly all
             // of the loop was the wait on the first read of a run, and the line of the run some
             // runs ahead is asked for so that the waits overlap.
+            //
+            // Runs that cover most of the rows between the first and the last of them are unpacked
+            // the other way, the whole span at once into a buffer the thread keeps and the runs
+            // copied out of it, as `Packed::values_at` does for rows. q21 keeps about half of all
+            // orders, so the runs of their lineitems nearly tile the span, and the unpack does a
+            // value in about one instruction where `code_at` takes ten.
+            thread_local! {
+                static SPAN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+            }
             let words = packed.words;
             let width = packed.width as usize;
             let mut out = vec![T::default(); rows];
+            let (low, high) = runs.iter().fold((usize::MAX, 0), |(low, high), &(start, length)| {
+                (low.min(start as usize), high.max(start as usize + length as usize))
+            });
+            if rows > 0 && high - low <= rows.saturating_mul(2) {
+                let mut copied = |span: &mut Vec<u64>| {
+                    if span.len() < high - low {
+                        span.resize(high - low, 0);
+                    }
+                    let span = &mut span[..high - low];
+                    packed.unpack(low, span);
+                    let mut at = 0;
+                    for &(start, length) in runs {
+                        let (from, length) = (start as usize - low, length as usize);
+                        for (slot, &code) in out[at..at + length].iter_mut().zip(&span[from..]) {
+                            *slot = value(code);
+                        }
+                        at += length;
+                    }
+                };
+                SPAN.with(|held| match held.try_borrow_mut() {
+                    Ok(mut held) => copied(&mut held),
+                    Err(_) => copied(&mut Vec::new()),
+                });
+                return out;
+            }
             let mut at = 0;
             for (index, &(start, length)) in runs.iter().enumerate() {
                 if let Some(&(ahead, _)) = runs.get(index + PREFETCH_AHEAD) {
@@ -8883,15 +8917,22 @@ mod tests {
     }
 
     /// Runs of a packed column, cut at rows that do and do not start a word, read what a gather
-    /// of the same rows reads, and a column with nulls goes through the gather.
+    /// of the same rows reads, and a column with nulls goes through the gather. The first runs are
+    /// far apart and read a code at a time, and the others cover most of their span, one set of
+    /// them out of order, and are read from the span unpacked whole.
     #[test]
     fn a_gather_of_runs_reads_what_a_gather_of_their_rows_reads() {
         let words: Vec<u64> =
             (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
-        let runs = [(0, 3), (5, 1), (63, 2), (70, 0), (100, 64), (299, 1)];
-        let rows: Vec<u32> =
-            runs.iter().flat_map(|&(start, length)| start..start + length).collect();
-        for width in [1, 7, 13, 32, 33, 50] {
+        let sparse = [(0, 3), (5, 1), (63, 2), (70, 0), (100, 64), (299, 1)];
+        let dense = [(10, 20), (31, 5), (36, 40), (90, 3)];
+        let unordered = [(150, 10), (120, 10), (130, 15), (161, 1)];
+        for (runs, width) in [&sparse[..], &dense, &unordered]
+            .into_iter()
+            .flat_map(|runs| [1, 7, 13, 32, 33, 50].map(|width| (runs, width)))
+        {
+            let rows: Vec<u32> =
+                runs.iter().flat_map(|&(start, length)| start..start + length).collect();
             for ty in [LogicalType::BigInt, LogicalType::Integer] {
                 let base = if ty == LogicalType::BigInt { -1_000 } else { 0 };
                 let width = if ty == LogicalType::Integer { width.min(31) } else { width };
