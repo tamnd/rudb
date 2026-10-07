@@ -3200,14 +3200,11 @@ impl<'a> Building<'a, '_> {
                     }
                 });
             }
+            let missing = || refuse("a filter on a column the parent does not have");
             let mut columns = Vec::with_capacity(scanned.len());
             for (field, &read) in scanned.iter().zip(&read) {
                 let at = if read {
-                    Some(
-                        parent_table
-                            .column_index(&field.name)
-                            .ok_or_else(|| refuse("a filter on a column the parent does not have"))?,
-                    )
+                    Some(parent_table.column_index(&field.name).ok_or_else(missing)?)
                 } else {
                     None
                 };

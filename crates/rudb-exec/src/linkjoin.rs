@@ -435,10 +435,9 @@ impl Stream for LinkJoin {
             rids: Vec::new(),
             children: Vec::new(),
             parents: Vec::new(),
-            tested: self
-                .tested
-                .as_ref()
-                .map_or_else(Vec::new, |tested| tested.tests.iter().map(Prepared::scratch).collect()),
+            tested: self.tested.as_ref().map_or_else(Vec::new, |tested| {
+                tested.tests.iter().map(Prepared::scratch).collect()
+            }),
             gauge: Gauge::new(1),
         }
     }
@@ -627,7 +626,10 @@ mod tests {
         );
         let test = Prepared::one(&plan, over, &gathered_schema(true)).expect("a test");
         operator(kind, parents, rows)
-            .testing(Some(Tested { columns: vec![(Some(0), LogicalType::Integer)], tests: vec![test] }))
+            .testing(Some(Tested {
+                columns: vec![(Some(0), LogicalType::Integer)],
+                tests: vec![test],
+            }))
             .in_session(&Session::default())
     }
 
