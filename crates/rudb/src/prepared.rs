@@ -80,7 +80,7 @@ struct Described {
 }
 
 /// An `INSERT INTO t [(columns)] VALUES (row), ...` whose items are parameters or `NULL`, with
-/// nothing after the rows: no `RETURNING`, no `ON CONFLICT`.
+/// no `ON CONFLICT` after the rows and a `RETURNING` of columns at most.
 ///
 /// This is the trickle insert, one row or a few per statement, and binding it builds a plan of a
 /// projection over a `VALUES` only for the executor to walk it back down to the rows. So the shape is
@@ -88,7 +88,8 @@ struct Described {
 /// in. A column the statement leaves out gets its default here when the default is a constant, a
 /// `nextval` or the time of the transaction. Anything else the shape does not settle by itself, a
 /// constraint, another default or a value that needs more than a widening to fit its column, goes
-/// the long way, so the errors and the answers are the ones the plan gives.
+/// the long way, so the errors and the answers are the ones the plan gives. A `RETURNING` of the
+/// table's columns gives them from the rows as they went in.
 #[derive(Debug, Clone)]
 pub(crate) struct Direct {
     /// The table's name, as it was written.
@@ -97,6 +98,8 @@ pub(crate) struct Direct {
     pub(crate) columns: Vec<String>,
     /// The rows, each one item for each column the statement names.
     pub(crate) rows: Vec<Vec<Item>>,
+    /// The `RETURNING` list, read as a [`Lookup`] that sets nothing equal.
+    pub(crate) returning: Option<Lookup>,
     /// What the last execution worked out about the table, kept while the catalog stays as it was.
     pub(crate) found: Found,
 }
@@ -133,6 +136,8 @@ pub(crate) struct Targets {
     pub(crate) at: Vec<usize>,
     /// Each column the row leaves out that has a default, with the default.
     pub(crate) fills: Vec<(usize, Fill)>,
+    /// The columns the `RETURNING` list gives, with their names and types.
+    pub(crate) returning: Option<Arc<Target>>,
 }
 
 /// A column default that a [`Direct`] insert can supply with no plan.
@@ -445,9 +450,13 @@ impl Direct {
 
     /// The rows of `insert` with what it says about a key it finds held left aside.
     fn reading(ast: &Ast, insert: ast::Insert) -> Option<Self> {
-        if insert.returning.is_some() || insert.copy || insert.source == rudb_parse::NONE {
+        if insert.copy || insert.source == rudb_parse::NONE {
             return None;
         }
+        let returning = match insert.returning {
+            Some(at) => Some(Self::returning(ast, at)?),
+            None => None,
+        };
         let query = ast.query(insert.source);
         let ast::QueryBody::Values(rows) = query.body else { return None };
         if query != ast::Query::bare(query.body) {
@@ -466,8 +475,23 @@ impl Direct {
             name: ast.name(insert.name).map(str::to_owned).collect(),
             columns: ast.name(insert.columns).map(str::to_owned).collect(),
             rows,
+            returning,
             found: Found::default(),
         })
+    }
+
+    /// The `RETURNING` list held at `at`, if it is columns and stars of the table.
+    fn returning(ast: &Ast, at: ast::QueryRef) -> Option<Lookup> {
+        let query = ast.query(at);
+        let ast::QueryBody::Select(select) = query.body else { return None };
+        if query != ast::Query::bare(query.body) {
+            return None;
+        }
+        let select = ast.select(select);
+        if select.filter != rudb_parse::NONE {
+            return None;
+        }
+        Lookup::listing(ast, select)
     }
 }
 
@@ -477,6 +501,9 @@ impl Upsert {
         let [ast::Statement::Insert(at)] = ast.statements.as_slice() else { return None };
         let insert = ast.insert(*at);
         let conflict = insert.conflict?;
+        if insert.returning.is_some() {
+            return None;
+        }
         let direct = Direct::reading(ast, insert)?;
         if direct.rows.len() != 1 {
             return None;
@@ -588,12 +615,20 @@ impl Lookup {
     /// The table and the select list of `select`, with no columns set equal yet, if it reads one
     /// table by name with a `WHERE` and nothing else.
     fn reading(ast: &Ast, select: ast::Select) -> Option<Self> {
+        if select.filter == rudb_parse::NONE {
+            return None;
+        }
+        Self::listing(ast, select)
+    }
+
+    /// The table and the select list of `select`, if it reads one table by name and the list is
+    /// columns and stars. A `WHERE` is the caller's to read.
+    fn listing(ast: &Ast, select: ast::Select) -> Option<Self> {
         if select.distinct != ast::Distinct::No
             || select.group_by.len != 0
             || select.group_by_all
             || select.having != rudb_parse::NONE
             || select.qualify != rudb_parse::NONE
-            || select.filter == rudb_parse::NONE
         {
             return None;
         }
@@ -1175,7 +1210,8 @@ mod tests {
         assert_eq!(db.table_len("t").expect("counts"), 2);
 
         for sql in [
-            "INSERT INTO t VALUES (?, ?, ?, ?) RETURNING id",
+            "INSERT INTO t VALUES (?, ?, ?, ?) RETURNING id + 1",
+            "INSERT INTO t VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING id",
             "INSERT INTO t SELECT ?, ?, ?, ?",
             "INSERT INTO t VALUES (?, ?, ?, 1 + ?)",
         ] {
