@@ -1861,12 +1861,11 @@ impl Vector {
         let mut row = 0;
         if offset % 64 == 0 {
             let mut codes = [0_u64; 64];
-            while row + 64 <= self.len
-                && unpack_block_at(words, (offset + row) / 64 * width as usize, width, &mut codes)
-            {
+            while row + 64 <= self.len {
                 let into = &mut held[row / per..(row + 64) / per];
-                for (word, codes) in into.iter_mut().zip(codes.chunks_exact(per)) {
-                    *word = codes.iter().rev().fold(0, |word, &code| word << lanes | code);
+                let word = (offset + row) / 64 * width as usize;
+                if !widen_block(words, word, width, lanes, into, &mut codes) {
+                    break;
                 }
                 row += 64;
             }
@@ -5134,6 +5133,39 @@ fn unpack_block_at(words: &[u64], word: usize, width: u32, out: &mut [u64; 64]) 
     }
     let Some(words) = words.get(word..word + width as usize) else { return false };
     unpack_block(words, width, out);
+    true
+}
+
+/// The block of 64 codes whose `width` words start at `words[word]` widened to `lanes` bits each
+/// into `into`, and false when `words` does not hold them all.
+///
+/// Sixteen bit lanes are packed in AVX2 registers when the sixteen bytes past the block are there,
+/// and otherwise the codes are unpacked and folded into words, `codes` being room for them.
+fn widen_block(
+    words: &[u64],
+    word: usize,
+    width: u32,
+    lanes: u32,
+    into: &mut [u64],
+    codes: &mut [u64; 64],
+) -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if lanes == 16 {
+        let start = word * size_of::<u64>();
+        let bytes = crate::lanes::bytes_of(words);
+        let block = bytes.get(start..start + crate::lanes::readable(width as usize));
+        if let (Some(block), Ok(into)) = (block, <&mut [u64; 16]>::try_from(&mut *into)) {
+            crate::lanes::widen_16(block, width as usize, into);
+            return true;
+        }
+    }
+    if !unpack_block_at(words, word, width, codes) {
+        return false;
+    }
+    let per = (u64::BITS / lanes) as usize;
+    for (word, codes) in into.iter_mut().zip(codes.chunks_exact(per)) {
+        *word = codes.iter().rev().fold(0, |word, &code| word << lanes | code);
+    }
     true
 }
 

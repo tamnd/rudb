@@ -422,6 +422,54 @@ pub(crate) fn unpack(bytes: &[u8], width: usize, out: &mut [u64; 64]) {
     }
 }
 
+/// The block of 64 codes at `bytes` widened to sixteen bits each, four codes a word of `out`.
+///
+/// The same shuffle, shift and mask as [`unpack`], with two groups' sixteen lanes packed down to
+/// sixteen bits and stored together rather than each code widened to a word. A page whose codes are
+/// a few bits short of sixteen is widened to them as it is decoded, see `Vector::on_lanes`, and
+/// folding unpacked words into lanes in scalar registers was most of what that cost. `bytes` is as
+/// [`within`] takes it, and a code is at most fifteen bits, which the unsigned pack keeps whole.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+pub(crate) fn widen_16(bytes: &[u8], width: usize, out: &mut [u64; 16]) {
+    use std::arch::x86_64::{
+        _mm_loadu_si128, _mm256_and_si256, _mm256_loadu_si256, _mm256_packus_epi32,
+        _mm256_permute4x64_epi64, _mm256_set_m128i, _mm256_set1_epi32, _mm256_shuffle_epi8,
+        _mm256_srlv_epi32, _mm256_storeu_si256,
+    };
+    assert!((1..=15).contains(&width) && bytes.len() >= readable(width));
+    let (shuffle, shifts) = &LANES[width];
+    let half = 4 * width / 8;
+    // SAFETY: the loads are the ones [`unpack`] makes, which the assert keeps inside `bytes`. Pair
+    // `p` stores four words at `4 * p`, so the last store ends at word 16, the end of `out`.
+    // Neither `loadu` nor `storeu` has an alignment requirement.
+    unsafe {
+        let shuffle = _mm256_loadu_si256(shuffle.as_ptr().cast());
+        let shifts = _mm256_loadu_si256(shifts.as_ptr().cast());
+        #[expect(clippy::cast_possible_wrap, reason = "the lanes are read unsigned")]
+        let mask = _mm256_set1_epi32(((1_u32 << width) - 1) as i32);
+        let at = bytes.as_ptr();
+        let to = out.as_mut_ptr();
+        let group = |group: usize| {
+            let first = at.add(group * width);
+            let lanes = _mm256_set_m128i(
+                _mm_loadu_si128(first.add(half).cast()),
+                _mm_loadu_si128(first.cast()),
+            );
+            _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(lanes, shuffle), shifts), mask)
+        };
+        for pair in 0..4 {
+            // The pack works within each half of the register, so its four quarters come out as
+            // the first group's low four, the second's low four, the first's high four and the
+            // second's high four, and the permute puts the middle two the other way round.
+            let packed = _mm256_packus_epi32(group(2 * pair), group(2 * pair + 1));
+            let ordered = _mm256_permute4x64_epi64::<0b1101_1000>(packed);
+            _mm256_storeu_si256(to.add(pair * 4).cast(), ordered);
+        }
+    }
+}
+
 /// Adds `(code + lift) * stride` for each of the codes from group `at` on into `into`, eight codes a
 /// group, for as many groups as `into` holds and `bytes` has to read, and returns how many codes
 /// that was.
