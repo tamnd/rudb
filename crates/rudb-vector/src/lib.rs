@@ -65,6 +65,6 @@ pub use string::{INLINE_LIMIT, StringColumn, StringView};
 pub use validity::{Bitmap, Live, Validity};
 pub use vector::{
     Against, Builder, Coded, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, MapParts, NO_ROW,
-    PACKED_WIDTH_MAX, PACKING_PAYS_AT, PREFETCH_AHEAD, Packed, Runs, TextSource, VECTOR_SIZE, Vector,
-    below, enum_code_type, enum_position, prefetch, search_below,
+    PACKED_WIDTH_MAX, PACKING_PAYS_AT, PREFETCH_AHEAD, Packed, Runs, TextSource, VECTOR_SIZE,
+    Vector, below, enum_code_type, enum_position, prefetch, search_below,
 };
