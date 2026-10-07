@@ -1016,7 +1016,7 @@ impl Binder<'_> {
         }
         let mut op = op;
         if self.semantics.unknown_types() == UnknownTypes::Postgres {
-            self.unknown_operand(op, &mut left, &mut right);
+            self.unknown_operand(ast, written, op, &mut left, &mut right)?;
         }
         if self.semantics.operator_rules() == OperatorRules::Postgres {
             // A string literal joined to a `bytea` is a `bytea` too.
@@ -1211,23 +1211,63 @@ impl Binder<'_> {
         Ok(())
     }
 
-    /// Casts a parameter of no known type on one side of an arithmetic operator to the type that
-    /// PostgreSQL picks for it, when the other side is a date, a time or an interval.
+    /// Casts an operand of no known type on one side of an arithmetic operator to the type that
+    /// PostgreSQL picks for it. That is a parameter and a string literal, which are both of type
+    /// `unknown` in PostgreSQL.
     ///
-    /// PostgreSQL first tries the operator with the parameter as the type of the other side, so
-    /// `now() - $1` subtracts two `timestamptz` values. When there is no such operator, it takes
-    /// the one operator that is left, so `now() + $1` adds an `interval`. The function resolution
-    /// of rudb finds no overload for a null on these operators, so the cast comes first. The
-    /// operators that PostgreSQL finds ambiguous, such as `date + $1`, are left as they are.
-    fn unknown_operand(&mut self, op: BinaryOp, left: &mut ExprRef, right: &mut ExprRef) {
+    /// PostgreSQL first tries the operator with the unknown operand as the type of the other side,
+    /// so `1 + '5'` adds two `integer` values and `now() - $1` subtracts two `timestamptz` values.
+    /// When there is no such operator, it takes the one operator that is left, so `now() + $1`
+    /// adds an `interval` and `interval '1 day' * '2'` multiplies by a `float8`. The function
+    /// resolution of rudb finds no overload for these, so the cast comes first. The operators that
+    /// PostgreSQL finds ambiguous, such as `date + $1`, are left as they are.
+    ///
+    /// A string literal is read by the input function of the type, as it is in a cast, so
+    /// `1 + '1.5'` is the error of PostgreSQL and not 3.
+    fn unknown_operand(
+        &mut self,
+        ast: &Ast,
+        written: [ast::ExprRef; 2],
+        op: BinaryOp,
+        left: &mut ExprRef,
+        right: &mut ExprRef,
+    ) -> Result<()> {
         use LogicalType as L;
-        let (unknown_left, other) = match (self.is_placeholder(*left), self.is_placeholder(*right))
-        {
+        let unknown = |binder: &Self, at: usize, side: ExprRef| {
+            binder.is_placeholder(side)
+                || matches!(
+                    ast.expr(written[at]),
+                    ast::Expr::Literal { kind: LiteralKind::String, .. }
+                )
+        };
+        let (unknown_left, other) = match (unknown(self, 0, *left), unknown(self, 1, *right)) {
             (true, false) => (true, self.plan().expr_type(*right).clone()),
             (false, true) => (false, self.plan().expr_type(*left).clone()),
-            _ => return,
+            _ => return Ok(()),
+        };
+        let number = other.is_integer()
+            || matches!(other, L::Float | L::Double | L::Decimal { .. } | L::Numeric);
+        let float = matches!(other, L::Float | L::Double);
+        // A `numeric` operand takes the unknown one as a `numeric` with no precision.
+        let same = match other {
+            L::Decimal { .. } => L::Numeric,
+            _ => other.clone(),
         };
         let wanted = match (op, &other) {
+            (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide, _)
+            | (BinaryOp::IntegerDivide, _)
+                if number =>
+            {
+                same
+            }
+            (BinaryOp::Modulo, _) if number && !float => same,
+            (BinaryOp::BitAnd | BinaryOp::BitOr, _) if other.is_integer() => same,
+            (BinaryOp::ShiftLeft | BinaryOp::ShiftRight, _)
+                if other.is_integer() && !unknown_left =>
+            {
+                L::Integer
+            }
+            (BinaryOp::Multiply, L::Interval) => L::Double,
             (BinaryOp::Add, L::Timestamp | L::TimestampTz | L::Time | L::Interval) => L::Interval,
             (
                 BinaryOp::Subtract,
@@ -1236,10 +1276,15 @@ impl Binder<'_> {
             (BinaryOp::Subtract, L::TimeTz) if !unknown_left => L::Interval,
             (BinaryOp::Divide | BinaryOp::IntegerDivide, L::Interval) if !unknown_left => L::Double,
             (BinaryOp::Concat, L::Blob) => L::Blob,
-            _ => return,
+            _ => return Ok(()),
         };
-        let side = if unknown_left { left } else { right };
-        *side = self.cast_to(*side, &wanted);
+        let (side, at) = if unknown_left { (left, written[0]) } else { (right, written[1]) };
+        let oid = rudb_pgtypes::pg_type(&wanted).oid;
+        *side = match self.read_literal(ast, at, oid) {
+            Some(value) => self.cast_to(value?, &wanted),
+            None => self.cast_to(*side, &wanted),
+        };
+        Ok(())
     }
 
     /// The PostgreSQL operators on dates and times that the functions of rudb answer in another
@@ -4802,6 +4847,10 @@ fn undefined_function(
 /// The error of PostgreSQL for an operator that takes no operands of these types, which a
 /// PostgreSQL session sends in place of the error of the pin. It is placed at the operator, which
 /// is where the PostgreSQL transform places the expression. Another error stays as it is.
+///
+/// PostgreSQL finds more than one operator for an arithmetic operator over two unknown operands,
+/// as in `'1' + '2'`, and for `date + unknown`, so these are not unique where the others do not
+/// exist.
 fn undefined_operator(
     ast: &Ast,
     error: Error,
@@ -4822,11 +4871,35 @@ fn undefined_operator(
         BinaryOp::NotILike => "!~~*".to_string(),
         _ => spelling(ast, op),
     };
-    let mapped = Error::new(error.code(), message.to_string())
-        .state(SqlState::UNDEFINED_FUNCTION)
-        .pg(format!("operator does not exist: {left} {symbol} {right}"))
-        .detail("No operator of that name accepts the given argument types.")
-        .hint("You might need to add explicit type casts.");
+    let arithmetic = matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Modulo
+            | BinaryOp::Caret
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+    );
+    let unknown = [&left, &right].map(|name| name == "unknown");
+    let ambiguous = (arithmetic && unknown == [true, true])
+        || (op == BinaryOp::Add
+            && ((left == "date" && unknown[1]) || (unknown[0] && right == "date")));
+    let mapped = Error::new(error.code(), message.to_string());
+    let mapped = match ambiguous {
+        true => mapped
+            .state(SqlState::AMBIGUOUS_FUNCTION)
+            .pg(format!("operator is not unique: {left} {symbol} {right}"))
+            .detail("Could not choose a best candidate operator."),
+        false => mapped
+            .state(SqlState::UNDEFINED_FUNCTION)
+            .pg(format!("operator does not exist: {left} {symbol} {right}"))
+            .detail("No operator of that name accepts the given argument types."),
+    }
+    .hint("You might need to add explicit type casts.");
     match error.span() {
         Some(span) => mapped.with_span(span),
         None => mapped,
