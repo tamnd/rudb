@@ -1281,6 +1281,9 @@ impl Binder<'_> {
             && let [only] = arguments[..]
         {
             let bound = self.bind_expr(ast, only, scope)?;
+            if crate::advisory::gives_void(ast, only) {
+                return Ok(self.add_constant(Value::Varchar("void".into())));
+            }
             let ty = self.plan().expr_type(bound).clone();
             let untyped = ty == LogicalType::Null
                 || matches!(ast.expr(only), ast::Expr::Literal { kind: LiteralKind::String, .. });
@@ -1294,6 +1297,9 @@ impl Binder<'_> {
             && postgres
             && let Some(call) = self.postgres_call(ast, &written, &arguments, scope)?
         {
+            return Ok(call);
+        }
+        if !modified && let Some(call) = self.sleep_call(ast, &written, &arguments, scope)? {
             return Ok(call);
         }
         if !modified && let Some(call) = self.advisory_call(ast, &written, &arguments, scope)? {
