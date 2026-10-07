@@ -6678,8 +6678,8 @@ mod tests {
         for (name, written) in [("__rudb_widened_add", "+"), ("__rudb_widened_subtract", "-")] {
             for args in [[left.clone(), right.clone()], [constant.clone(), right.clone()]] {
                 agrees(name, &args, &wide);
-                let cast = |side: &Vector| cast::cast(side, &wide, false).expect("widens");
-                let expected = call(written, &[cast(&args[0]), cast(&args[1])], &wide, None);
+                let widen = |side: &Vector| cast(side, &wide, false).expect("widens");
+                let expected = call(written, &[widen(&args[0]), widen(&args[1])], &wide, None);
                 let answer = call(name, &args, &wide, None).expect("answers");
                 assert_eq!(format!("{answer:?}"), format!("{:?}", expected.expect("answers")));
             }
