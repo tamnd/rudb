@@ -623,10 +623,15 @@ fn parallel(dir: &Path, threads: usize, window: Duration) -> Result<u64> {
                 let block = vec![0x3c_u8; 4 << 10];
                 let mut done = 0u64;
                 let mut offset = 0;
-                while !stop.load(Ordering::Relaxed) {
+                // One sync at least, so a thread the scheduler started late still counts and a
+                // busy machine measures a slow device rather than none.
+                loop {
                     write_and_sync(&file, call, &block, offset)?;
                     offset = (offset + 4096) % (4 << 20);
                     done += 1;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
                 Ok(done)
             })
@@ -646,7 +651,7 @@ fn parallel(dir: &Path, threads: usize, window: Duration) -> Result<u64> {
         clippy::cast_sign_loss,
         reason = "a sync count is far under 2^53 and the rate is positive"
     )]
-    let rate = if spent > 0.0 { (total as f64 / spent) as u64 } else { 0 };
+    let rate = if spent > 0.0 { ((total as f64 / spent) as u64).max(1) } else { 0 };
     Ok(rate)
 }
 
