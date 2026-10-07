@@ -1225,34 +1225,44 @@ impl Compressed<'_> {
     /// Each symbol is one eight byte store into room made ahead of it, which is what
     /// [`SymbolTable::decompress_at`] is for. A run of `n` codes writes at most `n` symbols of at
     /// most [`MAX_SYMBOL_LEN`] bytes, the last store included, so that much room past where the run
-    /// starts is all it needs. The room is made by doubling, so the zeroes written to make it add up
-    /// to at most twice what the chunk decompresses to. Growing a vector a symbol at a time and
-    /// cutting it back was a fifth of TPC-H q13, all of it the order comment.
+    /// starts is all it needs. Growing a vector a symbol at a time and cutting it back was a fifth
+    /// of TPC-H q13, all of it the order comment.
+    ///
+    /// The room is made by doubling in a buffer kept by the thread, and only what the chunk
+    /// decompressed to is copied out into a vector of exactly that length. Made in the values'
+    /// own vector, the room was two or three times the output, zeroed afresh for every chunk, and
+    /// kept at that capacity for as long as the values were held.
     ///
     /// # Errors
     ///
     /// If a run is past the end of the chunk or does not decompress.
     fn all_into(&self, flat: &mut Flat) -> Result<()> {
-        let out = &mut flat.bytes;
-        let mut at = out.len();
-        let mut payload = self.payload;
-        for &run in &self.lengths {
-            let Some((codes, rest)) = payload.split_at_checked(run) else {
-                return Err(Error::internal("a compressed run is past the end of its chunk"));
-            };
-            payload = rest;
-            let need = run
-                .checked_mul(MAX_SYMBOL_LEN)
-                .and_then(|room| room.checked_add(at))
-                .ok_or_else(|| Error::internal("a compressed chunk longer than memory"))?;
-            if out.len() < need {
-                out.resize(need.max(out.len() * 2), 0);
-            }
-            at = self.table.decompress_at(codes, out, at)?;
-            flat.ends.push(at);
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        out.truncate(at);
-        Ok(())
+        SCRATCH.with_borrow_mut(|out| -> Result<()> {
+            let base = flat.bytes.len();
+            let mut at = 0;
+            let mut payload = self.payload;
+            for &run in &self.lengths {
+                let Some((codes, rest)) = payload.split_at_checked(run) else {
+                    return Err(Error::internal("a compressed run is past the end of its chunk"));
+                };
+                payload = rest;
+                let need = run
+                    .checked_mul(MAX_SYMBOL_LEN)
+                    .and_then(|room| room.checked_add(at))
+                    .ok_or_else(|| Error::internal("a compressed chunk longer than memory"))?;
+                if out.len() < need {
+                    out.resize(need.max(out.len() * 2), 0);
+                }
+                at = self.table.decompress_at(codes, out, at)?;
+                flat.ends.push(base + at);
+            }
+            flat.bytes.reserve_exact(at);
+            flat.bytes.extend_from_slice(&out[..at]);
+            Ok(())
+        })
     }
 
     /// The compressed bytes of run `index`, with `at` saying where the run starts and left where

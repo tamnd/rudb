@@ -6538,22 +6538,30 @@ impl NativeText {
     ///
     /// [`Self::payload_block`] keeps it forever, which is what a point read wants and what a walk
     /// of the whole dictionary must not do. Both call this and they differ in nothing else.
+    ///
+    /// The stored block is read into a buffer the thread keeps, since it is dropped as soon as it
+    /// is decoded. A walk of the whole dictionary decodes thousands of blocks, and each one used to
+    /// take and zero an allocation of its own to read into.
     fn decode_block(&self, block: usize) -> Result<Vec<u8>> {
-        let len = self.lengths[block];
-        let mut stored = vec![
-            0;
-            usize::try_from(len).map_err(|_| invalid(
-                "global dictionary block does not fit in memory"
-            ))?
-        ];
-        read_at(&self.file, self.starts[block], &mut stored)?;
-        if checksum(&stored) != self.hashes[block] {
-            return Err(invalid("global dictionary payload checksum differs"));
+        thread_local! {
+            static STORED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        let len = usize::try_from(self.lengths[block])
+            .map_err(|_| invalid("global dictionary block does not fit in memory"))?;
         let first = block * TEXT_PAYLOAD_VALUES;
         let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
         let want = self.end_within(last - 1)? as usize;
-        let values = string::decode_flat(&stored)?;
+        let values = STORED.with_borrow_mut(|stored| {
+            if stored.len() < len {
+                stored.resize(len, 0);
+            }
+            let stored = &mut stored[..len];
+            read_at(&self.file, self.starts[block], stored)?;
+            if checksum(stored) != self.hashes[block] {
+                return Err(invalid("global dictionary payload checksum differs"));
+            }
+            string::decode_flat(stored)
+        })?;
         if values.len() != last - first {
             return Err(invalid("global dictionary block holds the wrong value count"));
         }
