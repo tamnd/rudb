@@ -17,6 +17,9 @@ mod expr;
 mod query;
 mod types;
 
+use std::cell::OnceCell;
+
+use rudb_common::session::IdentifierCase;
 use rudb_common::{Error, Span};
 use rudb_parse::Ast;
 use rudb_parse::ast::{Expr, ExprRef, QueryRef, Slice, SourceRef, Statement, StrRef, WindowRef};
@@ -50,7 +53,7 @@ impl From<Error> for Refused {
 /// a node that the transform does not build yet.
 pub fn transform(text: &str) -> Result<Ast, Refused> {
     let (list, _) = crate::parse(text).map_err(Refused::Syntax)?;
-    let mut transform = Transform::new(text)?;
+    let mut transform = Transform::new(text);
     for node in list.iter().flatten() {
         let Node::RawStmt(raw) = node else {
             return Err(not_yet(node));
@@ -59,6 +62,26 @@ pub fn transform(text: &str) -> Result<Ast, Refused> {
         transform.ast.statements.push(statement);
     }
     Ok(transform.ast)
+}
+
+/// The [`Ast`] of a script that a PostgreSQL session sent. This is the parse entry of such a session.
+///
+/// The PostgreSQL grammar reads the text, so a syntax error is the error that PostgreSQL gives. A
+/// script with a statement that [`transform`] does not build yet goes through the DuckDB grammar
+/// of `rudb-parse`, with its unquoted names folded to lower case as PostgreSQL folds them, until
+/// the transform builds that statement.
+///
+/// # Errors
+///
+/// The error of the grammar or of the transform, with the SQLSTATE and the position that
+/// PostgreSQL gives.
+pub fn parse_ast(text: &str) -> Result<Ast, Error> {
+    match transform(text) {
+        Ok(ast) => Ok(ast),
+        Err(Refused::NotYet(_)) => rudb_parse::parse_ast_postgres(text, IdentifierCase::Lower),
+        Err(Refused::Syntax(error)) => Err(error.into()),
+        Err(Refused::Error(error)) => Err(error),
+    }
 }
 
 /// The result of one step of the transform.
@@ -104,8 +127,10 @@ struct Transform<'a> {
     ast: Ast,
     interned: Interner,
     /// Each token of the text as the lexer gives it, with its start, its end and its kind. A node
-    /// has the start of one token as its location, and this is how its span is found.
-    tokens: Vec<(u32, u32, u16)>,
+    /// has the start of one token as its location, and this is how its span is found. The text is
+    /// lexed the first time a span is needed, so a statement that the transform refuses at once
+    /// does not pay for it.
+    tokens: OnceCell<Vec<(u32, u32, u16)>>,
     /// The span of the statement being transformed, which a node with no location gets.
     span: Span,
     /// The windows of the `WINDOW` clause of the select being transformed, each with its name,
@@ -127,22 +152,12 @@ struct Transform<'a> {
 }
 
 impl<'a> Transform<'a> {
-    fn new(text: &'a str) -> Made<Self> {
-        let mut lexer = crate::Lexer::new(text);
-        let mut tokens = Vec::new();
-        loop {
-            let token = lexer.next_token().map_err(Refused::Syntax)?;
-            if token.kind == 0 {
-                break;
-            }
-            #[expect(clippy::cast_possible_truncation, reason = "a statement is less than 4 GiB")]
-            tokens.push((token.start as u32, token.end as u32, token.kind));
-        }
-        Ok(Transform {
+    fn new(text: &'a str) -> Self {
+        Transform {
             text,
             ast: Ast { source: text.into(), ..Ast::default() },
             interned: Interner::default(),
-            tokens,
+            tokens: OnceCell::new(),
             span: Span::new(0, 0),
             windows: Vec::new(),
             scope: Vec::new(),
@@ -150,6 +165,25 @@ impl<'a> Transform<'a> {
             depth: 0,
             recursing: Vec::new(),
             self_reads: Vec::new(),
+        }
+    }
+
+    /// The tokens of the text. The grammar has read the text already, so the lexer gives no error
+    /// here.
+    fn tokens(&self) -> &[(u32, u32, u16)] {
+        self.tokens.get_or_init(|| {
+            let mut lexer = crate::Lexer::new(self.text);
+            let mut tokens = Vec::new();
+            while let Ok(token) = lexer.next_token()
+                && token.kind != 0
+            {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a statement is less than 4 GiB"
+                )]
+                tokens.push((token.start as u32, token.end as u32, token.kind));
+            }
+            tokens
         })
     }
 
@@ -174,8 +208,9 @@ impl<'a> Transform<'a> {
         let Ok(location) = u32::try_from(location) else {
             return self.span;
         };
-        match self.tokens.binary_search_by_key(&location, |&(start, _, _)| start) {
-            Ok(index) => Span::new(location, self.tokens[index].1),
+        let tokens = self.tokens();
+        match tokens.binary_search_by_key(&location, |&(start, _, _)| start) {
+            Ok(index) => Span::new(location, tokens[index].1),
             Err(_) => Span::new(location, location),
         }
     }
@@ -183,9 +218,10 @@ impl<'a> Transform<'a> {
     /// The kind of the token at a location, and the kind of the token after it.
     fn token_at(&self, location: i32) -> Option<(u16, u16)> {
         let location = u32::try_from(location).ok()?;
-        let index = self.tokens.binary_search_by_key(&location, |&(start, _, _)| start).ok()?;
-        let next = self.tokens.get(index + 1).map_or(0, |&(_, _, kind)| kind);
-        Some((self.tokens[index].2, next))
+        let tokens = self.tokens();
+        let index = tokens.binary_search_by_key(&location, |&(start, _, _)| start).ok()?;
+        let next = tokens.get(index + 1).map_or(0, |&(_, _, kind)| kind);
+        Some((tokens[index].2, next))
     }
 
     fn intern(&mut self, text: &str) -> StrRef {

@@ -13300,6 +13300,49 @@ fn a_postgres_session_names_columns_the_way_postgres_does() {
 }
 
 #[test]
+fn a_postgres_session_reads_the_types_of_the_sql_syntax() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let types = |sql: &str| connection.query(sql).expect(sql).types().to_vec();
+    let written = [
+        ("1::smallint", LogicalType::SmallInt),
+        ("1::int", LogicalType::Integer),
+        ("1::integer", LogicalType::Integer),
+        ("1::bigint", LogicalType::BigInt),
+        ("1::real", LogicalType::Float),
+        ("1::float", LogicalType::Double),
+        ("1::double precision", LogicalType::Double),
+        ("1::numeric", LogicalType::Numeric),
+        ("1::decimal(10, 2)", LogicalType::Decimal { width: 10, scale: 2 }),
+        ("true::boolean", LogicalType::Boolean),
+        ("'a'::char(3)", LogicalType::Varchar),
+        ("'a'::character varying(3)", LogicalType::Varchar),
+        ("'a'::varchar", LogicalType::Varchar),
+        ("'a'::text", LogicalType::Varchar),
+        ("'2020-01-01'::date", LogicalType::Date),
+        ("'2020-01-01'::timestamp", LogicalType::Timestamp),
+        ("'2020-01-01'::timestamp with time zone", LogicalType::TimestampTz),
+        ("'1 day'::interval", LogicalType::Interval),
+        ("1::pg_catalog.int4", LogicalType::Integer),
+        ("ARRAY[1]::pg_catalog.int8[]", LogicalType::List(Box::new(LogicalType::BigInt))),
+        ("ARRAY[1]::int[]", LogicalType::List(Box::new(LogicalType::Integer))),
+    ];
+    for (cast, ty) in written {
+        assert_eq!(types(&format!("SELECT {cast}")), [ty], "{cast}");
+    }
+}
+
+#[test]
 fn a_result_knows_the_table_column_of_each_plain_column() {
     let db = Database::new();
     let connection = db.connect();
