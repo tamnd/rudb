@@ -20,7 +20,7 @@ use rudb_vector::{Builder, Chunk, Selection, VECTOR_SIZE, Vector, concat};
 use crate::catalog::DETACHED;
 use crate::gone::Gone;
 use crate::held::Held;
-use crate::keys::{ForeignKey, Key, Seen};
+use crate::keys::{ForeignKey, Identity, Key, Seen};
 use crate::name::{QualifiedName, same_name};
 use crate::points::{Edge, Point, Points, Reach, Spot, looks_up};
 
@@ -1638,6 +1638,8 @@ pub struct Table {
     defaults: Vec<Option<String>>,
     /// The PostgreSQL type each column was declared with, or empty when no column has one.
     types: Vec<Option<DeclaredType>>,
+    /// Which columns are identity columns, or empty when no column is one.
+    identities: Vec<Option<Identity>>,
     /// The SQL of each `CHECK` constraint, in the order written.
     checks: Vec<String>,
     /// The foreign keys this table's rows have to meet, in the order written.
@@ -1692,6 +1694,7 @@ impl Table {
             indexes: Vec::new(),
             defaults: Vec::new(),
             types: Vec::new(),
+            identities: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
             order: Vec::new(),
@@ -1717,6 +1720,7 @@ impl Table {
         let (keys, foreign) = restored(&name, stored);
         let defaults = stored.defaults.clone();
         let types = stored.types.clone();
+        let identities = restored_identities(stored, columns.len());
         let checks = stored.checks.clone();
         let order = restored_order(stored);
         let apart = restored_apart(stored);
@@ -1738,6 +1742,7 @@ impl Table {
             indexes,
             defaults,
             types,
+            identities,
             checks,
             foreign,
             order,
@@ -1813,6 +1818,15 @@ impl Table {
                 crate::Constraint::NotNull(at) => (3, at),
             };
             stored.order.push((kind, place(at)?));
+        }
+        // An identity column is kept in the same list, 5 for `ALWAYS` and 6 for `BY DEFAULT`, which
+        // a build that predates it passes over.
+        for (at, identity) in self.identities.iter().enumerate() {
+            match identity {
+                Some(Identity::Always) => stored.order.push((5, place(at)?)),
+                Some(Identity::ByDefault) => stored.order.push((6, place(at)?)),
+                None => {}
+            }
         }
         for index in &self.indexes {
             stored.indexes.push(rudb_native::StoredIndex {
@@ -2954,6 +2968,17 @@ impl Table {
         self.types = types;
     }
 
+    /// Whether a column is an identity column, and of which kind.
+    #[must_use]
+    pub fn identity(&self, column: usize) -> Option<Identity> {
+        self.identities.get(column).copied().flatten()
+    }
+
+    /// Declares which columns are identity columns, one per column.
+    pub fn set_identities(&mut self, identities: Vec<Option<Identity>>) {
+        self.identities = identities;
+    }
+
     /// The SQL of each `CHECK` constraint, in the order written.
     #[must_use]
     pub fn checks(&self) -> &[String] {
@@ -3302,6 +3327,7 @@ impl Table {
         };
         self.defaults.resize(self.columns.len(), None);
         self.types.resize(self.columns.len(), None);
+        self.identities.resize(self.columns.len(), None);
         let mut moved = true;
         match alteration {
             Alteration::Rename(to) => self.name.table = to,
@@ -3315,6 +3341,7 @@ impl Table {
                 self.columns.push(field);
                 self.defaults.push(default);
                 self.types.push(declared);
+                self.identities.push(None);
                 self.depend_on(sequences);
             }
             Alteration::DropColumn { column, checks } => {
@@ -3372,6 +3399,7 @@ impl Table {
                 self.columns.remove(column);
                 self.defaults.remove(column);
                 self.types.remove(column);
+                self.identities.remove(column);
                 self.checks = checks;
                 self.clustering = None;
             }
@@ -3547,6 +3575,24 @@ fn restored_order(stored: &rudb_native::Constraints) -> Vec<crate::Constraint> {
             }
         })
         .collect()
+}
+
+/// The identity columns [`Table::stored_constraints`] wrote down, one per column, or empty when
+/// no column is one.
+fn restored_identities(stored: &rudb_native::Constraints, width: usize) -> Vec<Option<Identity>> {
+    let mut identities = Vec::new();
+    for &(kind, at) in &stored.order {
+        let identity = match kind {
+            5 => Identity::Always,
+            6 => Identity::ByDefault,
+            _ => continue,
+        };
+        identities.resize(width, None);
+        if let Some(held) = identities.get_mut(usize::from(at)) {
+            *held = Some(identity);
+        }
+    }
+    identities
 }
 
 /// The keys [`Table::stored_constraints`] wrote down as written apart from their columns.

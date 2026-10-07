@@ -450,7 +450,10 @@ impl Direct {
 
     /// The rows of `insert` with what it says about a key it finds held left aside.
     fn reading(ast: &Ast, insert: ast::Insert) -> Option<Self> {
-        if insert.copy || insert.source == rudb_parse::NONE {
+        if insert.copy
+            || insert.source == rudb_parse::NONE
+            || insert.overriding != ast::Overriding::None
+        {
             return None;
         }
         let returning = match insert.returning {
