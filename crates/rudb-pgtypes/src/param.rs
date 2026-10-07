@@ -178,6 +178,9 @@ fn bpchar_value(text: &str, typmod: i32) -> Result<Value, TypeError> {
 
 fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Value, TypeError> {
     let cx = &settings.datetime;
+    if let Some(kind) = RegKind::from_oid(oid) {
+        return Ok(Value::UInteger(reg_value(kind, text)?));
+    }
     Ok(match oid {
         oids::BOOL => Value::Boolean(bool_in(text)?),
         oids::INT2 => Value::SmallInt(int2_in(text)?),
@@ -193,7 +196,6 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
             let values = oidvector_in(text)?;
             vector(LogicalType::UInteger, values.into_iter().map(Value::UInteger))
         }
-        oid if let Some(kind) = RegKind::from_oid(oid) => Value::UInteger(reg_value(kind, text)?),
         oids::NAME => Value::Varchar(name_in(text).to_owned()),
         oids::FLOAT4 => Value::Float(float4_in(text)?),
         oids::FLOAT8 => Value::Double(float8_in(text)?),
@@ -206,11 +208,14 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_in(text, -1, cx)?)),
         oids::TIMESTAMPTZ => Value::TimestampTz(timestamp(timestamptz_in(text, -1, cx)?)),
         oids::INTERVAL => interval(interval_in(text, -1, settings.interval_style)?),
-        oid if let Some((element, delim)) = element(oid) => {
-            let array = array_in(text, delim, true, |text| text_value(element, text, settings))?;
-            list(element, array, |value| value)?
-        }
-        _ => Value::Varchar(text.to_owned()),
+        _ => match element(oid) {
+            Some((element, delim)) => {
+                let array =
+                    array_in(text, delim, true, |text| text_value(element, text, settings))?;
+                list(element, array, |value| value)?
+            }
+            None => Value::Varchar(text.to_owned()),
+        },
     })
 }
 
@@ -266,16 +271,18 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_recv(recv, -1)?)),
         oids::TIMESTAMPTZ => Value::TimestampTz(timestamp(timestamp_recv(recv, -1)?)),
         oids::INTERVAL => interval(interval_recv(recv, -1)?),
-        oid if let Some((element, _)) = element(oid) => {
-            let array = array_recv(recv, element, |recv| binary_value(element, recv))?;
-            list(element, array, |value| value)?
-        }
         _ => {
-            let name = TypeInfo::get(oid).map_or_else(|| oid.to_string(), |info| info.name.into());
-            return Err(TypeError::new(
-                SqlState::UNDEFINED_FUNCTION,
-                format!("no binary input function available for type {name}"),
-            ));
+            if let Some((element, _)) = element(oid) {
+                let array = array_recv(recv, element, |recv| binary_value(element, recv))?;
+                list(element, array, |value| value)?
+            } else {
+                let name =
+                    TypeInfo::get(oid).map_or_else(|| oid.to_string(), |info| info.name.into());
+                return Err(TypeError::new(
+                    SqlState::UNDEFINED_FUNCTION,
+                    format!("no binary input function available for type {name}"),
+                ));
+            }
         }
     })
 }

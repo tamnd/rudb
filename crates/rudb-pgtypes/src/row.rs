@@ -189,10 +189,8 @@ impl Kind {
                 Kind::Int8
             }
             oids::OID if *logical == L::UInteger => Kind::Oid,
-            oid if *logical == L::UInteger
-                && let Some(kind) = RegKind::from_oid(oid) =>
-            {
-                Kind::Reg(kind)
+            oid if *logical == L::UInteger && RegKind::from_oid(oid).is_some() => {
+                Kind::Reg(RegKind::from_oid(oid)?)
             }
             oids::FLOAT4 if *logical == L::Float => Kind::Float4,
             oids::FLOAT8 if *logical == L::Double => Kind::Float8,
