@@ -672,7 +672,7 @@ fn zz_probe_the_log_around_a_load() {
         let kinds = listed(&fs, &dir, 0)
             .ok()
             .and_then(|list| list.into_iter().next())
-            .and_then(|first| SegmentHeader::decode(&std::fs::read(&first.1).ok()?).ok())
+            .and_then(|first| SegmentHeader::decode(&std::fs::read(&first.1).ok()?))
             .and_then(|header| replay(&fs, &dir, 0, header.database).ok())
             .map(|read| {
                 read.blocks
