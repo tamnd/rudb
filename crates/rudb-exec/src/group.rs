@@ -318,6 +318,12 @@ pub(crate) struct Aggregate<'a> {
     /// group by with a million groups and no `DISTINCT` anywhere in it used to allocate a million
     /// empty sets to look at none of them.
     sets: bool,
+    /// Which calls keep their distinct values in a set of `BIGINT`s rather than a set of rows, one
+    /// flag a call.
+    ///
+    /// Worked out once here rather than for every group, because asking the plan for an argument's
+    /// type was most of what starting a group's sets cost, and TPC-H q16 starts 18,314 of them.
+    big_int_sets: Vec<bool>,
     /// Which calls fold a vector at a time. An ungrouped aggregate has exactly one slot, so there
     /// is no key to build, no hash to take and no lookup to do, and what is left of the row loop is
     /// the fold itself. `DISTINCT` needs a value per row to put in a set and `FILTER` needs the rows
@@ -1610,6 +1616,14 @@ impl<'a> Aggregate<'a> {
             alone,
             partition_from,
             sets: calls.iter().any(|call| call.distinct),
+            big_int_sets: calls
+                .iter()
+                .map(|call| {
+                    call.distinct
+                        && call.args.len() == 1
+                        && plan.expr_type(call.args[0]) == &LogicalType::BigInt
+                })
+                .collect(),
             every: by_vector.iter().all(|&yes| yes),
             count_only: !alone
                 && calls.len() == 1
@@ -4875,10 +4889,7 @@ impl<'a> Aggregate<'a> {
     }
 
     fn fresh_seen(&self, seen: &mut Vec<DistinctSet>) {
-        for call in &self.calls {
-            let big_int = call.distinct
-                && call.args.len() == 1
-                && self.plan.expr_type(call.args[0]) == &LogicalType::BigInt;
+        for &big_int in &self.big_int_sets {
             if big_int {
                 seen.push(DistinctSet::BigInt(BigIntDistinct::default()));
             } else {
