@@ -33,8 +33,8 @@ use rudb::{Connection, ErrorCode, QueryResult, Transaction};
 use rudb_common::guc::{self, Action, Origin, Settings};
 use rudb_common::session::Postgres;
 use rudb_pgtypes::{
-    ByteaOutput, DateFormat, DateOrder, DateStyle, DateTimeInput, IntervalStyle, NoZones,
-    OutputSettings, RowEncoder, TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
+    ByteaOutput, DateFormat, DateTimeInput, IntervalStyle, NoZones, OutputSettings, RowEncoder,
+    TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
 };
 use rudb_pgwire::{
     CommandTag, Field, Frontend, Handshake, Level, OutBuf, QUERY_CANCELED, Replication, Session,
@@ -1128,27 +1128,8 @@ impl Runner {
         self.sync_superuser();
         self.seen = self.guc.generation();
         let text = |name: &str| self.guc.get(name).unwrap_or_default();
-        let datestyle = text("DateStyle");
-        let (style, order) = datestyle.split_once(", ").unwrap_or(("ISO", "MDY"));
-        self.format.date_format = DateFormat {
-            style: match style {
-                "SQL" => DateStyle::Sql,
-                "Postgres" => DateStyle::Postgres,
-                "German" => DateStyle::German,
-                _ => DateStyle::Iso,
-            },
-            order: match order {
-                "DMY" => DateOrder::Dmy,
-                "YMD" => DateOrder::Ymd,
-                _ => DateOrder::Mdy,
-            },
-        };
-        self.format.interval_style = match text("IntervalStyle").as_str() {
-            "postgres_verbose" => IntervalStyle::PostgresVerbose,
-            "sql_standard" => IntervalStyle::SqlStandard,
-            "iso_8601" => IntervalStyle::Iso8601,
-            _ => IntervalStyle::Postgres,
-        };
+        self.format.date_format = DateFormat::of_setting(&text("DateStyle"));
+        self.format.interval_style = IntervalStyle::of_setting(&text("IntervalStyle"));
         self.format.extra_float_digits = text("extra_float_digits").parse().unwrap_or(1);
         self.format.bytea_output =
             if text("bytea_output") == "escape" { ByteaOutput::Escape } else { ByteaOutput::Hex };

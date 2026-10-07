@@ -2927,6 +2927,86 @@ fn to_char_of_a_number_and_to_number_follow_the_templates_of_postgresql() {
 }
 
 #[test]
+fn pg_input_is_valid_and_pg_input_error_info_catch_the_error_of_the_input() {
+    let dirs = Dirs::new("pginput");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values of the PostgreSQL 19 oracle.
+    for (sql, value) in [
+        ("select pg_input_is_valid('12', 'int4')", "t"),
+        ("select pg_input_is_valid('70000', 'int2')", "f"),
+        (
+            "select pg_input_error_info('x', 'int4')",
+            "(\"invalid input syntax for type integer: \"\"x\"\"\",,,22P02)",
+        ),
+        ("select pg_input_error_info('12', 'int4')", "(,,,)"),
+        ("select (pg_input_error_info('70000', 'int2')).sql_error_code", "22003"),
+        ("select pg_typeof(pg_input_error_info('x', 'int4'))", "record"),
+        (
+            "select pg_input_error_info('{\"a\":', 'json')",
+            "(\"invalid input syntax for type json\",\"The input string ended unexpectedly.\",,22P02)",
+        ),
+        (
+            "select pg_input_error_info('abcd', 'varchar(3)')",
+            "(\"value too long for type character varying(3)\",,,22001)",
+        ),
+        (
+            "select pg_input_error_info('(1)', 'record')",
+            "(\"input of anonymous composite types is not implemented\",,,0A000)",
+        ),
+        (
+            "select pg_input_error_info('abc', 'regtype')",
+            "(\"type \"\"abc\"\" does not exist\",,,42704)",
+        ),
+        ("select pg_input_is_valid('pg_catalog.int4[]', 'regtype')", "t"),
+        ("select pg_input_is_valid('13/01/2024', 'date')", "f"),
+        (
+            "select string_agg(pg_input_is_valid(x, 'int4')::text, ',') from (values ('1'), ('a')) v(x)",
+            "true,false",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    client.query("set datestyle = 'ISO, DMY'");
+    assert_eq!(scalar(&mut client, "select pg_input_is_valid('13/01/2024', 'date')"), "t");
+    // An error of the name of the type is not caught.
+    for (sql, code, message, context) in [
+        (
+            "select pg_input_is_valid('1', 'nosuch')",
+            "42704",
+            "type \"nosuch\" does not exist",
+            None,
+        ),
+        (
+            "select pg_input_is_valid('1', 'int4(')",
+            "42601",
+            "syntax error at end of input",
+            Some("invalid type name \"int4(\""),
+        ),
+        (
+            "select pg_input_is_valid('1', 'int4(3)')",
+            "42601",
+            "type modifier is not allowed for type \"int4\"",
+            None,
+        ),
+        (
+            "select pg_input_is_valid('1', 'numeric(1001)')",
+            "22023",
+            "NUMERIC precision 1001 must be between 1 and 1000",
+            None,
+        ),
+    ] {
+        let messages = client.query(sql);
+        let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'W').as_deref(), context, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();

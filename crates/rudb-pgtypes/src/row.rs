@@ -98,6 +98,9 @@ enum Kind {
     Reg(RegKind),
     /// A column of the type of an untyped `NULL`. Every value is NULL.
     Null,
+    /// A struct sent as `record`. The text is the fields in parentheses, and the binary format is
+    /// the field count and then the type, the length and the bytes of each field.
+    Record,
     /// A rudb type with no PostgreSQL type of its own, sent as the text of each value. When
     /// `numeric` is true the column is sent as `numeric`, and the binary format is the binary
     /// format of that text.
@@ -112,8 +115,9 @@ enum Kind {
 /// types get the next signed type that holds all their values, and the integers of 64 bits or more
 /// without a sign or of 128 bits get `numeric`. A list gets the array type of its element type,
 /// with the typmod of the element as PostgreSQL does, when the element type has an array type and
-/// is not itself a list. The other rudb types, such as the nested lists, the structs and the
-/// enums, get `text` until their PostgreSQL types come.
+/// is not itself a list. A struct gets `record`, the type of a row with no named composite type.
+/// The other rudb types, such as the nested lists, the maps and the enums, get `text` until their
+/// PostgreSQL types come.
 pub fn pg_type(logical: &LogicalType) -> PgType {
     use LogicalType as L;
     let (oid, typmod) = match logical {
@@ -145,6 +149,7 @@ pub fn pg_type(logical: &LogicalType) -> PgType {
         L::Interval => (oids::INTERVAL, -1),
         L::Json => (oids::JSON, -1),
         L::Jsonb => (oids::JSONB, -1),
+        L::Struct(_) => (oids::RECORD, -1),
         _ => (oids::TEXT, -1),
     };
     PgType { oid, typmod }
@@ -215,6 +220,7 @@ impl Kind {
             oids::TIMESTAMPTZ if *logical == L::TimestampTz => Kind::TimestampTz,
             oids::INTERVAL if *logical == L::Interval => Kind::Interval,
             oids::UUID if *logical == L::Uuid => Kind::Uuid,
+            oids::RECORD if matches!(logical, L::Struct(_)) => Kind::Record,
             oids::INT2VECTOR | oids::OIDVECTOR if element_of(logical, oid).is_some() => {
                 Kind::Vector
             }
@@ -254,6 +260,7 @@ impl Kind {
             | Kind::Array
             | Kind::Vector
             | Kind::Null
+            | Kind::Record
             | Kind::Display { .. } => {
                 return None;
             }
@@ -312,6 +319,22 @@ fn element_of(logical: &LogicalType, oid: Oid) -> Option<(Oid, Kind)> {
     (!matches!(kind, Kind::Array | Kind::Vector)).then_some((elem, kind))
 }
 
+/// The plan of a column of the rudb type `logical` sent as the PostgreSQL type `oid`.
+fn column_plan(logical: &LogicalType, oid: Oid, binary: bool) -> Result<Plan, TypeError> {
+    let kind = Kind::of(logical, oid).ok_or_else(|| {
+        TypeError::new(
+            SqlState::FEATURE_NOT_SUPPORTED,
+            format!("cannot send a value of type {logical} as type {}", format_type(oid)),
+        )
+    })?;
+    let element = element_of(logical, oid).map(|(oid, kind)| {
+        let path = kind.plan(binary, None).path;
+        let delim = TypeInfo::get(oid).map_or(b',', |info| info.delim);
+        Element { kind, path, oid, delim }
+    });
+    Ok(kind.plan(binary, element))
+}
+
 /// The `DataRow` encoder of one result. It keeps its buffers between calls, so the rows of a
 /// result after the first vector need no allocation.
 #[derive(Debug, Default)]
@@ -347,21 +370,7 @@ impl RowEncoder {
                 if *oid == oids::BPCHAR && *logical == LogicalType::Varchar && typmod >= 4 {
                     return Ok(Kind::Bpchar((typmod - 4) as u32).plan(*binary, None));
                 }
-                let kind = Kind::of(logical, *oid).ok_or_else(|| {
-                    TypeError::new(
-                        SqlState::FEATURE_NOT_SUPPORTED,
-                        format!(
-                            "cannot send a value of type {logical} as type {}",
-                            format_type(*oid)
-                        ),
-                    )
-                })?;
-                let element = element_of(logical, *oid).map(|(oid, kind)| {
-                    let path = kind.plan(*binary, None).path;
-                    let delim = TypeInfo::get(oid).map_or(b',', |info| info.delim);
-                    Element { kind, path, oid, delim }
-                });
-                Ok(kind.plan(*binary, element))
+                column_plan(logical, *oid, *binary)
             })
             .collect::<Result<Vec<_>, TypeError>>()?;
         let staged = vec![Vec::new(); plans.len()];
@@ -404,8 +413,9 @@ impl RowEncoder {
                     )));
                 }
                 match vector.form() {
-                    // A list has no other form, and its elements are flattened in the first pass.
-                    Form::Flat | Form::List => Ok(Cow::Borrowed(vector)),
+                    // A list and a struct have no other form, and their elements and fields are
+                    // flattened in the first pass.
+                    Form::Flat | Form::List | Form::Struct => Ok(Cow::Borrowed(vector)),
                     // flatten: the encoder reads each value by its place in a flat column.
                     _ => vector.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string())),
                 }
@@ -582,6 +592,7 @@ fn lengths(
         Kind::Array | Kind::Vector => {
             return array_lengths(plan, vector, rows, settings, lens, staged);
         }
+        Kind::Record => return record_lengths(plan, vector, rows, settings, lens, staged),
         _ => {}
     }
     let data = vector.data().ok_or_else(|| wrong_data(plan))?;
@@ -792,7 +803,15 @@ fn stage_column(
                 stage(lens, staged, i, |out| uuid_out(&bytes, out))?;
             }
         }
-        (Kind::Text | Kind::Array | Kind::Vector | Kind::Null | Kind::Display { .. }, _) => {
+        (
+            Kind::Text
+            | Kind::Array
+            | Kind::Vector
+            | Kind::Null
+            | Kind::Record
+            | Kind::Display { .. },
+            _,
+        ) => {
             return Err(wrong_data(plan));
         }
     }
@@ -823,11 +842,7 @@ fn array_lengths(
         .map(parts)
         .fold((usize::MAX, 0), |(low, high), part| (low.min(part.start), high.max(part.end)));
     let low = low.min(high);
-    let child = match child.form() {
-        Form::Flat | Form::List => Cow::Borrowed(child),
-        // flatten: the elements are read by their place in a flat column.
-        _ => child.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string()))?,
-    };
+    let child = flat_part(child)?;
     if child.len() < high {
         return Err(wrong_data(plan));
     }
@@ -874,6 +889,108 @@ fn array_lengths(
         })?;
     }
     Ok(())
+}
+
+/// A list element column or a struct field column as a vector whose values can be read by their
+/// place.
+fn flat_part(part: &Vector) -> Result<Cow<'_, Vector>, TypeError> {
+    match part.form() {
+        Form::Flat | Form::List | Form::Struct => Ok(Cow::Borrowed(part)),
+        // flatten: the values are read by their place in a flat column.
+        _ => part.flatten().map(Cow::Owned).map_err(|e| internal(e.to_string())),
+    }
+}
+
+/// The first pass for a record column. Each field of all the rows goes through the first and the
+/// third pass of its own kind at once, which writes each value after its length as the binary
+/// format of a record has it. Then each row is the text or the binary format of its fields, as
+/// `record_out` and `record_send` write them.
+fn record_lengths(
+    plan: Plan,
+    vector: &Vector,
+    rows: Range<usize>,
+    settings: &OutputSettings<'_>,
+    lens: &mut [i32],
+    staged: &mut Vec<u8>,
+) -> Result<(), TypeError> {
+    let LogicalType::Struct(fields) = vector.logical_type() else { return Err(wrong_data(plan)) };
+    let parts = vector.struct_parts().ok_or_else(|| wrong_data(plan))?;
+    if parts.len() != fields.len() {
+        return Err(wrong_data(plan));
+    }
+    let live = vector.validity().live();
+    let start = rows.start;
+    let n = lens.len();
+    // For each field, its type and the length and the bytes of its value in each row.
+    let mut columns = Vec::with_capacity(fields.len());
+    for (field, part) in fields.iter().zip(parts) {
+        let oid = pg_type(&field.ty).oid;
+        let inner = column_plan(&field.ty, oid, plan.binary)?;
+        let part = flat_part(part)?;
+        if part.len() < rows.end {
+            return Err(wrong_data(plan));
+        }
+        let mut field_lens = vec![-1; n];
+        let mut field_staged = Vec::new();
+        lengths(inner, &part, rows.clone(), settings, &mut field_lens, &mut field_staged)?;
+        let mut cursor = Vec::with_capacity(n);
+        let mut size = 0;
+        for &len in &field_lens {
+            cursor.push(size);
+            size += 4 + len.max(0) as usize;
+        }
+        let mut values = vec![0; size];
+        let mut at = cursor.clone();
+        put(inner, &part, start, &field_lens, &field_staged, &mut at, &mut values)?;
+        columns.push((oid, field_lens, cursor, values));
+    }
+    let count = i32::try_from(fields.len()).map_err(|_| wrong_data(plan))?;
+    for i in (0..n).filter(|&i| live.at(start + i)) {
+        stage(lens, staged, i, |out| {
+            if plan.binary {
+                out.extend_from_slice(&count.to_be_bytes());
+                for (oid, field_lens, cursor, values) in &columns {
+                    out.extend_from_slice(&oid.to_be_bytes());
+                    let len = 4 + field_lens[i].max(0) as usize;
+                    out.extend_from_slice(&values[cursor[i]..cursor[i] + len]);
+                }
+                return;
+            }
+            out.push(b'(');
+            for (at, (_, field_lens, cursor, values)) in columns.iter().enumerate() {
+                if at > 0 {
+                    out.push(b',');
+                }
+                if let Ok(len) = usize::try_from(field_lens[i]) {
+                    record_field_out(&values[cursor[i] + 4..cursor[i] + 4 + len], out);
+                }
+            }
+            out.push(b')');
+        })?;
+    }
+    Ok(())
+}
+
+/// The text of one field of a record, in double quotes when it is empty or has a quote, a
+/// backslash, a parenthesis, a comma or a space, with each quote and backslash doubled.
+fn record_field_out(text: &[u8], out: &mut Vec<u8>) {
+    let quote = text.is_empty()
+        || text.iter().any(|&b| {
+            // `isspace` of C also takes the vertical tab, which `is_ascii_whitespace` does not.
+            matches!(b, b'"' | b'\\' | b'(' | b')' | b',' | 0x0b) || b.is_ascii_whitespace()
+        });
+    if !quote {
+        out.extend_from_slice(text);
+        return;
+    }
+    out.push(b'"');
+    for &b in text {
+        if b == b'"' || b == b'\\' {
+            out.push(b);
+        }
+        out.push(b);
+    }
+    out.push(b'"');
 }
 
 /// An `int2vector` or an `oidvector` has one dimension with the lower bound 0, also when it is
@@ -1103,6 +1220,7 @@ fn fixed(
         | Kind::Array
         | Kind::Vector
         | Kind::Null
+        | Kind::Record
         | Kind::Display { .. } => {
             return Err(wrong_data(plan));
         }
@@ -1583,6 +1701,66 @@ mod tests {
             empty.extend_from_slice(&w.to_be_bytes());
         }
         assert_eq!(rows[2][1].as_deref(), Some(&empty[..]));
+    }
+
+    /// A struct is a `record`, in the text and the binary format of `record_out` and
+    /// `record_send`.
+    #[test]
+    fn a_struct_is_a_record() {
+        use rudb_common::Field;
+        let zone = FixedZone::utc();
+        let settings = settings(&zone);
+        let inner = LogicalType::Struct(vec![Field::new("x", LogicalType::Integer)]);
+        let ty = LogicalType::Struct(vec![
+            Field::new("a", LogicalType::Integer),
+            Field::new("b", LogicalType::Varchar),
+            Field::new("c", inner.clone()),
+        ]);
+        let row = |a: Value, b: Value, c: Value| {
+            Value::Struct(vec![("a".into(), a), ("b".into(), b), ("c".into(), c)])
+        };
+        let x = |v: i32| Value::Struct(vec![("x".into(), Value::Integer(v))]);
+        let records = Vector::from_values(
+            ty.clone(),
+            &[
+                row(Value::Integer(1), Value::Varchar("a b".into()), x(2)),
+                Value::Null,
+                row(Value::Null, Value::Varchar(String::new()), Value::Null),
+                row(Value::Integer(3), Value::Varchar(r#"q"\(,)"#.into()), x(4)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(pg_type(&ty).oid, oids::RECORD);
+        assert_eq!(pg_type(&LogicalType::List(Box::new(ty.clone()))).oid, oids::RECORD_ARRAY);
+        let encode = |binary| {
+            let mut out = Vec::new();
+            RowEncoder::new(&[(ty.clone(), oids::RECORD, binary)])
+                .unwrap()
+                .encode(std::slice::from_ref(&records), 0..4, &settings, &mut out)
+                .unwrap();
+            decode(&out)
+        };
+        let rows = encode(false);
+        let cell = |row: usize| rows[row][0].clone().map(|v| String::from_utf8(v).unwrap());
+        assert_eq!(cell(0).as_deref(), Some(r#"(1,"a b","(2)")"#));
+        assert_eq!(cell(1), None);
+        assert_eq!(cell(2).as_deref(), Some(r#"(,"",)"#));
+        assert_eq!(cell(3).as_deref(), Some(r#"(3,"q""\\(,)","(4)")"#));
+        let rows = encode(true);
+        let mut first = Vec::new();
+        for w in [3i32, 23, 4, 1, 25, 3] {
+            first.extend_from_slice(&w.to_be_bytes());
+        }
+        first.extend_from_slice(b"a b");
+        for w in [2249i32, 16, 1, 23, 4, 2] {
+            first.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(rows[0][0].as_deref(), Some(&first[..]));
+        let mut third = Vec::new();
+        for w in [3i32, 23, -1, 25, 0, 2249, -1] {
+            third.extend_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(rows[2][0].as_deref(), Some(&third[..]));
     }
 
     #[test]

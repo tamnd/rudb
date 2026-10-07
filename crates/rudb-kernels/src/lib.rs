@@ -92,6 +92,7 @@ mod number;
 mod path;
 mod peel;
 mod pgformat;
+pub mod pginput;
 pub mod prepare;
 mod printf;
 mod quantile;

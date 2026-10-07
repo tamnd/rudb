@@ -180,6 +180,12 @@ impl Binder<'_> {
             let constant = self.add_constant(value);
             return Ok(Some(self.cast_to(constant, &LogicalType::Varchar)));
         }
+        if let [text, type_name] = arguments
+            && (named("pg_input_is_valid") || named("pg_input_error_info"))
+        {
+            let valid = named("pg_input_is_valid");
+            return self.input_check(ast, valid, *text, *type_name, scope).map(Some);
+        }
         if let [value, template] = arguments
             && let Some(call) = self.formatting_call(ast, written, *value, *template, scope)?
         {
@@ -267,6 +273,39 @@ impl Binder<'_> {
             _ => return Ok(None),
         };
         self.bind_macro_body(written, &text, scope).map(Some)
+    }
+
+    /// `pg_input_is_valid(text, type)` when `valid`, and `pg_input_error_info(text, type)`. The
+    /// kernel reads the text with the input function of the type, which reads `DateStyle` and
+    /// `IntervalStyle`, so they are given to it as two constants. A new value of a setting makes a
+    /// new plan.
+    fn input_check(
+        &mut self,
+        ast: &Ast,
+        valid: bool,
+        text: ast::ExprRef,
+        type_name: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let text = self.bind_expr(ast, text, scope)?;
+        let text = self.cast_to(text, &LogicalType::Varchar);
+        let type_name = self.bind_expr(ast, type_name, scope)?;
+        let type_name = self.cast_to(type_name, &LogicalType::Varchar);
+        let setting = |name: &str, default: &str| {
+            let value = self.session.postgres().and_then(|pg| pg.settings.get(name));
+            Value::Varchar(value.unwrap_or_else(|| default.to_owned()))
+        };
+        let date_style = setting("DateStyle", "ISO, MDY");
+        let interval_style = setting("IntervalStyle", "postgres");
+        let date_style = self.add_constant(date_style);
+        let interval_style = self.add_constant(interval_style);
+        let (kernel, returns) = match valid {
+            true => ("__rudb_pg_input_valid", LogicalType::Boolean),
+            false => ("__rudb_pg_input_error", rudb_kernels::pginput::error_type()),
+        };
+        let name = self.plan_mut().intern(kernel);
+        let args = self.plan_mut().add_expr_list(&[text, type_name, date_style, interval_style]);
+        Ok(self.add_expr(Expr::Function { name, args }, returns))
     }
 
     /// `to_char` of a date and a time, `to_timestamp(text, text)` and `to_date(text, text)`, as

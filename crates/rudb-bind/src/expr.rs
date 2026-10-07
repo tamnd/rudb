@@ -5159,8 +5159,23 @@ fn undefined_operator(
 /// `bytea_output`: `float4`, `float8`, `bytea`, and an array of those, of an integer, of
 /// `boolean`, of `numeric`, of `text` or of `uuid`. The type must also be the one that the OID
 /// names here, so that the folding of a constant, which has the value and not its type, finds it.
+/// A struct is a `record`, whose fields have their own output functions, and the folding takes
+/// its type from the value, so a struct and a list of structs are among these when no field reads
+/// the time zone.
 fn plain_output(ty: &LogicalType) -> Option<u32> {
     use LogicalType as L;
+    match ty {
+        L::Struct(fields) => {
+            return fields
+                .iter()
+                .all(|field| plain_field(&field.ty))
+                .then_some(rudb_pgtypes::oid::RECORD);
+        }
+        L::List(element) if matches!(**element, L::Struct(_)) => {
+            return plain_output(element).map(|_| rudb_pgtypes::oid::RECORD_ARRAY);
+        }
+        _ => {}
+    }
     let plain = match ty {
         L::Float | L::Double | L::Blob => true,
         L::List(element) => matches!(
@@ -5180,6 +5195,37 @@ fn plain_output(ty: &LogicalType) -> Option<u32> {
     };
     let oid = rudb_pgtypes::pg_type(ty).oid;
     (plain && rudb_pgtypes::logical_type(oid).as_ref() == Some(ty)).then_some(oid)
+}
+
+/// Whether the output function of the PostgreSQL type of a field of a struct reads no time zone.
+/// The cast writes the dates and the intervals with the default `DateStyle` and `IntervalStyle`,
+/// as the cast of the engine writes them outside a struct.
+fn plain_field(ty: &LogicalType) -> bool {
+    use LogicalType as L;
+    match ty {
+        L::Boolean
+        | L::TinyInt
+        | L::SmallInt
+        | L::Integer
+        | L::BigInt
+        | L::Float
+        | L::Double
+        | L::Numeric
+        | L::Decimal { .. }
+        | L::Varchar
+        | L::Blob
+        | L::Uuid
+        | L::Date
+        | L::Time
+        | L::Timestamp
+        | L::Interval
+        | L::Json
+        | L::Jsonb
+        | L::Null => true,
+        L::Struct(_) => plain_output(ty).is_some(),
+        L::List(element) => !matches!(**element, L::List(_)) && plain_field(element),
+        _ => false,
+    }
 }
 
 /// Whether a cast between two PostgreSQL number types can fail, so that a PostgreSQL session casts
