@@ -5761,9 +5761,10 @@ pub struct PagePool {
     /// Set by [`PagePool::last_statement`] and never cleared, so that [`PagePool::rereads`] can put
     /// `last` back for a statement that reads nothing twice.
     told: Arc<AtomicBool>,
-    /// The tables the statement running now reads more than once, by name in lower case, which
-    /// are the ones whose parts are still held in the last statement. See [`PagePool::rereads`].
-    reread: Arc<RwLock<Vec<String>>>,
+    /// The columns the statement running now reads more than once, as the table and the column in
+    /// lower case, which are the ones whose parts are still held in the last statement. See
+    /// [`PagePool::rereads`].
+    reread: Arc<RwLock<Vec<(String, String)>>>,
 }
 
 #[derive(Debug, Default)]
@@ -5824,16 +5825,22 @@ impl PagePool {
     /// region twice and q20 reads `lineitem` and `part` twice. Holding a part only on its second read
     /// decoded every phone number twice in q22, 19 M instructions of decompression becoming 39 M.
     ///
-    /// It is said by table, because holding is only worth it for the table read twice. TPC-H q07
+    /// It is said by column, because holding is only worth it for the column read twice. TPC-H q07
     /// and q08 read `nation` twice, and when that held every part of `lineitem` and `orders` they
     /// read once, each part decoded went into memory of its own that stayed taken to the end, and
     /// the kernel faulting in and zeroing those pages cost about what the query's own work did.
-    /// Let go after the chunk, the next part decodes into the same memory.
-    pub fn rereads<S: AsRef<str>>(&self, tables: &[S]) {
-        let tables: Vec<String> =
-            tables.iter().map(|table| table.as_ref().to_ascii_lowercase()).collect();
-        self.last.store(self.told.load(Atomic::Relaxed) && tables.is_empty(), Atomic::Relaxed);
-        *self.reread.write().unwrap_or_else(PoisonError::into_inner) = tables;
+    /// Let go after the chunk, the next part decodes into the same memory. Said by table, q21 held
+    /// every part of `lineitem`'s order key that its first scan read, since the table is read three
+    /// times, and the walks that read it again never read the key.
+    pub fn rereads<S: AsRef<str>>(&self, columns: &[(S, S)]) {
+        let columns: Vec<(String, String)> = columns
+            .iter()
+            .map(|(table, column)| {
+                (table.as_ref().to_ascii_lowercase(), column.as_ref().to_ascii_lowercase())
+            })
+            .collect();
+        self.last.store(self.told.load(Atomic::Relaxed) && columns.is_empty(), Atomic::Relaxed);
+        *self.reread.write().unwrap_or_else(PoisonError::into_inner) = columns;
     }
 
     /// A pool with no budget of its own that hears [`PagePool::last_statement`] when `other`
@@ -5848,16 +5855,13 @@ impl PagePool {
         }
     }
 
-    /// Whether [`PagePool::last_statement`] has been said and this statement reads `table` once,
-    /// so that a read of it holds nothing it decodes. See [`PagePool::rereads`].
-    fn is_last_for(&self, table: &str) -> bool {
+    /// Whether [`PagePool::last_statement`] has been said and this statement reads `column` of
+    /// `table` once, so that a read of it holds nothing it decodes. See [`PagePool::rereads`].
+    fn is_last_for(&self, table: &str, column: &str) -> bool {
         self.told.load(Atomic::Relaxed)
-            && !self
-                .reread
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|reread| reread.eq_ignore_ascii_case(table))
+            && !self.reread.read().unwrap_or_else(PoisonError::into_inner).iter().any(|reread| {
+                reread.0.eq_ignore_ascii_case(table) && reread.1.eq_ignore_ascii_case(column)
+            })
     }
 
     /// Whether no statement after the one running reads through this pool, whether or not this one
@@ -9943,7 +9947,7 @@ impl Reader {
                     let runs = if keeps { self.runs(at, column, rows, bytes)? } else { None };
                     indexed = runs.is_some();
                     let runs = runs.as_deref();
-                    if keeps && self.pool.is_last_for(&self.table.name) {
+                    if keeps && self.last_for(column) {
                         self.pay(at, column, paid);
                         decode_at(&field.ty, rows, bytes, dictionary, positions, runs)?
                     } else if keeps && self.pay_or_hold(at, column, paid, rows) {
@@ -10020,7 +10024,7 @@ impl Reader {
         // rows, so that it takes the slot's lock once rather than three times. See [`Self::runs`].
         if let (PartSlot::Indexed { runs, seen, used }, Some(positions)) = (&mut *held, positions) {
             let paid = positions.len();
-            if !self.pool.is_last_for(&self.table.name) && seen.saturating_add(paid) >= rows {
+            if !self.last_for(column) && seen.saturating_add(paid) >= rows {
                 return Err(Undecoded::Keep);
             }
             *seen = seen.saturating_add(paid);
@@ -10039,9 +10043,7 @@ impl Reader {
                 // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
                 // across the suite against 35 for the third, nearly all of it decoding again the
                 // parts the first run had decoded and let go.
-                if before >= rows
-                    || (positions.is_none() && !self.pool.is_last_for(&self.table.name))
-                {
+                if before >= rows || (positions.is_none() && !self.last_for(column)) {
                     return Err(Undecoded::Keep);
                 }
                 // With no statement after this one, a whole read only counts its rows, and a
@@ -10054,6 +10056,13 @@ impl Reader {
                 Err(Undecoded::Read)
             }
         }
+    }
+
+    /// Whether this statement reads `column` of this table once and no statement after it reads
+    /// through the pool, so a read of it holds nothing. See [`PagePool::rereads`].
+    fn last_for(&self, column: usize) -> bool {
+        let name = self.table.fields.get(column).map_or("", |field| field.name.as_str());
+        self.pool.is_last_for(&self.table.name, name)
     }
 
     /// Adds `paid` to what reads of part `at` of `column` have paid, or answers that this read
@@ -18997,8 +19006,9 @@ mod tests {
         fs::remove_file(path).expect("remove scratch file");
     }
 
-    /// A statement that reads a table twice holds a part on its first read even after the last
-    /// statement is announced, and one that does not goes back to only counting.
+    /// A statement that reads a column twice holds a part on its first read even after the last
+    /// statement is announced, and one that reads it once goes back to only counting, even when it
+    /// reads another column of the same table twice.
     #[test]
     fn a_last_statement_that_reads_twice_holds_on_the_first_read() {
         let path = path("last-rereads");
@@ -19015,15 +19025,15 @@ mod tests {
 
         let pool = PagePool::new(usize::MAX);
         pool.last_statement();
-        pool.rereads(&["A"]);
+        pool.rereads(&[("A", "ID")]);
         let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
         let a = catalog.table("a").expect("a");
         let slot = |part: usize| a.cache.slot(0, part).expect("made").lock().expect("the slot");
         a.read(0, &[0]).expect("a part");
         assert!(matches!(*slot(0), PartSlot::Held { .. }), "the first read holds it");
-        pool.rereads(&["b"]);
+        pool.rereads(&[("a", "name")]);
         a.read(1, &[0]).expect("a part");
-        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a table read once only counts");
+        assert!(matches!(*slot(1), PartSlot::Seen(64)), "a column read once only counts");
         drop((a, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }

@@ -16,6 +16,10 @@
 //! the sibling alone run once for each sibling rather than once for each pair, and each row compares
 //! its own value with the values of its parent's siblings that passed them.
 //!
+//! A walk straight over another one to the same siblings, which q21's `EXISTS` over its `NOT EXISTS`
+//! is, runs as one. Each row's parent is looked up once and its children found once, the columns
+//! either walk reads are read once, and each comparison runs over them in turn.
+//!
 //! It only holds when every child with a key found its parent. A child whose key names no parent
 //! is a row the walk cannot reach, so a link with even one of those is refused when the operator is
 //! built rather than being a match that goes missing.
@@ -94,6 +98,23 @@ pub(crate) struct Walk {
     pub(crate) tests: Vec<ExprRef>,
 }
 
+impl Walk {
+    /// Whether `other` walks to the same siblings as this from the same rows, and both compare a
+    /// column of the sibling with the row, so that the two run as one, see [`Siblings::also`].
+    pub(crate) fn fuses_with(&self, plan: &Plan, other: &Self) -> bool {
+        let same = match (&self.children, &other.children) {
+            (Children::Runs(one), Children::Runs(two)) => Arc::ptr_eq(one, two),
+            (Children::Listed(one), Children::Listed(two)) => Arc::ptr_eq(one, two),
+            _ => false,
+        };
+        same && self.key == other.key
+            && Arc::ptr_eq(&self.keys, &other.keys)
+            && [self, other]
+                .iter()
+                .all(|walk| !walk.tests.is_empty() && compared(plan, walk).is_some())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Siblings {
     kind: JoinKind,
@@ -105,6 +126,10 @@ pub(crate) struct Siblings {
     /// Where the row's key is in the chunks that arrive.
     key: usize,
     tests: Tests,
+    /// How many of `read` the first walk reads, which are the first of them.
+    width: usize,
+    /// A second walk over the same siblings, run in the same pass.
+    also: Option<Also>,
     /// The first row of each part and then the row count, worked out on first use.
     starts: OnceLock<Vec<u64>>,
     compaction: &'static dyn Compaction,
@@ -136,6 +161,25 @@ enum Tests {
     Bare,
 }
 
+/// A second compared walk run over the siblings the first one found and read.
+///
+/// TPC-H q21 keeps a line when another line of its order has a different supplier and drops it
+/// when another line of its order with a different supplier was late. Run one after the other, the
+/// two walks looked up the same order, found the same lines and read the same supplier column at
+/// them, twice over.
+#[derive(Debug)]
+struct Also {
+    kind: JoinKind,
+    own: Vec<Prepared>,
+    op: CompareOp,
+    /// Where the column is among the columns this walk reads.
+    column: usize,
+    other: Box<Prepared>,
+    /// Where each column this walk reads is among the columns read, in the order this walk reads
+    /// them.
+    picks: Vec<usize>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Walking {
     scratch: Vec<Scratch>,
@@ -158,6 +202,11 @@ pub(crate) struct Walking {
     spans: Vec<(u32, u32, u32)>,
     /// The row's side of the comparison, `None` for a null.
     sides: Vec<Option<i64>>,
+    /// The scratch, the row's side and the rows marked of the second walk, see [`Also`].
+    also_scratch: Vec<Scratch>,
+    also_other: Scratch,
+    also_sides: Vec<Option<i64>>,
+    also_hit: Vec<bool>,
     /// The sibling's side at each of `rids`, whatever it is where `pass` is false.
     values: Vec<i64>,
     /// Whether the sibling at each of `rids` passed every condition on it and is not null.
@@ -194,22 +243,7 @@ impl Siblings {
         let tests = match compared(plan, &walk) {
             _ if walk.tests.is_empty() => Tests::Bare,
             Some((at, op, column, other)) => {
-                let mut fields = Vec::with_capacity(walk.read.len());
-                let mut bindings = Vec::with_capacity(walk.read.len());
-                for (column, _, field) in &walk.read {
-                    fields.push(field.clone());
-                    bindings.push(ColumnBinding::new(walk.index, *column));
-                }
-                let sibling = Schema::new(fields, bindings)?;
-                let own = walk
-                    .tests
-                    .iter()
-                    .enumerate()
-                    .filter(|&(test, _)| test != at)
-                    .map(|(_, &test)| Prepared::one(plan, test, &sibling))
-                    .collect::<Result<Vec<_>>>()?;
-                let column =
-                    walk.read.iter().position(|&(read, ..)| read == column).ok_or_else(missing)?;
+                let (own, column) = sibling_tests(plan, &walk, at, column)?;
                 Tests::Compared {
                     own,
                     op,
@@ -265,12 +299,49 @@ impl Siblings {
             children: walk.children,
             rows: walk.rows,
             read: walk.read.iter().map(|&(_, stored, _)| stored).collect(),
+            width: walk.read.len(),
+            also: None,
             key,
             tests,
             starts: OnceLock::new(),
             compaction,
             cancel,
         })
+    }
+
+    /// This walk with `walk` run in the same pass, over the same siblings, which
+    /// [`Walk::fuses_with`] says.
+    ///
+    /// # Errors
+    ///
+    /// If either walk does not compare a column of the sibling with the row, or a condition does
+    /// not read as an expression over the sibling.
+    pub(crate) fn also(mut self, plan: &Plan, walk: Walk, arriving: &Schema) -> Result<Self> {
+        let refused = || Error::internal("a sibling walk fused with one that compares nothing");
+        if !matches!(self.tests, Tests::Compared { .. }) || walk.tests.is_empty() {
+            return Err(refused());
+        }
+        let (at, op, column, other) = compared(plan, &walk).ok_or_else(refused)?;
+        let (own, column) = sibling_tests(plan, &walk, at, column)?;
+        let mut picks = Vec::with_capacity(walk.read.len());
+        for &(_, stored, _) in &walk.read {
+            match self.read.iter().position(|&read| read == stored) {
+                Some(at) => picks.push(at),
+                None => {
+                    picks.push(self.read.len());
+                    self.read.push(stored);
+                }
+            }
+        }
+        self.also = Some(Also {
+            kind: walk.kind,
+            own,
+            op,
+            column,
+            other: Box::new(Prepared::one(plan, other, arriving)?),
+            picks,
+        });
+        Ok(self)
     }
 
     #[must_use]
@@ -288,6 +359,11 @@ impl Siblings {
             },
             Tests::Bare => Tests::Bare,
         };
+        self.also = self.also.map(|also| Also {
+            own: all(also.own).collect(),
+            other: Box::new(also.other.in_session(session)),
+            ..also
+        });
         self
     }
 
@@ -315,6 +391,10 @@ impl Siblings {
         let rows = chunk.len();
         local.hit.clear();
         local.hit.resize(rows, false);
+        local.also_hit.clear();
+        if self.also.is_some() {
+            local.also_hit.resize(rows, false);
+        }
         let keys = chunk.column(self.key)?;
         local.keys.clear();
         let block = !keys.validity().has_nulls(rows)
@@ -654,8 +734,13 @@ impl Siblings {
         } else if listed {
             coalesce(&local.rids, &mut local.runs);
         }
-        let read = self.read(&local.runs, &mut local.part, &mut local.within)?;
+        let mut read = self.read(&local.runs, &mut local.part, &mut local.within)?;
         let length = local.runs.iter().map(|&(_, length)| length as usize).sum();
+        let picked = self
+            .also
+            .as_ref()
+            .map(|also| also.picks.iter().map(|&at| read[at].clone()).collect::<Vec<_>>());
+        read.truncate(self.width);
         values_of(
             Chunk::with_rows(read, length)?,
             own,
@@ -664,41 +749,93 @@ impl Siblings {
             &mut local.values,
             &mut local.pass,
         )?;
-        // The operator is settled once for the batch, so that the loop over the siblings has no
-        // match in it.
-        match op {
-            CompareOp::Equal => found(local, |sibling, row| sibling == row),
-            CompareOp::NotEqual => found(local, |sibling, row| sibling != row),
-            CompareOp::Less => found(local, |sibling, row| sibling < row),
-            CompareOp::LessOrEqual => found(local, |sibling, row| sibling <= row),
-            CompareOp::Greater => found(local, |sibling, row| sibling > row),
-            CompareOp::GreaterOrEqual => found(local, |sibling, row| sibling >= row),
-            _ => {}
+        settle(op, local, false);
+        if let (Some(also), Some(picked)) = (&self.also, picked) {
+            values_of(
+                Chunk::with_rows(picked, length)?,
+                &also.own,
+                also.column,
+                &mut local.also_scratch,
+                &mut local.values,
+                &mut local.pass,
+            )?;
+            settle(also.op, local, true);
         }
         Ok(())
     }
 }
 
-/// Marks each row of the batch with a sibling whose value `holds` against the row's side.
-fn found(local: &mut Walking, holds: impl Fn(i64, i64) -> bool) {
-    for &(row, start, len) in &local.spans {
-        let Some(side) = local.sides[row as usize] else { continue };
+/// Marks the rows of the batch with a sibling that stands in `op` to the row, for the second walk
+/// when `second` is set.
+///
+/// The operator is settled once for the batch, so that the loop over the siblings has no match in
+/// it.
+fn settle(op: CompareOp, local: &mut Walking, second: bool) {
+    match op {
+        CompareOp::Equal => found(local, second, |sibling, row| sibling == row),
+        CompareOp::NotEqual => found(local, second, |sibling, row| sibling != row),
+        CompareOp::Less => found(local, second, |sibling, row| sibling < row),
+        CompareOp::LessOrEqual => found(local, second, |sibling, row| sibling <= row),
+        CompareOp::Greater => found(local, second, |sibling, row| sibling > row),
+        CompareOp::GreaterOrEqual => found(local, second, |sibling, row| sibling >= row),
+        _ => {}
+    }
+}
+
+/// Marks each row of the batch with a sibling whose value `holds` against the row's side, the
+/// second walk's side and marks when `second` is set.
+fn found(local: &mut Walking, second: bool, holds: impl Fn(i64, i64) -> bool) {
+    let Walking { spans, sides, also_sides, hit, also_hit, values, pass, moved, rising, .. } =
+        local;
+    let (sides, hit) = if second { (also_sides, also_hit) } else { (sides, hit) };
+    for &(row, start, len) in spans.iter() {
+        let Some(side) = sides[row as usize] else { continue };
         let places = start as usize..(start + len) as usize;
-        let found = if local.rising {
-            local.values[places.clone()]
+        let found = if *rising {
+            values[places.clone()]
                 .iter()
-                .zip(&local.pass[places])
+                .zip(&pass[places])
                 .any(|(&value, &pass)| pass & holds(value, side))
         } else {
-            local.moved[places].iter().any(|&at| {
+            moved[places].iter().any(|&at| {
                 let at = at as usize;
-                local.pass[at] & holds(local.values[at], side)
+                pass[at] & holds(values[at], side)
             })
         };
         if found {
-            local.hit[row as usize] = true;
+            hit[row as usize] = true;
         }
     }
+}
+
+/// The conditions of `walk` on the sibling alone, which are all but the one at `at`, over the
+/// columns it reads, and where `column`, the sibling's side of that one, is among them.
+fn sibling_tests(
+    plan: &Plan,
+    walk: &Walk,
+    at: usize,
+    column: u32,
+) -> Result<(Vec<Prepared>, usize)> {
+    let mut fields = Vec::with_capacity(walk.read.len());
+    let mut bindings = Vec::with_capacity(walk.read.len());
+    for (column, _, field) in &walk.read {
+        fields.push(field.clone());
+        bindings.push(ColumnBinding::new(walk.index, *column));
+    }
+    let sibling = Schema::new(fields, bindings)?;
+    let own = walk
+        .tests
+        .iter()
+        .enumerate()
+        .filter(|&(test, _)| test != at)
+        .map(|(_, &test)| Prepared::one(plan, test, &sibling))
+        .collect::<Result<Vec<_>>>()?;
+    let column = walk
+        .read
+        .iter()
+        .position(|&(read, ..)| read == column)
+        .ok_or_else(|| Error::internal("a sibling walk compares a column it does not read"))?;
+    Ok((own, column))
 }
 
 /// The runs a walk over a link found, as the rows of `local`, for a batch whose parents did not
@@ -890,6 +1027,14 @@ impl Stream for Siblings {
             owners: Vec::new(),
             spans: Vec::new(),
             sides: Vec::new(),
+            also_scratch: self
+                .also
+                .as_ref()
+                .map(|also| also.own.iter().map(Prepared::scratch).collect())
+                .unwrap_or_default(),
+            also_other: self.also.as_ref().map(|also| also.other.scratch()).unwrap_or_default(),
+            also_sides: Vec::new(),
+            also_hit: Vec::new(),
             values: Vec::new(),
             pass: Vec::new(),
             moved: Vec::new(),
@@ -919,9 +1064,17 @@ impl Stream for Siblings {
             local.sides.clear();
             signed(sides, rows, &mut local.block, &mut local.sides);
         }
+        if let Some(also) = &self.also {
+            let sides = also.other.evaluate_one(chunk, &mut local.also_other)?;
+            local.also_sides.clear();
+            signed(sides, rows, &mut local.block, &mut local.also_sides);
+        }
         self.mark(chunk, local)?;
         let wanted = self.kind == JoinKind::Semi;
-        let kept = Selection::from_predicate(rows, |row| local.hit[row] == wanted);
+        let also = self.also.as_ref().map(|also| also.kind == JoinKind::Semi);
+        let kept = Selection::from_predicate(rows, |row| {
+            local.hit[row] == wanted && also.is_none_or(|wanted| local.also_hit[row] == wanted)
+        });
         if kept.len() != rows {
             narrow(self.compaction, chunk, &kept, &mut local.gauge)?;
         }

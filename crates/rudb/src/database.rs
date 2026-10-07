@@ -5548,7 +5548,8 @@ impl Shared {
         cancel: &Cancel,
         under: Under<'_>,
     ) -> Result<QueryResult> {
-        self.inner.pages.rereads(&tables_read_twice(plan));
+        let walked = rudb_exec::sibling_reads(plan, catalog, under.session);
+        self.inner.pages.rereads(&columns_read_twice(plan, &walked));
         if self.inner.settings.engine() == COMPILED_ENGINE {
             // A query the first engine answers out of the statistics kept about its tables,
             // without reading a row, has nothing for compiled code to make faster.
@@ -8723,22 +8724,49 @@ fn aggregates_a_table(plan: &Plan, node: NodeRef) -> bool {
     plan.node(node).children().into_iter().flatten().any(|child| aggregates_a_table(plan, child))
 }
 
-/// The tables two scans in `plan` both read, whose parts a read holds for the other scan inside one
-/// statement. See [`rudb_native::PagePool::rereads`].
-fn tables_read_twice(plan: &Plan) -> Vec<&str> {
-    fn tables<'p>(plan: &'p Plan, node: NodeRef, found: &mut Vec<(&'p str, &'p str, &'p str)>) {
-        if let Node::Get { catalog, schema, table, .. } = *plan.node(node) {
-            found.push((plan.string(catalog), plan.string(schema), plan.string(table)));
+/// The columns two scans in `plan` both read, as the table and the column, whose parts a read holds
+/// for the other scan inside one statement. See [`rudb_native::PagePool::rereads`].
+///
+/// A scan in `walked` is one the first engine answers by walking to each row's siblings, which
+/// reads the columns listed there rather than the ones the scan lists. A table read twice is not a
+/// column read twice: q21 reads `lineitem` three times and its order key once, since the walks take
+/// the order key from the link, and holding every part of it the first scan read decoded each one
+/// whole for a second read that never came.
+fn columns_read_twice<'p>(
+    plan: &'p Plan,
+    walked: &'p [(u32, Vec<String>)],
+) -> Vec<(&'p str, &'p str)> {
+    fn tables<'p>(
+        plan: &'p Plan,
+        walked: &'p [(u32, Vec<String>)],
+        node: NodeRef,
+        found: &mut Vec<(&'p str, &'p str, &'p str, &'p str)>,
+    ) {
+        if let Node::Get { catalog, schema, table, index, columns, .. } = *plan.node(node) {
+            let at = (plan.string(catalog), plan.string(schema), plan.string(table));
+            match walked.iter().find(|(walk, _)| *walk == index) {
+                Some((_, read)) => {
+                    found.extend(read.iter().map(|column| (at.0, at.1, at.2, column.as_str())));
+                }
+                None => found.extend(
+                    plan.field_list(columns)
+                        .iter()
+                        .map(|field| (at.0, at.1, at.2, field.name.as_str())),
+                ),
+            }
         }
         for child in plan.node(node).children().into_iter().flatten() {
-            tables(plan, child, found);
+            tables(plan, walked, child, found);
         }
     }
     let mut found = Vec::new();
-    tables(plan, plan.root(), &mut found);
+    tables(plan, walked, plan.root(), &mut found);
     found.sort_unstable();
-    let mut twice: Vec<&str> =
-        found.windows(2).filter(|pair| pair[0] == pair[1]).map(|pair| pair[0].2).collect();
+    let mut twice: Vec<(&str, &str)> = found
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| (pair[0].2, pair[0].3))
+        .collect();
     twice.dedup();
     twice
 }

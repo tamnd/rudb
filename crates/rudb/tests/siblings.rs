@@ -62,11 +62,20 @@ fn plan(database: &Database, sql: &str) -> String {
 
 /// The shape of TPC-H q21, one `EXISTS` and one `NOT EXISTS` over the other children of the
 /// same parent, each with a condition the key alone does not answer.
-const QUERIES: [&str; 12] = [
+const QUERIES: [&str; 14] = [
     "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE o1.o_late AND EXISTS (SELECT * \
      FROM orders o2 WHERE o2.o_custkey = o1.o_custkey AND o2.o_clerk <> o1.o_clerk) AND NOT \
      EXISTS (SELECT * FROM orders o3 WHERE o3.o_custkey = o1.o_custkey AND o3.o_clerk <> \
      o1.o_clerk AND o3.o_late)",
+    // Two walks over the same siblings, which run as one, comparing different columns.
+    "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE NOT EXISTS (SELECT * FROM orders \
+     o2 WHERE o2.o_custkey = o1.o_custkey AND o2.o_orderkey < o1.o_orderkey - 2) AND EXISTS \
+     (SELECT * FROM orders o3 WHERE o3.o_custkey = o1.o_custkey AND o3.o_clerk > o1.o_clerk AND \
+     NOT o3.o_late)",
+    "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE EXISTS (SELECT * FROM orders o2 \
+     WHERE o2.o_custkey = o1.o_custkey AND o2.o_clerk = o1.o_clerk + 1) AND EXISTS (SELECT * \
+     FROM orders o3 WHERE o3.o_custkey = o1.o_custkey AND o3.o_orderkey > o1.o_orderkey + 3 AND \
+     o3.o_late)",
     "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE EXISTS (SELECT * FROM orders o2 \
      WHERE o2.o_custkey = o1.o_custkey AND o2.o_orderkey > o1.o_orderkey + 3)",
     "SELECT count(*), sum(o1.o_orderkey) FROM orders o1 WHERE NOT EXISTS (SELECT * FROM orders \
@@ -116,14 +125,14 @@ fn answers_the_same(shuffled: bool) {
         .unwrap_or_else(|| panic!("no scan of o2 on the tree:\n{text}"));
     assert!(scan.contains("not measured"), "{text}");
     // Nor is it when the key is the whole condition, since the parent's child count says it all.
-    let text = plan(&database, QUERIES[8]);
+    let text = plan(&database, QUERIES[10]);
     let scan = text
         .lines()
         .find(|line| line.contains("Get ") && line.contains("orders"))
         .unwrap_or_else(|| panic!("no scan of orders on the tree:\n{text}"));
     assert!(scan.contains("not measured"), "{text}");
     // Nor when the child has a filter of its own and the key is the only condition between them.
-    let text = plan(&database, QUERIES[10]);
+    let text = plan(&database, QUERIES[12]);
     let scan = text
         .lines()
         .find(|line| line.contains("Get ") && line.contains("orders"))

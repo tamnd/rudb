@@ -1626,6 +1626,32 @@ pub fn walks_siblings(plan: &Plan, catalog: &Catalog) -> bool {
     walks(plan, catalog, plan.root())
 }
 
+/// The scans of `plan` that the first engine answers by walking each row to its siblings, each as
+/// its table index and the names of the columns the walk reads in its place.
+///
+/// The walk reads the columns its tests read and never the key it follows, which the link and the
+/// key map answer. A page pool told the columns a statement reads twice holds a decoded part for
+/// the second read, and counted off the plan alone the order key of TPC-H q21 is read three times
+/// when it is read once. See `rudb_native::PagePool::rereads`.
+#[must_use]
+pub fn sibling_reads(plan: &Plan, catalog: &Catalog, session: &Session) -> Vec<(u32, Vec<String>)> {
+    fn reads(plan: &Plan, catalog: &Catalog, node: NodeRef, out: &mut Vec<(u32, Vec<String>)>) {
+        if let Node::Join { right, kind, conditions, .. } = *plan.node(node)
+            && let Some(walk) = walk(plan, catalog, kind, right, conditions)
+        {
+            out.push((walk.index, walk.read.into_iter().map(|(_, _, field)| field.name).collect()));
+        }
+        for child in plan.node(node).children().into_iter().flatten() {
+            reads(plan, catalog, child, out);
+        }
+    }
+    let mut out = Vec::new();
+    if session.rules().enabled(Rule::GraphReduction) {
+        reads(plan, catalog, plan.root(), &mut out);
+    }
+    out
+}
+
 /// A semi or an anti join that can be answered by walking each row to its siblings, when it is one.
 ///
 /// The other side has to be a scan of a stored child table under nothing but filters, and one of
@@ -2688,6 +2714,21 @@ impl<'a> Building<'a, '_> {
         if self.session.rules().enabled(Rule::GraphReduction)
             && let Some(found) = walk(plan, self.catalog, kind, right, conditions)
         {
+            // A walk straight over another to the same siblings runs as one, so that each row's
+            // siblings are found and read once. TPC-H q21's `EXISTS` sits on its `NOT EXISTS`.
+            if let Node::Join { left: under, right: inner, kind, conditions, .. } = *plan.node(left)
+                && let Some(first) = walk(plan, self.catalog, kind, inner, conditions)
+                && first.fuses_with(plan, &found)
+            {
+                let below = self.node(under)?;
+                let operator =
+                    Siblings::new(plan, first, &below.schema, self.seams, self.cancel.clone())?
+                        .also(plan, found, &below.schema)?
+                        .in_session(self.session);
+                let schema = below.schema.clone();
+                let counters = self.watch(reference, id, pipeline, "Siblings", None);
+                return Ok(below.then(Arc::new(Watched::new(operator, counters)), schema));
+            }
             let below = self.node(left)?;
             let operator =
                 Siblings::new(plan, found, &below.schema, self.seams, self.cancel.clone())?
