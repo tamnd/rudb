@@ -26,6 +26,7 @@ use rudb_parse::ast::{self, Ast};
 use rudb_pipeline::{Lease, Morsel, Pool, Progress, Sink, keep_pages};
 use rudb_plan::{Expr, Node, NodeRef, Plan};
 use rudb_storage::{ReadGuard, ReadMostly, WriteGuard};
+use rudb_txn::log::CommitSync;
 use rudb_vector::{Chunk, Data, Form, Selection, VECTOR_SIZE, Vector};
 
 use crate::config::Config;
@@ -681,6 +682,9 @@ struct Conn {
 
 /// How many plans a connection keeps by the text of their query.
 const SIMPLE_PLANS: usize = 32;
+
+/// The value of `off` among the options of `synchronous_commit`, from `guc_tables.c`.
+const SYNC_OFF: u8 = 4;
 
 /// The optimized plan of a query, kept by its exact text, with what it was bound against.
 ///
@@ -4086,6 +4090,19 @@ impl Shared {
         self.conn.received.store(micros, Ordering::Release);
     }
 
+    /// What this commit waits for. In a PostgreSQL session `synchronous_commit = off` does not
+    /// wait, and its other values wait as `commit_sync` of the database says.
+    fn commit_sync(&self) -> CommitSync {
+        let postgres = self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner);
+        let off = postgres.as_ref().is_some_and(|postgres| {
+            rudb_common::guc::find("synchronous_commit").is_some_and(|parameter| {
+                postgres.settings.setting(parameter) == rudb_common::guc::Setting::Enum(SYNC_OFF)
+            })
+        });
+        drop(postgres);
+        if off { CommitSync::None } else { self.inner.settings.commit_sync() }
+    }
+
     pub(crate) fn set_postgres(&self, postgres: Arc<Postgres>) {
         *self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner) = Some(postgres);
     }
@@ -5003,7 +5020,7 @@ impl Shared {
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
         if !held.needs_checkpoint() {
-            match held.enqueue(self.inner.settings.commit_sync()) {
+            match held.enqueue(self.commit_sync()) {
                 Ok(None) if !self.over(held) => return Ok(()),
                 Ok(None) => {}
                 Ok(Some(pending)) => {

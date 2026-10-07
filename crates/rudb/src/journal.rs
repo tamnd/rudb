@@ -28,7 +28,9 @@
 //! every append before it, and a drop and a create of the same name are replayed in their place.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::{Filesystem, RealFilesystem};
@@ -65,6 +67,10 @@ const BULK_ROWS: usize = 262_144;
 
 /// How many bytes of blocks `commit_sync = none` lets queue before it writes them out.
 const QUEUED: u64 = 1 << 20;
+
+/// How long the log writer waits between two syncs of the commits that did not wait, which is
+/// the default `wal_writer_delay` of PostgreSQL.
+const WRITER_DELAY: Duration = Duration::from_millis(200);
 
 /// A record staged for the commit: its kind, its payload, and the rows it inserts.
 #[derive(Debug)]
@@ -263,6 +269,48 @@ pub(crate) struct Journal {
     /// Whether the file has an anchor this log is replayed against. Until it does a commit
     /// checkpoints, because a log beside a file without one is taken for another file's.
     anchored: bool,
+    /// Whether the log writer runs, see [`wake_writer`].
+    writer: Arc<AtomicBool>,
+}
+
+/// Starts the log writer when it does not run. It syncs the lane every [`WRITER_DELAY`] while a
+/// commit that did not wait is not on stable storage, and stops when all of them are. So a crash
+/// loses only the commits of the last moments, as with `synchronous_commit = off` in PostgreSQL,
+/// and an idle database has no thread for it.
+fn wake_writer(lane: &Arc<Lane>, writer: &Arc<AtomicBool>) {
+    if writer.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let lane = Arc::downgrade(lane);
+    let writer = Arc::clone(writer);
+    let started = std::thread::Builder::new().name("rudb-log-writer".into()).spawn({
+        let writer = Arc::clone(&writer);
+        move || write_behind(&lane, &writer)
+    });
+    if started.is_err() {
+        writer.store(false, Ordering::Release);
+    }
+}
+
+/// The loop of the log writer. A lane that was dropped or failed ends it.
+fn write_behind(lane: &Weak<Lane>, writer: &AtomicBool) {
+    loop {
+        std::thread::sleep(WRITER_DELAY);
+        let Some(lane) = lane.upgrade() else { break };
+        if lane.behind() {
+            if lane.flush().is_err() {
+                break;
+            }
+            continue;
+        }
+        writer.store(false, Ordering::Release);
+        // A commit that queued a block after the look above found the writer still running and
+        // did not start another, so this one goes on for it.
+        if !lane.behind() || writer.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    }
+    writer.store(false, Ordering::Release);
 }
 
 /// A block queued in the lane that its commit has not waited for yet.
@@ -320,6 +368,7 @@ impl Journal {
             logged: 0,
             dirty: false,
             anchored: anchor.is_some(),
+            writer: Arc::default(),
         };
         let Some(anchor) = anchor else {
             if writable {
@@ -448,6 +497,7 @@ impl Journal {
             dirty: false,
             anchored: self.anchored,
             logged: 0,
+            writer: Arc::default(),
         }
     }
 
@@ -545,6 +595,7 @@ impl Journal {
             if lane.unwritten() >= QUEUED {
                 lane.write_out()?;
             }
+            wake_writer(&lane, &self.writer);
             return Ok(None);
         }
         Ok(Some(Pending { lane, end, sync }))
@@ -1521,6 +1572,34 @@ mod tests {
     use super::{
         Change, decode_rows, header, put, put_rows, put_runs, put_text, put_value_rows, read_record,
     };
+
+    #[test]
+    fn the_log_writer_syncs_the_commits_that_did_not_wait_and_then_stops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use rudb_io::SimFilesystem;
+        use rudb_txn::log::{Block, Lane, Options};
+
+        let fs = Arc::new(SimFilesystem::new());
+        let lane = Lane::open(fs, std::path::Path::new("/log"), Options::new(1)).unwrap();
+        let lane = Arc::new(lane);
+        let writer = Arc::new(AtomicBool::new(false));
+        let mut block = Block::new(1, 1, 0);
+        block.push(Kind::Insert, 0, b"row").unwrap();
+        lane.enqueue(&block).unwrap();
+        assert!(lane.behind());
+        super::wake_writer(&lane, &writer);
+        assert!(writer.load(Ordering::Acquire));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (lane.behind() || writer.load(Ordering::Acquire))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(super::WRITER_DELAY / 4);
+        }
+        assert!(!lane.behind());
+        assert!(!writer.load(Ordering::Acquire));
+    }
 
     fn insert(fields: &[Field], chunks: &[Chunk]) -> Option<Vec<u8>> {
         let mut out = header("main", "items")?;

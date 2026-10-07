@@ -550,6 +550,13 @@ impl Lane {
         self.wait(state, end, Reach::Durable).map(|_| ())
     }
 
+    /// Whether a block committed so far is not yet on stable storage.
+    #[must_use]
+    pub fn behind(&self) -> bool {
+        let state = self.lock();
+        state.reserved > state.durable
+    }
+
     /// The lane position every block before which is on stable storage.
     #[must_use]
     pub fn durable(&self) -> u64 {
