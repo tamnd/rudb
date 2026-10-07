@@ -1,9 +1,10 @@
 //! The reader of the PostgreSQL grammar, `gram.y`, and the two files written from it without the C.
 //!
 //! The reader keeps what the table generator needs: the tokens, the precedence declarations, every
-//! rule, every alternative and every `%prec`. It drops the prologue, the `%union`, the `%type`
-//! lines and every C action. `gram.y` has no mid-rule action, and the reader refuses one, because
-//! an action between two symbols is a hidden empty rule and the generator does not make those.
+//! rule, every alternative and every `%prec`. It also keeps what the generator of the action glue
+//! needs: the prologue, the `%union`, the tag of each symbol and the C action of each alternative.
+//! `gram.y` has no mid-rule action, and the reader refuses one, because an action between two
+//! symbols is a hidden empty rule and the generator does not make those.
 //!
 //! The symbols are numbered as bison 2.3 numbers them, so a state number of the generated tables
 //! is the state number in `bison -v` output for the same file. `$end`, `error` and `$undefined`
@@ -33,6 +34,10 @@ pub(super) struct Rule {
     pub(super) prec: Option<usize>,
     /// The name of the alternative, the rule name and the number of the alternative from 1.
     pub(super) name: String,
+    /// The C action in its braces, or `None` when the alternative has no action.
+    pub(super) action: Option<String>,
+    /// The line of `gram.y` where the alternative starts: the line of its first item.
+    pub(super) line: usize,
 }
 
 /// One declaration line, kept so that `gram.rules` declares the tokens in the same order.
@@ -52,6 +57,12 @@ pub(super) struct Grammar {
     pub(super) rules: Vec<Rule>,
     /// The number that `%expect` gives.
     pub(super) expect: usize,
+    /// The `%union` member that `%token <tag>` or `%type <tag>` gives each symbol, or `None`.
+    pub(super) tags: Vec<Option<String>>,
+    /// The C in `%{ ... %}`, without the two lines that open and close it.
+    pub(super) prologue: String,
+    /// The body of `%union`, in its braces.
+    pub(super) union: String,
     declarations: Vec<Declaration>,
 }
 
@@ -64,12 +75,13 @@ enum Item {
     Char(String),
     /// A `%` directive, without the `%`.
     Directive(String),
-    /// A `<tag>`.
-    Tag,
+    /// A `<tag>`, without the angle brackets.
+    Tag(String),
     /// A string in double quotes.
     Text,
-    /// A block in braces: an action, the `%union` body or a `%parse-param` argument.
-    Braces,
+    /// A block in braces, with the braces: an action, the `%union` body or a `%parse-param`
+    /// argument.
+    Braces(String),
     Colon,
     Pipe,
     Semicolon,
@@ -200,7 +212,7 @@ impl Scanner<'_> {
             }
             b'{' => {
                 self.braces()?;
-                Item::Braces
+                Item::Braces(self.slice(start))
             }
             b'"' => {
                 self.quoted()?;
@@ -218,7 +230,7 @@ impl Scanner<'_> {
                     self.bump();
                 }
                 self.bump();
-                Item::Tag
+                Item::Tag(String::from_utf8_lossy(&self.text[start + 1..self.at - 1]).into_owned())
             }
             b'%' if self.peek(1) == b'%' => {
                 self.at += 2;
@@ -311,6 +323,8 @@ struct Alternative {
     rhs: Vec<usize>,
     prec: Option<usize>,
     name: String,
+    action: Option<String>,
+    line: usize,
 }
 
 /// Reads `gram.y`.
@@ -318,6 +332,7 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
     // The prologue in `%{ ... %}` is C and goes before anything the scanner reads.
     let open = text.find("%{").ok_or("gram.y has no prologue")?;
     let close = text[open..].find("\n%}").ok_or("the prologue of gram.y does not end")? + open + 3;
+    let prologue = text[open + 2..close - 2].to_string();
     let line = text[..close].matches('\n').count() + 1;
     let mut scanner = Scanner { text: text.as_bytes(), at: close, line };
 
@@ -336,6 +351,8 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
 
     // The declarations, up to the first `%%`.
     let mut declarations = Vec::new();
+    let mut tags: HashMap<usize, String> = HashMap::new();
+    let mut union = None;
     let mut expect = None;
     let mut level = 0u16;
     let mut pending = scanner.next()?;
@@ -352,8 +369,8 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
                     "nonassoc" => "%nonassoc",
                     "type" => "%type",
                     "expect" => "%expect",
-                    "pure-parser" | "name-prefix" | "locations" | "parse-param" | "lex-param"
-                    | "union" => "",
+                    "union" => "%union",
+                    "pure-parser" | "name-prefix" | "locations" | "parse-param" | "lex-param" => "",
                     other => return Err(at(format!("the directive %{other} is not known"))),
                 };
                 let assoc = match directive {
@@ -366,9 +383,20 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
                     level += 1;
                 }
                 let mut named = Vec::new();
+                let mut tag = None;
                 loop {
                     pending = scanner.next()?;
                     match &pending {
+                        Some((Item::Tag(name), _)) => tag = Some(name.clone()),
+                        Some((Item::Braces(body), _)) if directive == "%union" => {
+                            union = Some(body.clone());
+                        }
+                        Some((Item::Word(name), _)) if directive == "%type" => {
+                            let symbol = symbols.get(name);
+                            if let Some(tag) = &tag {
+                                tags.insert(symbol, tag.clone());
+                            }
+                        }
                         Some((Item::Word(word), _)) if directive == "%expect" => {
                             expect =
                                 Some(word.parse().map_err(|_| at(format!("bad %expect {word}")))?);
@@ -377,6 +405,9 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
                             if directive == "%token" || assoc.is_some() =>
                         {
                             let symbol = symbols.token(name).map_err(at)?;
+                            if let Some(tag) = &tag {
+                                tags.insert(symbol, tag.clone());
+                            }
                             if let Some(assoc) = assoc {
                                 symbols.precedence[symbol] = (level, assoc);
                             }
@@ -394,6 +425,7 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
         }
     }
     let expect = expect.ok_or("gram.y has no %expect")?;
+    let union = union.ok_or("gram.y has no %union")?;
 
     // The rules, up to the second `%%`. A rule is `name: alternative | alternative ;`, an
     // alternative is symbols, then an optional `%prec token`, then an optional action.
@@ -418,14 +450,16 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
         loop {
             let mut rhs = Vec::new();
             let mut prec = None;
-            let mut action = false;
+            let mut action = None;
+            let mut first = None;
             let end = loop {
                 let Some((item, line)) = scanner.next()? else {
                     return Err("gram.y ends in a rule".to_string());
                 };
+                first.get_or_insert(line);
                 let at = |message: String| format!("gram.y line {line}: {message}");
                 match item {
-                    Item::Word(name) | Item::Char(name) if action || prec.is_some() => {
+                    Item::Word(name) | Item::Char(name) if action.is_some() || prec.is_some() => {
                         return Err(at(format!("{name} after an action or a %prec")));
                     }
                     Item::Word(name) => rhs.push(symbols.get(&name)),
@@ -439,16 +473,20 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
                         };
                         prec = Some(token);
                     }
-                    Item::Braces if action => return Err(at("two actions".to_string())),
-                    Item::Braces => action = true,
-                    Item::Pipe | Item::Semicolon => break item,
+                    Item::Braces(_) if action.is_some() => {
+                        return Err(at("two actions".to_string()));
+                    }
+                    Item::Braces(body) => action = Some(body),
+                    Item::Pipe | Item::Semicolon => break (item, line),
                     other => return Err(at(format!("unexpected {other:?} in a rule"))),
                 }
             };
             let count = counts.entry(lhs).or_insert(0);
             *count += 1;
             let name = format!("{}.{count}", symbols.names[lhs]);
-            alternatives.push(Alternative { lhs, rhs, prec, name });
+            let (end, line) = end;
+            let line = first.unwrap_or(line);
+            alternatives.push(Alternative { lhs, rhs, prec, name, action, line });
             if end == Item::Semicolon {
                 break;
             }
@@ -483,6 +521,8 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
         rhs: vec![number[start], number[0]],
         prec: None,
         name: "$accept.1".to_string(),
+        action: None,
+        line: 0,
     }];
     for alternative in alternatives {
         let rhs: Vec<usize> = alternative.rhs.iter().map(|&old| number[old]).collect();
@@ -490,7 +530,14 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
             .prec
             .map(|old| number[old])
             .or_else(|| rhs.iter().rev().find(|&&symbol| symbol < tokens).copied());
-        rules.push(Rule { lhs: number[alternative.lhs], rhs, prec, name: alternative.name });
+        rules.push(Rule {
+            lhs: number[alternative.lhs],
+            rhs,
+            prec,
+            name: alternative.name,
+            action: alternative.action,
+            line: alternative.line,
+        });
     }
     let declarations = declarations
         .into_iter()
@@ -499,7 +546,18 @@ pub(super) fn read(text: &str) -> Result<Grammar, String> {
             symbols: d.symbols.iter().map(|&s| number[s]).collect(),
         })
         .collect();
-    Ok(Grammar { symbols: names, tokens, precedence, rules, expect, declarations })
+    let tags = order.iter().map(|old| tags.remove(old)).collect();
+    Ok(Grammar {
+        symbols: names,
+        tokens,
+        precedence,
+        rules,
+        expect,
+        tags,
+        prologue,
+        union,
+        declarations,
+    })
 }
 
 /// The header of the two files written from `gram.y`.

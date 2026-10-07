@@ -5,6 +5,10 @@
 //! gate if the two disagree. The same command writes `gram.rules`, the grammar without its C,
 //! and `productions.txt`, the name of each alternative.
 
+// The glue is long and has the layout of its generator. rustfmt does not change it, so that
+// `cargo xtask pg-check` can compare it byte for byte.
+#[rustfmt::skip]
+pub(crate) mod glue;
 pub(crate) mod keywords;
 pub(crate) mod nodes;
 pub(crate) mod tables;

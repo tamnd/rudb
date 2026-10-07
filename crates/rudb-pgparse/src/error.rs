@@ -34,6 +34,22 @@ impl Error {
         Error { code, message: message.to_owned(), hint: None, location: Some(location) }
     }
 
+    /// The error for an action of `gram.y` that is not ported yet. `rule` is its name in
+    /// `productions.txt`, for example `a_expr.17`.
+    pub(crate) fn not_ported(rule: &str) -> Error {
+        Error {
+            code: "0A000",
+            message: format!("the action of the rule {rule} of gram.y is not ported"),
+            hint: None,
+            location: None,
+        }
+    }
+
+    /// An error for a fault of the parser itself, with SQLSTATE `XX000`.
+    pub(crate) fn internal(message: &str) -> Error {
+        Error { code: "XX000", message: message.to_owned(), hint: None, location: None }
+    }
+
     /// The error that `report_invalid_encoding` gives for bytes that are not UTF-8, or that
     /// contain a zero byte. `bad` starts at the first bad byte.
     pub(crate) fn encoding(bad: &[u8]) -> Error {
@@ -71,11 +87,25 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A notice of the lexer, for example for an identifier that is too long.
+/// A notice or a warning of the lexer or the parser, for example for an identifier that is too
+/// long.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
+    /// The severity, `NOTICE` or `WARNING`.
+    pub severity: Severity,
     /// The SQLSTATE, for example `42622`.
     pub code: &'static str,
     /// The message, as PostgreSQL writes it.
     pub message: String,
+    /// The byte offset in the text that the notice points to, or `None`.
+    pub location: Option<usize>,
+}
+
+/// The severity of a [`Notice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    /// `NOTICE`.
+    Notice,
+    /// `WARNING`.
+    Warning,
 }

@@ -13,7 +13,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use crate::error::{Error, Notice};
+use crate::error::{Error, Notice, Severity};
 use crate::generated::keywords::{self, Keyword};
 use crate::generated::tables::token;
 use crate::parser::character;
@@ -293,8 +293,10 @@ pub(crate) fn truncate<'a>(name: Cow<'a, str>, notices: &mut Vec<Notice>) -> Cow
         length -= 1;
     }
     notices.push(Notice {
+        severity: Severity::Notice,
         code: "42622",
         message: format!("identifier \"{name}\" will be truncated to \"{}\"", &name[..length]),
+        location: None,
     });
     match name {
         Cow::Borrowed(name) => Cow::Borrowed(&name[..length]),

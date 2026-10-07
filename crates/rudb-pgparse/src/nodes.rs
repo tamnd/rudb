@@ -14,8 +14,9 @@ pub use crate::generated::nodes::*;
 /// The text of a `char *` field.
 pub type Str = Box<str>;
 
-/// A `List *` of nodes. `NIL` is the empty list.
-pub type List = Vec<Node>;
+/// A `List *` of nodes. `NIL` is the empty list. An element can be `NULL`, as in the
+/// `list_make1(NIL)` of `DISTINCT`, and `outfuncs.c` writes it as `<>`.
+pub type List = Vec<Option<Node>>;
 
 /// A node type that `outNode` writes in braces.
 pub trait Out {
@@ -202,7 +203,10 @@ pub(crate) mod w {
             if i > 0 {
                 s.push(' ');
             }
-            node.write(s);
+            match node {
+                Some(node) => node.write(s),
+                None => s.push_str("<>"),
+            }
         }
         s.push(')');
     }
@@ -270,16 +274,16 @@ mod tests {
         assert_eq!(token(Some("<x")), "\\<x");
     }
 
-    fn string(text: &str) -> Node {
-        Node::String(text.into())
+    fn string(text: &str) -> Option<Node> {
+        Some(Node::String(text.into()))
     }
 
-    fn column(name: &str, location: i32) -> Node {
-        ColumnRef { fields: vec![string(name)], location }.into()
+    fn column(name: &str, location: i32) -> Option<Node> {
+        Some(ColumnRef { fields: vec![string(name)], location }.into())
     }
 
-    fn integer(value: i32, location: i32) -> Node {
-        A_Const { val: Some(Node::Integer(value)), isnull: false, location }.into()
+    fn integer(value: i32, location: i32) -> Option<Node> {
+        Some(A_Const { val: Some(Node::Integer(value)), isnull: false, location }.into())
     }
 
     /// The tree that PostgreSQL 19 logs with `debug_print_raw_parse` for a query, built by hand.
@@ -289,13 +293,13 @@ mod tests {
         let plus = A_Expr {
             kind: A_Expr_Kind::AEXPR_OP,
             name: vec![string("+")],
-            lexpr: Some(column("a", 7)),
-            rexpr: Some(integer(1, 9)),
+            lexpr: column("a", 7),
+            rexpr: integer(1, 9),
             location: 8,
             ..A_Expr::default()
         };
         let cast = TypeCast {
-            arg: Some(A_Const { val: Some(string("q")), isnull: false, location: 17 }.into()),
+            arg: Some(A_Const { val: string("q"), isnull: false, location: 17 }.into()),
             typeName: Some(Box::new(TypeName {
                 names: vec![string("text")],
                 typemod: -1,
@@ -307,7 +311,7 @@ mod tests {
         let between = A_Expr {
             kind: A_Expr_Kind::AEXPR_BETWEEN,
             name: vec![string("BETWEEN")],
-            lexpr: Some(column("b", 40)),
+            lexpr: column("b", 40),
             rexpr: Some(Node::List(vec![integer(1, 50), integer(2, 56)])),
             location: 42,
             ..A_Expr::default()
@@ -316,16 +320,21 @@ mod tests {
             BoolExpr { boolop: BoolExprType::NOT_EXPR, args: vec![column("c", 66)], location: 62 };
         let select = SelectStmt {
             targetList: vec![
-                ResTarget {
-                    name: Some("x".into()),
-                    val: Some(plus.into()),
-                    location: 7,
-                    ..ResTarget::default()
-                }
-                .into(),
-                ResTarget { val: Some(cast.into()), location: 17, ..ResTarget::default() }.into(),
+                Some(
+                    ResTarget {
+                        name: Some("x".into()),
+                        val: Some(plus.into()),
+                        location: 7,
+                        ..ResTarget::default()
+                    }
+                    .into(),
+                ),
+                Some(
+                    ResTarget { val: Some(cast.into()), location: 17, ..ResTarget::default() }
+                        .into(),
+                ),
             ],
-            fromClause: vec![
+            fromClause: vec![Some(
                 RangeVar {
                     relname: Some("t".into()),
                     inh: true,
@@ -334,11 +343,11 @@ mod tests {
                     ..RangeVar::default()
                 }
                 .into(),
-            ],
+            )],
             whereClause: Some(
                 BoolExpr {
                     boolop: BoolExprType::AND_EXPR,
-                    args: vec![between.into(), not.into()],
+                    args: vec![Some(between.into()), Some(not.into())],
                     location: 58,
                 }
                 .into(),
@@ -362,7 +371,7 @@ mod tests {
             :windowClause <> :valuesLists <> :sortClause <> :limitOffset <> :limitCount <> \
             :limitOption 0 :lockingClause <> :withClause <> :op 0 :all false :larg <> :rarg <>} \
             :stmt_location 0 :stmt_len 0})";
-        assert_eq!(list_text(&vec![raw.into()]), expected);
+        assert_eq!(list_text(&vec![Some(raw.into())]), expected);
     }
 
     /// A node type that is the first field of another writes its fields with `base.` before them.
@@ -390,7 +399,7 @@ mod tests {
                     location: 21,
                     ..RangeVar::default()
                 })),
-                tableElts: vec![column.into()],
+                tableElts: vec![Some(column.into())],
                 ..CreateStmt::default()
             },
             servername: Some("s".into()),

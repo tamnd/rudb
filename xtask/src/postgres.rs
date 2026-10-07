@@ -20,6 +20,7 @@
 //! are the reference for its lexer. `cargo xtask pg-grammar` runs bison on the same grammar and
 //! compares the two sets of tables entry by entry.
 
+mod glue;
 mod gram;
 mod guc;
 mod lalr;
@@ -77,6 +78,15 @@ const VENDORS: [Vendor; 5] = [
             ("src/include/nodes/primnodes.h", "primnodes.h"),
             ("src/include/nodes/parsenodes.h", "parsenodes.h"),
             ("src/include/nodes/value.h", "value.h"),
+            ("src/include/catalog/pg_class.h", "pg_class.h"),
+            ("src/include/catalog/pg_am.h", "pg_am.h"),
+            ("src/include/catalog/pg_attribute.h", "pg_attribute.h"),
+            ("src/include/catalog/pg_trigger.h", "pg_trigger.h"),
+            ("src/include/catalog/index.h", "index.h"),
+            ("src/include/commands/trigger.h", "trigger.h"),
+            ("src/include/utils/datetime.h", "datetime.h"),
+            ("src/include/utils/timestamp.h", "timestamp.h"),
+            ("src/include/utils/xml.h", "xml.h"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
@@ -99,7 +109,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 9] = [
+const GENERATED: [Generated; 10] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -151,15 +161,87 @@ const GENERATED: [Generated; 9] = [
             "crates/rudb-pgparse/vendor/primnodes.h",
             "crates/rudb-pgparse/vendor/parsenodes.h",
             "crates/rudb-pgparse/vendor/value.h",
+            "crates/rudb-pgparse/vendor/pg_class.h",
+            "crates/rudb-pgparse/vendor/pg_am.h",
+            "crates/rudb-pgparse/vendor/pg_attribute.h",
+            "crates/rudb-pgparse/vendor/pg_trigger.h",
+            "crates/rudb-pgparse/vendor/index.h",
+            "crates/rudb-pgparse/vendor/trigger.h",
+            "crates/rudb-pgparse/vendor/datetime.h",
+            "crates/rudb-pgparse/vendor/timestamp.h",
+            "crates/rudb-pgparse/vendor/xml.h",
+            "crates/rudb-common/vendor/errcodes.txt",
+            "crates/rudb-pgtypes/vendor/pg_type.dat",
             "crates/rudb-pgparse/vendor/gram.y",
         ],
         generate: nodes::nodes,
     },
+    Generated {
+        output: "crates/rudb-pgparse/src/generated/glue.rs",
+        inputs: &[
+            "crates/rudb-pgparse/vendor/nodes.h",
+            "crates/rudb-pgparse/vendor/lockoptions.h",
+            "crates/rudb-pgparse/vendor/primnodes.h",
+            "crates/rudb-pgparse/vendor/parsenodes.h",
+            "crates/rudb-pgparse/vendor/value.h",
+            "crates/rudb-pgparse/vendor/pg_class.h",
+            "crates/rudb-pgparse/vendor/pg_am.h",
+            "crates/rudb-pgparse/vendor/pg_attribute.h",
+            "crates/rudb-pgparse/vendor/pg_trigger.h",
+            "crates/rudb-pgparse/vendor/index.h",
+            "crates/rudb-pgparse/vendor/trigger.h",
+            "crates/rudb-pgparse/vendor/datetime.h",
+            "crates/rudb-pgparse/vendor/timestamp.h",
+            "crates/rudb-pgparse/vendor/xml.h",
+            "crates/rudb-common/vendor/errcodes.txt",
+            "crates/rudb-pgtypes/vendor/pg_type.dat",
+            "crates/rudb-pgparse/vendor/gram.y",
+            "crates/rudb-pgparse/src/actions/",
+        ],
+        generate: glue::glue,
+    },
 ];
 
-/// The text of the inputs of a generated file.
+/// The text of the inputs of a generated file. The text of an input that ends with `/` is the
+/// text of the `.rs` files in that directory, in the order of their names.
 fn inputs(root: &Path, generated: &Generated) -> Result<Vec<String>, String> {
-    generated.inputs.iter().map(|input| read(&root.join(input))).collect()
+    generated
+        .inputs
+        .iter()
+        .map(|input| {
+            if !input.ends_with('/') {
+                return read(&root.join(input));
+            }
+            let dir = root.join(input);
+            let entries =
+                std::fs::read_dir(&dir).map_err(|e| format!("could not list {input}: {e}"))?;
+            let mut paths: Vec<_> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|e| e == "rs"))
+                .collect();
+            paths.sort();
+            let texts: Vec<String> =
+                paths.iter().map(|path| read(path)).collect::<Result<_, _>>()?;
+            Ok(texts.concat())
+        })
+        .collect()
+}
+
+/// Regenerates the Rust made from the vendored files, without a PostgreSQL checkout. A port of an
+/// action of `gram.y` in `src/actions` needs this, because the glue lists the ported rules.
+pub(crate) fn generate() -> Result<(), String> {
+    let root = crate::root();
+    for generated in &GENERATED {
+        let text = (generated.generate)(&inputs(&root, generated)?)?;
+        let path = root.join(generated.output);
+        if read(&path).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&path, text)
+                .map_err(|e| format!("could not write {}: {e}", generated.output))?;
+            println!("wrote {}", generated.output);
+        }
+    }
+    Ok(())
 }
 
 /// Copies the files from a PostgreSQL checkout and regenerates the Rust made from them.
@@ -203,12 +285,7 @@ pub(crate) fn vendor(checkout: Option<&str>) -> Result<(), String> {
             .map_err(|e| format!("could not write {dir}/VENDOR: {e}"))?;
     }
 
-    for generated in &GENERATED {
-        let text = (generated.generate)(&inputs(&root, generated)?)?;
-        std::fs::write(root.join(generated.output), text)
-            .map_err(|e| format!("could not write {}: {e}", generated.output))?;
-        println!("wrote {}", generated.output);
-    }
+    generate()?;
     println!("vendored {copied} files at {version} ({commit})");
     Ok(())
 }
@@ -265,8 +342,9 @@ pub(crate) fn check() -> Result<(), String> {
     }
     Err(format!(
         "{} problems with the vendored PostgreSQL files\n  \
-         run `cargo xtask pg-vendor <checkout>` with a PostgreSQL checkout at the pin and commit \
-         the result. Do not edit a vendored or a generated file by hand",
+         run `cargo xtask pg-generate`, or `cargo xtask pg-vendor <checkout>` with a PostgreSQL \
+         checkout at the pin, and commit the result. Do not edit a vendored or a generated file by \
+         hand",
         problems.len()
     ))
 }
