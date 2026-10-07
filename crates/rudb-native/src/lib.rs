@@ -8212,6 +8212,15 @@ impl Reader {
     /// read the way a sparse scan reads them so no page is kept for it, and a pattern nothing in the
     /// sample matched is charged half a row of the sample rather than none. The answer is kept for
     /// as long as the reader is, so a statement run again asks the file nothing.
+    ///
+    /// The parts' rows are laid end to end and the pattern is run over them once. Run a part at a
+    /// time, each run was a new pattern with a memo of its own, and a part's 256 rows are too few to
+    /// decide a dictionary block whole, so every run decoded the blocks its rows landed in. On a
+    /// column of millions of values the rows land in a different block apiece, and the 16 thousand
+    /// of them decoded each block of `Title` and `URL` about six times to plan ClickBench q23, which
+    /// was a third of the query, and pushed every block past the count at which a later read keeps
+    /// it. Once over all of them decides a block whole the first time a row lands in it, and a
+    /// block whose stored signature rules the pattern out is not decoded at all.
     #[must_use]
     pub fn matched(&self, column: usize, function: &str, pattern: &str) -> Option<f64> {
         let key = (column, function.to_owned(), pattern.to_owned());
@@ -8223,10 +8232,22 @@ impl Reader {
             return None;
         }
         let taken = self.sampled_parts();
-        let (mut rows, mut kept) = (0_usize, 0_usize);
+        let mut pieces = Vec::with_capacity(taken);
         for at in 0..taken {
             let Some(chunk) = self.sample(at, taken, column)? else { continue };
-            let passed = passing(chunk.column(0).ok()?, function, pattern)?;
+            pieces.push(chunk.column(0).ok()?.clone());
+        }
+        let laid = match pieces.as_slice() {
+            [] | [_] => None,
+            _ => rudb_vector::assemble::concat(&LogicalType::Varchar, &pieces).ok().flatten(),
+        };
+        let runs = match &laid {
+            Some(laid) => slice::from_ref(laid),
+            None => pieces.as_slice(),
+        };
+        let (mut rows, mut kept) = (0_usize, 0_usize);
+        for piece in runs {
+            let passed = passing(piece, function, pattern)?;
             rows += passed.len();
             kept += passed.iter().filter(|&&passed| passed).count();
         }
