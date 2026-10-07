@@ -7082,7 +7082,10 @@ impl Shared {
                 Ok(QueryResult::empty())
             }
             Bound::Sequence(change) => {
-                let Some(name) = change.name else { return Ok(QueryResult::empty()) };
+                let Some(name) = change.name else {
+                    let skipped = change.missing.map(|name| Notice::skipped("sequence", &name));
+                    return Ok(QueryResult::empty().noting(skipped.into_iter().collect()));
+                };
                 if let Some(owner) = change.owner {
                     catalog.own_sequence(&name, owner)?;
                     return Ok(QueryResult::empty());

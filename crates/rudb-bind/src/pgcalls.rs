@@ -9,7 +9,9 @@
 //! one of them is bound as usual and then cast to the type that PostgreSQL gives it, so a client
 //! that reads the type from the RowDescription gets the type it expects.
 
-use rudb_common::{LogicalType, Result, Value};
+use rudb_catalog::{Catalog, same_name};
+use rudb_common::{Error, LogicalType, Result, SqlState, Value};
+use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 
@@ -28,6 +30,95 @@ const INTEGER_RESULTS: &[&str] = &[
     "position",
     "strpos",
 ];
+
+/// The text of `expr` when it is a string literal.
+fn string_literal(ast: &Ast, expr: ast::ExprRef) -> Option<&str> {
+    match ast.expr(expr) {
+        ast::Expr::Literal { kind: LiteralKind::String, text } => Some(ast.string(text)),
+        _ => None,
+    }
+}
+
+/// An identifier as PostgreSQL's `quote_ident` writes it, in quotes when it has a capital letter
+/// or when it would not read back as the same name without them.
+fn quote_ident(name: &str) -> String {
+    if name.chars().any(char::is_uppercase) {
+        return format!("\"{}\"", name.replace('"', "\"\""));
+    }
+    rudb_parse::quoted(name)
+}
+
+/// The name of the sequence in a default of the form `nextval('name')`.
+fn nextval_of(default: &str) -> Option<String> {
+    let inside = default.strip_prefix("nextval('")?.strip_suffix("')")?;
+    Some(inside.replace("''", "'"))
+}
+
+/// A dotted name in text split into its parts, as PostgreSQL reads one: a part in quotes keeps its
+/// case and a doubled quote in it is one quote, and the rest is folded to lower case.
+fn folded_parts(text: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut rest = text.chars().peekable();
+    let mut inside = false;
+    while let Some(c) = rest.next() {
+        let part = parts.last_mut().expect("one part at least");
+        match c {
+            '"' if inside && rest.peek() == Some(&'"') => {
+                rest.next();
+                part.push('"');
+            }
+            '"' => inside = !inside,
+            '.' if !inside => parts.push(String::new()),
+            c if inside => part.push(c),
+            c => part.extend(c.to_lowercase()),
+        }
+    }
+    parts
+}
+
+/// What `pg_get_serial_sequence(table, column)` gives: the name of the sequence that the default of
+/// the column takes its values from, with its schema, when the table owns that sequence, and a
+/// null when it does not. The table is read as PostgreSQL reads a name in text, folded to lower
+/// case unless it is in quotes. The names are then found without regard to case, because a name
+/// written with no quotes is not folded when a table is created here yet, and a table made as
+/// `FooBar` is to be found as `foobar`.
+fn serial_sequence_of(catalog: &Catalog, table: &str, column: &str) -> Result<Value> {
+    let parts = folded_parts(table);
+    let written = parts.join(".");
+    let missing = || {
+        Error::catalog(format!("Table with name {written} does not exist!"))
+            .state(SqlState::UNDEFINED_TABLE)
+            .pg(format!("relation \"{written}\" does not exist"))
+            .unplaced()
+    };
+    let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    let name = catalog.resolve(&parts).map_err(|_| missing())?;
+    let held = catalog.table(&name).map_err(|_| missing())?;
+    let Some(at) = held.columns().iter().position(|field| same_name(&field.name, column)) else {
+        return Err(Error::binder(format!(
+            "column \"{column}\" of relation \"{}\" does not exist",
+            name.table
+        ))
+        .state(SqlState::UNDEFINED_COLUMN)
+        .unplaced());
+    };
+    let Some(sequence) = held.default(at).and_then(nextval_of) else {
+        return Ok(Value::Null);
+    };
+    let parts = rudb_parse::identifier_parts(&sequence);
+    let parts = parts.iter().map(String::as_str).collect::<Vec<_>>();
+    let Ok(sequence) = catalog.resolve_sequence(&parts) else {
+        return Ok(Value::Null);
+    };
+    if catalog.sequence(&sequence)?.owner() != Some(&name) {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Varchar(format!(
+        "{}.{}",
+        quote_ident(&sequence.schema),
+        quote_ident(&sequence.table)
+    )))
+}
 
 /// Whether `ty` fits in an `int4`.
 fn narrow(ty: &LogicalType) -> bool {
@@ -60,7 +151,7 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         scope: &Scope,
     ) -> Result<Option<ExprRef>> {
-        let named = |name: &str| rudb_catalog::same_name(written, name);
+        let named = |name: &str| same_name(written, name);
         if arguments.is_empty() && named("pg_backend_pid") {
             let backend = self.session.postgres().map_or(0, |postgres| postgres.backend);
             return Ok(Some(self.add_constant(Value::Integer(backend))));
@@ -77,6 +168,17 @@ impl Binder<'_> {
             return Ok(Some(
                 self.add_expr(Expr::Function { name, args }, LogicalType::TimestampTz),
             ));
+        }
+        // The sequence is found when the statement is bound, so the call has to give two string
+        // literals, which is how the ORMs write it.
+        if named("pg_get_serial_sequence")
+            && let [table, column] = arguments
+            && let (Some(table), Some(column)) =
+                (string_literal(ast, *table), string_literal(ast, *column))
+        {
+            let value = serial_sequence_of(self.catalog(), table, column)?;
+            let constant = self.add_constant(value);
+            return Ok(Some(self.cast_to(constant, &LogicalType::Varchar)));
         }
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
@@ -170,8 +272,7 @@ impl Binder<'_> {
 
     /// The call `written` resolved to `call`, cast to the type that PostgreSQL gives the result.
     pub(crate) fn postgres_result(&mut self, written: &str, call: ExprRef) -> ExprRef {
-        let named =
-            |names: &[&str]| names.iter().any(|name| rudb_catalog::same_name(written, name));
+        let named = |names: &[&str]| names.iter().any(|name| same_name(written, name));
         let ty = self.plan().expr_type(call).clone();
         if ty == LogicalType::BigInt && named(INTEGER_RESULTS) {
             return self.cast_to(call, &LogicalType::Integer);
@@ -196,7 +297,7 @@ impl Binder<'_> {
         types: &[LogicalType],
         call: ExprRef,
     ) -> ExprRef {
-        if rudb_catalog::same_name(written, "sign") && types.len() == 1 {
+        if same_name(written, "sign") && types.len() == 1 {
             let ty = match types[0] {
                 LogicalType::Decimal { .. } | LogicalType::Numeric => LogicalType::Numeric,
                 _ => LogicalType::Double,
@@ -206,7 +307,7 @@ impl Binder<'_> {
             }
             return call;
         }
-        let named = ["gcd", "lcm"].iter().any(|name| rudb_catalog::same_name(written, name));
+        let named = ["gcd", "lcm"].iter().any(|name| same_name(written, name));
         match named && !types.is_empty() && types.iter().all(narrow) {
             true if *self.plan().expr_type(call) == LogicalType::BigInt => {
                 self.cast_to(call, &LogicalType::Integer)
@@ -223,8 +324,7 @@ impl Binder<'_> {
     /// only the `numeric` overload takes one. A parameter of no type with a scale is a `numeric`
     /// for the same reason.
     pub(crate) fn postgres_rounding(&mut self, written: &str, arguments: &mut [ExprRef]) {
-        let named =
-            |names: &[&str]| names.iter().any(|name| rudb_catalog::same_name(written, name));
+        let named = |names: &[&str]| names.iter().any(|name| same_name(written, name));
         let ty = match arguments.len() {
             1 if named(&["round", "trunc", "ceil", "ceiling", "floor"]) => LogicalType::Double,
             2 if named(&["round", "trunc"]) => LogicalType::Numeric,
@@ -243,7 +343,7 @@ impl Binder<'_> {
     /// `int4` here, as PostgreSQL types it.
     pub(crate) fn postgres_series(&mut self, function: &str, arguments: &mut [ExprRef]) -> bool {
         if self.session.postgres().is_none()
-            || !rudb_catalog::same_name(function, "generate_series")
+            || !same_name(function, "generate_series")
             || arguments.is_empty()
         {
             return false;
