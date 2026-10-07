@@ -648,3 +648,48 @@ fn a_sequence_hands_out_no_value_twice_across_a_crash() {
     let db = open(&path);
     assert_eq!(rows(&db, "SELECT nextval('s')"), [[Value::BigInt(after + 1)]]);
 }
+
+#[test]
+fn zz_probe_the_log_around_a_load() {
+    use rudb_io::RealFilesystem;
+    use rudb_txn::log::{SegmentHeader, replay, segments as listed};
+    let path = path("probe");
+    let db = open(&path);
+    let mut out = String::new();
+    let mut look = |step: &str| {
+        let fs = RealFilesystem::new();
+        let dir = wal(&path);
+        let files = std::fs::read_dir(&dir)
+            .map(|dir| {
+                dir.filter_map(|entry| entry.ok())
+                    .map(|entry| {
+                        let len = entry.metadata().map_or(0, |meta| meta.len());
+                        format!("{}={len}", entry.file_name().to_string_lossy())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let kinds = listed(&fs, &dir, 0)
+            .ok()
+            .and_then(|list| list.into_iter().next())
+            .and_then(|first| SegmentHeader::decode(&std::fs::read(&first.1).ok()?).ok())
+            .and_then(|header| replay(&fs, &dir, 0, header.database).ok())
+            .map(|read| {
+                read.blocks
+                    .iter()
+                    .flat_map(|block| &block.records)
+                    .map(|record| format!("{:?}", record.header.kind))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("\nPROBE {step}: files {files:?} records {kinds:?}"));
+    };
+    db.execute("CREATE TABLE t (id BIGINT)").expect("creates");
+    look("create");
+    db.execute("INSERT INTO t VALUES (0)").expect("inserts");
+    look("insert one");
+    db.execute("INSERT INTO t SELECT range + 1 FROM range(262144)").expect("loads");
+    look("load");
+    drop(db);
+    panic!("{out}");
+}
