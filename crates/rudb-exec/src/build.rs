@@ -2714,6 +2714,21 @@ impl<'a> Building<'a, '_> {
         if self.session.rules().enabled(Rule::GraphReduction)
             && let Some(found) = walk(plan, self.catalog, kind, right, conditions)
         {
+            // A walk straight over another to the same siblings runs as one, so that each row's
+            // siblings are found and read once. TPC-H q21's `EXISTS` sits on its `NOT EXISTS`.
+            if let Node::Join { left: under, right: inner, kind, conditions, .. } = *plan.node(left)
+                && let Some(first) = walk(plan, self.catalog, kind, inner, conditions)
+                && first.fuses_with(plan, &found)
+            {
+                let below = self.node(under)?;
+                let operator =
+                    Siblings::new(plan, first, &below.schema, self.seams, self.cancel.clone())?
+                        .also(plan, found, &below.schema)?
+                        .in_session(self.session);
+                let schema = below.schema.clone();
+                let counters = self.watch(reference, id, pipeline, "Siblings", None);
+                return Ok(below.then(Arc::new(Watched::new(operator, counters)), schema));
+            }
             let below = self.node(left)?;
             let operator =
                 Siblings::new(plan, found, &below.schema, self.seams, self.cancel.clone())?
