@@ -3065,3 +3065,39 @@ fn distinct_sorts_on_what_it_selects_and_a_count_is_a_bigint() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_table_or_a_view_of_a_query_has_no_two_columns_of_one_name() {
+    let dirs = Dirs::new("query-columns");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The cases of the PostgreSQL 19 oracle. A column list renames the first columns before the
+    // names are compared, and a quoted name is compared as written.
+    for sql in [
+        "create temp table t3 (z) as select 1 as x, 2 as x",
+        "create temp view v2 (z) as select 1 as x, 2 as x",
+        "create temp view v5 as select 1 as \"X\", 2 as x",
+        "create temp table t5 as select 1 as \"X\", 2 as x",
+    ] {
+        assert!(!tags(&client.query(sql)).contains('E'), "{sql}");
+    }
+    for (sql, name) in [
+        ("create temp table t2 as select 1 as x, 2 as x", "x"),
+        ("create temp table t4 (x) as select 1 as y, 2 as x", "x"),
+        ("create temp table t6 as select 1, 2", "?column?"),
+        ("create temp table t7 as select 1 as a, 2 as A", "a"),
+        ("create temp view v1 as select 1 as x, 2 as x", "x"),
+        ("create temp view v3 (a, a) as select 1, 2", "a"),
+        ("create temp view v4 (x) as select 1 as y, 2 as x", "x"),
+        ("create temp view v6 as select 1, 2", "?column?"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42701"), "{sql}");
+        let message = format!("column \"{name}\" specified more than once");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message.as_str()), "{sql}");
+        assert_eq!(messages[0].field(b'P'), None, "{sql}");
+    }
+    server.stop().unwrap();
+}

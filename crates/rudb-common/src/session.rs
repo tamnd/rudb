@@ -190,6 +190,7 @@ pub struct Semantics {
     table_names: TableNames,
     distinct_order: DistinctOrder,
     count_types: CountTypes,
+    query_columns: QueryColumns,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -234,6 +235,7 @@ impl Default for Semantics {
             table_names: TableNames::Pin,
             distinct_order: DistinctOrder::Pin,
             count_types: CountTypes::Pin,
+            query_columns: QueryColumns::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -388,6 +390,11 @@ impl Semantics {
     #[must_use]
     pub fn count_types(self) -> CountTypes {
         self.count_types
+    }
+    /// What a table or a view made of a query does with two columns of one name.
+    #[must_use]
+    pub fn query_columns(self) -> QueryColumns {
+        self.query_columns
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -752,6 +759,19 @@ pub enum DistinctOrder {
     /// As in PostgreSQL: a plain `DISTINCT` sorts only on the columns that it selects, and the
     /// `ORDER BY` of a `DISTINCT ON` starts with the expressions of the `DISTINCT ON`. Each other
     /// query is `42P10`.
+    Postgres,
+}
+
+/// What a table or a view made of a query does with two columns of one name, in `CREATE TABLE
+/// AS` and `CREATE VIEW`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum QueryColumns {
+    /// As in DuckDB: when the statement has no column list, the second column takes the name with
+    /// `_1`, so `CREATE TABLE t AS SELECT 1 AS x, 2 AS x` has the columns `x` and `x_1`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the statement is `42701 column "x" specified more than once`, after the
+    /// column list renames the first columns.
     Postgres,
 }
 
@@ -1261,6 +1281,7 @@ impl Session {
             self.semantics.table_names = TableNames::Postgres;
             self.semantics.distinct_order = DistinctOrder::Postgres;
             self.semantics.count_types = CountTypes::Postgres;
+            self.semantics.query_columns = QueryColumns::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }
