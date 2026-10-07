@@ -10,4 +10,15 @@ For each column that every branch tests against constants, the pass now also sta
 
 ## Results
 
-Measured against main at 2bade134, in instructions a run at SF1 on one thread, with every answer the same at one and four threads on both the clustered and the base database. Together with note 134, which reads a code page at the rows a scan keeps, q19 went from 181M to 173M. Against the main of a few days before, at 20444c5d, the same two took q19 from 95M to 88M. Main itself moved q19 from 95M to 181M in between, which is not this change and is written up on the milestone.
+Measured against main at 86fee134, which has #2756 and #2765, in user instructions a run at SF1 on one thread on server3, with every answer the same at one and four threads on both the clustered and the base database.
+
+| query | main (M instructions) | this change (M instructions) |
+| --- | --- | --- |
+| q19 | 249 | 240 |
+| q07 | 35 | 35 |
+| q12 | 65 | 65 |
+| q22 | 48 | 48 |
+| q01 | 131 | 131 |
+| q06 | 17 | 17 |
+
+Against an older main, before #2756 made each operand of an `OR` cheaper and #2765 stated the `l_quantity` range, the same change took q19 from 174M to 146M. What is left of that is the part side: three brands, twelve containers and a bound on the size, which no other rule states. The 249M of main at 86fee134 is mostly `Vector::on_lanes` from #2760, about 63M a run, which #2773 and the PRs after it are taking down.
