@@ -737,8 +737,11 @@ fn a_parameter_of_no_type_takes_the_type_that_postgres_gives_it() {
     let mut client = Client::unix(&server);
     connect(&mut client, PROTOCOL_3_0);
     client.query("create table t (a int4, c text, h varchar(5), i timestamptz)");
-    let cases: [(&str, &[u32]); 10] = [
+    let cases: [(&str, &[u32]); 13] = [
         ("select a from t limit $1 offset $2", &[20, 20]),
+        ("insert into t (a) select $1", &[23]),
+        ("select a from t union select $1", &[23]),
+        ("select $1 union select $2", &[25, 25]),
         ("select a from t where a = $1 limit $2", &[23, 20]),
         ("insert into t (h, a) values ($1, $2)", &[1043, 23]),
         ("update t set h = $1", &[1043]),
@@ -1062,6 +1065,31 @@ fn a_mean_and_a_sum_of_a_numeric_are_numerics_with_their_digits() {
         let wanted = (!text.is_empty()).then(|| text.as_bytes().to_vec());
         assert_eq!(data_row(&messages[1]), [wanted], "{sql}");
     }
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_parameter_alone_in_the_select_list_has_its_declared_type() {
+    let dirs = Dirs::new("declared_param");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // `"char"`, `name`, `oid` and `bpchar` have the logical type of another PostgreSQL type, so
+    // the column must take the declared type and not the type of its values.
+    client.parse("", "select $1, $2, $3, $4, $5", &[18, 19, 26, 1042, 705]);
+    client.describe(Target::Statement, "");
+    let values: [&[u8]; 5] = [b"a", b"x", b"42", b"ab", b"u"];
+    client.bind("", "", &[], &values.map(Some));
+    client.describe(Target::Portal, "");
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tT2TDCZ");
+    // A parameter of the type `unknown` has no type, and one of no type is `text`.
+    assert_eq!(parameter_types(&messages[1]), [18, 19, 26, 1042, 25]);
+    let types = [18, 19, 26, 1042, 25];
+    assert_eq!(row_shape(&messages[2]).iter().map(|c| c.1).collect::<Vec<_>>(), types);
+    assert_eq!(row_shape(&messages[4]).iter().map(|c| c.1).collect::<Vec<_>>(), types);
+    assert_eq!(data_row(&messages[5]), values.map(|v| Some(v.to_vec())));
     server.stop().unwrap();
 }
 

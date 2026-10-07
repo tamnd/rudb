@@ -2801,6 +2801,7 @@ fn insert(
         if written.copy {
             binder.copy_into = Some(targets.iter().map(|&at| fields[at].clone()).collect());
         }
+        binder.unknowns_kept = binder.insert_inputs.is_none();
         let bound = binder.bind_query(ast, written.source)?;
         binder.copy_into = None;
         bound
@@ -3042,6 +3043,7 @@ fn change(
     let table = catalog.table(&name)?;
     let mut binder = Binder::with(catalog, parameters, session);
     binder.default_as_null = defaulted.contains(&true);
+    binder.unknowns_kept = true;
     let (root, scope) = binder.bind_query(ast, written.source)?;
     binder.default_as_null = false;
     let width = fields.len();
