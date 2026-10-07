@@ -38,7 +38,7 @@ pub use catalog::{
 pub use gone::Gone;
 pub use held::Held;
 pub use index::Index;
-pub use keys::{Constraint, ForeignKey, Key, KeyLog};
+pub use keys::{Constraint, ForeignKey, Identity, Key, KeyLog};
 pub use macros::{Macro, Overload, Parameter};
 pub use mirror::{FileStamp, MIRROR_CATALOG};
 pub use name::{QualifiedName, same_name};

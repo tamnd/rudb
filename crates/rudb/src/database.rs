@@ -8228,6 +8228,10 @@ fn direct_targets(
     if direct.rows.first().is_none_or(|row| targets.len() != row.len()) {
         return None;
     }
+    // A value for a `GENERATED ALWAYS` column is refused, which the plan does.
+    if targets.iter().any(|&at| table.identity(at) == Some(rudb_catalog::Identity::Always)) {
+        return None;
+    }
     let mut fills = Vec::new();
     for at in (0..fields.len()).filter(|at| !targets.contains(at)) {
         if let Some(text) = table.default(at) {
@@ -8425,7 +8429,8 @@ fn point_write_target(
     if !target.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG) {
         return None;
     }
-    let fields = catalog.table(&target.name).ok()?.columns();
+    let table = catalog.table(&target.name).ok()?;
+    let fields = table.columns();
     for (column, _) in &write.sets {
         let mut found = fields
             .iter()
@@ -8433,7 +8438,8 @@ fn point_write_target(
             .filter(|(_, field)| field.name.eq_ignore_ascii_case(column))
             .map(|(at, _)| at);
         let at = found.next()?;
-        if found.next().is_some() {
+        // A `GENERATED ALWAYS` column is refused, which the plan does.
+        if found.next().is_some() || table.identity(at) == Some(rudb_catalog::Identity::Always) {
             return None;
         }
         target.sets.push(at);
@@ -9302,6 +9308,9 @@ fn create_table(
     }
     if create.defaults.iter().any(Option::is_some) {
         catalog.table_mut(&create.name)?.set_defaults(create.defaults);
+    }
+    if create.identities.iter().any(Option::is_some) {
+        catalog.table_mut(&create.name)?.set_identities(create.identities);
     }
     if create.types.iter().any(Option::is_some) {
         catalog.table_mut(&create.name)?.set_types(create.types);

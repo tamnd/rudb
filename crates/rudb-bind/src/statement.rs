@@ -225,6 +225,8 @@ pub struct CreateTable {
     /// The sequences that a `serial` column makes, which the table owns. Each is also in
     /// `sequences`.
     pub serials: Vec<(QualifiedName, rudb_common::sequence::Options)>,
+    /// Which columns are identity columns, one per column, or empty when no column is one.
+    pub identities: Vec<Option<rudb_catalog::Identity>>,
     /// The SQL of each `CHECK`, in the order written.
     pub checks: Vec<String>,
     /// The foreign keys, in the order written.
@@ -1293,7 +1295,7 @@ fn create_table(
                 )));
             }
             let serial = if session.postgres().is_some() { serial_type(text) } else { None };
-            serials.push(serial.is_some());
+            serials.push(serial.is_some() || def.identity.is_some());
             let ty = match serial.clone() {
                 Some(ty) => ty,
                 None => column_type(catalog, session, text, Some(&name))?,
@@ -1301,9 +1303,15 @@ fn create_table(
             if ty == LogicalType::Type {
                 return Err(Error::invalid_input("A table cannot be created with a 'TYPE' column"));
             }
+            if def.identity.is_some() && serial_options(&ty).max == 0 {
+                return Err(Error::binder(
+                    "identity column type must be smallint, integer, or bigint",
+                )
+                .state(SqlState::INVALID_PARAMETER_VALUE));
+            }
             types.push(pg_declared(text, &ty));
             let column = ast.string(def.name);
-            columns.push(if def.not_null || serial.is_some() {
+            columns.push(if def.not_null || serial.is_some() || def.identity.is_some() {
                 Field::required(column, ty)
             } else {
                 Field::new(column, ty)
@@ -1337,17 +1345,46 @@ fn create_table(
     let mut defaults = Vec::with_capacity(defs.len());
     let mut sequences = Vec::new();
     let mut made = Vec::new();
+    let mut identities = Vec::new();
     for (at, def) in defs.iter().enumerate() {
         if serials.get(at).copied().unwrap_or(false) {
             let column = &columns[at];
             if def.default != NONE {
+                let what = if def.identity.is_some() {
+                    "both default and identity specified"
+                } else {
+                    "multiple default values specified"
+                };
                 return Err(Error::binder(format!(
-                    "multiple default values specified for column \"{}\" of table \"{}\"",
+                    "{what} for column \"{}\" of table \"{}\"",
                     column.name, name.table
                 ))
                 .state(SqlState::SYNTAX_ERROR));
             }
-            let sequence = serial_sequence(catalog, &name, &column.name, &made);
+            let (sequence, options) = match def.identity {
+                Some(identity) => {
+                    let options = identity_options(identity.options, &column.ty)?;
+                    let named: Vec<&str> = ast.name(identity.sequence).collect();
+                    let sequence = match named.split_last() {
+                        Some((last, [])) => {
+                            QualifiedName { table: (*last).to_string(), ..name.clone() }
+                        }
+                        Some(_) => catalog.resolve_for_create(&named)?,
+                        None => serial_sequence(catalog, &name, &column.name, &made),
+                    };
+                    identities.resize(at + 1, None);
+                    identities[at] = Some(if identity.always {
+                        rudb_catalog::Identity::Always
+                    } else {
+                        rudb_catalog::Identity::ByDefault
+                    });
+                    (sequence, options)
+                }
+                None => (
+                    serial_sequence(catalog, &name, &column.name, &made),
+                    serial_options(&column.ty),
+                ),
+            };
             let text = if sequence.schema.eq_ignore_ascii_case(&name.schema) {
                 sequence.table.clone()
             } else {
@@ -1355,7 +1392,7 @@ fn create_table(
             };
             defaults.push(Some(format!("nextval('{}')", text.replace('\'', "''"))));
             sequences.push(sequence.clone());
-            made.push((sequence, serial_options(&column.ty)));
+            made.push((sequence, options));
             continue;
         }
         defaults.push(if def.default == NONE {
@@ -1419,6 +1456,7 @@ fn create_table(
         foreign,
         sequences,
         serials: made,
+        identities,
         order: ast.constraint_list(written.order).iter().map(|&held| constraint(held)).collect(),
         apart: ast
             .constraint_list(written.order)
@@ -1442,14 +1480,59 @@ fn serial_type(text: &str) -> Option<LogicalType> {
 }
 
 /// The options of the sequence behind a `serial` column, which stops at the largest value of the
-/// column type, as `CREATE SEQUENCE ... AS` does.
+/// column type, as `CREATE SEQUENCE ... AS` does. The largest value is 0 for a type that is not a
+/// `smallint`, an `integer` or a `bigint`.
 fn serial_options(ty: &LogicalType) -> rudb_common::sequence::Options {
     let max = match ty {
         LogicalType::SmallInt => i64::from(i16::MAX),
         LogicalType::Integer => i64::from(i32::MAX),
-        _ => i64::MAX,
+        LogicalType::BigInt => i64::MAX,
+        _ => 0,
     };
     rudb_common::sequence::Options { increment: 1, min: 1, max, start: 1, cycle: false }
+}
+
+/// The options of the sequence behind an identity column. A bound that the options did not give is
+/// the bound of a `bigint`, which comes down to the bound of the column type here, and a bound that
+/// they gave has to fit the column type.
+fn identity_options(
+    mut options: rudb_common::sequence::Options,
+    ty: &LogicalType,
+) -> Result<rudb_common::sequence::Options> {
+    let max = serial_options(ty).max;
+    let min = -max - 1;
+    let name = match ty {
+        LogicalType::SmallInt => "smallint",
+        LogicalType::Integer => "integer",
+        _ => "bigint",
+    };
+    if options.max == i64::MAX {
+        if options.start == options.max {
+            options.start = max;
+        }
+        options.max = max;
+    }
+    if options.min == i64::MIN {
+        options.min = min;
+    }
+    let out = |what: &str, value: i64| {
+        Error::binder(format!("{what} ({value}) is out of range for sequence data type {name}"))
+            .state(SqlState::INVALID_PARAMETER_VALUE)
+    };
+    if options.max > max || options.max < min {
+        return Err(out("MAXVALUE", options.max));
+    }
+    if options.min > max || options.min < min {
+        return Err(out("MINVALUE", options.min));
+    }
+    if options.start > options.max {
+        return Err(Error::binder(format!(
+            "START value ({}) cannot be greater than MAXVALUE ({})",
+            options.start, options.max
+        ))
+        .state(SqlState::INVALID_PARAMETER_VALUE));
+    }
+    Ok(options)
 }
 
 /// The name PostgreSQL gives the sequence of a `serial` column: `<table>_<column>_seq`, cut to the
@@ -2825,6 +2908,29 @@ fn insert(
         targets
     };
 
+    // A value for a `GENERATED ALWAYS` identity column is refused unless the statement said
+    // `OVERRIDING`, and `DEFAULT` is not a value. `COPY` puts the value in, as in PostgreSQL.
+    if !written.copy && written.overriding == ast::Overriding::None {
+        for (from, &at) in targets.iter().enumerate() {
+            if target.identity(at) == Some(rudb_catalog::Identity::Always)
+                && !all_default(ast, written.source, from)
+            {
+                let column = &fields[at].name;
+                return Err(Error::binder(format!(
+                    "cannot insert a non-DEFAULT value into column \"{column}\""
+                ))
+                .state(SqlState::GENERATED_ALWAYS)
+                .detail(format!(
+                    "Column \"{column}\" is an identity column defined as GENERATED ALWAYS."
+                ))
+                .hint("Use OVERRIDING SYSTEM VALUE to override.")
+                .unplaced());
+            }
+        }
+    }
+    // `OVERRIDING USER VALUE` leaves out what the statement gives an identity column.
+    let ignored =
+        |at: usize| written.overriding == ast::Overriding::User && target.identity(at).is_some();
     let defaults: Vec<(LogicalType, Option<String>)> = (0..fields.len())
         .map(|at| (fields[at].ty.clone(), target.default(at).map(str::to_owned)))
         .collect();
@@ -2903,7 +3009,7 @@ fn insert(
     let mut exprs: Vec<ExprRef> = Vec::with_capacity(fields.len());
     let mut names = Vec::with_capacity(fields.len());
     for (at, field) in fields.iter().enumerate() {
-        let expr = match targets.iter().position(|&target| target == at) {
+        let expr = match targets.iter().position(|&target| target == at).filter(|_| !ignored(at)) {
             Some(from) => {
                 let column = &scope.columns[from];
                 let expr =
@@ -2940,6 +3046,19 @@ fn insert(
         checks,
         patched: None,
     }))
+}
+
+/// Whether every row of an `INSERT ... VALUES` writes `DEFAULT` for the value at `from`.
+fn all_default(ast: &Ast, source: ast::QueryRef, from: usize) -> bool {
+    if source == NONE {
+        return true;
+    }
+    let ast::QueryBody::Values(rows) = ast.query(source).body else { return false };
+    ast.rows(rows).iter().all(|&row| {
+        ast.expr_list(row)
+            .get(from)
+            .is_some_and(|&expr| matches!(ast.expr(expr), ast::Expr::Default))
+    })
 }
 
 /// Which key an `ON CONFLICT` is about and what it does, refused the way the pin refuses one that
@@ -3094,6 +3213,19 @@ fn change(
         }
     }
     let table = catalog.table(&name)?;
+    for (from, &at) in targets.iter().enumerate() {
+        if table.identity(at) == Some(rudb_catalog::Identity::Always) && !defaulted[from] {
+            let column = &fields[at].name;
+            return Err(Error::binder(format!(
+                "column \"{column}\" can only be updated to DEFAULT"
+            ))
+            .state(SqlState::GENERATED_ALWAYS)
+            .detail(format!(
+                "Column \"{column}\" is an identity column defined as GENERATED ALWAYS."
+            ))
+            .unplaced());
+        }
+    }
     let mut binder = Binder::with(catalog, parameters, session);
     binder.default_as_null = defaulted.contains(&true);
     binder.unknowns_kept = true;

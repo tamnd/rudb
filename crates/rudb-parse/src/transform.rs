@@ -24,10 +24,10 @@ use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 use crate::ast::{
     AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
     CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
-    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Quantifier, Query,
-    QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice, Source, SourceRef,
-    StarLists, Statement, StrRef, Target, Transaction, Trigger, TriggerEvent, TriggerTiming,
-    UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Overriding,
+    Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice,
+    Source, SourceRef, StarLists, Statement, StrRef, Target, Transaction, Trigger, TriggerEvent,
+    TriggerTiming, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -526,6 +526,97 @@ impl<'a> Transform<'a> {
             }
         }
         names
+    }
+
+    /// The words that [`crate::dialect::postgres_tokens`] took out of the tokens of `node`, from
+    /// the text between its tokens and the text between its last token and the next one.
+    fn dropped(&self, node: u32) -> Vec<&'a str> {
+        if !self.postgres {
+            return Vec::new();
+        }
+        let node = self.tree.node(node);
+        let (start, end) = (node.start as usize, node.end as usize);
+        let mut words = Vec::new();
+        for at in start..end {
+            let (Some(last), Some(next)) = (self.tokens.get(at), self.tokens.get(at + 1)) else {
+                break;
+            };
+            let gap = &self.query[last.end as usize..next.start as usize];
+            if gap.trim().is_empty() {
+                continue;
+            }
+            let Ok(tokens) = tokenize(gap) else { continue };
+            for token in tokens {
+                let text = token.text(gap);
+                if !text.is_empty() {
+                    let from = last.end as usize + token.start as usize;
+                    words.push(&self.query[from..from + text.len()]);
+                }
+            }
+        }
+        words
+    }
+
+    /// The `GENERATED ... AS IDENTITY` of a column definition, read back from the words that
+    /// [`crate::dialect::postgres_tokens`] took out.
+    ///
+    /// The options are read by the rules of `CREATE SEQUENCE`, so they are settled and refused the
+    /// same way. `SEQUENCE NAME` names the sequence, and `CACHE` changes nothing in rudb, so both
+    /// are taken out before that.
+    fn identity(&mut self, node: u32) -> Result<Option<crate::ast::Identity>> {
+        let words = self.dropped(node);
+        let Some(at) = words.iter().position(|word| word.eq_ignore_ascii_case("generated")) else {
+            return Ok(None);
+        };
+        let always = words.get(at + 1).is_some_and(|word| word.eq_ignore_ascii_case("always"));
+        let Some(open) = words.iter().position(|word| word.eq_ignore_ascii_case("identity")) else {
+            return Ok(None);
+        };
+        let mut options = String::new();
+        let mut sequence = Vec::new();
+        let listed = words.get(open + 1) == Some(&"(");
+        let options_at = if listed { open + 2..words.len().saturating_sub(1) } else { 0..0 };
+        let mut rest = words.get(options_at).unwrap_or_default().iter();
+        while let Some(word) = rest.next() {
+            if word.eq_ignore_ascii_case("cache") {
+                rest.next();
+            } else if word.eq_ignore_ascii_case("sequence")
+                && rest.clone().next().is_some_and(|next| next.eq_ignore_ascii_case("name"))
+            {
+                rest.next();
+                while let Some(part) = rest.next() {
+                    let part = self.fold_identifier(part);
+                    sequence.push(self.intern(&part));
+                    if rest.clone().next() != Some(&".") {
+                        break;
+                    }
+                    rest.next();
+                }
+            } else {
+                options.push(' ');
+                options.push_str(word);
+            }
+        }
+        let made = parse_ast(&format!("CREATE SEQUENCE s{options}"))?;
+        let Some(&Statement::Sequence(index)) = made.statements.first() else {
+            return Err(Error::parser("identity column options are not sequence options"));
+        };
+        let options = made.sequence(index).options;
+        let sequence = self.part_slice(sequence);
+        Ok(Some(crate::ast::Identity { always, options, sequence }))
+    }
+
+    /// The `OVERRIDING` of an `INSERT`, read back from the words that
+    /// [`crate::dialect::postgres_tokens`] took out.
+    fn overriding(&self, node: u32) -> Overriding {
+        let words = self.dropped(node);
+        match words.iter().position(|word| word.eq_ignore_ascii_case("overriding")) {
+            Some(at) if words.get(at + 1).is_some_and(|word| word.eq_ignore_ascii_case("user")) => {
+                Overriding::User
+            }
+            Some(_) => Overriding::System,
+            None => Overriding::None,
+        }
     }
 
     /// `Statement <- SelectStatement / ...`, twenty seven alternatives of which ten are done.
@@ -1648,7 +1739,8 @@ impl<'a> Transform<'a> {
                 "Adding a NOT NULL column with IF NOT EXISTS is not supported",
             ));
         }
-        Ok(AlterAction::AddColumn { column: ColumnDef { name, ty, not_null, default }, quiet })
+        let column = ColumnDef { name, ty, not_null, default, identity: None };
+        Ok(AlterAction::AddColumn { column, quiet })
     }
 
     /// `AlterColumnEntry <- AddOrDropDefault / ChangeNullability / AlterType`.
@@ -2111,7 +2203,8 @@ impl<'a> Transform<'a> {
                 _ => return self.unsupported(constraint),
             }
         }
-        Ok((ColumnDef { name, ty, not_null, default }, keys))
+        let identity = self.identity(node)?;
+        Ok((ColumnDef { name, ty, not_null, default, identity }, keys))
     }
 
     /// `WithList <- 'WITH' RelOptionOrOids` of a table, in a PostgreSQL session.
@@ -2188,7 +2281,13 @@ impl<'a> Transform<'a> {
             let mut defs = Vec::new();
             for kid in self.kids(names) {
                 let name = self.identifier(kid);
-                defs.push(ColumnDef { name, ty: NONE, not_null: false, default: NONE });
+                defs.push(ColumnDef {
+                    name,
+                    ty: NONE,
+                    not_null: false,
+                    default: NONE,
+                    identity: None,
+                });
             }
             self.column_def_slice(defs)
         };
@@ -2785,7 +2884,16 @@ impl<'a> Transform<'a> {
         let returning = self.returning(node, name, alias)?;
         let conflict = self.conflict(node, name, alias)?;
         let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert { name, columns, source, returning, conflict, copy: false });
+        let overriding = self.overriding(node);
+        self.ast.inserts.push(Insert {
+            name,
+            columns,
+            source,
+            returning,
+            conflict,
+            copy: false,
+            overriding,
+        });
         Ok(Statement::Insert(index))
     }
 
@@ -2923,6 +3031,7 @@ impl<'a> Transform<'a> {
             returning: None,
             conflict: None,
             copy: true,
+            overriding: Overriding::None,
         });
         Ok(Statement::Insert(index))
     }
@@ -3474,6 +3583,7 @@ impl<'a> Transform<'a> {
             returning,
             conflict: None,
             copy: false,
+            overriding: Overriding::None,
         });
         if delete { Statement::Delete(index) } else { Statement::Update(index) }
     }
