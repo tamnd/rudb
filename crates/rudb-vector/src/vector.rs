@@ -3928,11 +3928,19 @@ impl Vector {
             // has. Through the closures of a range's map, the base, the words and the width were
             // loaded again for every value and the vector asked whether it had room, about thirty
             // instructions a value for what `code_at` does in ten.
+            //
+            // The runs of a join's matches are a few rows each and far apart, so each starts on a
+            // cache line of its own. On q04, where the lineitems of an order are a run, nearly all
+            // of the loop was the wait on the first read of a run, and the line of the run some
+            // runs ahead is asked for so that the waits overlap.
             let words = packed.words;
             let width = packed.width as usize;
             let mut out = vec![T::default(); rows];
             let mut at = 0;
-            for &(start, length) in runs {
+            for (index, &(start, length)) in runs.iter().enumerate() {
+                if let Some(&(ahead, _)) = runs.get(index + PREFETCH_AHEAD) {
+                    prefetch_word(words, (packed.offset + ahead as usize) * width / 64);
+                }
                 let length = length as usize;
                 let mut bit = (packed.offset + start as usize) * width;
                 for slot in &mut out[at..at + length] {
