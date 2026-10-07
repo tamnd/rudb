@@ -2307,7 +2307,10 @@ impl<'a> Binder<'a> {
                 let mut found = None;
                 for target in targets {
                     if target.alias != NONE
-                        && self.semantics.identifier_compare().same(ast.string(target.alias), written)
+                        && self
+                            .semantics
+                            .identifier_compare()
+                            .same(ast.string(target.alias), written)
                     {
                         if found.is_some() {
                             return Ok(None);
