@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
-use rudb_common::{DeclaredType, Error, Field, LogicalType, Origin, Result, Value};
+use rudb_common::{
+    DeclaredType, Error, Field, IdentifierCompare, LogicalType, Origin, Result, Value,
+};
 use rudb_parse::ast::{self, Ast};
 
 use crate::connection::single;
@@ -100,6 +102,8 @@ pub(crate) struct Direct {
     pub(crate) rows: Vec<Vec<Item>>,
     /// The `RETURNING` list, read as a [`Lookup`] that sets nothing equal.
     pub(crate) returning: Option<Lookup>,
+    /// How the session that read the statement compares a column name with a name of the table.
+    pub(crate) compare: IdentifierCompare,
     /// What the last execution worked out about the table, kept while the catalog stays as it was.
     pub(crate) found: Found,
 }
@@ -177,6 +181,8 @@ pub(crate) struct Lookup {
     pub(crate) picks: Vec<Pick>,
     /// Each column the `WHERE` names, as written, with the item it is set equal to.
     pub(crate) equal: Vec<(Vec<String>, Item)>,
+    /// How the session that read the statement compares a column name with a name of the table.
+    pub(crate) compare: IdentifierCompare,
     /// What the last execution worked out from the names, kept while they resolve the same.
     pub(crate) found: Resolved,
 }
@@ -439,17 +445,17 @@ fn numbered_one_to_n(names: &[String]) -> bool {
 
 impl Direct {
     /// The shape of `ast`, if it is one statement of it.
-    fn of(ast: &Ast) -> Option<Self> {
+    fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
         let [ast::Statement::Insert(at)] = ast.statements.as_slice() else { return None };
         let insert = ast.insert(*at);
         if insert.conflict.is_some() {
             return None;
         }
-        Self::reading(ast, insert)
+        Self::reading(ast, insert, compare)
     }
 
     /// The rows of `insert` with what it says about a key it finds held left aside.
-    fn reading(ast: &Ast, insert: ast::Insert) -> Option<Self> {
+    fn reading(ast: &Ast, insert: ast::Insert, compare: IdentifierCompare) -> Option<Self> {
         if insert.copy
             || insert.source == rudb_parse::NONE
             || insert.overriding != ast::Overriding::None
@@ -457,7 +463,7 @@ impl Direct {
             return None;
         }
         let returning = match insert.returning {
-            Some(at) => Some(Self::returning(ast, at)?),
+            Some(at) => Some(Self::returning(ast, at, compare)?),
             None => None,
         };
         let query = ast.query(insert.source);
@@ -479,12 +485,13 @@ impl Direct {
             columns: ast.name(insert.columns).map(str::to_owned).collect(),
             rows,
             returning,
+            compare,
             found: Found::default(),
         })
     }
 
     /// The `RETURNING` list held at `at`, if it is columns and stars of the table.
-    fn returning(ast: &Ast, at: ast::QueryRef) -> Option<Lookup> {
+    fn returning(ast: &Ast, at: ast::QueryRef, compare: IdentifierCompare) -> Option<Lookup> {
         let query = ast.query(at);
         let ast::QueryBody::Select(select) = query.body else { return None };
         if query != ast::Query::bare(query.body) {
@@ -494,20 +501,20 @@ impl Direct {
         if select.filter != rudb_parse::NONE {
             return None;
         }
-        Lookup::listing(ast, select)
+        Lookup::listing(ast, select, compare)
     }
 }
 
 impl Upsert {
     /// The shape of `ast`, if it is one statement of it.
-    fn of(ast: &Ast) -> Option<Self> {
+    fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
         let [ast::Statement::Insert(at)] = ast.statements.as_slice() else { return None };
         let insert = ast.insert(*at);
         let conflict = insert.conflict?;
         if insert.returning.is_some() {
             return None;
         }
-        let direct = Direct::reading(ast, insert)?;
+        let direct = Direct::reading(ast, insert, compare)?;
         if direct.rows.len() != 1 {
             return None;
         }
@@ -516,7 +523,7 @@ impl Upsert {
             ast::ConflictAction::Nothing => Action::Nothing,
             ast::ConflictAction::Replace => Action::Replace,
             ast::ConflictAction::Update { columns, query } => {
-                Action::Update(Self::changes(ast, columns, query)?)
+                Action::Update(Self::changes(ast, columns, query, compare)?)
             }
         };
         Some(Self { insert: direct, key, action })
@@ -529,6 +536,7 @@ impl Upsert {
         ast: &Ast,
         columns: ast::Slice,
         query: ast::QueryRef,
+        compare: IdentifierCompare,
     ) -> Option<Vec<(String, Change)>> {
         let query = ast.query(query);
         let ast::QueryBody::Select(select) = query.body else { return None };
@@ -567,17 +575,14 @@ impl Upsert {
         };
         let mut changes = Vec::with_capacity(columns.len());
         for (column, value) in columns.into_iter().zip(values) {
-            if changes.iter().any(|(held, _): &(String, Change)| held.eq_ignore_ascii_case(&column))
-            {
+            if changes.iter().any(|(held, _): &(String, Change)| compare.same(held, &column)) {
                 return None;
             }
             // The held row's column itself, bare or by the table's label.
             let itself = |expr| match ast.expr(expr) {
                 ast::Expr::Column { name } => match ast.name(name).collect::<Vec<_>>().as_slice() {
-                    [bare] => bare.eq_ignore_ascii_case(&column),
-                    [table, bare] => {
-                        table.eq_ignore_ascii_case(&label) && bare.eq_ignore_ascii_case(&column)
-                    }
+                    [bare] => compare.same(bare, &column),
+                    [table, bare] => compare.same(table, &label) && compare.same(bare, &column),
                     _ => false,
                 },
                 _ => false,
@@ -602,7 +607,7 @@ impl Upsert {
 
 impl Lookup {
     /// The shape of `ast`, if it is one statement of it.
-    fn of(ast: &Ast) -> Option<Self> {
+    fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
         let [ast::Statement::Query(at)] = ast.statements.as_slice() else { return None };
         let query = ast.query(*at);
         let ast::QueryBody::Select(select) = query.body else { return None };
@@ -610,23 +615,23 @@ impl Lookup {
             return None;
         }
         let select = ast.select(select);
-        let mut lookup = Self::reading(ast, select)?;
+        let mut lookup = Self::reading(ast, select, compare)?;
         lookup.equal = equalities(ast, select.filter)?;
         Some(lookup)
     }
 
     /// The table and the select list of `select`, with no columns set equal yet, if it reads one
     /// table by name with a `WHERE` and nothing else.
-    fn reading(ast: &Ast, select: ast::Select) -> Option<Self> {
+    fn reading(ast: &Ast, select: ast::Select, compare: IdentifierCompare) -> Option<Self> {
         if select.filter == rudb_parse::NONE {
             return None;
         }
-        Self::listing(ast, select)
+        Self::listing(ast, select, compare)
     }
 
     /// The table and the select list of `select`, if it reads one table by name and the list is
     /// columns and stars. A `WHERE` is the caller's to read.
-    fn listing(ast: &Ast, select: ast::Select) -> Option<Self> {
+    fn listing(ast: &Ast, select: ast::Select, compare: IdentifierCompare) -> Option<Self> {
         if select.distinct != ast::Distinct::No
             || select.group_by.len != 0
             || select.group_by_all
@@ -662,6 +667,7 @@ impl Lookup {
             alias,
             picks,
             equal: Vec::new(),
+            compare,
             found: Resolved::default(),
         })
     }
@@ -710,7 +716,7 @@ pub(crate) const RANGE_ROWS: usize = 1_000;
 
 impl RangeRead {
     /// The shape of `ast`, if it is one statement of it.
-    fn of(ast: &Ast) -> Option<Self> {
+    fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
         use rudb_catalog::Reach;
         let [ast::Statement::Query(at)] = ast.statements.as_slice() else { return None };
         let query = ast.query(*at);
@@ -725,7 +731,7 @@ impl RangeRead {
             return None;
         }
         let select = ast.select(select);
-        let mut lookup = Lookup::reading(ast, select)?;
+        let mut lookup = Lookup::reading(ast, select, compare)?;
         let words = |slice| ast.name(slice).map(str::to_owned).collect::<Vec<_>>();
         let ast::Expr::Binary { op, left, right } = ast.expr(select.filter) else { return None };
         let (column, bound, flipped) = match (ast.expr(left), ast.expr(right)) {
@@ -749,11 +755,11 @@ impl RangeRead {
         let ordered = words(name);
         let last = ordered.last()?;
         let renamed = lookup.picks.iter().any(|pick| match pick {
-            Pick::Column(_, Some(alias)) => alias.eq_ignore_ascii_case(last),
+            Pick::Column(_, Some(alias)) => compare.same(alias, last),
             _ => false,
         });
         let same = ordered.len() == column.len()
-            && ordered.iter().zip(&column).all(|(a, b)| a.eq_ignore_ascii_case(b));
+            && ordered.iter().zip(&column).all(|(a, b)| compare.same(a, b));
         if renamed || !same {
             return None;
         }
@@ -782,7 +788,7 @@ impl PointWrite {
     ///
     /// The statement is held as `SELECT *, hit, values... FROM table`, see the parser's
     /// `changed_rows`, so that is the query looked for here.
-    fn of(ast: &Ast) -> Option<Self> {
+    fn of(ast: &Ast, compare: IdentifierCompare) -> Option<Self> {
         let (at, delete) = match ast.statements.as_slice() {
             [ast::Statement::Update(at)] => (at, false),
             [ast::Statement::Delete(at)] => (at, true),
@@ -833,14 +839,14 @@ impl PointWrite {
         let parameter = |expr| item(ast, expr).filter(|item| !matches!(item, Item::Null));
         let mut sets = Vec::with_capacity(columns.len());
         for (column, value) in columns.into_iter().zip(values) {
-            if sets.iter().any(|(held, _): &(String, Set)| held.eq_ignore_ascii_case(&column)) {
+            if sets.iter().any(|(held, _): &(String, Set)| compare.same(held, &column)) {
                 return None;
             }
             // The column itself, unqualified, which is the only way the shape reads it.
             let itself = |expr| match ast.expr(expr) {
                 ast::Expr::Column { name } => {
                     let mut words = ast.name(name);
-                    words.next().is_some_and(|word| word.eq_ignore_ascii_case(&column))
+                    words.next().is_some_and(|word| compare.same(word, &column))
                         && words.next().is_none()
                 }
                 _ => false,
@@ -866,6 +872,7 @@ impl PointWrite {
             alias,
             picks: vec![Pick::All(Vec::new())],
             equal,
+            compare,
             found: Resolved::default(),
         };
         Some(Self { lookup, sets, delete })
@@ -883,22 +890,23 @@ pub(crate) struct Short {
 }
 
 impl Short {
-    /// The shapes `ast` has.
-    pub(crate) fn of(ast: &Ast) -> Self {
+    /// The shapes `ast` has, with the names compared as `compare` says, which is the rule of the
+    /// session that read the statement.
+    pub(crate) fn of(ast: &Ast, compare: IdentifierCompare) -> Self {
         Self {
-            direct: Direct::of(ast),
-            lookup: Lookup::of(ast),
-            write: PointWrite::of(ast),
-            range: RangeRead::of(ast),
-            upsert: Upsert::of(ast),
+            direct: Direct::of(ast, compare),
+            lookup: Lookup::of(ast, compare),
+            write: PointWrite::of(ast, compare),
+            range: RangeRead::of(ast, compare),
+            upsert: Upsert::of(ast, compare),
         }
     }
 
     /// The shapes of `ast` when it has its values written in. An insert of more than one row is a
     /// load, which the plan streams into the file of a database, so only an insert of one row
     /// takes the short way.
-    pub(crate) fn written(ast: &Ast) -> Self {
-        let mut short = Self::of(ast);
+    pub(crate) fn written(ast: &Ast, compare: IdentifierCompare) -> Self {
+        let mut short = Self::of(ast, compare);
         short.direct = short.direct.filter(|direct| direct.rows.len() == 1);
         short
     }
@@ -954,7 +962,7 @@ impl Prepared {
         let session = shared.session();
         let ast = crate::database::parse(&session, sql)?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
-        let short = Short::of(&ast);
+        let short = Short::of(&ast, session.semantics().identifier_compare());
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
         let described = Arc::default();
@@ -1220,7 +1228,13 @@ mod tests {
         ] {
             assert!(db.prepare(sql).expect("prepares").short.direct.is_none(), "{sql}");
         }
-        assert!(Direct::of(&rudb_parse::parse_ast("SELECT ?").expect("parses")).is_none());
+        assert!(
+            Direct::of(
+                &rudb_parse::parse_ast("SELECT ?").expect("parses"),
+                rudb_common::IdentifierCompare::default()
+            )
+            .is_none()
+        );
     }
 
     #[test]

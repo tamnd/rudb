@@ -2233,7 +2233,7 @@ impl<'a> Binder<'a> {
     pub(crate) fn output_name(&self, ast: &Ast, target: ast::ExprRef, input: &Scope) -> String {
         if let ast::Expr::Column { name } = ast.expr(target) {
             let parts: Vec<&str> = ast.name(name).collect();
-            if let Ok(found) = input.resolve(&parts) {
+            if let Ok(found) = input.resolve(self.semantics.identifier_compare(), &parts) {
                 // A column found by its second name is headed by that name, so `t.range` over
                 // `range(2) t` is a column called `range` on the pin while `SELECT *` calls it `t`.
                 let written = parts.last().copied().unwrap_or_default();
@@ -2479,7 +2479,7 @@ impl<'a> Binder<'a> {
             ast::Expr::Column { name } => {
                 let parts: Vec<&str> = ast.name(name).collect();
                 let [written] = parts.as_slice() else { return Ok(None) };
-                Ok(output.position_of(None, written))
+                Ok(output.position_of(self.semantics.identifier_compare(), None, written))
             }
             _ => Ok(None),
         }

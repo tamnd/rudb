@@ -188,6 +188,7 @@ pub struct Semantics {
     integer_division: bool,
     ieee_floating_point_ops: bool,
     identifier_case: IdentifierCase,
+    identifier_compare: IdentifierCompare,
     insert_columns: InsertColumns,
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
@@ -209,6 +210,7 @@ impl Default for Semantics {
             integer_division: false,
             ieee_floating_point_ops: true,
             identifier_case: IdentifierCase::Preserve,
+            identifier_compare: IdentifierCompare::CaseInsensitive,
             insert_columns: InsertColumns::Exact,
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
@@ -232,6 +234,11 @@ impl Semantics {
     #[must_use]
     pub fn identifier_case(self) -> IdentifierCase {
         self.identifier_case
+    }
+    /// How two identifiers are compared after the parser.
+    #[must_use]
+    pub fn identifier_compare(self) -> IdentifierCompare {
+        self.identifier_compare
     }
     /// How the values of an `INSERT` are matched to the columns of the table.
     #[must_use]
@@ -333,6 +340,41 @@ pub enum IdentifierCase {
     Lower,
     /// Fold ASCII letters to uppercase.
     Upper,
+}
+
+/// How two identifiers are compared after the parser, when a name is looked up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IdentifierCompare {
+    /// ASCII letters compare without regard to case, as in DuckDB. `"A"` and `"a"` are one name.
+    #[default]
+    CaseInsensitive,
+    /// The bytes compare, as in PostgreSQL. The parser folds each unquoted name, so `A` and `a`
+    /// are one name, and `"A"` and `"a"` are two.
+    Exact,
+}
+
+impl IdentifierCompare {
+    /// Whether two identifiers name the same object.
+    #[must_use]
+    pub fn same(self, left: &str, right: &str) -> bool {
+        match self {
+            Self::CaseInsensitive => left.eq_ignore_ascii_case(right),
+            Self::Exact => left == right,
+        }
+    }
+
+    /// The place of the one name in `names` that is the same as `written`, or `None` when no name
+    /// or more than one name is.
+    #[must_use]
+    pub fn find<'a>(
+        self,
+        names: impl IntoIterator<Item = &'a str>,
+        written: &str,
+    ) -> Option<usize> {
+        let mut found = names.into_iter().enumerate().filter(|(_, name)| self.same(name, written));
+        let (at, _) = found.next()?;
+        found.next().is_none().then_some(at)
+    }
 }
 
 /// How the values of an `INSERT` are matched to the columns of the table.
@@ -713,14 +755,15 @@ impl Session {
     /// Records the PostgreSQL session that runs the statements, or none.
     ///
     /// A PostgreSQL session also takes the rules of PostgreSQL for division: `/` of two integers
-    /// is an integer, and a zero divisor is an error for every type. And it takes the rule of
-    /// PostgreSQL for the values of an `INSERT`.
+    /// is an integer, and a zero divisor is an error for every type. It takes the rule of
+    /// PostgreSQL for the values of an `INSERT`, and it compares identifiers byte for byte.
     pub fn set_postgres(&mut self, postgres: Option<Arc<Postgres>>) {
         if postgres.is_some() {
             self.semantics.integer_division = true;
             self.semantics.ieee_floating_point_ops = false;
             self.semantics.null_on_division_by_zero = false;
             self.semantics.insert_columns = InsertColumns::Leading;
+            self.semantics.identifier_compare = IdentifierCompare::Exact;
         }
         self.postgres = Postgreses(postgres);
     }

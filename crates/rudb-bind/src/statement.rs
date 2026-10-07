@@ -1362,7 +1362,7 @@ fn create_table(
         }
         (columns, Some(finish(binder, root)?))
     };
-    duplicate_check(&columns)?;
+    duplicate_check(&columns, session.semantics().identifier_compare())?;
     let generated = if defs.iter().any(|def| def.generated != NONE) {
         generated_columns(ast, defs, &mut columns, (catalog, parameters, session))?
     } else {
@@ -3139,18 +3139,28 @@ fn insert(
     let targets: Vec<usize> = if written.columns.is_empty() {
         (0..fields.len()).filter(|&at| target.generated(at).is_none()).collect()
     } else {
+        let compare = session.semantics().identifier_compare();
         let mut targets = Vec::new();
         for column in ast.name(written.columns) {
-            let at = fields.iter().position(|field| same_name(&field.name, column)).ok_or_else(
+            let at = fields.iter().position(|field| compare.same(&field.name, column)).ok_or_else(
                 || {
                     Error::binder(format!(
                         "Table \"{}\" does not have a column with name \"{column}\"",
                         name.table
                     ))
+                    .state(SqlState::UNDEFINED_COLUMN)
+                    .pg(format!(
+                        "column \"{column}\" of relation \"{}\" does not exist",
+                        name.table
+                    ))
+                    .unplaced()
                 },
             )?;
             if targets.contains(&at) {
-                return Err(Error::binder(format!("Duplicate column name \"{column}\" in INSERT")));
+                return Err(Error::binder(format!("Duplicate column name \"{column}\" in INSERT"))
+                    .state(SqlState::DUPLICATE_COLUMN)
+                    .pg(format!("column \"{column}\" specified more than once"))
+                    .unplaced());
             }
             if target.generated(at).is_some() {
                 return Err(Error::binder("Cannot insert into a generated column"));
@@ -3521,13 +3531,17 @@ fn bind_conflict(
             _ => Some(0),
         }
     } else {
+        let compare = session.semantics().identifier_compare();
         let mut wanted = Vec::new();
         for column in ast.name(conflict.target) {
-            let Some(at) = fields.iter().position(|field| same_name(&field.name, column)) else {
+            let Some(at) = fields.iter().position(|field| compare.same(&field.name, column)) else {
                 return Err(Error::binder(format!(
                     "Table \"{}\" does not have a column with name \"{column}\"",
                     name.table
-                )));
+                ))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!("column \"{column}\" does not exist"))
+                .unplaced());
             };
             wanted.push(at);
         }
@@ -3557,18 +3571,15 @@ fn bind_conflict(
                 .collect(),
         ),
         ast::ConflictAction::Update { columns: written, query } => {
+            let compare = session.semantics().identifier_compare();
             let mut columns = Vec::new();
             for column in ast.name(written) {
-                let Some(at) = fields.iter().position(|field| same_name(&field.name, column))
+                let Some(at) = fields.iter().position(|field| compare.same(&field.name, column))
                 else {
-                    return Err(Error::binder(format!(
-                        "Referenced update column {column} not found in table!"
-                    )));
+                    return Err(missing_update_column(column, &name.table));
                 };
                 if columns.contains(&at) {
-                    return Err(Error::binder(format!(
-                        "Multiple assignments to same column \"\"{column}\"\""
-                    )));
+                    return Err(repeated_update_column(column));
                 }
                 if table.generated(at).is_some() {
                     return Err(Error::binder(format!(
@@ -3616,6 +3627,22 @@ fn bind_conflict(
 /// searched `CASE` does with one, so the one expression covers both. After the table's columns
 /// comes the flag saying which rows matched, which are the rows an `UPDATE` changed and the rows a
 /// `DELETE` takes out.
+/// The error for a `SET` of a column that the table does not have.
+fn missing_update_column(column: &str, table: &str) -> Error {
+    Error::binder(format!("Referenced update column {column} not found in table!"))
+        .state(SqlState::UNDEFINED_COLUMN)
+        .pg(format!("column \"{column}\" of relation \"{table}\" does not exist"))
+        .unplaced()
+}
+
+/// The error for a `SET` that names one column two times. The DuckDB text has the doubled quotes.
+fn repeated_update_column(column: &str) -> Error {
+    Error::binder(format!("Multiple assignments to same column \"\"{column}\"\""))
+        .state(SqlState::SYNTAX_ERROR)
+        .pg(format!("multiple assignments to same column \"{column}\""))
+        .unplaced()
+}
+
 fn change(
     ast: &Ast,
     catalog: &Catalog,
@@ -3635,21 +3662,20 @@ fn change(
         }));
     }
     let fields: Vec<Field> = catalog.table(&name)?.columns().to_vec();
+    let compare = session.semantics().identifier_compare();
     let mut targets: Vec<usize> = Vec::new();
     for column in ast.name(written.columns) {
-        let at =
-            fields.iter().position(|field| same_name(&field.name, column)).ok_or_else(|| {
-                Error::binder(format!("Referenced update column {column} not found in table!"))
-            })?;
+        let at = fields
+            .iter()
+            .position(|field| compare.same(&field.name, column))
+            .ok_or_else(|| missing_update_column(column, &name.table))?;
         if catalog.table(&name)?.generated(at).is_some() {
             return Err(Error::binder(format!(
                 "Cant update column \"{column}\" because it is a generated column!"
             )));
         }
         if targets.contains(&at) {
-            return Err(Error::binder(format!(
-                "Multiple assignments to same column \"\"{column}\"\""
-            )));
+            return Err(repeated_update_column(column));
         }
         targets.push(at);
     }

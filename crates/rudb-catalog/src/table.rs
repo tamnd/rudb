@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rudb_common::bounds::{Bound, Frequencies, Zones};
 use rudb_common::stat::{Provenance, Stat};
 use rudb_common::{
-    Clustering, ColumnFacts, DeclaredType, Error, Field, LogicalType, Result, Value,
+    Clustering, ColumnFacts, DeclaredType, Error, Field, IdentifierCompare, LogicalType, Result,
+    SqlState, Value,
 };
 use rudb_encoding::sequence::Sequence;
 use rudb_native::{
@@ -51,19 +52,24 @@ pub fn revision_now() -> u64 {
 /// TABLE` drops the old table on its way to creating the new one, so a check that only happened
 /// inside [`Table::new`] would report the duplicate after the old table was already gone.
 ///
+/// The names are compared by the rule of the session that writes the list. The error has the
+/// text of DuckDB and the SQLSTATE and the text of PostgreSQL.
+///
 /// # Errors
 ///
-/// If two of the columns have the same name, compared the way SQL compares names, which is without
-/// regard to case.
-pub fn duplicate_check(columns: &[Field]) -> Result<()> {
+/// If two of the columns have the same name.
+pub fn duplicate_check(columns: &[Field], compare: IdentifierCompare) -> Result<()> {
     for (at, column) in columns.iter().enumerate() {
-        if columns[..at].iter().any(|held| same_name(&held.name, &column.name)) {
+        if columns[..at].iter().any(|held| compare.same(&held.name, &column.name)) {
             // The one that arrived second is the one named, spelled the way it was written rather
             // than the way the first one was. `CREATE TABLE t (Abc INTEGER, aBC VARCHAR)` says aBC.
             return Err(Error::catalog(format!(
                 "Column with name {} already exists!",
                 column.name
-            )));
+            ))
+            .state(SqlState::DUPLICATE_COLUMN)
+            .pg(format!("column \"{}\" specified more than once", column.name))
+            .unplaced());
         }
     }
     Ok(())
@@ -1694,13 +1700,13 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// If two columns have the same name, which SQL does not allow and which would make a column
-    /// reference ambiguous in a way no error message could explain later. The message is DuckDB's,
-    /// which names the column and not the table and is a catalog error rather than a binder one,
-    /// because the same sentence comes out of `CREATE TABLE t (a INT, a INT)` and out of a
-    /// `CREATE TABLE ... AS` whose column list repeats a name.
+    /// If two columns have the same bytes as their name, which would make a column reference
+    /// ambiguous in a way no error message could explain later. The binder compares the names by
+    /// the rule of the session before this, so a DuckDB session refuses `a` and `A` there. A
+    /// PostgreSQL session can make a table with both `"a"` and `"A"`, so the table itself only
+    /// refuses the same bytes twice.
     pub fn new(name: QualifiedName, columns: Vec<Field>) -> Result<Self> {
-        duplicate_check(&columns)?;
+        duplicate_check(&columns, IdentifierCompare::Exact)?;
         let types = columns.iter().map(|column| column.ty.clone()).collect();
         Ok(Self {
             name,
@@ -1734,7 +1740,7 @@ impl Table {
     /// If the reader's stored schema has duplicate column names.
     pub fn native(name: QualifiedName, reader: NativeReader) -> Result<Self> {
         let columns = reader.table().fields().to_vec();
-        duplicate_check(&columns)?;
+        duplicate_check(&columns, IdentifierCompare::Exact)?;
         let clustering = reader.table().clustering().cloned();
         let stored = reader.table().constraints();
         let (keys, foreign) = restored(&name, stored);
@@ -1928,10 +1934,18 @@ impl Table {
         self.columns.iter().map(|column| column.ty.clone()).collect()
     }
 
-    /// Where a column sits, by name, under the identifier rule.
+    /// Where a column sits, by name. A column with the same bytes comes first, and then a column
+    /// whose name differs only in case.
+    ///
+    /// A table that a PostgreSQL session made can have `"A"` and `a` as two columns, and the plan
+    /// names each scanned column by its stored name. So the exact match must win. A DuckDB table
+    /// has no two names that differ only in case, so for it the order changes nothing.
     #[must_use]
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|column| same_name(&column.name, name))
+        self.columns
+            .iter()
+            .position(|column| column.name == name)
+            .or_else(|| self.columns.iter().position(|column| same_name(&column.name, name)))
     }
 
     /// The rows.
@@ -3763,7 +3777,7 @@ fn lay(ty: &LogicalType, chunks: &[Chunk], column: usize, rows: usize) -> Result
 pub fn null_in(table: &QualifiedName, column: &str, row: &[Value]) -> Error {
     let values = row.iter().map(pg_text).collect::<Vec<_>>().join(", ");
     Error::constraint(format!("NOT NULL constraint failed: {}.{column}", table.table))
-        .state(rudb_common::SqlState::NOT_NULL_VIOLATION)
+        .state(SqlState::NOT_NULL_VIOLATION)
         .pg(format!(
             "null value in column \"{column}\" of relation \"{}\" violates not-null constraint",
             table.table
@@ -3839,14 +3853,23 @@ mod tests {
 
     #[test]
     fn two_columns_with_one_name_is_caught() {
-        let error = Table::new(
-            QualifiedName::new("memory", "main", "t"),
-            vec![Field::new("a", LogicalType::Integer), Field::new("A", LogicalType::Varchar)],
-        )
-        .expect_err("two columns called a");
+        let columns =
+            vec![Field::new("a", LogicalType::Integer), Field::new("A", LogicalType::Varchar)];
+        let error = duplicate_check(&columns, IdentifierCompare::CaseInsensitive)
+            .expect_err("two columns called a");
         // Named after the second of the two and spelled the way it was written there, which is what
         // duckdb v1.4.1 says for `CREATE TABLE t (a INTEGER, A VARCHAR)`.
         assert_eq!(error.to_string(), "Catalog Error: Column with name A already exists!");
+        assert_eq!(error.reported_state().as_str(), "42701");
+        // The bytes differ, so a PostgreSQL session and the table itself take the two names.
+        duplicate_check(&columns, IdentifierCompare::Exact).expect("two names");
+        Table::new(QualifiedName::new("memory", "main", "t"), columns).expect("two names");
+        let error = Table::new(
+            QualifiedName::new("memory", "main", "t"),
+            vec![Field::new("a", LogicalType::Integer), Field::new("a", LogicalType::Varchar)],
+        )
+        .expect_err("two columns called a");
+        assert_eq!(error.to_string(), "Catalog Error: Column with name a already exists!");
     }
 
     #[test]

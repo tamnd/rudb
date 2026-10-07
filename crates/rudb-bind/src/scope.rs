@@ -9,8 +9,7 @@
 //! message should use, and it is deliberately not the catalog name: after `FROM hits AS h` there is
 //! no `hits` to refer to, which is SQL's rule and not ours.
 
-use rudb_catalog::same_name;
-use rudb_common::{Error, Field, LogicalType, Origin, Result};
+use rudb_common::{Error, Field, IdentifierCompare, LogicalType, Origin, Result, SqlState};
 use rudb_plan::ColumnBinding;
 
 /// One visible column.
@@ -139,8 +138,8 @@ impl Scope {
     /// # Errors
     ///
     /// If nothing matches, or if one part matches more than one column. The messages are DuckDB's.
-    pub(crate) fn resolve(&self, parts: &[&str]) -> Result<&Visible> {
-        if let Some(visible) = self.resolve_optional(parts)? {
+    pub(crate) fn resolve(&self, compare: IdentifierCompare, parts: &[&str]) -> Result<&Visible> {
+        if let Some(visible) = self.resolve_optional(compare, parts)? {
             return Ok(visible);
         }
         let (table, column) = match parts {
@@ -154,11 +153,15 @@ impl Scope {
                 )));
             }
         };
-        Err(self.not_found(table, column))
+        Err(self.not_found(compare, table, column))
     }
 
     /// Resolves a name when it is present, while still reporting ambiguity.
-    pub(crate) fn resolve_optional(&self, parts: &[&str]) -> Result<Option<&Visible>> {
+    pub(crate) fn resolve_optional(
+        &self,
+        compare: IdentifierCompare,
+        parts: &[&str],
+    ) -> Result<Option<&Visible>> {
         let (table, column) = match parts {
             [column] => (None, *column),
             [table, column] => (Some(*table), *column),
@@ -174,18 +177,18 @@ impl Scope {
             .columns
             .iter()
             .filter(|held| {
-                same_name(&held.name, column)
+                compare.same(&held.name, column)
                     && (table.is_some() || !(held.qualified || held.hidden))
-                    && table.is_none_or(|table| same_name(&held.table, table))
+                    && table.is_none_or(|table| compare.same(&held.table, table))
             })
             .collect();
         let matched = if matched.is_empty() {
             self.columns
                 .iter()
                 .filter(|held| {
-                    held.also.as_deref().is_some_and(|also| same_name(also, column))
+                    held.also.as_deref().is_some_and(|also| compare.same(also, column))
                         && (table.is_some() || !held.hidden)
-                        && table.is_none_or(|table| same_name(&held.table, table))
+                        && table.is_none_or(|table| compare.same(&held.table, table))
                 })
                 .collect()
         } else {
@@ -214,11 +217,15 @@ impl Scope {
     ///
     /// If the qualifier names no table in scope, or if there is nothing in scope at all, which is
     /// `SELECT *` with no `FROM` clause and is an error rather than zero columns.
-    pub(crate) fn star(&self, qualifier: Option<&str>) -> Result<Vec<&Visible>> {
+    pub(crate) fn star(
+        &self,
+        compare: IdentifierCompare,
+        qualifier: Option<&str>,
+    ) -> Result<Vec<&Visible>> {
         let matched: Vec<&Visible> = match qualifier {
             None => self.columns.iter().filter(|held| !held.hidden).collect(),
             Some(table) => {
-                self.columns.iter().filter(|held| same_name(&held.table, table)).collect()
+                self.columns.iter().filter(|held| compare.same(&held.table, table)).collect()
             }
         };
         if matched.is_empty() {
@@ -294,12 +301,17 @@ impl Scope {
     }
 
     /// Where a column of that name sits, if exactly one does.
-    pub(crate) fn position_of(&self, table: Option<&str>, name: &str) -> Option<usize> {
+    pub(crate) fn position_of(
+        &self,
+        compare: IdentifierCompare,
+        table: Option<&str>,
+        name: &str,
+    ) -> Option<usize> {
         let mut found = None;
         for (at, held) in self.columns.iter().enumerate() {
-            if same_name(&held.name, name)
+            if compare.same(&held.name, name)
                 && (table.is_some() || !held.hidden)
-                && table.is_none_or(|table| same_name(&held.table, table))
+                && table.is_none_or(|table| compare.same(&held.table, table))
             {
                 if found.is_some() {
                     return None;
@@ -317,22 +329,28 @@ impl Scope {
     /// and two columns called `current_date` is the ambiguity error rather than the session constant.
     /// That was measured: `SELECT current_date FROM t, u` with the name in both is
     /// `Ambiguous reference to column name "current_date"` on the pin.
-    pub(crate) fn names(&self, column: &str) -> bool {
-        self.columns.iter().any(|held| !held.hidden && same_name(&held.name, column))
+    pub(crate) fn names(&self, compare: IdentifierCompare, column: &str) -> bool {
+        self.columns.iter().any(|held| !held.hidden && compare.same(&held.name, column))
     }
 
-    fn not_found(&self, table: Option<&str>, column: &str) -> Error {
+    fn not_found(&self, compare: IdentifierCompare, table: Option<&str>, column: &str) -> Error {
         match table {
-            Some(table) if self.columns.iter().all(|held| !same_name(&held.table, table)) => {
+            Some(table) if self.columns.iter().all(|held| !compare.same(&held.table, table)) => {
                 Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
+                    .state(SqlState::UNDEFINED_TABLE)
+                    .pg(format!("missing FROM-clause entry for table \"{table}\""))
             }
             Some(table) => Error::binder(format!(
                 "Referenced column \"{column}\" not found in table \"{table}\"!"
-            )),
+            ))
+            .state(SqlState::UNDEFINED_COLUMN)
+            .pg(format!("column {table}.{column} does not exist")),
             None => Error::binder(format!(
                 "Referenced column \"{column}\" not found in FROM clause!{}",
                 self.candidates()
-            )),
+            ))
+            .state(SqlState::UNDEFINED_COLUMN)
+            .pg(format!("column \"{column}\" does not exist")),
         }
     }
 
@@ -359,6 +377,8 @@ impl Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DUCKDB: IdentifierCompare = IdentifierCompare::CaseInsensitive;
 
     fn scope() -> Scope {
         let mut scope = Scope::empty();
@@ -410,39 +430,39 @@ mod tests {
     #[test]
     fn a_unique_name_resolves_without_a_table() {
         let scope = scope();
-        let found = scope.resolve(&["userid"]).expect("one column is called that");
+        let found = scope.resolve(DUCKDB, &["userid"]).expect("one column is called that");
         assert_eq!(found.binding, ColumnBinding::new(0, 0));
     }
 
     #[test]
     fn a_name_in_two_tables_needs_the_table() {
         let scope = scope();
-        let error = scope.resolve(&["url"]).expect_err("two columns are called url");
+        let error = scope.resolve(DUCKDB, &["url"]).expect_err("two columns are called url");
         assert!(error.message().contains("Ambiguous"), "{error}");
-        let found = scope.resolve(&["visits", "url"]).expect("qualified");
+        let found = scope.resolve(DUCKDB, &["visits", "url"]).expect("qualified");
         assert_eq!(found.binding, ColumnBinding::new(1, 0));
     }
 
     #[test]
     fn a_name_that_is_not_there_lists_what_is() {
-        let error = scope().resolve(&["nope"]).expect_err("no such column");
+        let error = scope().resolve(DUCKDB, &["nope"]).expect_err("no such column");
         assert!(error.message().contains("not found in FROM clause"), "{error}");
         assert!(error.message().contains("UserID"), "the message should say what is there");
     }
 
     #[test]
     fn a_table_that_is_not_there_says_that_rather_than_naming_the_column() {
-        let error = scope().resolve(&["nope", "url"]).expect_err("no such table");
+        let error = scope().resolve(DUCKDB, &["nope", "url"]).expect_err("no such table");
         assert!(error.message().contains("Referenced table \"nope\""), "{error}");
     }
 
     #[test]
     fn a_star_expands_in_order_and_a_qualified_one_expands_to_its_table() {
         let scope = scope();
-        let all = scope.star(None).expect("three columns");
+        let all = scope.star(DUCKDB, None).expect("three columns");
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].name, "UserID");
-        let one = scope.star(Some("VISITS")).expect("one column, case insensitively");
+        let one = scope.star(DUCKDB, Some("VISITS")).expect("one column, case insensitively");
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].binding, ColumnBinding::new(1, 0));
     }
@@ -450,7 +470,21 @@ mod tests {
     #[test]
     fn a_qualified_name_ignores_the_schema_in_front_of_it() {
         let scope = scope();
-        let found = scope.resolve(&["memory", "main", "hits", "UserID"]).expect("four parts");
+        let found =
+            scope.resolve(DUCKDB, &["memory", "main", "hits", "UserID"]).expect("four parts");
         assert_eq!(found.binding, ColumnBinding::new(0, 0));
+    }
+
+    #[test]
+    fn a_postgresql_session_compares_the_bytes_of_a_name() {
+        let scope = scope();
+        let exact = IdentifierCompare::Exact;
+        let error = scope.resolve(exact, &["userid"]).expect_err("no column is called userid");
+        assert!(error.message().contains("not found in FROM clause"), "{error}");
+        let found = scope.resolve(exact, &["UserID"]).expect("one column is called UserID");
+        assert_eq!(found.binding, ColumnBinding::new(0, 0));
+        scope.star(exact, Some("VISITS")).expect_err("no table is called VISITS");
+        assert_eq!(scope.position_of(exact, None, "userid"), None);
+        assert!(!scope.names(exact, "userid"));
     }
 }
