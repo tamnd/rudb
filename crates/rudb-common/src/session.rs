@@ -188,6 +188,8 @@ pub struct Semantics {
     condition_types: ConditionTypes,
     common_types: CommonTypes,
     table_names: TableNames,
+    distinct_order: DistinctOrder,
+    count_types: CountTypes,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -230,6 +232,8 @@ impl Default for Semantics {
             condition_types: ConditionTypes::Pin,
             common_types: CommonTypes::Pin,
             table_names: TableNames::Pin,
+            distinct_order: DistinctOrder::Pin,
+            count_types: CountTypes::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -374,6 +378,16 @@ impl Semantics {
     #[must_use]
     pub fn table_names(self) -> TableNames {
         self.table_names
+    }
+    /// What a `SELECT DISTINCT` can sort on.
+    #[must_use]
+    pub fn distinct_order(self) -> DistinctOrder {
+        self.distinct_order
+    }
+    /// What type the count of a `LIMIT` and an `OFFSET` takes.
+    #[must_use]
+    pub fn count_types(self) -> CountTypes {
+        self.count_types
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -725,6 +739,31 @@ pub enum TableNames {
     /// As in PostgreSQL: two items of one `FROM`, or the two sides of a join, cannot, and the
     /// query is `42712 table name "t" specified more than once`. Two tables with no alias are
     /// the exception when they are two different tables, such as `s.t` and `r.t`.
+    Postgres,
+}
+
+/// What a `SELECT DISTINCT` can sort on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DistinctOrder {
+    /// As in DuckDB: anything. A plain `DISTINCT` that sorts on a column it does not select is a
+    /// `DISTINCT ON` the columns that it selects, and a `DISTINCT ON` sorts on any columns.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a plain `DISTINCT` sorts only on the columns that it selects, and the
+    /// `ORDER BY` of a `DISTINCT ON` starts with the expressions of the `DISTINCT ON`. Each other
+    /// query is `42P10`.
+    Postgres,
+}
+
+/// What type the count of a `LIMIT` and an `OFFSET` takes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CountTypes {
+    /// As in DuckDB: any value that the engine casts to `BIGINT`, so `LIMIT true` is one row.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a `bigint`, or a type with an implicit or an assignment cast to
+    /// `bigint`. A string literal is read with the input function of `bigint`. Any other type is
+    /// `42804 argument of LIMIT must be type bigint, not type boolean`.
     Postgres,
 }
 
@@ -1220,6 +1259,8 @@ impl Session {
             self.semantics.condition_types = ConditionTypes::Postgres;
             self.semantics.common_types = CommonTypes::Postgres;
             self.semantics.table_names = TableNames::Postgres;
+            self.semantics.distinct_order = DistinctOrder::Postgres;
+            self.semantics.count_types = CountTypes::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }

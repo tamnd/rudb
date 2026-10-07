@@ -17,9 +17,9 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    AggregateTypes, CommonTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field,
-    FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session, ShowBehavior,
-    Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames,
+    AggregateTypes, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error, ErrorTexts,
+    Field, FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session,
+    ShowBehavior, Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -1984,20 +1984,30 @@ impl<'a> Binder<'a> {
         }
 
         self.clause = "ORDER BY clause";
-        let mut extra = Vec::new();
+        let mut sorted = Vec::new();
         self.unnest_here = true;
         let keys = self.select_sort_keys(
-            ast, query, &input, &output, project, &mut exprs, &mut names, &mut extra, &mut above,
+            ast,
+            query,
+            &input,
+            &output,
+            project,
+            &mut exprs,
+            &mut names,
+            &mut sorted,
+            &mut above,
         )?;
+        let extra = sorted.iter().any(|key| key.extra);
         self.unnest_here = outer_unnest_here;
         self.in_unnest = outer_in_unnest;
         self.unnest_grouping = outer_unnest_grouping;
         self.grouped_unnests = outer_grouped_unnests;
         self.joined_above = outer_joined_above;
+        self.distinct_order(ast, written.distinct, &output, &sorted)?;
         let mut on = self.distinct_on(ast, written.distinct, &output)?;
         // A plain DISTINCT sorted on something it does not select is, as on the pin, a DISTINCT ON
         // what it selects, keeping the first row of each.
-        if !extra.is_empty() && written.distinct == Distinct::Yes {
+        if extra && written.distinct == Distinct::Yes {
             for column in &output.columns[..visible] {
                 let (binding, ty) = (column.binding, column.ty.clone());
                 on.push(self.plan.add_expr(Expr::Column(binding), ty));
@@ -2072,7 +2082,7 @@ impl<'a> Binder<'a> {
         }
         node = self.apply_limit(ast, query, node, &mut output)?;
 
-        if extra.is_empty() {
+        if !extra {
             output.columns.truncate(visible);
             return Ok((node, output));
         }
@@ -2469,7 +2479,7 @@ impl<'a> Binder<'a> {
         project: u32,
         exprs: &mut Vec<ExprRef>,
         names: &mut Vec<String>,
-        extra: &mut Vec<usize>,
+        sorted: &mut Vec<Sorted>,
         above: &mut Vec<PendingSubquery>,
     ) -> Result<Vec<SortKey>> {
         if query.order_by_all {
@@ -2481,16 +2491,13 @@ impl<'a> Binder<'a> {
             if let Some(expanded) = self.bind_star_each(ast, item.expr, input)? {
                 for bound in expanded {
                     let bound = self.over_aggregate(bound, input)?;
-                    let position = match exprs.iter().position(|&held| self.same_expr(held, bound))
-                    {
-                        Some(position) => position,
-                        None => {
-                            exprs.push(bound);
-                            names.push(describe(ast, item.expr, self.semantics));
-                            extra.push(exprs.len() - 1);
-                            exprs.len() - 1
-                        }
-                    };
+                    let held = exprs.iter().position(|&held| self.same_expr(held, bound));
+                    let position = held.unwrap_or_else(|| {
+                        exprs.push(bound);
+                        names.push(describe(ast, item.expr, self.semantics));
+                        exprs.len() - 1
+                    });
+                    sorted.push(Sorted { position, written: item.expr, extra: held.is_none() });
                     let ty = self.plan.expr_type(exprs[position]).clone();
                     let expr = self.column(project, position, ty);
                     keys.push(self.sort_key(expr, item));
@@ -2498,24 +2505,24 @@ impl<'a> Binder<'a> {
                 continue;
             }
             self.check_order_literal(ast, item.expr)?;
-            let position = match self.output_position(ast, item.expr, output)? {
-                Some(position) => position,
+            let (position, extra) = match self.output_position(ast, item.expr, output)? {
+                Some(position) => (position, false),
                 None => {
                     let before = self.scalar_subqueries.len();
                     let bound = self.bind_expr(ast, item.expr, input)?;
                     self.lift_over_aggregate(before, above, input)?;
                     let bound = self.over_aggregate(bound, input)?;
                     match exprs.iter().position(|&held| self.same_expr(held, bound)) {
-                        Some(position) => position,
+                        Some(position) => (position, false),
                         None => {
                             exprs.push(bound);
                             names.push(describe(ast, item.expr, self.semantics));
-                            extra.push(exprs.len() - 1);
-                            exprs.len() - 1
+                            (exprs.len() - 1, true)
                         }
                     }
                 }
             };
+            sorted.push(Sorted { position, written: item.expr, extra });
             let ty = self.plan.expr_type(exprs[position]).clone();
             let expr = self.column(project, position, ty);
             keys.push(self.sort_key(expr, item));
@@ -2645,6 +2652,68 @@ impl<'a> Binder<'a> {
             return Err(Error::binder(
                 "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to allow this behavior.",
             ));
+        }
+        Ok(())
+    }
+
+    /// The rule of [`DistinctOrder::Postgres`] for what a `SELECT DISTINCT` sorts on, as
+    /// `transformDistinctClause` and `transformDistinctOnClause` check it. A plain `DISTINCT`
+    /// sorts only on the columns that it selects. The `ORDER BY` of a `DISTINCT ON` starts with
+    /// the expressions of the `DISTINCT ON`, in any order, and the error is at the first one that
+    /// comes after a key that is not one of them.
+    fn distinct_order(
+        &self,
+        ast: &Ast,
+        distinct: Distinct,
+        output: &Scope,
+        sorted: &[Sorted],
+    ) -> Result<()> {
+        if self.semantics.distinct_order() != DistinctOrder::Postgres {
+            return Ok(());
+        }
+        let misplaced = |written: ast::ExprRef, message: &str| {
+            Err(Error::binder(message.to_string())
+                .state(SqlState::INVALID_COLUMN_REFERENCE)
+                .with_span(ast.leftmost_span(written)))
+        };
+        let items = match distinct {
+            Distinct::No => return Ok(()),
+            Distinct::Yes => {
+                return match sorted.iter().find(|key| key.extra) {
+                    Some(key) => misplaced(
+                        key.written,
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                    ),
+                    None => Ok(()),
+                };
+            }
+            Distinct::On(items) => ast.expr_list(items),
+        };
+        let mut on = Vec::with_capacity(items.len());
+        for &item in items {
+            if let Some(position) = self.output_position(ast, item, output)? {
+                on.push((position, item));
+            }
+        }
+        let message = "SELECT DISTINCT ON expressions must match initial ORDER BY expressions";
+        // A key that sorts on a column a second time is no key, as `addTargetToSortList` drops it.
+        let mut keys: Vec<usize> = Vec::with_capacity(sorted.len());
+        let mut skipped = false;
+        for key in sorted {
+            if keys.contains(&key.position) {
+                continue;
+            }
+            keys.push(key.position);
+            match on.iter().find(|(position, _)| *position == key.position) {
+                Some(&(_, item)) if skipped => return misplaced(item, message),
+                Some(_) => {}
+                None => skipped = true,
+            }
+        }
+        if skipped
+            && let Some(&(_, item)) = on.iter().find(|(position, _)| !keys.contains(position))
+        {
+            return misplaced(item, message);
         }
         Ok(())
     }
@@ -2838,6 +2907,7 @@ impl<'a> Binder<'a> {
         if self.semantics.unknown_types() == UnknownTypes::Postgres {
             self.resolve_placeholder(bound, &LogicalType::BigInt);
         }
+        let bound = self.as_count(ast, written, bound, clause)?;
         let Some(value) = fold::value_of(&self.plan, bound)? else {
             return Ok(Bound::Read(bound));
         };
@@ -6113,6 +6183,14 @@ fn first_column(ast: &Ast, query: ast::QueryRef) -> Span {
         _ => None,
     };
     first.map_or_else(|| ast.query_span(query), |expr| ast.expr_span(expr))
+}
+
+/// A key of the `ORDER BY` of a `SELECT`: the column of the projection that it sorts on, the
+/// expression as written, and whether the column is one that the query does not select.
+struct Sorted {
+    position: usize,
+    written: ast::ExprRef,
+    extra: bool,
 }
 
 /// The expression that a side of a set operation writes as its column `at`, when the side is a

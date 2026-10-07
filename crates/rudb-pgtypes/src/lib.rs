@@ -18,7 +18,8 @@
 //!
 //! [`common_type`] is `select_common_type`: the type of the values of a `CASE`, a `COALESCE` or
 //! an `ARRAY`. It reads the preferred types of `pg_type.dat` and the implicit casts of
-//! `pg_cast.dat`, which [`can_coerce_implicitly`] also answers from.
+//! `pg_cast.dat`, which [`can_coerce_implicitly`] also answers from. [`can_coerce_assigned`] adds
+//! the assignment casts.
 //!
 //! The text forms of `bool`, `"char"`, `name`, `int2`, `int4`, `int8`, `oid`, `float4`,
 //! `float8`, `bytea` and `uuid`. An input function takes the string and gives the value or a
@@ -120,7 +121,7 @@ pub use array::{
     oidvector_recv, oidvector_send,
 };
 pub use binary::{Recv, name_recv};
-pub use coerce::{Mismatch, can_coerce_implicitly, common_type, is_preferred};
+pub use coerce::{Mismatch, can_coerce_assigned, can_coerce_implicitly, common_type, is_preferred};
 pub use datetime::{
     Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
     DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,

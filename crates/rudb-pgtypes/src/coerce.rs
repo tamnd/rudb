@@ -1,7 +1,7 @@
 //! The type that PostgreSQL gives to a list of values that must have one type, as the arms of a
 //! `CASE` or the values of a `COALESCE`, an `ARRAY` or a column of `VALUES`.
 
-use crate::generated::casts::{IMPLICIT, PREFERRED};
+use crate::generated::casts::{ASSIGNMENT, IMPLICIT, PREFERRED};
 use crate::types::{Oid, TypeInfo};
 
 /// Whether a value of type `from` becomes a value of type `to` with no cast written, as
@@ -15,6 +15,23 @@ pub fn can_coerce_implicitly(from: Oid, to: Oid) -> bool {
         (Some(from), Some(to)) if from.is_array() && to.is_array() => {
             can_coerce_implicitly(from.elem, to.elem)
         }
+        _ => false,
+    }
+}
+
+/// Whether a value of type `from` becomes a value of type `to` where the type of the place it goes
+/// to decides, as in `INSERT` and `LIMIT`. This is `can_coerce_type` with `COERCION_ASSIGNMENT` for
+/// two built-in types: an implicit cast, an assignment cast, or the output function of `from` when
+/// `to` is a string type. An array becomes an array of another type when its elements do.
+pub fn can_coerce_assigned(from: Oid, to: Oid) -> bool {
+    if can_coerce_implicitly(from, to) || ASSIGNMENT.binary_search(&(from, to)).is_ok() {
+        return true;
+    }
+    match (TypeInfo::get(from), TypeInfo::get(to)) {
+        (Some(from), Some(to)) if from.is_array() && to.is_array() => {
+            can_coerce_assigned(from.elem, to.elem)
+        }
+        (_, Some(to)) => to.category == b'S',
         _ => false,
     }
 }
@@ -69,6 +86,17 @@ pub fn common_type(types: &[Option<Oid>]) -> Result<Oid, Mismatch> {
 mod tests {
     use super::*;
     use crate::oid;
+
+    #[test]
+    fn an_assignment_takes_the_casts_of_assignment_and_the_output_to_a_string() {
+        assert!(can_coerce_assigned(oid::INT4, oid::INT8));
+        assert!(can_coerce_assigned(oid::NUMERIC, oid::INT8));
+        assert!(can_coerce_assigned(oid::FLOAT8, oid::INT8));
+        assert!(can_coerce_assigned(oid::BOOL, oid::TEXT));
+        assert!(!can_coerce_assigned(oid::BOOL, oid::INT8));
+        assert!(!can_coerce_assigned(oid::TEXT, oid::INT8));
+        assert!(!can_coerce_assigned(oid::DATE, oid::INT8));
+    }
 
     #[test]
     fn the_common_type_follows_the_category_and_the_preferred_type() {
