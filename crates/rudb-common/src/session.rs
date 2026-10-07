@@ -190,6 +190,7 @@ pub struct Semantics {
     identifier_case: IdentifierCase,
     identifier_compare: IdentifierCompare,
     insert_columns: InsertColumns,
+    join_columns: JoinColumns,
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     pivot_limit: u64,
@@ -212,6 +213,7 @@ impl Default for Semantics {
             identifier_case: IdentifierCase::Preserve,
             identifier_compare: IdentifierCompare::CaseInsensitive,
             insert_columns: InsertColumns::Exact,
+            join_columns: JoinColumns::InPlace,
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
             pivot_limit: 100_000,
@@ -244,6 +246,11 @@ impl Semantics {
     #[must_use]
     pub fn insert_columns(self) -> InsertColumns {
         self.insert_columns
+    }
+    /// Where the columns that a `USING` or `NATURAL` join merges go, and what they are.
+    #[must_use]
+    pub fn join_columns(self) -> JoinColumns {
+        self.join_columns
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -387,6 +394,19 @@ pub enum InsertColumns {
     /// columns. The values go to the leading columns, and the other columns take their defaults.
     /// The errors are the ones of PostgreSQL.
     Leading,
+}
+
+/// Where the columns that a `USING` or `NATURAL` join merges go, and what they are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinColumns {
+    /// As in DuckDB: a merged column has the place of its left copy. An inner or a left join reads
+    /// the left copy at its own type. A name that `USING` gives two times is one name.
+    #[default]
+    InPlace,
+    /// As in PostgreSQL: the merged columns come first, in the order of `USING`, or in the order
+    /// of the left side for `NATURAL`. Each merged column has the common type of its two copies
+    /// for each kind of join. A name that `USING` gives two times is an error.
+    MergedFirst,
 }
 
 /// How `SHOW name` chooses between a setting and a table.
@@ -764,6 +784,7 @@ impl Session {
             self.semantics.null_on_division_by_zero = false;
             self.semantics.insert_columns = InsertColumns::Leading;
             self.semantics.identifier_compare = IdentifierCompare::Exact;
+            self.semantics.join_columns = JoinColumns::MergedFirst;
         }
         self.postgres = Postgreses(postgres);
     }

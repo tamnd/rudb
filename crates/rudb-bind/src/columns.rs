@@ -11,7 +11,7 @@
 //!
 //! This is the pin's `bind_star_expression.cpp`, and the errors are its errors.
 
-use rudb_common::{Error, LogicalType, Result, Value};
+use rudb_common::{Error, JoinColumns, LogicalType, Result, Value};
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse};
 use rudb_plan::{ConjunctionOp, Expr, ExprRef};
@@ -254,13 +254,15 @@ impl Binder<'_> {
         // A bare star walks the hidden copies of a joined-on column too. On the pin the column goes
         // where the first copy `EXCLUDE` does not name is, and a `RENAME` reaches it through that
         // copy's name, so `* EXCLUDE (a.k)` over `a JOIN b USING (k)` has `k` after `x`, and a bare
-        // `k` in the list takes it out wherever it is.
-        let walked = if table.is_none() { input.columns.iter().collect() } else { starred };
+        // `k` in the list takes it out wherever it is. PostgreSQL puts the merged columns first in
+        // the scope and has no `EXCLUDE` or `RENAME`, so there a bare star is the scope in order.
+        let walk = table.is_none() && self.semantics.join_columns() == JoinColumns::InPlace;
+        let walked = if walk { input.columns.iter().collect() } else { starred };
         let mut placed = Vec::new();
         for copy in walked {
             let group = match copy.using {
-                Some(Joined::Merged(_)) if table.is_none() => continue,
-                Some(Joined::Copy(group)) if table.is_none() => Some(group),
+                Some(Joined::Merged(_)) if walk => continue,
+                Some(Joined::Copy(group)) if walk => Some(group),
                 _ => None,
             };
             if let Some(at) = excluded.iter().position(|parts| names_column(parts, copy)) {
@@ -281,7 +283,7 @@ impl Binder<'_> {
                     .iter()
                     .find(|held| !held.hidden && held.using.map(Joined::group) == Some(group));
                 column = shown.ok_or_else(|| Error::internal("a joined-on column with no copy"))?;
-            } else if table.is_none() && copy.hidden {
+            } else if walk && copy.hidden {
                 continue;
             }
             let mut name = column.name.clone();

@@ -17,8 +17,8 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    DeclaredType, Error, Field, LogicalType, Origin, Result, Semantics, Session, ShowBehavior,
-    Span, SqlState, Stat, StateKey, Value,
+    DeclaredType, Error, Field, JoinColumns, LogicalType, Origin, Result, Semantics, Session,
+    ShowBehavior, Span, SqlState, Stat, StateKey, Value,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -4455,6 +4455,14 @@ impl<'a> Binder<'a> {
         // NATURAL is USING over whatever both sides happen to call the same thing, which is why it
         // is resolved here and never reaches the plan as its own idea.
         let compare = self.semantics.identifier_compare();
+        let first = self.semantics.join_columns() == JoinColumns::MergedFirst
+            && matches!(
+                kind,
+                ast::JoinKind::Inner
+                    | ast::JoinKind::Left
+                    | ast::JoinKind::Right
+                    | ast::JoinKind::Full
+            );
         let merged: Vec<String> = if natural {
             let mut names = Vec::new();
             for (at, column) in scope.columns.iter().enumerate().take(split) {
@@ -4474,11 +4482,17 @@ impl<'a> Binder<'a> {
             // `USING (id)` means, and the reference binary agrees. Taking it twice would build the
             // same equality twice and, worse, drop the right side's copy twice, which takes a
             // column out of the answer that nobody named and runs off the end of the scope when the
-            // copy was the last column in it.
+            // copy was the last column in it. PostgreSQL refuses the second name.
             let mut names: Vec<String> = Vec::new();
             for name in ast.name(using) {
                 if !names.iter().any(|held| compare.same(held, name)) {
                     names.push(name.to_string());
+                } else if first {
+                    return Err(Error::binder(format!(
+                        "column name \"{name}\" appears more than once in USING clause"
+                    ))
+                    .state(SqlState::DUPLICATE_COLUMN)
+                    .unplaced());
                 }
             }
             names
@@ -4495,6 +4509,7 @@ impl<'a> Binder<'a> {
                         "column \"{name}\" specified in USING clause does not exist in left table"
                     ))
                     .state(SqlState::UNDEFINED_COLUMN)
+                    .unplaced()
                 })?;
             let right_at = scope.columns[split..]
                 .iter()
@@ -4505,6 +4520,7 @@ impl<'a> Binder<'a> {
                         "column \"{name}\" specified in USING clause does not exist in right table"
                     ))
                     .state(SqlState::UNDEFINED_COLUMN)
+                    .unplaced()
                 })?;
             let left_column = &scope.columns[left_at];
             let (left_binding, left_type) = (left_column.binding, left_column.ty.clone());
@@ -4519,8 +4535,9 @@ impl<'a> Binder<'a> {
         // copy is hidden there. It stays for `b.k` and `b.*`, which still read the right side's own
         // value on the pin. A `RIGHT` or `FULL` join hides the left copy as well, because there the
         // bare name is not the left value, and puts the column it does read in its place once the
-        // join is built. See `Binder::merged`.
-        let outer = matches!(kind, ast::JoinKind::Right | ast::JoinKind::Full);
+        // join is built. PostgreSQL does this for each kind of join, and puts the merged columns
+        // first. See `Binder::merged`.
+        let outer = matches!(kind, ast::JoinKind::Right | ast::JoinKind::Full) || first;
         for &(left_at, right_at) in &pairs {
             // The two copies join one group, and so does anything already in a group with either,
             // which is a column joined on again in a chain of joins.
@@ -4635,39 +4652,68 @@ impl<'a> Binder<'a> {
             })
         };
         if outer && !pairs.is_empty() {
-            let node = self.merged(node, &mut scope, kind == JoinKind::Full, &pairs)?;
+            let node = self.merged(node, &mut scope, kind, &pairs, first)?;
             return Ok((node, scope));
         }
         Ok((node, scope))
     }
 
-    /// The column a bare name reads after a `RIGHT` or `FULL` join `USING` it, put where the left
-    /// copy was.
+    /// The column a bare name reads after a join `USING` it, when the left copy is not that
+    /// column.
     ///
     /// After a `RIGHT` join it is the right side's value, which is there on every row, and its
     /// type is the right side's. After a `FULL` join it is `COALESCE(a.k, b.k)` at the type the two
     /// meet at, so a row from either side has its key, and that needs a projection above the join
     /// to compute it in. `SELECT typeof(k)` over an `INTEGER` and a `BIGINT` key is `BIGINT` on the
     /// pin for both kinds and `INTEGER` for an inner or a left join, which reads the left copy.
+    /// The column has the place of the left copy.
+    ///
+    /// With `first`, which is the rule of PostgreSQL, this is done for an inner and a left join
+    /// too, which read the left value. Each column has the common type of its two copies, so a
+    /// projection casts a value that has another type. The columns come first, in the order of
+    /// `pairs`.
     ///
     /// The column has no table name, so `a.k` and `b.k` still find each side's hidden copy.
     fn merged(
         &mut self,
         node: NodeRef,
         scope: &mut Scope,
-        full: bool,
+        kind: JoinKind,
         pairs: &[(usize, usize)],
+        first: bool,
     ) -> Result<NodeRef> {
+        /// The value of one merged column: a copy that the join gives, or an expression that a
+        /// projection above the join computes.
+        enum Taken {
+            Copy(usize),
+            Computed(ExprRef),
+        }
+        let mut values = Vec::with_capacity(pairs.len());
+        for &(left_at, right_at) in pairs {
+            let (left, right) = (&scope.columns[left_at], &scope.columns[right_at]);
+            let ty = if first { left.ty.promote(&right.ty) } else { None };
+            let value = match kind {
+                JoinKind::Full => {
+                    let left = self.plan.add_expr(Expr::Column(left.binding), left.ty.clone());
+                    let right = self.plan.add_expr(Expr::Column(right.binding), right.ty.clone());
+                    Taken::Computed(self.call("coalesce", vec![left, right])?)
+                }
+                JoinKind::Right => Taken::Copy(right_at),
+                _ => Taken::Copy(left_at),
+            };
+            values.push(match (value, ty) {
+                (Taken::Copy(at), Some(ty)) if scope.columns[at].ty != ty => {
+                    let column = &scope.columns[at];
+                    let value = self.plan.add_expr(Expr::Column(column.binding), column.ty.clone());
+                    Taken::Computed(self.cast_to(value, &ty))
+                }
+                (Taken::Computed(value), Some(ty)) => Taken::Computed(self.cast_to(value, &ty)),
+                (value, _) => value,
+            });
+        }
         let mut node = node;
-        let mut made = Vec::with_capacity(pairs.len());
-        if full {
-            let mut values = Vec::with_capacity(pairs.len());
-            for &(left_at, right_at) in pairs {
-                let (left, right) = (&scope.columns[left_at], &scope.columns[right_at]);
-                let left = self.plan.add_expr(Expr::Column(left.binding), left.ty.clone());
-                let right = self.plan.add_expr(Expr::Column(right.binding), right.ty.clone());
-                values.push(self.call("coalesce", vec![left, right])?);
-            }
+        let mut computed = Vec::new();
+        if values.iter().any(|value| matches!(value, Taken::Computed(_))) {
             let index = self.fresh_index();
             let mut exprs = Vec::with_capacity(scope.columns.len() + values.len());
             let mut names = Vec::with_capacity(scope.columns.len() + values.len());
@@ -4679,43 +4725,56 @@ impl<'a> Binder<'a> {
             for (at, column) in scope.columns.iter_mut().enumerate() {
                 column.binding = ColumnBinding::new(index, at as u32);
             }
-            for (at, (&value, &(left_at, _))) in values.iter().zip(pairs).enumerate() {
-                exprs.push(value);
-                names.push(self.plan.intern(&scope.columns[left_at].name));
-                let ty = self.plan.expr_type(value).clone();
-                made.push((left_at, ColumnBinding::new(index, (width + at) as u32), ty));
+            for (value, &(left_at, _)) in values.iter().zip(pairs) {
+                if let Taken::Computed(value) = *value {
+                    let binding = ColumnBinding::new(index, (width + computed.len()) as u32);
+                    exprs.push(value);
+                    names.push(self.plan.intern(&scope.columns[left_at].name));
+                    computed.push((binding, self.plan.expr_type(value).clone()));
+                }
             }
             let exprs = self.plan.add_expr_list(&exprs);
             let names = self.plan.add_name_list(&names);
             node = self.add_node(Node::Project { input: node, index, exprs, names });
-        } else {
-            for &(left_at, right_at) in pairs {
-                let right = &scope.columns[right_at];
-                made.push((left_at, right.binding, right.ty.clone()));
-            }
         }
-        // From the back, so the positions of the ones still to place are where they were.
-        made.sort_by_key(|&(left_at, ..)| left_at);
-        for (left_at, binding, ty) in made.into_iter().rev() {
-            let name = scope.columns[left_at].name.clone();
-            let using = scope.columns[left_at].using.map(|joined| Joined::Merged(joined.group()));
-            scope.columns.insert(
-                left_at,
-                Visible {
-                    table: String::new(),
-                    name,
-                    binding,
-                    ty,
-                    not_null: false,
-                    key: None,
-                    default: None,
-                    origin: None,
-                    qualified: false,
-                    also: None,
-                    hidden: false,
-                    using,
-                },
-            );
+        let mut computed = computed.into_iter();
+        let mut made = Vec::with_capacity(pairs.len());
+        for (value, &(left_at, _)) in values.iter().zip(pairs) {
+            let (binding, ty, origin) = match *value {
+                Taken::Copy(at) => {
+                    let column = &scope.columns[at];
+                    (column.binding, column.ty.clone(), column.origin)
+                }
+                Taken::Computed(_) => {
+                    let (binding, ty) = computed.next().expect("one column for each value");
+                    (binding, ty, None)
+                }
+            };
+            let left = &scope.columns[left_at];
+            let column = Visible {
+                table: String::new(),
+                name: left.name.clone(),
+                binding,
+                ty,
+                not_null: false,
+                key: None,
+                default: None,
+                origin,
+                qualified: false,
+                also: None,
+                hidden: false,
+                using: left.using.map(|joined| Joined::Merged(joined.group())),
+            };
+            made.push((left_at, column));
+        }
+        if first {
+            scope.columns.splice(0..0, made.into_iter().map(|(_, column)| column));
+        } else {
+            // From the back, so the positions of the ones still to place are where they were.
+            made.sort_by_key(|&(left_at, _)| left_at);
+            for (left_at, column) in made.into_iter().rev() {
+                scope.columns.insert(left_at, column);
+            }
         }
         Ok(node)
     }
