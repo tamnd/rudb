@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.41
+
+This release makes the release gate pass again, continues the PostgreSQL parser inside PG4 (#2492), and makes several TPC-H and ClickBench queries faster.
+
+The tag for 0.8.40 failed `cargo xtask ci`, and nothing from it was published. #2743 wrote `cast::cast` where `cast` was already in scope, and the gate denies that warning, so `rudb-kernels` did not compile. #2750 calls `cast` directly. #2759 says why a flatten that #2754 added is meant, which the flatten check asks for.
+
+#2746 adds the PostgreSQL lexer and the lookahead filter to `rudb-pgparse`, and #2748 adds the node types of the raw parse tree. #2751, #2752 and #2757 run the actions of `gram.y`, so `rudb-pgparse` builds the raw parse tree of every statement the same way PostgreSQL 19 does. #2758 transforms the raw parse tree of a query into the AST of `rudb-parse`, with the rules that the two dialects share in `rudb_parse::build`, and a test compares the trees of the two transforms.
+
+#2747 sorts fixed width keys by counting the bytes that vary. #2754 cuts a `CASE` branch to the columns it reads and places a constant once. #2755 estimates every node of a finished plan in one walk, and #2756 runs the operands of an `OR` over the same rows until most of them are accepted. #2760 compares bit packed codes of most widths where they lie in a range filter, so a date or quantity filter of TPC-H does not first move each code into a lane of its own. #2749 binds `PIVOT` and `UNPIVOT` the way the pin does, and #2753 reads an integer literal as the integer type it meets, as DuckDB does.
+
+Because 0.8.40 was not published, this release is the first to publish `rudb-pgparse`. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.40
 
 This release makes the release gate pass again, fixes the row order and checkpoint work that broke it, and continues the PostgreSQL work inside PG2 (#2490) and PG5 (#2493), with join order and link join work.
