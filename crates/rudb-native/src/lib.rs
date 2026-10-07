@@ -9454,15 +9454,13 @@ impl Reader {
             return Ok(None);
         }
         let rows = place.rows as usize;
-        // A row whose sketch lacks a bit the pieces need cannot hold them, so only the rest are
-        // walked, for each pattern. See `grams`.
-        let first = self.firsts.get(part).copied().unwrap_or_default();
-        let sketch = self
-            .text_grams
-            .get(column)
-            .and_then(|slot| slot.get_or_init(|| grams::text_grams(self, column)).as_deref())
-            .and_then(|words| words.get(first..first + rows));
-        if sketch.is_none()
+        // Whether there is a sketch is asked of the file's sections, and the sketch itself is only
+        // read once a part turns out to be compressed text, since a column coded with dictionaries
+        // never walks one and the sketch is eight bytes a row of the whole table.
+        let sketched = self.text_grams.get(column).is_some_and(|slot| {
+            slot.get().map_or_else(|| grams::has_text_grams(self, column), Option::is_some)
+        });
+        if !sketched
             && let Some(Ok(slot)) = self.cache.made(column, part).map(Mutex::lock)
             && slot.seen().is_none_or(|before| before >= rows)
         {
@@ -9472,6 +9470,15 @@ impl Reader {
             if bytes.first() != Some(&6) {
                 return Ok(None);
             }
+            // A row whose sketch lacks a bit the pieces need cannot hold them, so only the rest
+            // are walked, for each pattern. See `grams`.
+            let first = self.firsts.get(part).copied().unwrap_or_default();
+            let sketch = self
+                .text_grams
+                .get(column)
+                .filter(|_| sketched)
+                .and_then(|slot| slot.get_or_init(|| grams::text_grams(self, column)).as_deref())
+                .and_then(|words| words.get(first..first + rows));
             if sketch.is_none() {
                 self.pay(part, column, rows);
             }
