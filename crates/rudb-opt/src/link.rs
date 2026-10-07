@@ -23,11 +23,13 @@
 //!
 //! # What this pass will not do
 //!
-//! It will not read a link for a join whose parent is anything but a bare scan. A gather by row id
-//! reads the parent's stored rows, so a filter or a projection between the scan and the join is a
-//! restriction the gather would ignore, which is a wrong answer rather than a slow one. That is not
-//! a gap so much as the shape of the direction: a join that is selective on the parent side is what
-//! section 5.4's reduction is for, and the reduction is the next milestone.
+//! It will not read a link for a join whose parent is anything but a scan under filters. A gather
+//! by row id reads the parent's stored rows, so a projection or a join between the scan and the join
+//! changes what a parent row is, and a gather that read past it would be a wrong answer rather than
+//! a slow one. A filter is different: it is a test on the parent row, and the link join runs it on
+//! the parent of each child row it finds and treats a parent that fails as no parent. A semi or an
+//! anti join over a filtered parent reads the columns the filter needs, so it is sized like the
+//! others rather than taken whatever the parent's size.
 //!
 //! It will read one through joins on the child side, where the child's rows are the side a join
 //! streams, because that is where the child sits in nearly every real query. TPC-H Q9 reads
@@ -362,6 +364,15 @@ pub enum Why {
     RowIdGone,
     /// The row id the link join carries would reach somewhere that counts its input's columns.
     ColumnWouldShow,
+    /// The parent is filtered to no more rows than the child brings, so a hash table over the rows
+    /// that passed is small and the reduction it sends to the child's scan reads less than a test
+    /// of every child row would.
+    Filtered {
+        /// The rows the child was estimated at.
+        child: u64,
+        /// The rows the filtered parent was estimated at.
+        parent: u64,
+    },
     /// The parent fits in cache after projection, so the build costs less than the gathers.
     Fits {
         /// The rows the parent was estimated at.
@@ -410,7 +421,7 @@ impl Why {
             Self::NotBuilt => 2,
             Self::RowIdGone => 3,
             Self::ColumnWouldShow => 4,
-            Self::Fits { .. } | Self::Wide { .. } => 5,
+            Self::Filtered { .. } | Self::Fits { .. } | Self::Wide { .. } => 5,
             Self::Narrow { .. } | Self::NeverRead | Self::Keyed => 6,
         }
     }
@@ -441,6 +452,11 @@ impl std::fmt::Display for Why {
             Self::ColumnWouldShow => {
                 write!(out, "the row id would reach an operator that counts its input's columns")
             }
+            Self::Filtered { child, parent } => write!(
+                out,
+                "the parent is filtered to {parent} rows, which is not more than the {child} rows \
+                 of the child"
+            ),
             Self::Fits { rows, bytes } => write!(
                 out,
                 "the parent is {rows} rows and {bytes} bytes projected, which fits in cache"
@@ -481,16 +497,19 @@ pub fn why(plan: &Plan, at: NodeRef, context: &Context) -> Option<Why> {
         // Already taken, so the question is which bullet of section 6.4 took it. A semi or an anti
         // is the bullet that does not size anything, and everything else got here through the width.
         Node::LinkJoin { keyed: true, .. } => Some(Why::Keyed),
-        Node::LinkJoin { parent, kind, .. } => Some(match kind {
-            JoinKind::Semi | JoinKind::Anti => Why::NeverRead,
-            _ => match *plan.node(parent) {
+        Node::LinkJoin { parent, kind, .. } => {
+            let scan = stored(plan, parent);
+            Some(match *plan.node(scan) {
+                _ if scan == parent && matches!(kind, JoinKind::Semi | JoinKind::Anti) => {
+                    Why::NeverRead
+                }
                 Node::Get { columns, .. } => {
                     let sizes = context.sizes();
                     Why::Narrow { width: width(plan, columns), narrow: sizes.narrow_bytes }
                 }
                 _ => Why::ParentNotStored,
-            },
-        }),
+            })
+        }
         _ => None,
     }
 }
@@ -558,7 +577,7 @@ fn rewrite(
 /// The child's side of a join's one equality as a `BIGINT`, for a join that finds its parent by
 /// key. A key of a type that does not fit one is not a key an identity map can hold.
 fn child_key(plan: &mut Plan, parent: NodeRef, conditions: Slice) -> Option<ExprRef> {
-    let Node::Get { index, .. } = *plan.node(parent) else { return None };
+    let Node::Get { index, .. } = *plan.node(stored(plan, parent)) else { return None };
     let &[condition] = plan.expr_list(conditions) else { return None };
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
         return None;
@@ -629,7 +648,7 @@ fn decided(
                 continue;
             }
         };
-        let why = worth_it(plan, parent, kind, &found, context);
+        let why = worth_it(plan, child, parent, kind, &found, context);
         // Asked after the rest of it on purpose. What is above a join is the same whichever way
         // round its sides are read, so asking first would report a shape complaint for a join that
         // has no relationship at all and bury the reason that was actually in the way.
@@ -728,6 +747,18 @@ struct Match {
     scan: Option<NodeRef>,
     /// The parent's projected columns, which is what the gather costs per row.
     projected: Slice,
+    /// Whether the parent's scan is under filters, which a semi or an anti join then reads the
+    /// parent to run.
+    filtered: bool,
+}
+
+/// The scan under `parent`, through the filters a pushed down predicate leaves over it.
+fn stored(plan: &Plan, parent: NodeRef) -> NodeRef {
+    let mut at = parent;
+    while let Node::Filter { input, .. } = *plan.node(at) {
+        at = input;
+    }
+    at
 }
 
 /// Whether this pairing of the two inputs is a relationship the file holds a link for.
@@ -745,9 +776,11 @@ fn matched(
     context: &Context,
 ) -> std::result::Result<Match, Why> {
     // A gather by row id reads the parent's stored rows, so the parent has to be the stored table
-    // and nothing else. See the note at the top about what a filter here would mean.
+    // under nothing but filters. See the note at the top about what a filter here means.
+    let scan = stored(plan, parent);
+    let filtered = scan != parent;
     let Node::Get { table: parent_name, index: parent_index, columns: projected, .. } =
-        *plan.node(parent)
+        *plan.node(scan)
     else {
         return Err(Why::ParentNotStored);
     };
@@ -788,7 +821,7 @@ fn matched(
     // A parent whose key map is the identity is found from the key alone, which is cheaper than
     // reading a link even where there is one, and needs nothing of the rows but the key.
     if declared.identity && declared.second.is_none() {
-        return Ok(Match { scan: None, projected });
+        return Ok(Match { scan: None, projected, filtered });
     }
     let scan = stored.ok_or(Why::ChildNotStored)?;
     if !declared.built {
@@ -797,10 +830,12 @@ fn matched(
     // Section 5.1's rule, and the only thing between this pass and a wrong answer. A link is
     // indexed by a row of the child table, so it may only be read where every row reaching the join
     // is still a row of that table.
-    if !carried.get(child as usize).is_some_and(|rids| rids.has(child_index)) {
+    if !carried.get(child as usize).is_some_and(|rids| rids.has(child_index))
+        && !valued(plan, child, child_index)
+    {
         return Err(Why::RowIdGone);
     }
-    Ok(Match { scan: Some(scan), projected })
+    Ok(Match { scan: Some(scan), projected, filtered })
 }
 
 /// The scan that binds `index` anywhere under `at`, whatever is between them.
@@ -816,7 +851,33 @@ fn get_under(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
 }
 
 /// Section 6.4, which is the whole of the choice.
-fn worth_it(plan: &Plan, parent: NodeRef, kind: JoinKind, found: &Match, context: &Context) -> Why {
+fn worth_it(
+    plan: &Plan,
+    child: NodeRef,
+    parent: NodeRef,
+    kind: JoinKind,
+    found: &Match,
+    context: &Context,
+) -> Why {
+    // A filtered parent is a hash join's chance to cut the child down: the parents that passed go
+    // into a small table, and the reduction that table sends to the child's scan reads only their
+    // children. The link join has to test the parent of every child row that arrives, so it only
+    // wins where more parents pass than child rows arrive. TPC-H q17 is the other case, where 204
+    // parts passed and testing the part of every one of six million lines cost 30 times the plan
+    // it replaced. A side nobody estimated is left to the hash join, which is the plan that ran
+    // before any of this.
+    if found.filtered {
+        let rows = |node| estimate::rows(plan, node, context.facts());
+        match (rows(child), rows(parent)) {
+            (Some(child), Some(parent)) if child < parent => {}
+            (child, parent) => {
+                return Why::Filtered {
+                    child: child.unwrap_or(u64::MAX),
+                    parent: parent.unwrap_or(0),
+                };
+            }
+        }
+    }
     // Nothing is built and nothing is read but the key, so there is no size this loses at. A hash
     // join over the same parent reads its whole key column to build a table that answers the same
     // subtraction.
@@ -826,7 +887,7 @@ fn worth_it(plan: &Plan, parent: NodeRef, kind: JoinKind, found: &Match, context
     // Never touches the parent, so none of the rest of it applies. A semi join over a relationship
     // the file has verified is a sentinel test per child row, and there is no size at which a hash
     // table beats that.
-    if matches!(kind, JoinKind::Semi | JoinKind::Anti) {
+    if matches!(kind, JoinKind::Semi | JoinKind::Anti) && !found.filtered {
         return Why::NeverRead;
     }
     let width = width(plan, found.projected);
@@ -906,6 +967,38 @@ fn scan_under(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
             scan_under(plan, left, index).or_else(|| scan_under(plan, right, index))
         }
         _ => None,
+    }
+}
+
+/// Whether the row id column of the scan that binds `index` under `at` reaches `at` in every row,
+/// where [`rids_of`] says the rows are no longer the scan's rows in the order it read them.
+///
+/// The link join reads the row id out of a column rather than assuming it, so a row a hash join
+/// gathered out of its build side still names its row of the table, since the column was gathered
+/// with it. What ends a row id here is a side whose columns do not reach the output, which is the
+/// right side of a semi, an anti or a mark join, and a side an outer join pads, where the row id
+/// would be null. TPC-H q21 is the case: `l1` is the build side of the anti and the semi join, and
+/// the join to `orders` above them built a hash table over 729,413 orders for 8,357 lines.
+fn valued(plan: &Plan, at: NodeRef, index: u32) -> bool {
+    match *plan.node(at) {
+        Node::Get { index: found, .. } => found == index,
+        Node::Filter { input, .. } | Node::LinkJoin { child: input, .. } => {
+            valued(plan, input, index)
+        }
+        Node::Join { left, right, kind, .. } => {
+            let (left_kept, right_kept) = match kind {
+                JoinKind::Inner => (true, true),
+                JoinKind::Left
+                | JoinKind::Single
+                | JoinKind::Semi
+                | JoinKind::Anti
+                | JoinKind::Mark => (true, false),
+                JoinKind::Right => (false, true),
+                JoinKind::Full | JoinKind::Positional => (false, false),
+            };
+            (left_kept && valued(plan, left, index)) || (right_kept && valued(plan, right, index))
+        }
+        _ => false,
     }
 }
 
@@ -1015,16 +1108,69 @@ mod tests {
         );
     }
 
+    /// The row id is a column, and a build side gathers its columns with its rows, so a child in
+    /// another join's hash table still names its row of the table in every row it reaches.
     #[test]
-    fn a_child_gathered_into_another_join_s_hash_table_does_not() {
+    fn a_child_gathered_into_another_join_s_hash_table_reads_the_link_through_the_column() {
         let mut plan = under_a_join("right");
         let context = context(1_500_000);
         let text = rewritten(&mut plan, &context);
-        assert!(!text.contains("LinkJoin"), "a build side was read as rows of the table:\n{text}");
+        assert!(text.contains("LinkJoin"), "a gathered row id was not read:\n{text}");
+        assert!(text.contains("file_row_number"), "the scan was not asked for a row id:\n{text}");
+    }
+
+    /// The side a left join pads has a null for a row id in the rows it made up, so a child there
+    /// does not reach the join as rows of the table.
+    #[test]
+    fn a_child_on_the_side_an_outer_join_pads_does_not() {
+        let text = "Project #3 [#0.0::BIGINT AS k]\n  \
+             Join INNER on=[(#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n    \
+             Get memory.main.orders AS orders #1 [o_orderkey::BIGINT]\n    \
+             Join LEFT on=[(#2.0::BIGINT = #0.1::BIGINT)::BOOLEAN]\n      \
+             Get memory.main.part AS part #2 [p_partkey::BIGINT]\n      \
+             Get memory.main.lineitem AS lineitem #0 [l_orderkey::BIGINT, l_partkey::BIGINT]\n";
+        let mut plan = Plan::parse(text).unwrap_or_else(|error| panic!("{text}: {error}"));
+        let context = context(1_500_000);
+        let text = rewritten(&mut plan, &context);
+        assert!(!text.contains("LinkJoin"), "a padded side was read as rows of the table:\n{text}");
         let reasons = (0..u32::try_from(plan.node_count()).expect("a small plan"))
             .filter_map(|node| super::why(&plan, node, &context))
             .collect::<Vec<_>>();
         assert!(reasons.contains(&Why::RowIdGone), "{reasons:?}");
+    }
+
+    /// A filter over the parent is run on the parent of each child row, so it does not stop the
+    /// link from being read where more parents pass than child rows arrive. Where fewer pass, the
+    /// hash table over them is the better plan, and a semi join is no exception since it now reads
+    /// the parent.
+    #[test]
+    fn a_parent_under_a_filter_reads_the_link_only_where_more_parents_pass_than_children_arrive() {
+        let filtered = |kind: &str| {
+            let text = format!(
+                "Project #2 [#0.0::BIGINT AS k]\n  \
+                 Join {kind} on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n    \
+                 Get memory.main.lineitem AS lineitem #0 [l_orderkey::BIGINT]\n    \
+                 Filter (#1.1::VARCHAR = 'F'::VARCHAR)::BOOLEAN\n      \
+                 Get memory.main.orders AS orders #1 [o_orderkey::BIGINT, o_orderstatus::VARCHAR]\n"
+            );
+            Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
+        };
+        // Parents enough that what passes does not fit either, and few children.
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "lineitem", 1_000);
+        facts.record("memory", "main", "orders", 30_000_000);
+        let mut large = Context::new();
+        large.measure(Arc::new(facts));
+        large.relate(declared());
+        let mut plan = filtered("INNER");
+        let text = rewritten(&mut plan, &large);
+        assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
+        assert!(matches!(about(&plan, &large), Why::Narrow { .. }));
+        let mut plan = filtered("SEMI");
+        let small = context(1_000);
+        let text = rewritten(&mut plan, &small);
+        assert!(!text.contains("LinkJoin"), "a selective parent filter was linked:\n{text}");
+        assert!(matches!(about(&plan, &small), Why::Filtered { .. }));
     }
 
     /// `lineitem` against `partsupp` over both halves of its key, with `on` as the conditions.
@@ -1321,8 +1467,8 @@ mod tests {
 
     #[test]
     fn a_child_gathered_into_another_join_s_hash_table_is_still_found_by_key() {
-        // The rows reaching the join are no longer rows of `lineitem`, which rules out its link
-        // and not its key.
+        // The link was never built, and a key keeps its value through the hash table the rows
+        // were gathered out of.
         let mut plan = under_a_join("right");
         let mut context = context(1_500_000);
         let linked = Linked::declared("lineitem", "l_orderkey", "orders", "o_orderkey");
