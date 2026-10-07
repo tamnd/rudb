@@ -8696,16 +8696,6 @@ fn optimized(plan: &mut Plan, context: &rudb_opt::pass::Context) -> Result<(u64,
     Ok((optimize_ns, rewrite_ns))
 }
 
-/// Run something and say how long it took, in wall nanoseconds.
-///
-/// Here so that the three phases are timed the same way rather than three ways, and so that adding
-/// a span around a call that already existed does not also re-indent it. A failure is not timed,
-/// because there is no document to put the number in and a partial phase is not a phase.
-///
-/// The wall clock alone. This used to start a span on both clocks and keep only the wall reading,
-/// which was two reads of the thread CPU clock per phase and six per statement, and on Linux every
-/// one of those is a system call where the wall clock is a read out of the vDSO. The phases are
-/// single threaded, so the CPU reading said nothing the wall one did not.
 /// Parse a script in the dialect of the session. Every parse of a statement that a session runs
 /// comes through here, `08-the-dialect.md` section 8.1.
 pub(crate) fn parse(session: &Session, sql: &str) -> Result<Ast> {
@@ -8717,6 +8707,16 @@ pub(crate) fn parse(session: &Session, sql: &str) -> Result<Ast> {
     }
 }
 
+/// Run something and say how long it took, in wall nanoseconds.
+///
+/// Here so that the three phases are timed the same way rather than three ways, and so that adding
+/// a span around a call that already existed does not also re-indent it. A failure is not timed,
+/// because there is no document to put the number in and a partial phase is not a phase.
+///
+/// The wall clock alone. This used to start a span on both clocks and keep only the wall reading,
+/// which was two reads of the thread CPU clock per phase and six per statement, and on Linux every
+/// one of those is a system call where the wall clock is a read out of the vDSO. The phases are
+/// single threaded, so the CPU reading said nothing the wall one did not.
 fn timed<T>(what: impl FnOnce() -> Result<T>) -> Result<(T, u64)> {
     let span = Span::wall();
     let out = what()?;

@@ -17,8 +17,6 @@
 //! statement that a rule with one child said nothing, which is true of every chain link, and it
 //! means the twenty first precedence level upstream adds costs us nothing.
 
-use std::collections::HashMap;
-
 use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 
 use crate::ast::{
@@ -30,6 +28,7 @@ use crate::ast::{
     TriggerEvent, TriggerTiming, Truncate, UnaryOp, WindowBound, WindowExclude, WindowRef,
     WindowSpec, WindowUnit,
 };
+use crate::build::Interner;
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
 use crate::parameters::{self, Arranged, Refilled, Slot};
@@ -87,7 +86,7 @@ fn transform_dialect(
         tokens,
         tree,
         ast: Ast { source: query.into(), ..Ast::default() },
-        interned: HashMap::new(),
+        interned: Interner::default(),
         anonymous: 0,
         identifier_case,
         postgres,
@@ -143,7 +142,7 @@ struct Transform<'a> {
     tokens: &'a [Token],
     tree: &'a Tree,
     ast: Ast,
-    interned: HashMap<String, StrRef>,
+    interned: Interner,
     /// How many bare `?` parameters have been seen, which is what numbers the next one.
     anonymous: u32,
     identifier_case: IdentifierCase,
@@ -315,101 +314,67 @@ impl<'a> Transform<'a> {
 
     /// Intern a string, returning its index.
     fn intern(&mut self, text: &str) -> StrRef {
-        if let Some(&index) = self.interned.get(text) {
-            return index;
-        }
-        let index = u32::try_from(self.ast.strings.len())
-            .map_err(|_| Error::internal("more than four billion strings in one query"))
-            .unwrap_or(NONE);
-        self.ast.strings.push(text.to_string());
-        self.interned.insert(text.to_string(), index);
-        index
+        self.interned.intern(&mut self.ast, text)
     }
 
     /// Push an expression and return its index.
     fn push(&mut self, expr: Expr) -> ExprRef {
-        let index = self.ast.exprs.len() as u32;
-        self.ast.exprs.push(expr);
-        self.ast.expr_spans.push(self.current_span);
-        index
+        self.ast.push_expr(expr, self.current_span)
     }
 
     /// Push a from item and return its index.
     fn push_source(&mut self, source: Source) -> SourceRef {
-        let index = self.ast.sources.len() as u32;
-        self.ast.sources.push(source);
-        index
+        self.ast.push_source(source)
     }
 
     /// Push a query and return its index.
     fn push_query(&mut self, query: Query) -> QueryRef {
-        let index = self.ast.queries.len() as u32;
-        self.ast.queries.push(query);
-        self.ast.query_spans.push(self.current_span);
-        index
+        self.ast.push_query(query, self.current_span)
     }
 
     /// Push a select and return its index.
     fn push_select(&mut self, select: Select) -> SelectRef {
-        let index = self.ast.selects.len() as u32;
-        self.ast.selects.push(select);
-        index
+        self.ast.push_select(select)
     }
 
     /// Push a window and return its index.
     fn push_window(&mut self, spec: WindowSpec) -> WindowRef {
-        let index = self.ast.windows.len() as u32;
-        self.ast.windows.push(spec);
-        index
+        self.ast.push_window(spec)
     }
 
     /// Turn a vector of order by entries into a slice of the order item arena.
     fn order_slice(&mut self, items: Vec<OrderItem>) -> Slice {
-        let start = self.ast.order_items.len() as u32;
-        self.ast.order_items.extend(items);
-        Slice { start, len: self.ast.order_items.len() as u32 - start }
+        self.ast.order_slice(items)
     }
 
     /// Turn a vector of expressions into a slice of the expression list arena.
     fn expr_slice(&mut self, items: Vec<ExprRef>) -> Slice {
-        let start = self.ast.expr_lists.len() as u32;
-        self.ast.expr_lists.extend(items);
-        Slice { start, len: self.ast.expr_lists.len() as u32 - start }
+        self.ast.expr_slice(items)
     }
 
     /// Turn a vector of strings into a slice of the name arena.
     fn part_slice(&mut self, items: Vec<StrRef>) -> Slice {
-        let start = self.ast.parts.len() as u32;
-        self.ast.parts.extend(items);
-        Slice { start, len: self.ast.parts.len() as u32 - start }
+        self.ast.part_slice(items)
     }
 
     /// Turn a vector of materialised `WITH` indexes into a slice of the list pool.
     fn cte_slice(&mut self, items: Vec<u32>) -> Slice {
-        let start = self.ast.cte_lists.len() as u32;
-        self.ast.cte_lists.extend(items);
-        Slice { start, len: self.ast.cte_lists.len() as u32 - start }
+        self.ast.cte_slice(items)
     }
 
     /// Turn a vector of column definitions into a slice of the column arena.
     fn column_def_slice(&mut self, items: Vec<ColumnDef>) -> Slice {
-        let start = self.ast.column_defs.len() as u32;
-        self.ast.column_defs.extend(items);
-        Slice { start, len: self.ast.column_defs.len() as u32 - start }
+        self.ast.column_def_slice(items)
     }
 
     /// Turn a vector of targets into a slice of the target arena.
     fn target_slice(&mut self, items: Vec<Target>) -> Slice {
-        let start = self.ast.targets.len() as u32;
-        self.ast.targets.extend(items);
-        Slice { start, len: self.ast.targets.len() as u32 - start }
+        self.ast.target_slice(items)
     }
 
     /// Turn a vector of qualified names into a slice of the name list arena.
     fn name_list_slice(&mut self, items: Vec<Slice>) -> Slice {
-        let start = self.ast.name_lists.len() as u32;
-        self.ast.name_lists.extend(items);
-        Slice { start, len: self.ast.name_lists.len() as u32 - start }
+        self.ast.name_list_slice(items)
     }
 
     /// The error for a construct the transformer does not cover yet.
@@ -3029,9 +2994,7 @@ impl<'a> Transform<'a> {
                     targets.push(Target { expr, alias: NONE });
                 }
                 let targets = self.target_slice(targets);
-                let start = self.ast.source_lists.len() as u32;
-                self.ast.source_lists.push(source);
-                let from = Slice { start, len: 1 };
+                let from = self.ast.source_slice([source]);
                 let select = self.push_select(Select { targets, from, ..Select::empty() });
                 self.push_query(Query::bare(QueryBody::Select(select)))
             };
@@ -3377,9 +3340,7 @@ impl<'a> Transform<'a> {
             on: NONE,
             using: Slice::default(),
         });
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.push(joined);
-        let from = Slice { start, len: 1 };
+        let from = self.ast.source_slice([joined]);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         let query = self.push_query(Query::bare(QueryBody::Select(select)));
         let columns = self.part_slice(columns);
@@ -3406,9 +3367,7 @@ impl<'a> Transform<'a> {
     /// A `FROM` of the one table a writing statement names.
     fn written_table(&mut self, name: Slice, alias: StrRef) -> Slice {
         let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.push(source);
-        Slice { start, len: 1 }
+        self.ast.source_slice([source])
     }
 
     /// An `INSERT`, `UPDATE` or `DELETE`, with the definitions of a `WITH` ahead of it in scope.
@@ -3634,9 +3593,7 @@ impl<'a> Transform<'a> {
             on,
             using: Slice::default(),
         });
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.push(join);
-        let from = Slice { start, len: 1 };
+        let from = self.ast.source_slice([join]);
         let qualifier = self.part_slice(vec![alias]);
         let star = self.push(Expr::Star { qualifier, replacements: Slice::default() });
         let mut targets = vec![Target { expr: star, alias: NONE }];
@@ -4298,9 +4255,7 @@ impl<'a> Transform<'a> {
         let star =
             self.push(Expr::Star { qualifier: Slice::default(), replacements: Slice::default() });
         let targets = self.target_slice(vec![Target { expr: star, alias: NONE }]);
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.push(source);
-        let from = Slice { start, len: 1 };
+        let from = self.ast.source_slice([source]);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         self.push_query(Query::bare(QueryBody::Select(select)))
     }
@@ -4617,9 +4572,7 @@ impl<'a> Transform<'a> {
         for kid in self.kids(node) {
             items.push(self.table_ref(kid)?);
         }
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.extend(items);
-        Ok(Slice { start, len: self.ast.source_lists.len() as u32 - start })
+        Ok(self.ast.source_slice(items))
     }
 
     /// `TableRef <- InnerTableRef JoinOrPivot*`, left associative like the set operators.
@@ -4912,9 +4865,7 @@ impl<'a> Transform<'a> {
             targets.extend(aggregates);
             let targets = self.target_slice(targets);
             let group_by = self.expr_slice(grouped);
-            let start = self.ast.source_lists.len() as u32;
-            self.ast.source_lists.push(source);
-            let from = Slice { start, len: 1 };
+            let from = self.ast.source_slice([source]);
             let select = self.push_select(Select { targets, from, group_by, ..Select::empty() });
             return Ok(self.push_query(Query::bare(QueryBody::Select(select))));
         }
@@ -5000,9 +4951,7 @@ impl<'a> Transform<'a> {
         let cast = self.push(Expr::Cast { operand: expr, ty, try_cast: false });
         let filter = self.push(Expr::Unary { op: UnaryOp::IsNotNull, operand: expr });
         let targets = self.target_slice(vec![Target { expr: cast, alias: NONE }]);
-        let start = self.ast.source_lists.len() as u32;
-        self.ast.source_lists.push(source);
-        let from = Slice { start, len: 1 };
+        let from = self.ast.source_slice([source]);
         let select = self.push_select(Select {
             distinct: Distinct::Yes,
             targets,
@@ -5386,37 +5335,16 @@ impl<'a> Transform<'a> {
         }
         let text = self.text(node);
         let upper = text.to_ascii_uppercase();
+        if let Some(op) = crate::build::symbol_op(&upper) {
+            return Ok(op);
+        }
         let op = match upper.as_str() {
             "OR" => BinaryOp::Or,
             "AND" => BinaryOp::And,
-            "=" | "==" => BinaryOp::Eq,
-            "!=" | "<>" => BinaryOp::NotEq,
-            "<" => BinaryOp::Lt,
-            ">" => BinaryOp::Gt,
-            "<=" => BinaryOp::LtEq,
-            ">=" => BinaryOp::GtEq,
-            "+" => BinaryOp::Add,
-            "-" => BinaryOp::Subtract,
-            "*" => BinaryOp::Multiply,
-            "/" => BinaryOp::Divide,
+            "==" => BinaryOp::Eq,
             "//" => BinaryOp::IntegerDivide,
-            "%" => BinaryOp::Modulo,
             "**" => BinaryOp::Power,
-            "^" => BinaryOp::Caret,
-            "&" => BinaryOp::BitAnd,
-            "|" => BinaryOp::BitOr,
-            "<<" => BinaryOp::ShiftLeft,
-            ">>" => BinaryOp::ShiftRight,
-            "||" => BinaryOp::Concat,
             "COLLATE" => BinaryOp::Collate,
-            "->" => BinaryOp::Arrow,
-            "->>" => BinaryOp::LongArrow,
-            "@>" => BinaryOp::Contains,
-            "<@" => BinaryOp::ContainedBy,
-            "&&" => BinaryOp::Overlaps,
-            "^@" => BinaryOp::StartsWith,
-            "<<=" => BinaryOp::InetContainedByOrEq,
-            ">>=" => BinaryOp::InetContainsOrEq,
             _ if self.name(leaf) == "AtTimeZoneOperator" => BinaryOp::AtTimeZone,
             // `IsDistinctFromOp <- 'IS' 'NOT'? 'DISTINCT' 'FROM'`, told apart by the middle word,
             // which is not in the tree because keywords are terminals.
@@ -6725,7 +6653,7 @@ impl<'a> Transform<'a> {
             // one spelling that keyword has. `EXTRACT(seconds FROM t)` and `EXTRACT(SECOND FROM t)`
             // are both `date_part('SECOND', t)`, which was measured, and it shows up in the column
             // name as well as in the deparse, since an unaliased column is named after the call.
-            "ExtractDatePartArgument" => date_part(self.text(argument)),
+            "ExtractDatePartArgument" => crate::build::date_part(self.text(argument)),
             // An identifier, taken as written. Which specifier names are legal is not a question
             // about syntax, so the answer to it lives with the function.
             "ExtractIdentifierArgument" => self.text(argument).to_string(),
@@ -7181,51 +7109,6 @@ const UNITS: &[(&str, &str, Option<&str>)] = &[
     ("SecondKeyword", "to_seconds", None),
     ("MillisecondKeyword", "to_milliseconds", None),
 ];
-
-/// The one spelling a date part keyword is written back as, which is not always the singular.
-///
-/// Both spellings of each of the thirteen keywords land on one name, and the name is upper case and
-/// is plural for the two smallest parts and singular for the rest. That is not a rule, it is a list,
-/// and it was read off the pinned binary a keyword at a time: `EXTRACT(milliseconds FROM t)` and
-/// `EXTRACT(millisecond FROM t)` are both `date_part('MILLISECONDS', t)` while `EXTRACT(seconds FROM
-/// t)` is `date_part('SECOND', t)`.
-///
-/// A word that is not a keyword never reaches here, because the grammar tells the two apart, and it
-/// keeps whatever case it was written in. `EXTRACT(epoch FROM t)` stays lower case, measured.
-fn date_part(written: &str) -> String {
-    const PARTS: &[(&str, &str)] = &[
-        ("YEAR", "YEAR"),
-        ("YEARS", "YEAR"),
-        ("MONTH", "MONTH"),
-        ("MONTHS", "MONTH"),
-        ("DAY", "DAY"),
-        ("DAYS", "DAY"),
-        ("HOUR", "HOUR"),
-        ("HOURS", "HOUR"),
-        ("MINUTE", "MINUTE"),
-        ("MINUTES", "MINUTE"),
-        ("SECOND", "SECOND"),
-        ("SECONDS", "SECOND"),
-        ("MILLISECOND", "MILLISECONDS"),
-        ("MILLISECONDS", "MILLISECONDS"),
-        ("MICROSECOND", "MICROSECONDS"),
-        ("MICROSECONDS", "MICROSECONDS"),
-        ("WEEK", "WEEK"),
-        ("WEEKS", "WEEK"),
-        ("QUARTER", "QUARTER"),
-        ("QUARTERS", "QUARTER"),
-        ("DECADE", "DECADE"),
-        ("DECADES", "DECADE"),
-        ("CENTURY", "CENTURY"),
-        ("CENTURIES", "CENTURY"),
-        ("MILLENNIUM", "MILLENNIUM"),
-        ("MILLENNIA", "MILLENNIUM"),
-    ];
-    PARTS
-        .iter()
-        .find(|(spelling, _)| spelling.eq_ignore_ascii_case(written))
-        .map_or_else(|| written.to_string(), |(_, name)| (*name).to_string())
-}
 
 /// A grammar rule name like `DayToHour` as the words upstream puts in the message for it.
 fn worded(rule: &str) -> String {

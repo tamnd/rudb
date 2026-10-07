@@ -13,6 +13,8 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+rudb-common.workspace = true
+rudb-parse.workspace = true
 
 [lints]
 workspace = true

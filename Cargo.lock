@@ -835,6 +835,10 @@ dependencies = [
 [[package]]
 name = "rudb-pgparse"
 version = "0.8.40"
+dependencies = [
+ "rudb-common",
+ "rudb-parse",
+]
 
 [[package]]
 name = "rudb-pgtypes"
