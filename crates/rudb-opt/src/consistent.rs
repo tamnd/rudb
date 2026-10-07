@@ -1531,7 +1531,17 @@ fn search(
             // the side of the first movie to go first, which read 1,153,798 rows of
             // `movie_companies` where read after `movie_link` it is a few hundred.
             let (mut found, waiting) = steps(ranked, weights, holders, taken)?;
-            found.extend(waiting);
+            // A relation of one chunk or less costs the same wherever it goes, see
+            // [`Weight::read`], and taken it only leaves fewer values standing for the rest. So
+            // one that is an ear goes now, and the sets that hold some of those relations and
+            // not others are not searched. JOB 29a has five such tables among its seventeen,
+            // and the sets of them were thirty two times the sets the search carried, past
+            // [`STATES`], in a query whose planning was about two fifths of its time.
+            if let Some(&small) = found.iter().find(|&&(ear, _)| weights[ear].rows <= CHUNK) {
+                found = vec![small];
+            } else {
+                found.extend(waiting);
+            }
             for (ear, parent) in found {
                 let total = cost + prices.cost(ear, standing);
                 let key = taken | 1 << ear;
