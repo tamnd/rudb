@@ -3101,3 +3101,66 @@ fn a_table_or_a_view_of_a_query_has_no_two_columns_of_one_name() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_written_column_is_placed_at_its_name() {
+    let dirs = Dirs::new("column-positions");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    assert!(!tags(&client.query("create temp table t (a int, b text, c numeric)")).contains('E'));
+    // The cases of the PostgreSQL 19 oracle. An error about a column of the INSERT list or of the
+    // SET list is placed at the name of that column, and a repeated SET column has no place.
+    for (sql, state, message, position) in [
+        (
+            "insert into t (a, a) values (1, 2)",
+            "42701",
+            "column \"a\" specified more than once",
+            Some("19"),
+        ),
+        (
+            "insert into t (z) values (1)",
+            "42703",
+            "column \"z\" of relation \"t\" does not exist",
+            Some("16"),
+        ),
+        (
+            "insert into t (a, z) values (1, 2)",
+            "42703",
+            "column \"z\" of relation \"t\" does not exist",
+            Some("19"),
+        ),
+        (
+            "insert into t (a, b) values (1)",
+            "42601",
+            "INSERT has more target columns than expressions",
+            Some("19"),
+        ),
+        (
+            "insert into t (a, b) select 1",
+            "42601",
+            "INSERT has more target columns than expressions",
+            Some("19"),
+        ),
+        (
+            "update t set z = 1",
+            "42703",
+            "column \"z\" of relation \"t\" does not exist",
+            Some("14"),
+        ),
+        (
+            "update t set (a, z) = (1, 2)",
+            "42703",
+            "column \"z\" of relation \"t\" does not exist",
+            Some("18"),
+        ),
+        ("update t set a = 1, a = 2", "42601", "multiple assignments to same column \"a\"", None),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}

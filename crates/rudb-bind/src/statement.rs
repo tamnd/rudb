@@ -18,7 +18,7 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
     Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
-    LogicalType, PlanErrors, QueryColumns, Result, SequenceOwners, Session, SqlState, Stat,
+    LogicalType, PlanErrors, QueryColumns, Result, SequenceOwners, Session, Span, SqlState, Stat,
     TypeNames, UnknownTypes, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
@@ -3201,7 +3201,8 @@ fn insert(
     } else {
         let compare = session.semantics().identifier_compare();
         let mut targets = Vec::new();
-        for column in ast.name(written.columns) {
+        for (written_at, column) in ast.name(written.columns).enumerate() {
+            let span = ast.part_span(written.columns, written_at);
             let at = fields.iter().position(|field| compare.same(&field.name, column)).ok_or_else(
                 || {
                     Error::binder(format!(
@@ -3213,14 +3214,14 @@ fn insert(
                         "column \"{column}\" of relation \"{}\" does not exist",
                         name.table
                     ))
-                    .unplaced()
+                    .placed_at(span)
                 },
             )?;
             if targets.contains(&at) {
                 return Err(Error::binder(format!("Duplicate column name \"{column}\" in INSERT"))
                     .state(SqlState::DUPLICATE_COLUMN)
                     .pg(format!("column \"{column}\" specified more than once"))
-                    .unplaced());
+                    .placed_at(span));
             }
             if target.generated(at).is_some() {
                 return Err(Error::binder("Cannot insert into a generated column"));
@@ -3290,8 +3291,8 @@ fn insert(
                     )
                 }));
             }
-            // PostgreSQL points at the first value that has no column. It points at the first
-            // column that has no value too, but the AST keeps no place for the column list.
+            // PostgreSQL points at the first value that has no column, or at the first column that
+            // has no value.
             InsertColumns::Leading if scope.len() > targets.len() => {
                 let error = Error::binder("INSERT has more expressions than target columns")
                     .state(SqlState::SYNTAX_ERROR);
@@ -3303,7 +3304,7 @@ fn insert(
             InsertColumns::Leading if !written.columns.is_empty() => {
                 return Err(Error::binder("INSERT has more target columns than expressions")
                     .state(SqlState::SYNTAX_ERROR)
-                    .unplaced());
+                    .placed_at(ast.part_span(written.columns, scope.len())));
             }
             // With no column list, the values go to the leading columns and the others take
             // their defaults in the projection below.
@@ -3651,10 +3652,11 @@ fn bind_conflict(
         ast::ConflictAction::Update { columns: written, query } => {
             let compare = session.semantics().identifier_compare();
             let mut columns = Vec::new();
-            for column in ast.name(written) {
+            for (written_at, column) in ast.name(written).enumerate() {
                 let Some(at) = fields.iter().position(|field| compare.same(&field.name, column))
                 else {
-                    return Err(missing_update_column(column, &name.table));
+                    let span = ast.part_span(written, written_at);
+                    return Err(missing_update_column(column, &name.table, span));
                 };
                 if columns.contains(&at) {
                     return Err(repeated_update_column(column));
@@ -3812,12 +3814,13 @@ fn excluded_returning(ast: &Ast, query: Option<ast::QueryRef>) -> Result<()> {
 /// searched `CASE` does with one, so the one expression covers both. After the table's columns
 /// comes the flag saying which rows matched, which are the rows an `UPDATE` changed and the rows a
 /// `DELETE` takes out.
-/// The error for a `SET` of a column that the table does not have.
-fn missing_update_column(column: &str, table: &str) -> Error {
+/// The error for a `SET` of a column that the table does not have, at the column when the
+/// transform kept its place.
+fn missing_update_column(column: &str, table: &str, span: Option<Span>) -> Error {
     Error::binder(format!("Referenced update column {column} not found in table!"))
         .state(SqlState::UNDEFINED_COLUMN)
         .pg(format!("column \"{column}\" of relation \"{table}\" does not exist"))
-        .unplaced()
+        .placed_at(span)
 }
 
 /// The error for a `SET` that names one column two times. The DuckDB text has the doubled quotes.
@@ -3849,11 +3852,15 @@ fn change(
     let fields: Vec<Field> = catalog.table(&name)?.columns().to_vec();
     let compare = session.semantics().identifier_compare();
     let mut targets: Vec<usize> = Vec::new();
-    for column in ast.name(written.columns) {
-        let at = fields
-            .iter()
-            .position(|field| compare.same(&field.name, column))
-            .ok_or_else(|| missing_update_column(column, &name.table))?;
+    for (written_at, column) in ast.name(written.columns).enumerate() {
+        let at =
+            fields.iter().position(|field| compare.same(&field.name, column)).ok_or_else(|| {
+                missing_update_column(
+                    column,
+                    &name.table,
+                    ast.part_span(written.columns, written_at),
+                )
+            })?;
         if catalog.table(&name)?.generated(at).is_some() {
             return Err(Error::binder(format!(
                 "Cant update column \"{column}\" because it is a generated column!"

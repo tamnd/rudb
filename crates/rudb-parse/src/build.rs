@@ -116,6 +116,23 @@ impl Ast {
         tail(&self.parts, start)
     }
 
+    /// Add a run of names, each with the source range it was written at when there is one, as
+    /// [`Ast::part_span`] reads it.
+    pub fn placed_part_slice(
+        &mut self,
+        items: impl IntoIterator<Item = (StrRef, Option<Span>)>,
+    ) -> Slice {
+        let start = self.parts.len();
+        for (name, span) in items {
+            if let Some(span) = span {
+                let index = u32::try_from(self.parts.len()).unwrap_or(u32::MAX);
+                self.part_spans.push((index, span));
+            }
+            self.parts.push(name);
+        }
+        tail(&self.parts, start)
+    }
+
     /// Add a run of materialised `WITH` indexes.
     pub fn cte_slice(&mut self, items: impl IntoIterator<Item = u32>) -> Slice {
         let start = self.cte_lists.len();
@@ -152,6 +169,21 @@ impl Ast {
     }
 }
 
+/// A column of a `SET` and its new value. The span is where the column was written, when the
+/// transform knows it.
+#[derive(Debug, Clone, Copy)]
+pub struct Assignment {
+    pub column: StrRef,
+    pub span: Option<Span>,
+    pub value: ExprRef,
+}
+
+impl From<(StrRef, ExprRef)> for Assignment {
+    fn from((column, value): (StrRef, ExprRef)) -> Self {
+        Self { column, span: None, value }
+    }
+}
+
 /// An `UPDATE`, a `DELETE` or one table of a `TRUNCATE`, as the two transforms read it.
 #[derive(Debug)]
 pub struct Change {
@@ -160,7 +192,7 @@ pub struct Change {
     /// The alias of the table, or `NONE`.
     pub alias: StrRef,
     /// Each column that `SET` names, with its new value. Empty for a `DELETE`.
-    pub sets: Vec<(StrRef, ExprRef)>,
+    pub sets: Vec<Assignment>,
     /// The condition of the `WHERE`, or `NONE`.
     pub filter: ExprRef,
     /// The from items of `UPDATE ... FROM` or `DELETE ... USING`, or `None`.
@@ -212,16 +244,16 @@ impl Ast {
         interned: &mut Interner,
         name: Slice,
         alias: StrRef,
-        sets: Vec<(StrRef, ExprRef)>,
+        sets: Vec<Assignment>,
         condition: ExprRef,
         span: Span,
     ) -> ConflictAction {
         let condition = if condition == NONE { self.true_literal(span) } else { condition };
         let mut targets = Vec::with_capacity(sets.len() + 1);
         let mut columns = Vec::with_capacity(sets.len());
-        for (column, value) in sets {
-            columns.push(column);
-            targets.push(Target { expr: value, alias: NONE });
+        for set in sets {
+            columns.push((set.column, set.span));
+            targets.push(Target { expr: set.value, alias: NONE });
         }
         targets.push(Target { expr: condition, alias: NONE });
         let targets = self.target_slice(targets);
@@ -243,7 +275,7 @@ impl Ast {
         let from = self.source_slice([joined]);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         let query = self.push_query(Query::bare(QueryBody::Select(select)), span);
-        let columns = self.part_slice(columns);
+        let columns = self.placed_part_slice(columns);
         ConflictAction::Update { columns, query }
     }
 
@@ -263,7 +295,8 @@ impl Ast {
         span: Span,
     ) -> Statement {
         let Change { name, alias, sets, filter, using, returning, delete, truncate } = change;
-        let columns: Vec<StrRef> = sets.iter().map(|&(column, _)| column).collect();
+        let columns: Vec<(StrRef, Option<Span>)> =
+            sets.iter().map(|set| (set.column, set.span)).collect();
         let source = match using {
             None => {
                 let hit = if filter == NONE { self.true_literal(span) } else { filter };
@@ -273,7 +306,7 @@ impl Ast {
                 );
                 let mut targets =
                     vec![Target { expr: star, alias: NONE }, Target { expr: hit, alias: NONE }];
-                targets.extend(sets.iter().map(|&(_, expr)| Target { expr, alias: NONE }));
+                targets.extend(sets.iter().map(|set| Target { expr: set.value, alias: NONE }));
                 let targets = self.target_slice(targets);
                 let from = self.written_table(name, alias, span);
                 let select = self.push_select(Select { targets, from, ..Select::empty() });
@@ -281,7 +314,7 @@ impl Ast {
             }
             Some(from) => self.changed_rows_using(interned, name, alias, &sets, filter, from, span),
         };
-        let columns = self.part_slice(columns);
+        let columns = self.placed_part_slice(columns);
         let index = self.push_insert(Insert {
             name,
             columns,
@@ -302,7 +335,7 @@ impl Ast {
         interned: &mut Interner,
         name: Slice,
         alias: StrRef,
-        sets: &[(StrRef, ExprRef)],
+        sets: &[Assignment],
         filter: ExprRef,
         from: Slice,
         span: Span,
@@ -314,7 +347,7 @@ impl Ast {
         let yes = self.true_literal(span);
         let mut inner = vec![Target { expr: yes, alias: hit }];
         let mut outer_names = vec![hit];
-        for (at, &(_, value)) in sets.iter().enumerate() {
+        for (at, &Assignment { value, .. }) in sets.iter().enumerate() {
             let named = interned.intern(self, &format!("__rudb_value_{at}"));
             inner.push(Target { expr: value, alias: named });
             outer_names.push(named);

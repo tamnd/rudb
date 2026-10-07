@@ -1670,6 +1670,10 @@ pub struct Ast {
     pub strings: Vec<String>,
     /// Backing store for every [`Slice`] of names.
     pub parts: Vec<StrRef>,
+    /// Source ranges of some entries of `parts`, as the index of the entry and its range, in the
+    /// order of the index. Only a name that an error points at has one, such as a column of an
+    /// `INSERT` or of a `SET`, and only when the transform knows where it was written.
+    pub part_spans: Vec<(u32, Span)>,
     /// Backing store for every [`Slice`] of expressions.
     pub expr_lists: Vec<ExprRef>,
     /// Backing store for every [`Slice`] of from items.
@@ -1782,6 +1786,14 @@ impl Ast {
     /// The source range of a from item.
     pub fn source_span(&self, source: SourceRef) -> Span {
         self.source_spans[source as usize]
+    }
+
+    /// The source range of the name at `at` of a run of names, when it has one.
+    pub fn part_span(&self, names: Slice, at: usize) -> Option<Span> {
+        let at = u32::try_from(at).ok().filter(|&at| at < names.len)?;
+        let index = names.start + at;
+        let found = self.part_spans.binary_search_by_key(&index, |&(part, _)| part).ok()?;
+        Some(self.part_spans[found].1)
     }
 
     /// The text behind a [`StrRef`], or the empty string for `NONE`.
