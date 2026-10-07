@@ -84,6 +84,20 @@ const MACROS: &[Macro] = &[
     define("fdiv", &["x", "y"], "floor((x / y))"),
     define("fmod", &["x", "y"], "(x - (y * floor((x / y))))"),
     define(
+        "format_pg_type",
+        &["logical_type", "type_name"],
+        "CASE  WHEN ((upper(logical_type) = 'FLOAT')) THEN ('float4') WHEN ((upper(logical_type) \
+         = 'DOUBLE')) THEN ('float8') WHEN ((upper(logical_type) = 'DECIMAL')) THEN ('numeric') \
+         WHEN ((upper(logical_type) = 'ENUM')) THEN (lower(type_name)) WHEN ((upper(logical_type) \
+         = 'VARCHAR')) THEN ('varchar') WHEN ((upper(logical_type) = 'BLOB')) THEN ('bytea') WHEN \
+         ((upper(logical_type) = 'TIMESTAMP')) THEN ('timestamp') WHEN ((upper(logical_type) = \
+         'TIME')) THEN ('time') WHEN ((upper(logical_type) = 'TIMESTAMP WITH TIME ZONE')) THEN \
+         ('timestamptz') WHEN ((upper(logical_type) = 'TIME WITH TIME ZONE')) THEN ('timetz') \
+         WHEN ((upper(logical_type) = 'SMALLINT')) THEN ('int2') WHEN ((upper(logical_type) = \
+         'INTEGER')) THEN ('int4') WHEN ((upper(logical_type) = 'BIGINT')) THEN ('int8') WHEN \
+         ((upper(logical_type) = 'BOOLEAN')) THEN ('bool') ELSE lower(logical_type) END",
+    ),
+    define(
         "generate_subscripts",
         &["arr", "dim"],
         "unnest(generate_series(1, array_length(arr, dim)))",
@@ -131,6 +145,20 @@ const MACROS: &[Macro] = &[
          END), ',')) || '}') AS \"JSON\")",
     ),
     define("json_group_structure", &["x"], "(json_structure(json_group_array(x)) -> 0)"),
+    define(
+        "map_to_pg_oid",
+        &["type_name"],
+        "CASE  WHEN ((type_name = 'bool')) THEN (16) WHEN ((type_name = 'int16')) THEN (21) WHEN \
+         ((type_name = 'int')) THEN (23) WHEN ((type_name = 'bigint')) THEN (20) WHEN ((type_name \
+         = 'date')) THEN (1082) WHEN ((type_name = 'time')) THEN (1083) WHEN ((type_name = \
+         'datetime')) THEN (1114) WHEN ((type_name = 'dec')) THEN (1700) WHEN ((type_name = \
+         'float')) THEN (700) WHEN ((type_name = 'double')) THEN (701) WHEN ((type_name = \
+         'bpchar')) THEN (1043) WHEN ((type_name = 'binary')) THEN (17) WHEN ((type_name = \
+         'interval')) THEN (1186) WHEN ((type_name = 'timestamptz')) THEN (1184) WHEN ((type_name \
+         = 'timestamp with time zone')) THEN (1184) WHEN ((type_name = 'timetz')) THEN (1266) \
+         WHEN ((type_name = 'time with time zone')) THEN (1266) WHEN ((type_name = 'bit')) THEN \
+         (1560) WHEN ((type_name = 'guid')) THEN (2950) ELSE NULL END",
+    ),
     define(
         "md5_number_lower",
         &["param"],

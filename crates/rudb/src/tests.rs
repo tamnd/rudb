@@ -2328,24 +2328,32 @@ fn a_null_map_is_a_value_now_rather_than_an_unwritten_vector() {
 #[test]
 fn the_types_table_answers_a_query_a_client_would_actually_write() {
     let db = database();
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(99)]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_types()"), vec![vec![Value::BigInt(297)]]);
     // A client reading this table is asking whether the engine has a type, so the useful query is a
     // name lookup, and it has to work through the where clause rather than only over the whole
     // table.
     assert_eq!(
-        rows(&db, "SELECT logical_type, type_size FROM duckdb_types() WHERE type_name = 'hugeint'"),
+        rows(
+            &db,
+            "SELECT logical_type, type_size FROM duckdb_types() \
+             WHERE type_name = 'hugeint' AND database_name = 'memory'"
+        ),
         vec![vec![Value::Varchar("HUGEINT".to_string()), Value::BigInt(16)]]
     );
-    // The name is case insensitive the way every function name is, and the table is in the default
-    // catalog and schema because that is where the pin puts the builtin types.
+    // The name is case insensitive the way every function name is, and the builtin types are in
+    // the `main` schema of every database, because that is where the pin puts them.
+    let text = |name: &str| Value::Varchar(name.to_string());
     assert_eq!(
-        rows(&db, "SELECT DISTINCT database_name, schema_name FROM DuckDB_Types()"),
-        vec![vec![Value::Varchar("memory".to_string()), Value::Varchar("main".to_string())]]
+        rows(&db, "SELECT DISTINCT database_name, schema_name FROM DuckDB_Types() ORDER BY 1"),
+        ["memory", "system", "temp"].map(|name| vec![text(name), text("main")])
     );
     // `tags` is why this table needed a map vector, so it is read back here as one rather than only
     // counted.
     assert_eq!(
-        rows(&db, "SELECT tags FROM duckdb_types() WHERE type_name = 'boolean'"),
+        rows(
+            &db,
+            "SELECT tags FROM duckdb_types() WHERE type_name = 'boolean' AND database_name = 'temp'"
+        ),
         vec![vec![Value::map(LogicalType::Varchar, LogicalType::Varchar, Vec::new())]]
     );
 }
@@ -4336,7 +4344,7 @@ fn the_engine_ships_with_the_views_upstream_ships_with() {
     // The wrapper and the table function are different questions. The bare name is what somebody
     // made and the parentheses are what is really there, and the gap is the engine's own views.
     assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_views"), vec![vec![Value::BigInt(1)]]);
-    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_views()"), vec![vec![Value::BigInt(13)]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM duckdb_views()"), vec![vec![Value::BigInt(37)]]);
     // Nothing goes into a database the engine owns and nothing comes out of one.
     assert_eq!(
         failure(&db, "CREATE TABLE information_schema.x(a INTEGER)"),
