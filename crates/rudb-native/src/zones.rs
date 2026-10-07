@@ -204,6 +204,10 @@ impl Zones for Stripes {
         crate::graph::total_parent(&self.reader, column)
     }
 
+    fn found_link(&self, column: usize) -> Option<(String, usize, u64)> {
+        crate::graph::found_parent(&self.reader, column)
+    }
+
     fn generation(&self) -> Option<u64> {
         Some(self.reader.table().generation())
     }

@@ -1339,6 +1339,23 @@ pub fn stored_relationships(child: &Reader) -> Vec<(usize, String, usize)> {
 /// since a parent rewritten after the build may have lost a row a child pointed at.
 #[must_use]
 pub fn total_parent(child: &Reader, child_column: usize) -> Option<(String, usize, u64)> {
+    linked_parent(child, child_column, 0)
+}
+
+/// The same parent, when every row of the column that is not null found one.
+///
+/// A null key finds no parent and is no link, so a column with nulls in it is never total, and
+/// `cast_info.person_role_id` in JOB is null in about half its rows. A join to the parent still
+/// drops only the rows with a null key there, which a caller that drops nulls anyway can drop the
+/// parent for. The nulls are the stripes' own counts, which are exact and are of the generation the
+/// link was checked against, since a link of another generation is not read.
+#[must_use]
+pub fn found_parent(child: &Reader, child_column: usize) -> Option<(String, usize, u64)> {
+    linked_parent(child, child_column, child.null_count(child_column).ok()?)
+}
+
+/// The parent of [`total_parent`], when the children that found none are exactly `missed`.
+fn linked_parent(child: &Reader, child_column: usize, missed: u64) -> Option<(String, usize, u64)> {
     let table = child.table();
     let id = u64::try_from(child_column).ok()?;
     // The link when it was kept, and the adjacency when the link was over its budget and the
@@ -1361,7 +1378,7 @@ pub fn total_parent(child: &Reader, child_column: usize) -> Option<(String, usiz
         let counts = bytes.get(binding..binding + 24)?;
         let children = u64::from_le_bytes(counts.get(0..8)?.try_into().ok()?);
         let linked = u64::from_le_bytes(counts.get(16..24)?.try_into().ok()?);
-        (linked == children).then(|| (name.to_owned(), column, generation))
+        (linked.checked_add(missed)? == children).then(|| (name.to_owned(), column, generation))
     })
 }
 
@@ -2182,6 +2199,31 @@ mod tests {
         assert_eq!(link.forward(3), None, "a key that matches nothing is not a link");
         let child = Catalog::open(&path).expect("reopen").table("child").expect("the child");
         assert_eq!(total_parent(&child, 0), None, "a link some children missed is no certificate");
+        assert_eq!(found_parent(&child, 0), None, "and 9999 found nothing without being null");
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
+    fn a_link_every_key_that_is_not_null_found_is_a_certificate_for_those_keys() {
+        // JOB's `cast_info.person_role_id` is null in about half its rows and every other one
+        // names a `char_name` row. That is not total, and it is everything a join that drops nulls
+        // anyway needs to know.
+        let foreign = vec![Some(1), None, Some(2), None, Some(3), Some(3)];
+        let path = related("nulls", 10, &foreign);
+        let report = build_links(&path, &[edge()]).expect("build");
+        assert!(report[0].built, "{:?}", report[0].note);
+        assert_eq!((report[0].children, report[0].linked), (6, 4));
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        assert_eq!(total_parent(&child, 0), None, "the nulls found no parent");
+        assert_eq!(
+            found_parent(&child, 0),
+            Some(("parent".to_owned(), 0, parent.table().generation())),
+            "but every key did"
+        );
 
         fs::remove_file(&path).expect("clean up");
     }
