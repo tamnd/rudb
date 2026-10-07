@@ -216,7 +216,8 @@ impl Binder<'_> {
                 let expanded = self.user_macro(ast, expr, name, args, modified, scope)?;
                 expanded.ok_or_else(|| Error::internal("a macro that went away while it was bound"))
             }
-            ast::Expr::Function { .. } if let Some((message, _)) = ast.misnamed(expr) => {
+            ast::Expr::Function { .. } if ast.misnamed(expr).is_some() => {
+                let message = ast.misnamed(expr).map_or("", |(message, _)| message);
                 Err(Error::binder(message))
             }
             ast::Expr::Function { name, args, .. } if !ast.named_args(expr).is_empty() => {
@@ -3318,10 +3319,12 @@ impl Binder<'_> {
                 Expr::Cast { input, .. } if casts > 0 => pending.push((*input, ty, casts - 1)),
                 Expr::Function { name, args }
                     if plan.string(*name) == crate::structs::STRUCT_PACK
-                        && let LogicalType::Struct(fields) = &ty =>
+                        && matches!(ty, LogicalType::Struct(_)) =>
                 {
-                    for (&arg, field) in plan.expr_list(*args).iter().zip(fields) {
-                        pending.push((arg, field.ty.clone(), casts));
+                    if let LogicalType::Struct(fields) = &ty {
+                        for (&arg, field) in plan.expr_list(*args).iter().zip(fields) {
+                            pending.push((arg, field.ty.clone(), casts));
+                        }
                     }
                 }
                 Expr::Column(binding) => {

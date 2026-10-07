@@ -769,6 +769,10 @@ fn kept(
     (fraction, from)
 }
 
+/// The tests a filter makes of one column a scan reads: where the column is, each comparison with
+/// its bound, and the conjuncts the comparisons came from.
+type ColumnTests = (usize, Vec<(Op, Bound)>, Vec<ExprRef>);
+
 /// What fraction of a scan's rows the ranges among `pending` keep, counted out of a synopsis that
 /// lists every value of the column they are on or out of its buckets, with how many conditions that
 /// answered and what answered them. The ones it answered come out of `pending`.
@@ -795,7 +799,7 @@ fn listed(
     if rows == 0 {
         return (1.0, 0, None);
     }
-    let mut columns: Vec<(usize, Vec<(Op, Bound)>, Vec<ExprRef>)> = Vec::new();
+    let mut columns: Vec<ColumnTests> = Vec::new();
     for &conjunct in pending.iter() {
         let tests = bounds::of(plan, input, conjunct);
         let Some(&(position, ..)) = tests.first() else {

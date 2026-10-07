@@ -8135,7 +8135,7 @@ impl Reader {
     /// fifth of the rows. That is wrong both ways and JOB shows both: `'%Downey%Robert%'` keeps a
     /// handful of the four million names and `'%(co-production)%'` keeps a tenth of the companies,
     /// and in 6d the fifth made `name` look dearer than `cast_info` and put it after. So the pattern
-    /// is run over a stride of rows of [`STRATA`] parts spread across the table, see [`Self::sample`],
+    /// is run over a stride of rows of `STRATA` parts spread across the table, see `Self::sample`,
     /// read the way a sparse scan reads them so no page is kept for it, and a pattern nothing in the
     /// sample matched is charged half a row of the sample rather than none. The answer is kept for
     /// as long as the reader is, so a statement run again asks the file nothing.
