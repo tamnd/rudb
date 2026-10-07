@@ -583,6 +583,7 @@ impl<'a> Lexer<'a> {
             return Err(Error {
                 code: "22025",
                 message: "invalid Unicode escape".to_owned(),
+                detail: None,
                 hint: Some("Unicode escapes must be \\uXXXX or \\UXXXXXXXX."),
                 location: Some(i),
             });

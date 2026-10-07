@@ -158,6 +158,7 @@ fn unescape(text: &str, escape: u8, position: usize) -> Result<String, Error> {
             return Err(Error {
                 code: "42601",
                 message: "invalid Unicode escape".to_owned(),
+                detail: None,
                 hint: Some("Unicode escapes must be \\XXXX or \\+XXXXXX."),
                 location: Some(location(i)),
             });

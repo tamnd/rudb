@@ -10,6 +10,8 @@ pub struct Error {
     pub code: &'static str,
     /// The primary message, as PostgreSQL writes it.
     pub message: String,
+    /// The detail, or `None`.
+    pub detail: Option<&'static str>,
     /// The hint, or `None`.
     pub hint: Option<&'static str>,
     /// The byte offset in the text that the error points to, or `None`.
@@ -26,12 +28,18 @@ impl Error {
             let near = String::from_utf8_lossy(&text[start..end.clamp(start, text.len())]);
             format!("{message} at or near \"{near}\"")
         };
-        Error { code: "42601", message, hint: None, location: Some(start) }
+        Error { code: "42601", message, detail: None, hint: None, location: Some(start) }
     }
 
     /// An error with a location and no `at or near` part.
     pub(crate) fn at(code: &'static str, message: &str, location: usize) -> Error {
-        Error { code, message: message.to_owned(), hint: None, location: Some(location) }
+        Error {
+            code,
+            message: message.to_owned(),
+            detail: None,
+            hint: None,
+            location: Some(location),
+        }
     }
 
     /// The error for an action of `gram.y` that is not ported yet. `rule` is its name in
@@ -40,6 +48,7 @@ impl Error {
         Error {
             code: "0A000",
             message: format!("the action of the rule {rule} of gram.y is not ported"),
+            detail: None,
             hint: None,
             location: None,
         }
@@ -47,7 +56,13 @@ impl Error {
 
     /// An error for a fault of the parser itself, with SQLSTATE `XX000`.
     pub(crate) fn internal(message: &str) -> Error {
-        Error { code: "XX000", message: message.to_owned(), hint: None, location: None }
+        Error {
+            code: "XX000",
+            message: message.to_owned(),
+            detail: None,
+            hint: None,
+            location: None,
+        }
     }
 
     /// The error that `report_invalid_encoding` gives for bytes that are not UTF-8, or that
@@ -65,6 +80,7 @@ impl Error {
         Error {
             code: "22021",
             message: format!("invalid byte sequence for encoding \"UTF8\": {}", bytes.join(" ")),
+            detail: None,
             hint: None,
             location: None,
         }

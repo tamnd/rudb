@@ -170,3 +170,34 @@ pub(crate) fn makeJsonTablePathSpec(
         location: string_location,
     }
 }
+
+/// `makeDefElem`.
+pub(crate) fn makeDefElem(name: Option<Str>, arg: Option<Node>, location: i32) -> DefElem {
+    DefElem {
+        defnamespace: None,
+        defname: name,
+        arg,
+        defaction: DefElemAction::DEFELEM_UNSPEC,
+        location,
+    }
+}
+
+/// `makeDefElemExtended`.
+pub(crate) fn makeDefElemExtended(
+    nameSpace: Option<Str>,
+    name: Option<Str>,
+    arg: Option<Node>,
+    defaction: DefElemAction,
+    location: i32,
+) -> DefElem {
+    DefElem { defnamespace: nameSpace, defname: name, arg, defaction, location }
+}
+
+/// `makeVacuumRelation`.
+pub(crate) fn makeVacuumRelation(
+    relation: Option<Box<RangeVar>>,
+    oid: u32,
+    va_cols: List,
+) -> VacuumRelation {
+    VacuumRelation { relation, oid, va_cols }
+}

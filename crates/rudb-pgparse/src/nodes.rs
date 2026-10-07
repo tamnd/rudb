@@ -3,7 +3,8 @@
 //! The types are generated from the vendored headers into `generated/nodes.rs`, with the names and
 //! the fields that PostgreSQL gives them, so an action of `gram.y` ports to Rust line by line. This
 //! module has what the generator does not write: the names of the field types, the helpers of the
-//! writers, and the writers of the three node types that `outfuncs.c` writes by hand.
+//! writers, the writers of the three node types that `outfuncs.c` writes by hand, and the
+//! [`Equal`] of the pointers and the lists.
 //!
 //! The text of a node is the text of `nodeToStringWithLocations`. PostgreSQL logs that text for the
 //! raw parse tree of each statement when `debug_print_raw_parse` is on, so a test can compare the
@@ -17,6 +18,36 @@ pub type Str = Box<str>;
 /// A `List *` of nodes. `NIL` is the empty list. An element can be `NULL`, as in the
 /// `list_make1(NIL)` of `DISTINCT`, and `outfuncs.c` writes it as `<>`.
 pub type List = Vec<Option<Node>>;
+
+/// `equal()` of `equalfuncs.c`: two trees are equal when all their fields are equal, except the
+/// locations. The derived `PartialEq` compares the locations too, so it is not `equal()`.
+pub trait Equal {
+    /// The two values are equal, without a look at the locations.
+    fn equal(&self, other: &Self) -> bool;
+}
+
+impl<T: Equal + ?Sized> Equal for Box<T> {
+    fn equal(&self, other: &Self) -> bool {
+        (**self).equal(other)
+    }
+}
+
+/// Two `NULL` pointers are equal, and a `NULL` pointer is not equal to a node.
+impl<T: Equal> Equal for Option<T> {
+    fn equal(&self, other: &Self) -> bool {
+        match (self, other) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.equal(b),
+            _ => false,
+        }
+    }
+}
+
+impl<T: Equal> Equal for Vec<T> {
+    fn equal(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other).all(|(a, b)| a.equal(b))
+    }
+}
 
 /// A node type that `outNode` writes in braces.
 pub trait Out {

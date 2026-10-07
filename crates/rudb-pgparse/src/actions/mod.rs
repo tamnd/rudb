@@ -1,10 +1,13 @@
-//! The actions of `gram.y` that build the raw parse tree, ported from C by hand.
+//! The actions of `gram.y` that build the raw parse tree, with the functions that the actions call.
 //!
-//! `src/generated/glue.rs` has a trait for each rule of `gram.y` whose actions do more than move a
-//! value or make a constant, with a method for each such alternative. The default of a method
-//! gives the error that the action is not ported. A file here implements the trait of a rule for
-//! [`Parser`] and ports the C of each alternative line by line. After a new `impl`,
-//! `cargo xtask pg-generate` removes the empty `impl` of that trait from the glue.
+//! `cargo xtask pg-generate` translates most actions from C to Rust and writes them into
+//! `src/generated/glue.rs`. An action that the translator cannot write, for example one with a
+//! loop or a `switch`, is a method of a trait, one trait for each rule of `gram.y`. The default of
+//! a method gives the error that the action is not ported. A file here implements the trait of a
+//! rule for [`Parser`] and ports the C of each such alternative by hand, line by line. After a new
+//! `impl`, `cargo xtask pg-generate` removes the empty `impl` of that trait from the glue, and
+//! when the translator can write an action that has a port here, it fails until the port is
+//! removed.
 //!
 //! The arguments of a method are the values `$k` that the C uses, then the locations `@k`, then
 //! `@$`, and a port names them `vk`, `atk` and `here`. Bison sets `$$` to `$1` before an action,
@@ -13,7 +16,10 @@
 //! [`make`] has the functions of `makefuncs.c` and `value.c` that the actions use, [`funcs`] those
 //! of `nodeFuncs.c`, [`list`] the list and cast macros of `pg_list.h` and `nodes.h`, and [`gram`]
 //! the static functions of the prologue and the epilogue of `gram.y`. They keep the C names, so
-//! that a port reads as the C does.
+//! that a port reads as the C does. The translated actions call them too: a `pub(crate) fn` at
+//! the start of a line in these files, with no generic parameters, is a function that the
+//! translator knows by its signature. A result of `Result<T, Error>` tells it that the function
+//! can fail.
 
 #![allow(non_snake_case)]
 

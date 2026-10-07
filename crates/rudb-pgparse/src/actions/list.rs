@@ -25,11 +25,52 @@ pub(crate) fn castList(node: Option<Node>) -> Result<List, Error> {
     }
 }
 
+/// The struct that a pointer points to, for `$1->field` in C. A `NULL` pointer is an internal
+/// error, where the C would crash.
+pub(crate) fn pointee<T>(pointer: &Option<Box<T>>) -> Result<&T, Error> {
+    pointer.as_deref().ok_or_else(|| Error::internal("a NULL pointer in an action"))
+}
+
+/// The struct that a pointer points to, for `$1->field = value` in C.
+pub(crate) fn pointee_mut<T>(pointer: &mut Option<Box<T>>) -> Result<&mut T, Error> {
+    pointer.as_deref_mut().ok_or_else(|| Error::internal("a NULL pointer in an action"))
+}
+
+/// A pointer that the grammar never makes `NULL`, as `T *n = $1` in C has it.
+pub(crate) fn pointer<T>(pointer: Option<Box<T>>) -> Result<Box<T>, Error> {
+    pointer.ok_or_else(|| Error::internal("a NULL pointer in an action"))
+}
+
 /// `(T *) node` for a node that the grammar always makes of the type `T`.
 pub(crate) fn castMut<T: NodeType>(node: &mut Option<Node>) -> Result<&mut T, Error> {
     node.as_mut()
         .and_then(T::peek_mut)
         .ok_or_else(|| Error::internal("a cast of a node of the wrong type"))
+}
+
+/// `(T *) node` for a node that the grammar always makes of the type `T`, to read its fields.
+pub(crate) fn castRef<T: NodeType>(node: Option<&Node>) -> Result<&T, Error> {
+    node.and_then(T::peek).ok_or_else(|| Error::internal("a cast of a node of the wrong type"))
+}
+
+/// `linitial`. An element that the list does not have is `NULL`, where the C would crash.
+pub(crate) fn linitial(list: &List) -> Option<&Node> {
+    list.first().and_then(Option::as_ref)
+}
+
+/// `lsecond`.
+pub(crate) fn lsecond(list: &List) -> Option<&Node> {
+    list.get(1).and_then(Option::as_ref)
+}
+
+/// `llast`.
+pub(crate) fn llast(list: &List) -> Option<&Node> {
+    list.last().and_then(Option::as_ref)
+}
+
+/// `list_length`, which is never more than `i32::MAX` for a list of the parser.
+pub(crate) fn list_length(list: &List) -> i32 {
+    i32::try_from(list.len()).unwrap_or(i32::MAX)
 }
 
 /// A list as a node: `(Node *) list`. `NIL` is `NULL`.

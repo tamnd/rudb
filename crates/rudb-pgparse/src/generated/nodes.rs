@@ -15,7 +15,7 @@
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, missing_docs)]
 
-use crate::nodes::{List, NodeType, Out, Str, w};
+use crate::nodes::{Equal, List, NodeType, Out, Str, w};
 
 pub const PG_INT16_MAX: i32 = 32767;
 pub const NO_NULLTREATMENT: i32 = 0;
@@ -89,6 +89,15 @@ pub const HOUR: i32 = 10;
 pub const MINUTE: i32 = 11;
 pub const SECOND: i32 = 12;
 pub const INTERVAL_FULL_RANGE: i32 = 32767;
+pub const AccessShareLock: i32 = 1;
+pub const RowShareLock: i32 = 2;
+pub const RowExclusiveLock: i32 = 3;
+pub const ShareUpdateExclusiveLock: i32 = 4;
+pub const ShareLock: i32 = 5;
+pub const ShareRowExclusiveLock: i32 = 6;
+pub const ExclusiveLock: i32 = 7;
+pub const AccessExclusiveLock: i32 = 8;
+pub const InvalidRelFileNumber: u32 = 0;
 pub const ERRCODE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 pub const ERRCODE_INVALID_PARAMETER_VALUE: &str = "22023";
 pub const ERRCODE_SYNTAX_ERROR: &str = "42601";
@@ -97,6 +106,7 @@ pub const ERRCODE_RESERVED_NAME: &str = "42939";
 pub const ERRCODE_DUPLICATE_OBJECT: &str = "42710";
 pub const InvalidOid: u32 = 0;
 pub const TEXTOID: u32 = 25;
+pub const InvalidSubTransactionId: u32 = 0;
 
 /// The C enum `CmdType`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -6107,6 +6117,1929 @@ impl Out for XmlSerialize {
     }
 }
 
+impl Equal for ATAlterConstraint {
+    fn equal(&self, other: &Self) -> bool {
+        self.conname == other.conname
+            && self.alterEnforceability == other.alterEnforceability
+            && self.is_enforced == other.is_enforced
+            && self.alterDeferrability == other.alterDeferrability
+            && self.deferrable == other.deferrable
+            && self.initdeferred == other.initdeferred
+            && self.alterInheritability == other.alterInheritability
+            && self.noinherit == other.noinherit
+    }
+}
+
+impl Equal for A_ArrayExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.elements.equal(&other.elements)
+    }
+}
+
+impl Equal for A_Const {
+    fn equal(&self, other: &Self) -> bool {
+        self.val.equal(&other.val) && self.isnull == other.isnull
+    }
+}
+
+impl Equal for A_Expr {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.name.equal(&other.name)
+            && self.lexpr.equal(&other.lexpr)
+            && self.rexpr.equal(&other.rexpr)
+    }
+}
+
+impl Equal for A_Indices {
+    fn equal(&self, other: &Self) -> bool {
+        self.is_slice == other.is_slice
+            && self.lidx.equal(&other.lidx)
+            && self.uidx.equal(&other.uidx)
+    }
+}
+
+impl Equal for A_Indirection {
+    fn equal(&self, other: &Self) -> bool {
+        self.arg.equal(&other.arg) && self.indirection.equal(&other.indirection)
+    }
+}
+
+impl Equal for A_Star {
+    fn equal(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Equal for AccessPriv {
+    fn equal(&self, other: &Self) -> bool {
+        self.priv_name == other.priv_name && self.cols.equal(&other.cols)
+    }
+}
+
+impl Equal for Alias {
+    fn equal(&self, other: &Self) -> bool {
+        self.aliasname == other.aliasname && self.colnames.equal(&other.colnames)
+    }
+}
+
+impl Equal for AlterCollationStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.collname.equal(&other.collname)
+    }
+}
+
+impl Equal for AlterDatabaseRefreshCollStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.dbname == other.dbname
+    }
+}
+
+impl Equal for AlterDatabaseSetStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.dbname == other.dbname && self.setstmt.equal(&other.setstmt)
+    }
+}
+
+impl Equal for AlterDatabaseStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.dbname == other.dbname && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterDefaultPrivilegesStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.options.equal(&other.options) && self.action.equal(&other.action)
+    }
+}
+
+impl Equal for AlterDomainStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.subtype == other.subtype
+            && self.typeName.equal(&other.typeName)
+            && self.name == other.name
+            && self.def.equal(&other.def)
+            && self.behavior == other.behavior
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for AlterEnumStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.typeName.equal(&other.typeName)
+            && self.oldVal == other.oldVal
+            && self.newVal == other.newVal
+            && self.newValNeighbor == other.newValNeighbor
+            && self.newValIsAfter == other.newValIsAfter
+            && self.skipIfNewValExists == other.skipIfNewValExists
+    }
+}
+
+impl Equal for AlterEventTrigStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.trigname == other.trigname && self.tgenabled == other.tgenabled
+    }
+}
+
+impl Equal for AlterExtensionContentsStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.extname == other.extname
+            && self.action == other.action
+            && self.objtype == other.objtype
+            && self.object.equal(&other.object)
+    }
+}
+
+impl Equal for AlterExtensionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.extname == other.extname && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterFdwStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.fdwname == other.fdwname
+            && self.func_options.equal(&other.func_options)
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterForeignServerStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.servername == other.servername
+            && self.version == other.version
+            && self.options.equal(&other.options)
+            && self.has_version == other.has_version
+    }
+}
+
+impl Equal for AlterFunctionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objtype == other.objtype
+            && self.func.equal(&other.func)
+            && self.actions.equal(&other.actions)
+    }
+}
+
+impl Equal for AlterObjectDependsStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objectType == other.objectType
+            && self.relation.equal(&other.relation)
+            && self.object.equal(&other.object)
+            && self.extname.equal(&other.extname)
+            && self.remove == other.remove
+    }
+}
+
+impl Equal for AlterObjectSchemaStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objectType == other.objectType
+            && self.relation.equal(&other.relation)
+            && self.object.equal(&other.object)
+            && self.newschema == other.newschema
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for AlterOpFamilyStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.opfamilyname.equal(&other.opfamilyname)
+            && self.amname == other.amname
+            && self.isDrop == other.isDrop
+            && self.items.equal(&other.items)
+    }
+}
+
+impl Equal for AlterOperatorStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.opername.equal(&other.opername) && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterOwnerStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objectType == other.objectType
+            && self.relation.equal(&other.relation)
+            && self.object.equal(&other.object)
+            && self.newowner.equal(&other.newowner)
+    }
+}
+
+impl Equal for AlterPolicyStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.policy_name == other.policy_name
+            && self.table.equal(&other.table)
+            && self.roles.equal(&other.roles)
+            && self.qual.equal(&other.qual)
+            && self.with_check.equal(&other.with_check)
+    }
+}
+
+impl Equal for AlterPublicationStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.pubname == other.pubname
+            && self.options.equal(&other.options)
+            && self.pubobjects.equal(&other.pubobjects)
+            && self.action == other.action
+            && self.for_all_tables == other.for_all_tables
+            && self.for_all_sequences == other.for_all_sequences
+    }
+}
+
+impl Equal for AlterRoleSetStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.role.equal(&other.role)
+            && self.database == other.database
+            && self.setstmt.equal(&other.setstmt)
+    }
+}
+
+impl Equal for AlterRoleStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.role.equal(&other.role)
+            && self.options.equal(&other.options)
+            && self.action == other.action
+    }
+}
+
+impl Equal for AlterSeqStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.sequence.equal(&other.sequence)
+            && self.options.equal(&other.options)
+            && self.for_identity == other.for_identity
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for AlterStatsStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.defnames.equal(&other.defnames)
+            && self.stxstattarget.equal(&other.stxstattarget)
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for AlterSubscriptionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.subname == other.subname
+            && self.servername == other.servername
+            && self.conninfo == other.conninfo
+            && self.publication.equal(&other.publication)
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterSystemStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.setstmt.equal(&other.setstmt)
+    }
+}
+
+impl Equal for AlterTSConfigurationStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.cfgname.equal(&other.cfgname)
+            && self.tokentype.equal(&other.tokentype)
+            && self.dicts.equal(&other.dicts)
+            && self.r#override == other.r#override
+            && self.replace == other.replace
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for AlterTSDictionaryStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.dictname.equal(&other.dictname) && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterTableCmd {
+    fn equal(&self, other: &Self) -> bool {
+        self.subtype == other.subtype
+            && self.name == other.name
+            && self.num == other.num
+            && self.newowner.equal(&other.newowner)
+            && self.def.equal(&other.def)
+            && self.behavior == other.behavior
+            && self.missing_ok == other.missing_ok
+            && self.recurse == other.recurse
+    }
+}
+
+impl Equal for AlterTableMoveAllStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.orig_tablespacename == other.orig_tablespacename
+            && self.objtype == other.objtype
+            && self.roles.equal(&other.roles)
+            && self.new_tablespacename == other.new_tablespacename
+            && self.nowait == other.nowait
+    }
+}
+
+impl Equal for AlterTableSpaceOptionsStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.tablespacename == other.tablespacename
+            && self.options.equal(&other.options)
+            && self.isReset == other.isReset
+    }
+}
+
+impl Equal for AlterTableStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.cmds.equal(&other.cmds)
+            && self.objtype == other.objtype
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for AlterTypeStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.typeName.equal(&other.typeName) && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for AlterUserMappingStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.user.equal(&other.user)
+            && self.servername == other.servername
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for BoolExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.boolop == other.boolop && self.args.equal(&other.args)
+    }
+}
+
+impl Equal for BooleanTest {
+    fn equal(&self, other: &Self) -> bool {
+        self.arg.equal(&other.arg) && self.booltesttype == other.booltesttype
+    }
+}
+
+impl Equal for CTECycleClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.cycle_col_list.equal(&other.cycle_col_list)
+            && self.cycle_mark_column == other.cycle_mark_column
+            && self.cycle_mark_value.equal(&other.cycle_mark_value)
+            && self.cycle_mark_default.equal(&other.cycle_mark_default)
+            && self.cycle_path_column == other.cycle_path_column
+            && self.cycle_mark_type == other.cycle_mark_type
+            && self.cycle_mark_typmod == other.cycle_mark_typmod
+            && self.cycle_mark_collation == other.cycle_mark_collation
+            && self.cycle_mark_neop == other.cycle_mark_neop
+    }
+}
+
+impl Equal for CTESearchClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.search_col_list.equal(&other.search_col_list)
+            && self.search_breadth_first == other.search_breadth_first
+            && self.search_seq_column == other.search_seq_column
+    }
+}
+
+impl Equal for CallStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.funccall.equal(&other.funccall)
+            && self.funcexpr.equal(&other.funcexpr)
+            && self.outargs.equal(&other.outargs)
+    }
+}
+
+impl Equal for CaseExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.casetype == other.casetype
+            && self.casecollid == other.casecollid
+            && self.arg.equal(&other.arg)
+            && self.args.equal(&other.args)
+            && self.defresult.equal(&other.defresult)
+    }
+}
+
+impl Equal for CaseWhen {
+    fn equal(&self, other: &Self) -> bool {
+        self.expr.equal(&other.expr) && self.result.equal(&other.result)
+    }
+}
+
+impl Equal for CheckPointStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.options.equal(&other.options)
+    }
+}
+
+impl Equal for ClosePortalStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.portalname == other.portalname
+    }
+}
+
+impl Equal for CoalesceExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.coalescetype == other.coalescetype
+            && self.coalescecollid == other.coalescecollid
+            && self.args.equal(&other.args)
+    }
+}
+
+impl Equal for CollateClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.arg.equal(&other.arg) && self.collname.equal(&other.collname)
+    }
+}
+
+impl Equal for ColumnDef {
+    fn equal(&self, other: &Self) -> bool {
+        self.colname == other.colname
+            && self.typeName.equal(&other.typeName)
+            && self.compression == other.compression
+            && self.inhcount == other.inhcount
+            && self.is_local == other.is_local
+            && self.is_not_null == other.is_not_null
+            && self.is_from_type == other.is_from_type
+            && self.storage == other.storage
+            && self.storage_name == other.storage_name
+            && self.raw_default.equal(&other.raw_default)
+            && self.cooked_default.equal(&other.cooked_default)
+            && self.identity == other.identity
+            && self.identitySequence.equal(&other.identitySequence)
+            && self.generated == other.generated
+            && self.collClause.equal(&other.collClause)
+            && self.collOid == other.collOid
+            && self.constraints.equal(&other.constraints)
+            && self.fdwoptions.equal(&other.fdwoptions)
+    }
+}
+
+impl Equal for ColumnRef {
+    fn equal(&self, other: &Self) -> bool {
+        self.fields.equal(&other.fields)
+    }
+}
+
+impl Equal for CommentStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objtype == other.objtype
+            && self.object.equal(&other.object)
+            && self.comment == other.comment
+    }
+}
+
+impl Equal for CommonTableExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.ctename == other.ctename
+            && self.aliascolnames.equal(&other.aliascolnames)
+            && self.ctematerialized == other.ctematerialized
+            && self.ctequery.equal(&other.ctequery)
+            && self.search_clause.equal(&other.search_clause)
+            && self.cycle_clause.equal(&other.cycle_clause)
+            && self.cterecursive == other.cterecursive
+            && self.cterefcount == other.cterefcount
+            && self.ctecolnames.equal(&other.ctecolnames)
+            && self.ctecoltypes.equal(&other.ctecoltypes)
+            && self.ctecoltypmods.equal(&other.ctecoltypmods)
+            && self.ctecolcollations.equal(&other.ctecolcollations)
+    }
+}
+
+impl Equal for CompositeTypeStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.typevar.equal(&other.typevar) && self.coldeflist.equal(&other.coldeflist)
+    }
+}
+
+impl Equal for Constraint {
+    fn equal(&self, other: &Self) -> bool {
+        self.contype == other.contype
+            && self.conname == other.conname
+            && self.deferrable == other.deferrable
+            && self.initdeferred == other.initdeferred
+            && self.is_enforced == other.is_enforced
+            && self.skip_validation == other.skip_validation
+            && self.initially_valid == other.initially_valid
+            && self.is_no_inherit == other.is_no_inherit
+            && self.raw_expr.equal(&other.raw_expr)
+            && self.cooked_expr == other.cooked_expr
+            && self.generated_when == other.generated_when
+            && self.generated_kind == other.generated_kind
+            && self.nulls_not_distinct == other.nulls_not_distinct
+            && self.keys.equal(&other.keys)
+            && self.without_overlaps == other.without_overlaps
+            && self.including.equal(&other.including)
+            && self.exclusions.equal(&other.exclusions)
+            && self.options.equal(&other.options)
+            && self.indexname == other.indexname
+            && self.indexspace == other.indexspace
+            && self.reset_default_tblspc == other.reset_default_tblspc
+            && self.access_method == other.access_method
+            && self.where_clause.equal(&other.where_clause)
+            && self.pktable.equal(&other.pktable)
+            && self.fk_attrs.equal(&other.fk_attrs)
+            && self.pk_attrs.equal(&other.pk_attrs)
+            && self.fk_with_period == other.fk_with_period
+            && self.pk_with_period == other.pk_with_period
+            && self.fk_matchtype == other.fk_matchtype
+            && self.fk_upd_action == other.fk_upd_action
+            && self.fk_del_action == other.fk_del_action
+            && self.fk_del_set_cols.equal(&other.fk_del_set_cols)
+            && self.old_conpfeqop.equal(&other.old_conpfeqop)
+            && self.old_pktable_oid == other.old_pktable_oid
+    }
+}
+
+impl Equal for ConstraintsSetStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.constraints.equal(&other.constraints) && self.deferred == other.deferred
+    }
+}
+
+impl Equal for CopyStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.query.equal(&other.query)
+            && self.attlist.equal(&other.attlist)
+            && self.is_from == other.is_from
+            && self.is_program == other.is_program
+            && self.filename == other.filename
+            && self.options.equal(&other.options)
+            && self.whereClause.equal(&other.whereClause)
+    }
+}
+
+impl Equal for CreateAmStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.amname == other.amname
+            && self.handler_name.equal(&other.handler_name)
+            && self.amtype == other.amtype
+    }
+}
+
+impl Equal for CreateCastStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.sourcetype.equal(&other.sourcetype)
+            && self.targettype.equal(&other.targettype)
+            && self.func.equal(&other.func)
+            && self.context == other.context
+            && self.inout == other.inout
+    }
+}
+
+impl Equal for CreateConversionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.conversion_name.equal(&other.conversion_name)
+            && self.for_encoding_name == other.for_encoding_name
+            && self.to_encoding_name == other.to_encoding_name
+            && self.func_name.equal(&other.func_name)
+            && self.def == other.def
+    }
+}
+
+impl Equal for CreateDomainStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.domainname.equal(&other.domainname)
+            && self.typeName.equal(&other.typeName)
+            && self.collClause.equal(&other.collClause)
+            && self.constraints.equal(&other.constraints)
+    }
+}
+
+impl Equal for CreateEnumStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.typeName.equal(&other.typeName) && self.vals.equal(&other.vals)
+    }
+}
+
+impl Equal for CreateEventTrigStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.trigname == other.trigname
+            && self.eventname == other.eventname
+            && self.whenclause.equal(&other.whenclause)
+            && self.funcname.equal(&other.funcname)
+    }
+}
+
+impl Equal for CreateExtensionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.extname == other.extname
+            && self.if_not_exists == other.if_not_exists
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateFdwStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.fdwname == other.fdwname
+            && self.func_options.equal(&other.func_options)
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateForeignServerStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.servername == other.servername
+            && self.servertype == other.servertype
+            && self.version == other.version
+            && self.fdwname == other.fdwname
+            && self.if_not_exists == other.if_not_exists
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateForeignTableStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.base.equal(&other.base)
+            && self.servername == other.servername
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateFunctionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.is_procedure == other.is_procedure
+            && self.replace == other.replace
+            && self.funcname.equal(&other.funcname)
+            && self.parameters.equal(&other.parameters)
+            && self.returnType.equal(&other.returnType)
+            && self.options.equal(&other.options)
+            && self.sql_body.equal(&other.sql_body)
+    }
+}
+
+impl Equal for CreateOpClassItem {
+    fn equal(&self, other: &Self) -> bool {
+        self.itemtype == other.itemtype
+            && self.name.equal(&other.name)
+            && self.number == other.number
+            && self.order_family.equal(&other.order_family)
+            && self.class_args.equal(&other.class_args)
+            && self.storedtype.equal(&other.storedtype)
+    }
+}
+
+impl Equal for CreateOpClassStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.opclassname.equal(&other.opclassname)
+            && self.opfamilyname.equal(&other.opfamilyname)
+            && self.amname == other.amname
+            && self.datatype.equal(&other.datatype)
+            && self.items.equal(&other.items)
+            && self.isDefault == other.isDefault
+    }
+}
+
+impl Equal for CreateOpFamilyStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.opfamilyname.equal(&other.opfamilyname) && self.amname == other.amname
+    }
+}
+
+impl Equal for CreatePLangStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.replace == other.replace
+            && self.plname == other.plname
+            && self.plhandler.equal(&other.plhandler)
+            && self.plinline.equal(&other.plinline)
+            && self.plvalidator.equal(&other.plvalidator)
+            && self.pltrusted == other.pltrusted
+    }
+}
+
+impl Equal for CreatePolicyStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.policy_name == other.policy_name
+            && self.table.equal(&other.table)
+            && self.cmd_name == other.cmd_name
+            && self.permissive == other.permissive
+            && self.roles.equal(&other.roles)
+            && self.qual.equal(&other.qual)
+            && self.with_check.equal(&other.with_check)
+    }
+}
+
+impl Equal for CreatePublicationStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.pubname == other.pubname
+            && self.options.equal(&other.options)
+            && self.pubobjects.equal(&other.pubobjects)
+            && self.for_all_tables == other.for_all_tables
+            && self.for_all_sequences == other.for_all_sequences
+    }
+}
+
+impl Equal for CreateRangeStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.typeName.equal(&other.typeName) && self.params.equal(&other.params)
+    }
+}
+
+impl Equal for CreateRoleStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.stmt_type == other.stmt_type
+            && self.role == other.role
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateSchemaStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.schemaname == other.schemaname
+            && self.authrole.equal(&other.authrole)
+            && self.schemaElts.equal(&other.schemaElts)
+            && self.if_not_exists == other.if_not_exists
+    }
+}
+
+impl Equal for CreateSeqStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.sequence.equal(&other.sequence)
+            && self.options.equal(&other.options)
+            && self.ownerId == other.ownerId
+            && self.for_identity == other.for_identity
+            && self.if_not_exists == other.if_not_exists
+    }
+}
+
+impl Equal for CreateStatsStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.defnames.equal(&other.defnames)
+            && self.stat_types.equal(&other.stat_types)
+            && self.exprs.equal(&other.exprs)
+            && self.relations.equal(&other.relations)
+            && self.stxcomment == other.stxcomment
+            && self.transformed == other.transformed
+            && self.if_not_exists == other.if_not_exists
+            && self.owner == other.owner
+    }
+}
+
+impl Equal for CreateStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.tableElts.equal(&other.tableElts)
+            && self.inhRelations.equal(&other.inhRelations)
+            && self.partbound.equal(&other.partbound)
+            && self.partspec.equal(&other.partspec)
+            && self.ofTypename.equal(&other.ofTypename)
+            && self.constraints.equal(&other.constraints)
+            && self.nnconstraints.equal(&other.nnconstraints)
+            && self.options.equal(&other.options)
+            && self.oncommit == other.oncommit
+            && self.tablespacename == other.tablespacename
+            && self.accessMethod == other.accessMethod
+            && self.if_not_exists == other.if_not_exists
+    }
+}
+
+impl Equal for CreateSubscriptionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.subname == other.subname
+            && self.servername == other.servername
+            && self.conninfo == other.conninfo
+            && self.publication.equal(&other.publication)
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateTableAsStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.query.equal(&other.query)
+            && self.into.equal(&other.into)
+            && self.objtype == other.objtype
+            && self.is_select_into == other.is_select_into
+            && self.if_not_exists == other.if_not_exists
+    }
+}
+
+impl Equal for CreateTableSpaceStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.tablespacename == other.tablespacename
+            && self.owner.equal(&other.owner)
+            && self.location == other.location
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreateTransformStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.replace == other.replace
+            && self.type_name.equal(&other.type_name)
+            && self.lang == other.lang
+            && self.fromsql.equal(&other.fromsql)
+            && self.tosql.equal(&other.tosql)
+    }
+}
+
+impl Equal for CreateTrigStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.replace == other.replace
+            && self.isconstraint == other.isconstraint
+            && self.trigname == other.trigname
+            && self.relation.equal(&other.relation)
+            && self.funcname.equal(&other.funcname)
+            && self.args.equal(&other.args)
+            && self.row == other.row
+            && self.timing == other.timing
+            && self.events == other.events
+            && self.columns.equal(&other.columns)
+            && self.whenClause.equal(&other.whenClause)
+            && self.transitionRels.equal(&other.transitionRels)
+            && self.deferrable == other.deferrable
+            && self.initdeferred == other.initdeferred
+            && self.constrrel.equal(&other.constrrel)
+    }
+}
+
+impl Equal for CreateUserMappingStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.user.equal(&other.user)
+            && self.servername == other.servername
+            && self.if_not_exists == other.if_not_exists
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CreatedbStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.dbname == other.dbname && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for CurrentOfExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.cvarno == other.cvarno
+            && self.cursor_name == other.cursor_name
+            && self.cursor_param == other.cursor_param
+    }
+}
+
+impl Equal for DeallocateStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name && self.isall == other.isall
+    }
+}
+
+impl Equal for DeclareCursorStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.portalname == other.portalname
+            && self.options == other.options
+            && self.query.equal(&other.query)
+    }
+}
+
+impl Equal for DefElem {
+    fn equal(&self, other: &Self) -> bool {
+        self.defnamespace == other.defnamespace
+            && self.defname == other.defname
+            && self.arg.equal(&other.arg)
+            && self.defaction == other.defaction
+    }
+}
+
+impl Equal for DefineStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.oldstyle == other.oldstyle
+            && self.defnames.equal(&other.defnames)
+            && self.args.equal(&other.args)
+            && self.definition.equal(&other.definition)
+            && self.if_not_exists == other.if_not_exists
+            && self.replace == other.replace
+    }
+}
+
+impl Equal for DeleteStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.usingClause.equal(&other.usingClause)
+            && self.whereClause.equal(&other.whereClause)
+            && self.returningClause.equal(&other.returningClause)
+            && self.withClause.equal(&other.withClause)
+    }
+}
+
+impl Equal for DiscardStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.target == other.target
+    }
+}
+
+impl Equal for DoStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.args.equal(&other.args)
+    }
+}
+
+impl Equal for DropOwnedStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.roles.equal(&other.roles) && self.behavior == other.behavior
+    }
+}
+
+impl Equal for DropRoleStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.roles.equal(&other.roles) && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for DropStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objects.equal(&other.objects)
+            && self.removeType == other.removeType
+            && self.behavior == other.behavior
+            && self.missing_ok == other.missing_ok
+            && self.concurrent == other.concurrent
+    }
+}
+
+impl Equal for DropSubscriptionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.subname == other.subname
+            && self.missing_ok == other.missing_ok
+            && self.behavior == other.behavior
+    }
+}
+
+impl Equal for DropTableSpaceStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.tablespacename == other.tablespacename && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for DropUserMappingStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.user.equal(&other.user)
+            && self.servername == other.servername
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for DropdbStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.dbname == other.dbname
+            && self.missing_ok == other.missing_ok
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for ExecuteStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name && self.params.equal(&other.params)
+    }
+}
+
+impl Equal for ExplainStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.query.equal(&other.query) && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for FetchStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.direction == other.direction
+            && self.howMany == other.howMany
+            && self.portalname == other.portalname
+            && self.ismove == other.ismove
+            && self.direction_keyword == other.direction_keyword
+    }
+}
+
+impl Equal for FuncCall {
+    fn equal(&self, other: &Self) -> bool {
+        self.funcname.equal(&other.funcname)
+            && self.args.equal(&other.args)
+            && self.agg_order.equal(&other.agg_order)
+            && self.agg_filter.equal(&other.agg_filter)
+            && self.over.equal(&other.over)
+            && self.ignore_nulls == other.ignore_nulls
+            && self.agg_within_group == other.agg_within_group
+            && self.agg_star == other.agg_star
+            && self.agg_distinct == other.agg_distinct
+            && self.func_variadic == other.func_variadic
+            && self.funcformat == other.funcformat
+    }
+}
+
+impl Equal for FunctionParameter {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.argType.equal(&other.argType)
+            && self.mode == other.mode
+            && self.defexpr.equal(&other.defexpr)
+    }
+}
+
+impl Equal for GrantRoleStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.granted_roles.equal(&other.granted_roles)
+            && self.grantee_roles.equal(&other.grantee_roles)
+            && self.is_grant == other.is_grant
+            && self.opt.equal(&other.opt)
+            && self.grantor.equal(&other.grantor)
+            && self.behavior == other.behavior
+    }
+}
+
+impl Equal for GrantStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.is_grant == other.is_grant
+            && self.targtype == other.targtype
+            && self.objtype == other.objtype
+            && self.objects.equal(&other.objects)
+            && self.privileges.equal(&other.privileges)
+            && self.grantees.equal(&other.grantees)
+            && self.grant_option == other.grant_option
+            && self.grantor.equal(&other.grantor)
+            && self.behavior == other.behavior
+    }
+}
+
+impl Equal for GroupingFunc {
+    fn equal(&self, other: &Self) -> bool {
+        self.args.equal(&other.args) && self.agglevelsup == other.agglevelsup
+    }
+}
+
+impl Equal for GroupingSet {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.content.equal(&other.content)
+    }
+}
+
+impl Equal for ImportForeignSchemaStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.server_name == other.server_name
+            && self.remote_schema == other.remote_schema
+            && self.local_schema == other.local_schema
+            && self.list_type == other.list_type
+            && self.table_list.equal(&other.table_list)
+            && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for IndexElem {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.expr.equal(&other.expr)
+            && self.indexcolname == other.indexcolname
+            && self.collation.equal(&other.collation)
+            && self.opclass.equal(&other.opclass)
+            && self.opclassopts.equal(&other.opclassopts)
+            && self.ordering == other.ordering
+            && self.nulls_ordering == other.nulls_ordering
+    }
+}
+
+impl Equal for IndexStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.idxname == other.idxname
+            && self.relation.equal(&other.relation)
+            && self.accessMethod == other.accessMethod
+            && self.tableSpace == other.tableSpace
+            && self.indexParams.equal(&other.indexParams)
+            && self.indexIncludingParams.equal(&other.indexIncludingParams)
+            && self.options.equal(&other.options)
+            && self.whereClause.equal(&other.whereClause)
+            && self.excludeOpNames.equal(&other.excludeOpNames)
+            && self.idxcomment == other.idxcomment
+            && self.indexOid == other.indexOid
+            && self.oldNumber == other.oldNumber
+            && self.oldCreateSubid == other.oldCreateSubid
+            && self.oldFirstRelfilelocatorSubid == other.oldFirstRelfilelocatorSubid
+            && self.unique == other.unique
+            && self.nulls_not_distinct == other.nulls_not_distinct
+            && self.primary == other.primary
+            && self.isconstraint == other.isconstraint
+            && self.iswithoutoverlaps == other.iswithoutoverlaps
+            && self.deferrable == other.deferrable
+            && self.initdeferred == other.initdeferred
+            && self.transformed == other.transformed
+            && self.concurrent == other.concurrent
+            && self.if_not_exists == other.if_not_exists
+            && self.reset_default_tblspc == other.reset_default_tblspc
+    }
+}
+
+impl Equal for InferClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.indexElems.equal(&other.indexElems)
+            && self.whereClause.equal(&other.whereClause)
+            && self.conname == other.conname
+    }
+}
+
+impl Equal for InsertStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.cols.equal(&other.cols)
+            && self.selectStmt.equal(&other.selectStmt)
+            && self.onConflictClause.equal(&other.onConflictClause)
+            && self.returningClause.equal(&other.returningClause)
+            && self.withClause.equal(&other.withClause)
+            && self.r#override == other.r#override
+    }
+}
+
+impl Equal for IntoClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.rel.equal(&other.rel)
+            && self.colNames.equal(&other.colNames)
+            && self.accessMethod == other.accessMethod
+            && self.options.equal(&other.options)
+            && self.onCommit == other.onCommit
+            && self.tableSpaceName == other.tableSpaceName
+            && self.viewQuery.equal(&other.viewQuery)
+            && self.skipData == other.skipData
+    }
+}
+
+impl Equal for JoinExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.jointype == other.jointype
+            && self.isNatural == other.isNatural
+            && self.larg.equal(&other.larg)
+            && self.rarg.equal(&other.rarg)
+            && self.usingClause.equal(&other.usingClause)
+            && self.join_using_alias.equal(&other.join_using_alias)
+            && self.quals.equal(&other.quals)
+            && self.alias.equal(&other.alias)
+            && self.rtindex == other.rtindex
+    }
+}
+
+impl Equal for JsonAggConstructor {
+    fn equal(&self, other: &Self) -> bool {
+        self.output.equal(&other.output)
+            && self.agg_filter.equal(&other.agg_filter)
+            && self.agg_order.equal(&other.agg_order)
+            && self.over.equal(&other.over)
+    }
+}
+
+impl Equal for JsonArgument {
+    fn equal(&self, other: &Self) -> bool {
+        self.val.equal(&other.val) && self.name == other.name
+    }
+}
+
+impl Equal for JsonArrayAgg {
+    fn equal(&self, other: &Self) -> bool {
+        self.constructor.equal(&other.constructor)
+            && self.arg.equal(&other.arg)
+            && self.absent_on_null == other.absent_on_null
+    }
+}
+
+impl Equal for JsonArrayConstructor {
+    fn equal(&self, other: &Self) -> bool {
+        self.exprs.equal(&other.exprs)
+            && self.output.equal(&other.output)
+            && self.absent_on_null == other.absent_on_null
+    }
+}
+
+impl Equal for JsonArrayQueryConstructor {
+    fn equal(&self, other: &Self) -> bool {
+        self.query.equal(&other.query)
+            && self.output.equal(&other.output)
+            && self.format.equal(&other.format)
+            && self.absent_on_null == other.absent_on_null
+    }
+}
+
+impl Equal for JsonBehavior {
+    fn equal(&self, other: &Self) -> bool {
+        self.btype == other.btype && self.expr.equal(&other.expr) && self.coerce == other.coerce
+    }
+}
+
+impl Equal for JsonFormat {
+    fn equal(&self, other: &Self) -> bool {
+        self.format_type == other.format_type && self.encoding == other.encoding
+    }
+}
+
+impl Equal for JsonFuncExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.op == other.op
+            && self.column_name == other.column_name
+            && self.context_item.equal(&other.context_item)
+            && self.pathspec.equal(&other.pathspec)
+            && self.passing.equal(&other.passing)
+            && self.output.equal(&other.output)
+            && self.on_empty.equal(&other.on_empty)
+            && self.on_error.equal(&other.on_error)
+            && self.wrapper == other.wrapper
+            && self.quotes == other.quotes
+    }
+}
+
+impl Equal for JsonIsPredicate {
+    fn equal(&self, other: &Self) -> bool {
+        self.expr.equal(&other.expr)
+            && self.format.equal(&other.format)
+            && self.item_type == other.item_type
+            && self.unique_keys == other.unique_keys
+            && self.exprBaseType == other.exprBaseType
+    }
+}
+
+impl Equal for JsonKeyValue {
+    fn equal(&self, other: &Self) -> bool {
+        self.key.equal(&other.key) && self.value.equal(&other.value)
+    }
+}
+
+impl Equal for JsonObjectAgg {
+    fn equal(&self, other: &Self) -> bool {
+        self.constructor.equal(&other.constructor)
+            && self.arg.equal(&other.arg)
+            && self.absent_on_null == other.absent_on_null
+            && self.unique == other.unique
+    }
+}
+
+impl Equal for JsonObjectConstructor {
+    fn equal(&self, other: &Self) -> bool {
+        self.exprs.equal(&other.exprs)
+            && self.output.equal(&other.output)
+            && self.absent_on_null == other.absent_on_null
+            && self.unique == other.unique
+    }
+}
+
+impl Equal for JsonOutput {
+    fn equal(&self, other: &Self) -> bool {
+        self.typeName.equal(&other.typeName) && self.returning.equal(&other.returning)
+    }
+}
+
+impl Equal for JsonParseExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.expr.equal(&other.expr)
+            && self.output.equal(&other.output)
+            && self.unique_keys == other.unique_keys
+    }
+}
+
+impl Equal for JsonReturning {
+    fn equal(&self, other: &Self) -> bool {
+        self.format.equal(&other.format) && self.typid == other.typid && self.typmod == other.typmod
+    }
+}
+
+impl Equal for JsonScalarExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.expr.equal(&other.expr) && self.output.equal(&other.output)
+    }
+}
+
+impl Equal for JsonSerializeExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.expr.equal(&other.expr) && self.output.equal(&other.output)
+    }
+}
+
+impl Equal for JsonTable {
+    fn equal(&self, other: &Self) -> bool {
+        self.context_item.equal(&other.context_item)
+            && self.pathspec.equal(&other.pathspec)
+            && self.passing.equal(&other.passing)
+            && self.columns.equal(&other.columns)
+            && self.on_error.equal(&other.on_error)
+            && self.alias.equal(&other.alias)
+            && self.lateral == other.lateral
+    }
+}
+
+impl Equal for JsonTableColumn {
+    fn equal(&self, other: &Self) -> bool {
+        self.coltype == other.coltype
+            && self.name == other.name
+            && self.typeName.equal(&other.typeName)
+            && self.pathspec.equal(&other.pathspec)
+            && self.format.equal(&other.format)
+            && self.wrapper == other.wrapper
+            && self.quotes == other.quotes
+            && self.columns.equal(&other.columns)
+            && self.on_empty.equal(&other.on_empty)
+            && self.on_error.equal(&other.on_error)
+    }
+}
+
+impl Equal for JsonTablePathSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.string.equal(&other.string) && self.name == other.name
+    }
+}
+
+impl Equal for JsonValueExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.raw_expr.equal(&other.raw_expr)
+            && self.formatted_expr.equal(&other.formatted_expr)
+            && self.format.equal(&other.format)
+    }
+}
+
+impl Equal for ListenStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.conditionname == other.conditionname
+    }
+}
+
+impl Equal for LoadStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.filename == other.filename
+    }
+}
+
+impl Equal for LockStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relations.equal(&other.relations)
+            && self.mode == other.mode
+            && self.nowait == other.nowait
+    }
+}
+
+impl Equal for LockingClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.lockedRels.equal(&other.lockedRels)
+            && self.strength == other.strength
+            && self.waitPolicy == other.waitPolicy
+    }
+}
+
+impl Equal for MergeStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.sourceRelation.equal(&other.sourceRelation)
+            && self.joinCondition.equal(&other.joinCondition)
+            && self.mergeWhenClauses.equal(&other.mergeWhenClauses)
+            && self.returningClause.equal(&other.returningClause)
+            && self.withClause.equal(&other.withClause)
+    }
+}
+
+impl Equal for MergeSupportFunc {
+    fn equal(&self, other: &Self) -> bool {
+        self.msftype == other.msftype && self.msfcollid == other.msfcollid
+    }
+}
+
+impl Equal for MergeWhenClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.matchKind == other.matchKind
+            && self.commandType == other.commandType
+            && self.r#override == other.r#override
+            && self.condition.equal(&other.condition)
+            && self.targetList.equal(&other.targetList)
+            && self.values.equal(&other.values)
+    }
+}
+
+impl Equal for MinMaxExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.minmaxtype == other.minmaxtype
+            && self.minmaxcollid == other.minmaxcollid
+            && self.inputcollid == other.inputcollid
+            && self.op == other.op
+            && self.args.equal(&other.args)
+    }
+}
+
+impl Equal for MultiAssignRef {
+    fn equal(&self, other: &Self) -> bool {
+        self.source.equal(&other.source)
+            && self.colno == other.colno
+            && self.ncolumns == other.ncolumns
+    }
+}
+
+impl Equal for NamedArgExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.arg.equal(&other.arg) && self.name == other.name && self.argnumber == other.argnumber
+    }
+}
+
+impl Equal for NotifyStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.conditionname == other.conditionname && self.payload == other.payload
+    }
+}
+
+impl Equal for NullTest {
+    fn equal(&self, other: &Self) -> bool {
+        self.arg.equal(&other.arg)
+            && self.nulltesttype == other.nulltesttype
+            && self.argisrow == other.argisrow
+    }
+}
+
+impl Equal for ObjectWithArgs {
+    fn equal(&self, other: &Self) -> bool {
+        self.objname.equal(&other.objname)
+            && self.objargs.equal(&other.objargs)
+            && self.objfuncargs.equal(&other.objfuncargs)
+            && self.args_unspecified == other.args_unspecified
+    }
+}
+
+impl Equal for OnConflictClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.action == other.action
+            && self.infer.equal(&other.infer)
+            && self.lockStrength == other.lockStrength
+            && self.targetList.equal(&other.targetList)
+            && self.whereClause.equal(&other.whereClause)
+    }
+}
+
+impl Equal for PLAssignStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.indirection.equal(&other.indirection)
+            && self.nnames == other.nnames
+            && self.val.equal(&other.val)
+    }
+}
+
+impl Equal for ParamRef {
+    fn equal(&self, other: &Self) -> bool {
+        self.number == other.number
+    }
+}
+
+impl Equal for PartitionBoundSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.strategy == other.strategy
+            && self.is_default == other.is_default
+            && self.modulus == other.modulus
+            && self.remainder == other.remainder
+            && self.listdatums.equal(&other.listdatums)
+            && self.lowerdatums.equal(&other.lowerdatums)
+            && self.upperdatums.equal(&other.upperdatums)
+    }
+}
+
+impl Equal for PartitionCmd {
+    fn equal(&self, other: &Self) -> bool {
+        self.name.equal(&other.name)
+            && self.bound.equal(&other.bound)
+            && self.concurrent == other.concurrent
+    }
+}
+
+impl Equal for PartitionElem {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.expr.equal(&other.expr)
+            && self.collation.equal(&other.collation)
+            && self.opclass.equal(&other.opclass)
+    }
+}
+
+impl Equal for PartitionSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.strategy == other.strategy && self.partParams.equal(&other.partParams)
+    }
+}
+
+impl Equal for PrepareStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.argtypes.equal(&other.argtypes)
+            && self.query.equal(&other.query)
+    }
+}
+
+impl Equal for PublicationAllObjSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.pubobjtype == other.pubobjtype && self.except_tables.equal(&other.except_tables)
+    }
+}
+
+impl Equal for PublicationObjSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.pubobjtype == other.pubobjtype
+            && self.name == other.name
+            && self.pubtable.equal(&other.pubtable)
+    }
+}
+
+impl Equal for PublicationTable {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.whereClause.equal(&other.whereClause)
+            && self.columns.equal(&other.columns)
+            && self.except == other.except
+    }
+}
+
+impl Equal for RangeFunction {
+    fn equal(&self, other: &Self) -> bool {
+        self.lateral == other.lateral
+            && self.ordinality == other.ordinality
+            && self.is_rowsfrom == other.is_rowsfrom
+            && self.functions.equal(&other.functions)
+            && self.alias.equal(&other.alias)
+            && self.coldeflist.equal(&other.coldeflist)
+    }
+}
+
+impl Equal for RangeSubselect {
+    fn equal(&self, other: &Self) -> bool {
+        self.lateral == other.lateral
+            && self.subquery.equal(&other.subquery)
+            && self.alias.equal(&other.alias)
+    }
+}
+
+impl Equal for RangeTableFunc {
+    fn equal(&self, other: &Self) -> bool {
+        self.lateral == other.lateral
+            && self.docexpr.equal(&other.docexpr)
+            && self.rowexpr.equal(&other.rowexpr)
+            && self.namespaces.equal(&other.namespaces)
+            && self.columns.equal(&other.columns)
+            && self.alias.equal(&other.alias)
+    }
+}
+
+impl Equal for RangeTableFuncCol {
+    fn equal(&self, other: &Self) -> bool {
+        self.colname == other.colname
+            && self.typeName.equal(&other.typeName)
+            && self.for_ordinality == other.for_ordinality
+            && self.is_not_null == other.is_not_null
+            && self.colexpr.equal(&other.colexpr)
+            && self.coldefexpr.equal(&other.coldefexpr)
+    }
+}
+
+impl Equal for RangeTableSample {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.method.equal(&other.method)
+            && self.args.equal(&other.args)
+            && self.repeatable.equal(&other.repeatable)
+    }
+}
+
+impl Equal for RangeVar {
+    fn equal(&self, other: &Self) -> bool {
+        self.catalogname == other.catalogname
+            && self.schemaname == other.schemaname
+            && self.relname == other.relname
+            && self.inh == other.inh
+            && self.relpersistence == other.relpersistence
+            && self.alias.equal(&other.alias)
+    }
+}
+
+impl Equal for RawStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.stmt.equal(&other.stmt)
+    }
+}
+
+impl Equal for ReassignOwnedStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.roles.equal(&other.roles) && self.newrole.equal(&other.newrole)
+    }
+}
+
+impl Equal for RefreshMatViewStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.concurrent == other.concurrent
+            && self.skipData == other.skipData
+            && self.relation.equal(&other.relation)
+    }
+}
+
+impl Equal for ReindexStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.relation.equal(&other.relation)
+            && self.name == other.name
+            && self.params.equal(&other.params)
+    }
+}
+
+impl Equal for RenameStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.renameType == other.renameType
+            && self.relationType == other.relationType
+            && self.relation.equal(&other.relation)
+            && self.object.equal(&other.object)
+            && self.subname == other.subname
+            && self.newname == other.newname
+            && self.behavior == other.behavior
+            && self.missing_ok == other.missing_ok
+    }
+}
+
+impl Equal for RepackStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.command == other.command
+            && self.relation.equal(&other.relation)
+            && self.indexname == other.indexname
+            && self.usingindex == other.usingindex
+            && self.params.equal(&other.params)
+    }
+}
+
+impl Equal for ReplicaIdentityStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.identity_type == other.identity_type && self.name == other.name
+    }
+}
+
+impl Equal for ResTarget {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.indirection.equal(&other.indirection)
+            && self.val.equal(&other.val)
+    }
+}
+
+impl Equal for ReturnStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.returnval.equal(&other.returnval)
+    }
+}
+
+impl Equal for ReturningClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.options.equal(&other.options) && self.exprs.equal(&other.exprs)
+    }
+}
+
+impl Equal for ReturningOption {
+    fn equal(&self, other: &Self) -> bool {
+        self.option == other.option && self.value == other.value
+    }
+}
+
+impl Equal for RoleSpec {
+    fn equal(&self, other: &Self) -> bool {
+        self.roletype == other.roletype && self.rolename == other.rolename
+    }
+}
+
+impl Equal for RowExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.args.equal(&other.args)
+            && self.row_typeid == other.row_typeid
+            && self.row_format == other.row_format
+            && self.colnames.equal(&other.colnames)
+    }
+}
+
+impl Equal for RuleStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.rulename == other.rulename
+            && self.whereClause.equal(&other.whereClause)
+            && self.event == other.event
+            && self.instead == other.instead
+            && self.actions.equal(&other.actions)
+            && self.replace == other.replace
+    }
+}
+
+impl Equal for SQLValueFunction {
+    fn equal(&self, other: &Self) -> bool {
+        self.op == other.op && self.r#type == other.r#type && self.typmod == other.typmod
+    }
+}
+
+impl Equal for SecLabelStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.objtype == other.objtype
+            && self.object.equal(&other.object)
+            && self.provider == other.provider
+            && self.label == other.label
+    }
+}
+
+impl Equal for SelectStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.distinctClause.equal(&other.distinctClause)
+            && self.intoClause.equal(&other.intoClause)
+            && self.targetList.equal(&other.targetList)
+            && self.fromClause.equal(&other.fromClause)
+            && self.whereClause.equal(&other.whereClause)
+            && self.groupClause.equal(&other.groupClause)
+            && self.groupDistinct == other.groupDistinct
+            && self.havingClause.equal(&other.havingClause)
+            && self.windowClause.equal(&other.windowClause)
+            && self.valuesLists.equal(&other.valuesLists)
+            && self.sortClause.equal(&other.sortClause)
+            && self.limitOffset.equal(&other.limitOffset)
+            && self.limitCount.equal(&other.limitCount)
+            && self.limitOption == other.limitOption
+            && self.lockingClause.equal(&other.lockingClause)
+            && self.withClause.equal(&other.withClause)
+            && self.op == other.op
+            && self.all == other.all
+            && self.larg.equal(&other.larg)
+            && self.rarg.equal(&other.rarg)
+    }
+}
+
+impl Equal for SetToDefault {
+    fn equal(&self, other: &Self) -> bool {
+        self.typeId == other.typeId
+            && self.typeMod == other.typeMod
+            && self.collation == other.collation
+    }
+}
+
+impl Equal for SortBy {
+    fn equal(&self, other: &Self) -> bool {
+        self.node.equal(&other.node)
+            && self.sortby_dir == other.sortby_dir
+            && self.sortby_nulls == other.sortby_nulls
+            && self.useOp.equal(&other.useOp)
+    }
+}
+
+impl Equal for StatsElem {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name && self.expr.equal(&other.expr)
+    }
+}
+
+impl Equal for SubLink {
+    fn equal(&self, other: &Self) -> bool {
+        self.subLinkType == other.subLinkType
+            && self.subLinkId == other.subLinkId
+            && self.testexpr.equal(&other.testexpr)
+            && self.operName.equal(&other.operName)
+            && self.subselect.equal(&other.subselect)
+    }
+}
+
+impl Equal for TableLikeClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.options == other.options
+            && self.relationOid == other.relationOid
+    }
+}
+
+impl Equal for TransactionStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.options.equal(&other.options)
+            && self.savepoint_name == other.savepoint_name
+            && self.gid == other.gid
+            && self.chain == other.chain
+    }
+}
+
+impl Equal for TriggerTransition {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name && self.isNew == other.isNew && self.isTable == other.isTable
+    }
+}
+
+impl Equal for TruncateStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relations.equal(&other.relations)
+            && self.restart_seqs == other.restart_seqs
+            && self.behavior == other.behavior
+    }
+}
+
+impl Equal for TypeCast {
+    fn equal(&self, other: &Self) -> bool {
+        self.arg.equal(&other.arg) && self.typeName.equal(&other.typeName)
+    }
+}
+
+impl Equal for TypeName {
+    fn equal(&self, other: &Self) -> bool {
+        self.names.equal(&other.names)
+            && self.typeOid == other.typeOid
+            && self.setof == other.setof
+            && self.pct_type == other.pct_type
+            && self.typmods.equal(&other.typmods)
+            && self.typemod == other.typemod
+            && self.arrayBounds.equal(&other.arrayBounds)
+    }
+}
+
+impl Equal for UnlistenStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.conditionname == other.conditionname
+    }
+}
+
+impl Equal for UpdateStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.targetList.equal(&other.targetList)
+            && self.whereClause.equal(&other.whereClause)
+            && self.fromClause.equal(&other.fromClause)
+            && self.returningClause.equal(&other.returningClause)
+            && self.withClause.equal(&other.withClause)
+    }
+}
+
+impl Equal for VacuumRelation {
+    fn equal(&self, other: &Self) -> bool {
+        self.relation.equal(&other.relation)
+            && self.oid == other.oid
+            && self.va_cols.equal(&other.va_cols)
+    }
+}
+
+impl Equal for VacuumStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.options.equal(&other.options)
+            && self.rels.equal(&other.rels)
+            && self.is_vacuumcmd == other.is_vacuumcmd
+    }
+}
+
+impl Equal for VariableSetStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.name == other.name
+            && self.args.equal(&other.args)
+            && self.jumble_args == other.jumble_args
+            && self.is_local == other.is_local
+    }
+}
+
+impl Equal for VariableShowStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Equal for ViewStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.view.equal(&other.view)
+            && self.aliases.equal(&other.aliases)
+            && self.query.equal(&other.query)
+            && self.replace == other.replace
+            && self.options.equal(&other.options)
+            && self.withCheckOption == other.withCheckOption
+    }
+}
+
+impl Equal for WaitStmt {
+    fn equal(&self, other: &Self) -> bool {
+        self.lsn_literal == other.lsn_literal && self.options.equal(&other.options)
+    }
+}
+
+impl Equal for WindowDef {
+    fn equal(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.refname == other.refname
+            && self.partitionClause.equal(&other.partitionClause)
+            && self.orderClause.equal(&other.orderClause)
+            && self.frameOptions == other.frameOptions
+            && self.startOffset.equal(&other.startOffset)
+            && self.endOffset.equal(&other.endOffset)
+    }
+}
+
+impl Equal for WithClause {
+    fn equal(&self, other: &Self) -> bool {
+        self.ctes.equal(&other.ctes) && self.recursive == other.recursive
+    }
+}
+
+impl Equal for XmlExpr {
+    fn equal(&self, other: &Self) -> bool {
+        self.op == other.op
+            && self.name == other.name
+            && self.named_args.equal(&other.named_args)
+            && self.arg_names.equal(&other.arg_names)
+            && self.args.equal(&other.args)
+            && self.xmloption == other.xmloption
+            && self.indent == other.indent
+            && self.r#type == other.r#type
+            && self.typmod == other.typmod
+    }
+}
+
+impl Equal for XmlSerialize {
+    fn equal(&self, other: &Self) -> bool {
+        self.xmloption == other.xmloption
+            && self.expr.equal(&other.expr)
+            && self.typeName.equal(&other.typeName)
+            && self.indent == other.indent
+    }
+}
+
 /// A node of the raw parse tree. The nodes of `value.h` hold their value, and the other
 /// node types are boxed.
 #[derive(Clone, Debug, PartialEq)]
@@ -6555,6 +8488,241 @@ impl Node {
             Node::WithClause(node) => w::braced(s, &**node),
             Node::XmlExpr(node) => w::braced(s, &**node),
             Node::XmlSerialize(node) => w::braced(s, &**node),
+        }
+    }
+}
+
+impl Equal for Node {
+    fn equal(&self, other: &Node) -> bool {
+        match (self, other) {
+            (Node::List(a), Node::List(b)) => a.equal(b),
+            (Node::Integer(a), Node::Integer(b)) => a == b,
+            (Node::Float(a), Node::Float(b)) => a == b,
+            (Node::Boolean(a), Node::Boolean(b)) => a == b,
+            (Node::String(a), Node::String(b)) => a == b,
+            (Node::BitString(a), Node::BitString(b)) => a == b,
+            (Node::ATAlterConstraint(a), Node::ATAlterConstraint(b)) => a.equal(b),
+            (Node::A_ArrayExpr(a), Node::A_ArrayExpr(b)) => a.equal(b),
+            (Node::A_Const(a), Node::A_Const(b)) => a.equal(b),
+            (Node::A_Expr(a), Node::A_Expr(b)) => a.equal(b),
+            (Node::A_Indices(a), Node::A_Indices(b)) => a.equal(b),
+            (Node::A_Indirection(a), Node::A_Indirection(b)) => a.equal(b),
+            (Node::A_Star(a), Node::A_Star(b)) => a.equal(b),
+            (Node::AccessPriv(a), Node::AccessPriv(b)) => a.equal(b),
+            (Node::Alias(a), Node::Alias(b)) => a.equal(b),
+            (Node::AlterCollationStmt(a), Node::AlterCollationStmt(b)) => a.equal(b),
+            (Node::AlterDatabaseRefreshCollStmt(a), Node::AlterDatabaseRefreshCollStmt(b)) => {
+                a.equal(b)
+            }
+            (Node::AlterDatabaseSetStmt(a), Node::AlterDatabaseSetStmt(b)) => a.equal(b),
+            (Node::AlterDatabaseStmt(a), Node::AlterDatabaseStmt(b)) => a.equal(b),
+            (Node::AlterDefaultPrivilegesStmt(a), Node::AlterDefaultPrivilegesStmt(b)) => {
+                a.equal(b)
+            }
+            (Node::AlterDomainStmt(a), Node::AlterDomainStmt(b)) => a.equal(b),
+            (Node::AlterEnumStmt(a), Node::AlterEnumStmt(b)) => a.equal(b),
+            (Node::AlterEventTrigStmt(a), Node::AlterEventTrigStmt(b)) => a.equal(b),
+            (Node::AlterExtensionContentsStmt(a), Node::AlterExtensionContentsStmt(b)) => {
+                a.equal(b)
+            }
+            (Node::AlterExtensionStmt(a), Node::AlterExtensionStmt(b)) => a.equal(b),
+            (Node::AlterFdwStmt(a), Node::AlterFdwStmt(b)) => a.equal(b),
+            (Node::AlterForeignServerStmt(a), Node::AlterForeignServerStmt(b)) => a.equal(b),
+            (Node::AlterFunctionStmt(a), Node::AlterFunctionStmt(b)) => a.equal(b),
+            (Node::AlterObjectDependsStmt(a), Node::AlterObjectDependsStmt(b)) => a.equal(b),
+            (Node::AlterObjectSchemaStmt(a), Node::AlterObjectSchemaStmt(b)) => a.equal(b),
+            (Node::AlterOpFamilyStmt(a), Node::AlterOpFamilyStmt(b)) => a.equal(b),
+            (Node::AlterOperatorStmt(a), Node::AlterOperatorStmt(b)) => a.equal(b),
+            (Node::AlterOwnerStmt(a), Node::AlterOwnerStmt(b)) => a.equal(b),
+            (Node::AlterPolicyStmt(a), Node::AlterPolicyStmt(b)) => a.equal(b),
+            (Node::AlterPublicationStmt(a), Node::AlterPublicationStmt(b)) => a.equal(b),
+            (Node::AlterRoleSetStmt(a), Node::AlterRoleSetStmt(b)) => a.equal(b),
+            (Node::AlterRoleStmt(a), Node::AlterRoleStmt(b)) => a.equal(b),
+            (Node::AlterSeqStmt(a), Node::AlterSeqStmt(b)) => a.equal(b),
+            (Node::AlterStatsStmt(a), Node::AlterStatsStmt(b)) => a.equal(b),
+            (Node::AlterSubscriptionStmt(a), Node::AlterSubscriptionStmt(b)) => a.equal(b),
+            (Node::AlterSystemStmt(a), Node::AlterSystemStmt(b)) => a.equal(b),
+            (Node::AlterTSConfigurationStmt(a), Node::AlterTSConfigurationStmt(b)) => a.equal(b),
+            (Node::AlterTSDictionaryStmt(a), Node::AlterTSDictionaryStmt(b)) => a.equal(b),
+            (Node::AlterTableCmd(a), Node::AlterTableCmd(b)) => a.equal(b),
+            (Node::AlterTableMoveAllStmt(a), Node::AlterTableMoveAllStmt(b)) => a.equal(b),
+            (Node::AlterTableSpaceOptionsStmt(a), Node::AlterTableSpaceOptionsStmt(b)) => {
+                a.equal(b)
+            }
+            (Node::AlterTableStmt(a), Node::AlterTableStmt(b)) => a.equal(b),
+            (Node::AlterTypeStmt(a), Node::AlterTypeStmt(b)) => a.equal(b),
+            (Node::AlterUserMappingStmt(a), Node::AlterUserMappingStmt(b)) => a.equal(b),
+            (Node::BoolExpr(a), Node::BoolExpr(b)) => a.equal(b),
+            (Node::BooleanTest(a), Node::BooleanTest(b)) => a.equal(b),
+            (Node::CTECycleClause(a), Node::CTECycleClause(b)) => a.equal(b),
+            (Node::CTESearchClause(a), Node::CTESearchClause(b)) => a.equal(b),
+            (Node::CallStmt(a), Node::CallStmt(b)) => a.equal(b),
+            (Node::CaseExpr(a), Node::CaseExpr(b)) => a.equal(b),
+            (Node::CaseWhen(a), Node::CaseWhen(b)) => a.equal(b),
+            (Node::CheckPointStmt(a), Node::CheckPointStmt(b)) => a.equal(b),
+            (Node::ClosePortalStmt(a), Node::ClosePortalStmt(b)) => a.equal(b),
+            (Node::CoalesceExpr(a), Node::CoalesceExpr(b)) => a.equal(b),
+            (Node::CollateClause(a), Node::CollateClause(b)) => a.equal(b),
+            (Node::ColumnDef(a), Node::ColumnDef(b)) => a.equal(b),
+            (Node::ColumnRef(a), Node::ColumnRef(b)) => a.equal(b),
+            (Node::CommentStmt(a), Node::CommentStmt(b)) => a.equal(b),
+            (Node::CommonTableExpr(a), Node::CommonTableExpr(b)) => a.equal(b),
+            (Node::CompositeTypeStmt(a), Node::CompositeTypeStmt(b)) => a.equal(b),
+            (Node::Constraint(a), Node::Constraint(b)) => a.equal(b),
+            (Node::ConstraintsSetStmt(a), Node::ConstraintsSetStmt(b)) => a.equal(b),
+            (Node::CopyStmt(a), Node::CopyStmt(b)) => a.equal(b),
+            (Node::CreateAmStmt(a), Node::CreateAmStmt(b)) => a.equal(b),
+            (Node::CreateCastStmt(a), Node::CreateCastStmt(b)) => a.equal(b),
+            (Node::CreateConversionStmt(a), Node::CreateConversionStmt(b)) => a.equal(b),
+            (Node::CreateDomainStmt(a), Node::CreateDomainStmt(b)) => a.equal(b),
+            (Node::CreateEnumStmt(a), Node::CreateEnumStmt(b)) => a.equal(b),
+            (Node::CreateEventTrigStmt(a), Node::CreateEventTrigStmt(b)) => a.equal(b),
+            (Node::CreateExtensionStmt(a), Node::CreateExtensionStmt(b)) => a.equal(b),
+            (Node::CreateFdwStmt(a), Node::CreateFdwStmt(b)) => a.equal(b),
+            (Node::CreateForeignServerStmt(a), Node::CreateForeignServerStmt(b)) => a.equal(b),
+            (Node::CreateForeignTableStmt(a), Node::CreateForeignTableStmt(b)) => a.equal(b),
+            (Node::CreateFunctionStmt(a), Node::CreateFunctionStmt(b)) => a.equal(b),
+            (Node::CreateOpClassItem(a), Node::CreateOpClassItem(b)) => a.equal(b),
+            (Node::CreateOpClassStmt(a), Node::CreateOpClassStmt(b)) => a.equal(b),
+            (Node::CreateOpFamilyStmt(a), Node::CreateOpFamilyStmt(b)) => a.equal(b),
+            (Node::CreatePLangStmt(a), Node::CreatePLangStmt(b)) => a.equal(b),
+            (Node::CreatePolicyStmt(a), Node::CreatePolicyStmt(b)) => a.equal(b),
+            (Node::CreatePublicationStmt(a), Node::CreatePublicationStmt(b)) => a.equal(b),
+            (Node::CreateRangeStmt(a), Node::CreateRangeStmt(b)) => a.equal(b),
+            (Node::CreateRoleStmt(a), Node::CreateRoleStmt(b)) => a.equal(b),
+            (Node::CreateSchemaStmt(a), Node::CreateSchemaStmt(b)) => a.equal(b),
+            (Node::CreateSeqStmt(a), Node::CreateSeqStmt(b)) => a.equal(b),
+            (Node::CreateStatsStmt(a), Node::CreateStatsStmt(b)) => a.equal(b),
+            (Node::CreateStmt(a), Node::CreateStmt(b)) => a.equal(b),
+            (Node::CreateSubscriptionStmt(a), Node::CreateSubscriptionStmt(b)) => a.equal(b),
+            (Node::CreateTableAsStmt(a), Node::CreateTableAsStmt(b)) => a.equal(b),
+            (Node::CreateTableSpaceStmt(a), Node::CreateTableSpaceStmt(b)) => a.equal(b),
+            (Node::CreateTransformStmt(a), Node::CreateTransformStmt(b)) => a.equal(b),
+            (Node::CreateTrigStmt(a), Node::CreateTrigStmt(b)) => a.equal(b),
+            (Node::CreateUserMappingStmt(a), Node::CreateUserMappingStmt(b)) => a.equal(b),
+            (Node::CreatedbStmt(a), Node::CreatedbStmt(b)) => a.equal(b),
+            (Node::CurrentOfExpr(a), Node::CurrentOfExpr(b)) => a.equal(b),
+            (Node::DeallocateStmt(a), Node::DeallocateStmt(b)) => a.equal(b),
+            (Node::DeclareCursorStmt(a), Node::DeclareCursorStmt(b)) => a.equal(b),
+            (Node::DefElem(a), Node::DefElem(b)) => a.equal(b),
+            (Node::DefineStmt(a), Node::DefineStmt(b)) => a.equal(b),
+            (Node::DeleteStmt(a), Node::DeleteStmt(b)) => a.equal(b),
+            (Node::DiscardStmt(a), Node::DiscardStmt(b)) => a.equal(b),
+            (Node::DoStmt(a), Node::DoStmt(b)) => a.equal(b),
+            (Node::DropOwnedStmt(a), Node::DropOwnedStmt(b)) => a.equal(b),
+            (Node::DropRoleStmt(a), Node::DropRoleStmt(b)) => a.equal(b),
+            (Node::DropStmt(a), Node::DropStmt(b)) => a.equal(b),
+            (Node::DropSubscriptionStmt(a), Node::DropSubscriptionStmt(b)) => a.equal(b),
+            (Node::DropTableSpaceStmt(a), Node::DropTableSpaceStmt(b)) => a.equal(b),
+            (Node::DropUserMappingStmt(a), Node::DropUserMappingStmt(b)) => a.equal(b),
+            (Node::DropdbStmt(a), Node::DropdbStmt(b)) => a.equal(b),
+            (Node::ExecuteStmt(a), Node::ExecuteStmt(b)) => a.equal(b),
+            (Node::ExplainStmt(a), Node::ExplainStmt(b)) => a.equal(b),
+            (Node::FetchStmt(a), Node::FetchStmt(b)) => a.equal(b),
+            (Node::FuncCall(a), Node::FuncCall(b)) => a.equal(b),
+            (Node::FunctionParameter(a), Node::FunctionParameter(b)) => a.equal(b),
+            (Node::GrantRoleStmt(a), Node::GrantRoleStmt(b)) => a.equal(b),
+            (Node::GrantStmt(a), Node::GrantStmt(b)) => a.equal(b),
+            (Node::GroupingFunc(a), Node::GroupingFunc(b)) => a.equal(b),
+            (Node::GroupingSet(a), Node::GroupingSet(b)) => a.equal(b),
+            (Node::ImportForeignSchemaStmt(a), Node::ImportForeignSchemaStmt(b)) => a.equal(b),
+            (Node::IndexElem(a), Node::IndexElem(b)) => a.equal(b),
+            (Node::IndexStmt(a), Node::IndexStmt(b)) => a.equal(b),
+            (Node::InferClause(a), Node::InferClause(b)) => a.equal(b),
+            (Node::InsertStmt(a), Node::InsertStmt(b)) => a.equal(b),
+            (Node::IntoClause(a), Node::IntoClause(b)) => a.equal(b),
+            (Node::JoinExpr(a), Node::JoinExpr(b)) => a.equal(b),
+            (Node::JsonAggConstructor(a), Node::JsonAggConstructor(b)) => a.equal(b),
+            (Node::JsonArgument(a), Node::JsonArgument(b)) => a.equal(b),
+            (Node::JsonArrayAgg(a), Node::JsonArrayAgg(b)) => a.equal(b),
+            (Node::JsonArrayConstructor(a), Node::JsonArrayConstructor(b)) => a.equal(b),
+            (Node::JsonArrayQueryConstructor(a), Node::JsonArrayQueryConstructor(b)) => a.equal(b),
+            (Node::JsonBehavior(a), Node::JsonBehavior(b)) => a.equal(b),
+            (Node::JsonFormat(a), Node::JsonFormat(b)) => a.equal(b),
+            (Node::JsonFuncExpr(a), Node::JsonFuncExpr(b)) => a.equal(b),
+            (Node::JsonIsPredicate(a), Node::JsonIsPredicate(b)) => a.equal(b),
+            (Node::JsonKeyValue(a), Node::JsonKeyValue(b)) => a.equal(b),
+            (Node::JsonObjectAgg(a), Node::JsonObjectAgg(b)) => a.equal(b),
+            (Node::JsonObjectConstructor(a), Node::JsonObjectConstructor(b)) => a.equal(b),
+            (Node::JsonOutput(a), Node::JsonOutput(b)) => a.equal(b),
+            (Node::JsonParseExpr(a), Node::JsonParseExpr(b)) => a.equal(b),
+            (Node::JsonReturning(a), Node::JsonReturning(b)) => a.equal(b),
+            (Node::JsonScalarExpr(a), Node::JsonScalarExpr(b)) => a.equal(b),
+            (Node::JsonSerializeExpr(a), Node::JsonSerializeExpr(b)) => a.equal(b),
+            (Node::JsonTable(a), Node::JsonTable(b)) => a.equal(b),
+            (Node::JsonTableColumn(a), Node::JsonTableColumn(b)) => a.equal(b),
+            (Node::JsonTablePathSpec(a), Node::JsonTablePathSpec(b)) => a.equal(b),
+            (Node::JsonValueExpr(a), Node::JsonValueExpr(b)) => a.equal(b),
+            (Node::ListenStmt(a), Node::ListenStmt(b)) => a.equal(b),
+            (Node::LoadStmt(a), Node::LoadStmt(b)) => a.equal(b),
+            (Node::LockStmt(a), Node::LockStmt(b)) => a.equal(b),
+            (Node::LockingClause(a), Node::LockingClause(b)) => a.equal(b),
+            (Node::MergeStmt(a), Node::MergeStmt(b)) => a.equal(b),
+            (Node::MergeSupportFunc(a), Node::MergeSupportFunc(b)) => a.equal(b),
+            (Node::MergeWhenClause(a), Node::MergeWhenClause(b)) => a.equal(b),
+            (Node::MinMaxExpr(a), Node::MinMaxExpr(b)) => a.equal(b),
+            (Node::MultiAssignRef(a), Node::MultiAssignRef(b)) => a.equal(b),
+            (Node::NamedArgExpr(a), Node::NamedArgExpr(b)) => a.equal(b),
+            (Node::NotifyStmt(a), Node::NotifyStmt(b)) => a.equal(b),
+            (Node::NullTest(a), Node::NullTest(b)) => a.equal(b),
+            (Node::ObjectWithArgs(a), Node::ObjectWithArgs(b)) => a.equal(b),
+            (Node::OnConflictClause(a), Node::OnConflictClause(b)) => a.equal(b),
+            (Node::PLAssignStmt(a), Node::PLAssignStmt(b)) => a.equal(b),
+            (Node::ParamRef(a), Node::ParamRef(b)) => a.equal(b),
+            (Node::PartitionBoundSpec(a), Node::PartitionBoundSpec(b)) => a.equal(b),
+            (Node::PartitionCmd(a), Node::PartitionCmd(b)) => a.equal(b),
+            (Node::PartitionElem(a), Node::PartitionElem(b)) => a.equal(b),
+            (Node::PartitionSpec(a), Node::PartitionSpec(b)) => a.equal(b),
+            (Node::PrepareStmt(a), Node::PrepareStmt(b)) => a.equal(b),
+            (Node::PublicationAllObjSpec(a), Node::PublicationAllObjSpec(b)) => a.equal(b),
+            (Node::PublicationObjSpec(a), Node::PublicationObjSpec(b)) => a.equal(b),
+            (Node::PublicationTable(a), Node::PublicationTable(b)) => a.equal(b),
+            (Node::RangeFunction(a), Node::RangeFunction(b)) => a.equal(b),
+            (Node::RangeSubselect(a), Node::RangeSubselect(b)) => a.equal(b),
+            (Node::RangeTableFunc(a), Node::RangeTableFunc(b)) => a.equal(b),
+            (Node::RangeTableFuncCol(a), Node::RangeTableFuncCol(b)) => a.equal(b),
+            (Node::RangeTableSample(a), Node::RangeTableSample(b)) => a.equal(b),
+            (Node::RangeVar(a), Node::RangeVar(b)) => a.equal(b),
+            (Node::RawStmt(a), Node::RawStmt(b)) => a.equal(b),
+            (Node::ReassignOwnedStmt(a), Node::ReassignOwnedStmt(b)) => a.equal(b),
+            (Node::RefreshMatViewStmt(a), Node::RefreshMatViewStmt(b)) => a.equal(b),
+            (Node::ReindexStmt(a), Node::ReindexStmt(b)) => a.equal(b),
+            (Node::RenameStmt(a), Node::RenameStmt(b)) => a.equal(b),
+            (Node::RepackStmt(a), Node::RepackStmt(b)) => a.equal(b),
+            (Node::ReplicaIdentityStmt(a), Node::ReplicaIdentityStmt(b)) => a.equal(b),
+            (Node::ResTarget(a), Node::ResTarget(b)) => a.equal(b),
+            (Node::ReturnStmt(a), Node::ReturnStmt(b)) => a.equal(b),
+            (Node::ReturningClause(a), Node::ReturningClause(b)) => a.equal(b),
+            (Node::ReturningOption(a), Node::ReturningOption(b)) => a.equal(b),
+            (Node::RoleSpec(a), Node::RoleSpec(b)) => a.equal(b),
+            (Node::RowExpr(a), Node::RowExpr(b)) => a.equal(b),
+            (Node::RuleStmt(a), Node::RuleStmt(b)) => a.equal(b),
+            (Node::SQLValueFunction(a), Node::SQLValueFunction(b)) => a.equal(b),
+            (Node::SecLabelStmt(a), Node::SecLabelStmt(b)) => a.equal(b),
+            (Node::SelectStmt(a), Node::SelectStmt(b)) => a.equal(b),
+            (Node::SetToDefault(a), Node::SetToDefault(b)) => a.equal(b),
+            (Node::SortBy(a), Node::SortBy(b)) => a.equal(b),
+            (Node::StatsElem(a), Node::StatsElem(b)) => a.equal(b),
+            (Node::SubLink(a), Node::SubLink(b)) => a.equal(b),
+            (Node::TableLikeClause(a), Node::TableLikeClause(b)) => a.equal(b),
+            (Node::TransactionStmt(a), Node::TransactionStmt(b)) => a.equal(b),
+            (Node::TriggerTransition(a), Node::TriggerTransition(b)) => a.equal(b),
+            (Node::TruncateStmt(a), Node::TruncateStmt(b)) => a.equal(b),
+            (Node::TypeCast(a), Node::TypeCast(b)) => a.equal(b),
+            (Node::TypeName(a), Node::TypeName(b)) => a.equal(b),
+            (Node::UnlistenStmt(a), Node::UnlistenStmt(b)) => a.equal(b),
+            (Node::UpdateStmt(a), Node::UpdateStmt(b)) => a.equal(b),
+            (Node::VacuumRelation(a), Node::VacuumRelation(b)) => a.equal(b),
+            (Node::VacuumStmt(a), Node::VacuumStmt(b)) => a.equal(b),
+            (Node::VariableSetStmt(a), Node::VariableSetStmt(b)) => a.equal(b),
+            (Node::VariableShowStmt(a), Node::VariableShowStmt(b)) => a.equal(b),
+            (Node::ViewStmt(a), Node::ViewStmt(b)) => a.equal(b),
+            (Node::WaitStmt(a), Node::WaitStmt(b)) => a.equal(b),
+            (Node::WindowDef(a), Node::WindowDef(b)) => a.equal(b),
+            (Node::WithClause(a), Node::WithClause(b)) => a.equal(b),
+            (Node::XmlExpr(a), Node::XmlExpr(b)) => a.equal(b),
+            (Node::XmlSerialize(a), Node::XmlSerialize(b)) => a.equal(b),
+            _ => false,
         }
     }
 }
