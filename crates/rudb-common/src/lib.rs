@@ -63,7 +63,7 @@ pub use session::{
     ConditionTypes, DefaultNullOrder, ErrorTexts, FunctionRules, IdentifierCase, IdentifierCompare,
     InsertColumns, JoinColumns, NumberCasts, NumberLiterals, OperatorRules, PlanErrors,
     PreparedStatement, Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions,
-    ShowBehavior, TypeNames, UnknownTypes, ValuesNames, Variable,
+    ShowBehavior, TableNames, TypeNames, UnknownTypes, ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

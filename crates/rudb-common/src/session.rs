@@ -187,6 +187,7 @@ pub struct Semantics {
     cast_output: CastOutput,
     condition_types: ConditionTypes,
     common_types: CommonTypes,
+    table_names: TableNames,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -228,6 +229,7 @@ impl Default for Semantics {
             cast_output: CastOutput::Pin,
             condition_types: ConditionTypes::Pin,
             common_types: CommonTypes::Pin,
+            table_names: TableNames::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -367,6 +369,11 @@ impl Semantics {
     #[must_use]
     pub fn common_types(self) -> CommonTypes {
         self.common_types
+    }
+    /// Whether two items of one `FROM` can have the same name.
+    #[must_use]
+    pub fn table_names(self) -> TableNames {
+        self.table_names
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -691,8 +698,9 @@ pub enum ConditionTypes {
     Postgres,
 }
 
-/// What one type the values take that must have one type: the results of a `CASE` and the values
-/// of a `COALESCE`, a `GREATEST`, a `LEAST`, an `ARRAY` and an `IN` list.
+/// What one type the values take that must have one type: the results of a `CASE`, the values
+/// of a `COALESCE`, a `GREATEST`, a `LEAST`, an `ARRAY` and an `IN` list, and the columns of a
+/// `VALUES` and of a `UNION`, an `INTERSECT` and an `EXCEPT`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CommonTypes {
     /// As in DuckDB: the values meet at the type that holds all of them, and a string literal
@@ -703,6 +711,20 @@ pub enum CommonTypes {
     /// preferred type of each value. A string literal and a NULL take that type, and a string
     /// literal is read with the input function of the type. Two types in different categories are
     /// `42804 COALESCE types integer and text cannot be matched`.
+    Postgres,
+}
+
+/// Whether two items of one `FROM` can have the same name, which is the alias or else the name of
+/// the table, the `WITH` query or the function.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TableNames {
+    /// As in DuckDB: they can, and only a reference through the name, such as `t.a` or `*`, is
+    /// an error.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: two items of one `FROM`, or the two sides of a join, cannot, and the
+    /// query is `42712 table name "t" specified more than once`. Two tables with no alias are
+    /// the exception when they are two different tables, such as `s.t` and `r.t`.
     Postgres,
 }
 
@@ -1197,6 +1219,7 @@ impl Session {
             self.semantics.cast_output = CastOutput::Postgres;
             self.semantics.condition_types = ConditionTypes::Postgres;
             self.semantics.common_types = CommonTypes::Postgres;
+            self.semantics.table_names = TableNames::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }
