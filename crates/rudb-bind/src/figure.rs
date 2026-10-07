@@ -5,6 +5,7 @@
 //! calls it `?column?` when it is none of them. Drivers and tools show this name, and some map
 //! result columns to fields by it, so it has to be the same name that PostgreSQL gives.
 
+use rudb_common::ColumnNames;
 use rudb_parse::ast::{self, BinaryOp, QueryBody};
 use rudb_parse::{Ast, NONE};
 
@@ -18,7 +19,7 @@ impl Binder<'_> {
     /// The name of an unaliased target: the name of PostgreSQL in a PostgreSQL session, and the
     /// name of DuckDB in any other.
     pub(crate) fn target_name(&self, ast: &Ast, target: ast::ExprRef, input: &Scope) -> String {
-        if self.session.postgres().is_none() {
+        if self.semantics.column_names() == ColumnNames::Pin {
             return self.output_name(ast, target, input);
         }
         self.figure(ast, target, input).map_or_else(|| NO_NAME.to_owned(), |(name, _)| name)
