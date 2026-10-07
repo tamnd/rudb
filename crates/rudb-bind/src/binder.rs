@@ -18,7 +18,8 @@ use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name
 use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, DeclaredType, Error, Field, JoinColumns, LogicalType, Origin, Result,
-    Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey, Value, ValuesNames,
+    Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey, UnknownTypes, Value,
+    ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -2173,7 +2174,10 @@ impl<'a> Binder<'a> {
             self.unnest_root = false;
             let mut expr = expr?;
             // PostgreSQL makes a result column of a parameter of no type a `text`.
-            if self.session.postgres().is_some() && !unknowns_kept && self.is_placeholder(expr) {
+            if self.semantics.unknown_types() == UnknownTypes::Postgres
+                && !unknowns_kept
+                && self.is_placeholder(expr)
+            {
                 expr = self.cast_to(expr, &LogicalType::Varchar);
             }
             self.lift_over_aggregate(before, above, input)?;
@@ -2695,7 +2699,7 @@ impl<'a> Binder<'a> {
         let scope = Scope::empty();
         let bound = self.bind_expr(ast, written, &scope)?;
         // PostgreSQL casts the count to `bigint`, and a parameter takes that type.
-        if self.session.postgres().is_some() {
+        if self.semantics.unknown_types() == UnknownTypes::Postgres {
             self.resolve_placeholder(bound, &LogicalType::BigInt);
         }
         let Some(value) = fold::value_of(&self.plan, bound)? else {
@@ -4899,7 +4903,7 @@ impl<'a> Binder<'a> {
         }
 
         // `min` and `max` of a parameter of no type read `text` in PostgreSQL.
-        if self.session.postgres().is_some()
+        if self.semantics.unknown_types() == UnknownTypes::Postgres
             && matches!(name.to_ascii_lowercase().as_str(), "min" | "max")
             && let [only] = bound[..]
             && self.is_placeholder(only)

@@ -18,7 +18,7 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
     Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
-    LogicalType, Result, Session, SqlState, Stat, TypeNames, Value, Width,
+    LogicalType, Result, Session, SqlState, Stat, TypeNames, UnknownTypes, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -3233,7 +3233,7 @@ fn insert(
         // this statement knows, so the `VALUES` right under it is told.
         if matches!(ast.query(written.source).body, ast::QueryBody::Values(_)) {
             binder.insert_defaults = Some(targets.iter().map(|&at| defaults[at].clone()).collect());
-            if session.postgres().is_some() {
+            if session.semantics().unknown_types() == UnknownTypes::Postgres {
                 let oid = |at: usize| {
                     target.declared_type(at).map_or_else(
                         || rudb_pgtypes::pg_type(&fields[at].ty).oid,

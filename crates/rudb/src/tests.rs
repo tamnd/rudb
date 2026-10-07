@@ -13808,6 +13808,42 @@ fn each_dialect_names_columns_and_types_literals_and_character_types() {
 }
 
 #[test]
+fn each_dialect_types_unknown_values_and_operators() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let first = |connection: &crate::Connection, sql: &str| {
+        let result = connection.execute(sql).expect(sql);
+        result.rows().next().expect("a row").to_vec()
+    };
+    let described = |connection: &crate::Connection, sql: &str| {
+        let description = connection.prepare(sql).expect(sql).describe(&[]).expect(sql);
+        let fields = description.fields.unwrap_or_default();
+        (description.parameters, fields.into_iter().map(|field| field.ty).collect::<Vec<_>>())
+    };
+    let text = |text: &str| Value::Varchar(text.into());
+    let operators = "SELECT typeof(DATE '2020-01-03' - DATE '2020-01-01'), typeof(1.0 / 3)";
+    let db = Database::new();
+    let connection = db.connect();
+    assert_eq!(first(&connection, operators), [text("BIGINT"), text("DOUBLE")]);
+    assert_eq!(described(&connection, "SELECT $1 AS x"), (vec![None], vec![LogicalType::Null]));
+    assert_eq!(described(&connection, "SELECT 1 LIMIT $1").0, [None]);
+    let min = (vec![Some(LogicalType::Integer)], vec![LogicalType::Integer]);
+    assert_eq!(described(&connection, "SELECT min($1)"), min);
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    assert_eq!(first(&connection, operators), [text("INTEGER"), text("PG_NUMERIC")]);
+    let text_type = (vec![Some(LogicalType::Varchar)], vec![LogicalType::Varchar]);
+    assert_eq!(described(&connection, "SELECT $1 AS x"), text_type);
+    assert_eq!(described(&connection, "SELECT 1 LIMIT $1").0, [Some(LogicalType::BigInt)]);
+    assert_eq!(described(&connection, "SELECT min($1)"), text_type);
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
