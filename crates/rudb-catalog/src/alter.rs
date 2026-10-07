@@ -24,6 +24,8 @@ pub enum Alteration {
         to: String,
         /// Every `CHECK` of the table as it reads after the rename.
         checks: Vec<String>,
+        /// The expression of each generated column as it reads after the rename, one per column.
+        generated: Vec<Option<String>>,
     },
     /// `ADD COLUMN`, which goes on the end.
     AddColumn {
@@ -43,6 +45,8 @@ pub enum Alteration {
         column: usize,
         /// Every `CHECK` the table keeps.
         checks: Vec<String>,
+        /// The generated columns `CASCADE` drops with it, by place.
+        also: Vec<usize>,
     },
     /// `SET DEFAULT` or `DROP DEFAULT`.
     Default {

@@ -9777,7 +9777,7 @@ fn a_file_keeps_what_committed_and_loses_what_rolled_back_or_was_left_open() {
     assert_eq!(count(&db), "2");
     assert_eq!(rows(&db, "SELECT sum(a) FROM t")[0][0].to_string(), "3");
     drop(db);
-    let _ = std::fs::remove_file(&path);
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -13428,4 +13428,193 @@ fn a_whole_number_literal_takes_the_integer_type_it_meets_when_it_fits() {
     assert!(error.to_string().contains("Overflow in left shift (1 << 32)"), "{error}");
     let error = db.query("SELECT '010101'::BIT << -2").expect_err("refused");
     assert!(error.to_string().contains("Cannot left-shift by negative number -2"), "{error}");
+}
+
+#[test]
+fn a_generated_column_is_worked_out_from_the_row_it_is_in() {
+    let db = Database::new();
+    db.execute(
+        "CREATE TABLE t (a INTEGER, b AS (a * 5), c VARCHAR GENERATED ALWAYS AS (b || '!'))",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1), (NULL)").unwrap();
+    db.execute("INSERT INTO t (a) VALUES (2)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT * FROM t ORDER BY a NULLS LAST"),
+        vec![
+            vec![integer(1), integer(5), text("5!")],
+            vec![integer(2), integer(10), text("10!")],
+            vec![Value::Null, Value::Null, Value::Null],
+        ]
+    );
+    db.execute("UPDATE t SET a = 3 WHERE a = 1").unwrap();
+    assert_eq!(rows(&db, "SELECT b, c FROM t WHERE a = 3"), vec![vec![integer(15), text("15!")]]);
+    assert_eq!(
+        rows(&db, "SELECT sql FROM duckdb_tables() WHERE table_name = 't'"),
+        vec![vec![text(
+            "CREATE TABLE t(a INTEGER, b INTEGER GENERATED ALWAYS AS((a * 5)), c VARCHAR GENERATED \
+             ALWAYS AS((b || '!')));"
+        )]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT column_default, is_generated, generation_expression FROM duckdb_columns() \
+             WHERE table_name = 't' AND column_name = 'b'"
+        ),
+        vec![vec![
+            text("CAST((a * 5) AS INTEGER)"),
+            Value::Boolean(true),
+            text("CAST((a * 5) AS INTEGER)"),
+        ]]
+    );
+    db.execute("ALTER TABLE t RENAME COLUMN a TO z").unwrap();
+    db.execute("INSERT INTO t VALUES (4)").unwrap();
+    assert_eq!(rows(&db, "SELECT b FROM t WHERE z = 4"), vec![vec![integer(20)]]);
+    assert_eq!(
+        failure(&db, "INSERT INTO t VALUES (1, 2)"),
+        "table \"t\" has 1 columns but 2 values were supplied"
+    );
+    assert_eq!(
+        failure(&db, "INSERT INTO t (z, b) VALUES (1, 2)"),
+        "Cannot insert into a generated column"
+    );
+    assert_eq!(
+        failure(&db, "UPDATE t SET b = 1"),
+        "Cant update column \"b\" because it is a generated column!"
+    );
+    assert_eq!(
+        failure(&db, "ALTER TABLE t DROP COLUMN z"),
+        "Cannot drop column: column is a dependency of 1 or more generated column(s)"
+    );
+    assert_eq!(
+        failure(&db, "ALTER TABLE t ALTER z TYPE BIGINT"),
+        "This column is referenced by the generated column \"b\", so its type can not be changed"
+    );
+    db.execute("ALTER TABLE t DROP COLUMN c").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM t"), vec![vec![Value::BigInt(4)]]);
+}
+
+#[test]
+fn an_upsert_works_the_generated_columns_out_again() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, a INTEGER, b AS (a * 2))").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET a = excluded.a + 1")
+        .unwrap();
+    db.execute("INSERT OR REPLACE INTO t VALUES (2, 7)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT * FROM t ORDER BY k"),
+        vec![vec![integer(1), integer(6), integer(12)], vec![integer(2), integer(7), integer(14)]]
+    );
+    assert_eq!(
+        failure(&db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET b = 1"),
+        "Cant update column \"b\" because it is a generated column!"
+    );
+}
+
+#[test]
+fn a_drop_with_cascade_takes_the_generated_columns_that_read_the_column() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (a INTEGER, x INTEGER, b AS (a + 1), c AS (b * 2), d AS (x))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN a CASCADE").unwrap();
+    assert_eq!(rows(&db, "SELECT * FROM t"), vec![vec![integer(2), integer(2)]]);
+    assert_eq!(
+        rows(&db, "SELECT sql FROM duckdb_tables() WHERE table_name = 't'"),
+        vec![vec![text("CREATE TABLE t(x INTEGER, d INTEGER GENERATED ALWAYS AS(x));")]]
+    );
+    assert_eq!(
+        refusal(&db, "ALTER TABLE t DROP COLUMN x CASCADE"),
+        "Cannot drop column: table only has one column remaining!"
+    );
+    assert_eq!(
+        rows(&db, "SELECT name, dflt_value FROM pragma_table_info('t')"),
+        vec![vec![text("x"), Value::Null], vec![text("d"), text("CAST(x AS INTEGER)")]]
+    );
+    assert_eq!(
+        failure(&db, "ALTER TABLE t ADD PRIMARY KEY (d)"),
+        "cannot create a PRIMARY KEY on a generated column: d"
+    );
+    db.execute("CREATE TABLE u (price INTEGER, sold AS (price) CHECK (price > 5))").unwrap();
+    assert!(refusal(&db, "INSERT INTO u VALUES (1)").contains("CHECK constraint failed"));
+}
+
+#[test]
+fn a_generated_column_stays_one_when_the_file_is_opened_again() {
+    let path = std::env::temp_dir().join(format!(
+        "rudb-generated-{}-{}.rdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock advances")
+            .as_nanos()
+    ));
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("CREATE TABLE t (a INTEGER DEFAULT 7, b AS (a * 5))").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("CHECKPOINT").unwrap();
+    drop(db);
+    let db = Database::open(path.to_str().expect("a UTF-8 temporary path")).unwrap();
+    db.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT * FROM t ORDER BY a"),
+        vec![vec![integer(1), integer(5)], vec![integer(7), integer(35)]]
+    );
+    assert_eq!(
+        failure(&db, "INSERT INTO t (b) VALUES (1)"),
+        "Cannot insert into a generated column"
+    );
+    drop(db);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_generated_column_is_refused_the_way_the_pin_refuses_one() {
+    let db = Database::new();
+    let refused = [
+        ("CREATE TABLE t (a INT, b AS (a) STORED)", "Can not create a STORED generated column!"),
+        (
+            "CREATE TABLE t (b AS (1))",
+            "Creating a table without physical (non-generated) columns is not supported",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS (t.a))",
+            "Qualified (tbl.name) column references are not allowed inside of generated column \
+             expressions",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS ((SELECT 1)))",
+            "Expression of generated column \"b\" contains a subquery, which isn't allowed",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS (c))",
+            "Column \"c\" referenced by generated column does not exist",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS (c), c AS (b))",
+            "Circular dependency encountered when resolving generated column expressions",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS (a) NOT NULL)",
+            "Constraints on generated columns are not supported yet",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS (a), PRIMARY KEY (b))",
+            "Constraints on generated columns are not supported yet",
+        ),
+        (
+            "CREATE TABLE t (a INT, b AS (a) DEFAULT 1)",
+            "Not allowed to set default on a generated column",
+        ),
+        ("CREATE TABLE t (a INT, b AS (sum(a)))", "Aggregate functions are not supported here"),
+        (
+            "CREATE TABLE t (a INT, b AS (row_number() OVER ()))",
+            "Window functions are not supported here",
+        ),
+    ];
+    for (sql, message) in refused {
+        assert_eq!(failure(&db, sql), message, "{sql}");
+    }
 }

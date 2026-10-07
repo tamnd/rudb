@@ -586,6 +586,8 @@ pub(crate) fn columnnames(
         for schema in database.schemas() {
             for table in schema.tables() {
                 for (at, column) in table.columns().iter().enumerate() {
+                    // A generated column shows its expression cast to its type as its default.
+                    let generation = table.generation(at);
                     rows.push(column_row(
                         database,
                         schema,
@@ -595,7 +597,7 @@ pub(crate) fn columnnames(
                         &column.name,
                         &column.ty,
                         !column.not_null,
-                        table.default(at),
+                        (generation.as_deref().or(table.default(at)), generation.is_some()),
                     ));
                 }
             }
@@ -613,7 +615,7 @@ pub(crate) fn columnnames(
                         &field.name,
                         &field.ty,
                         true,
-                        None,
+                        (None, false),
                     ));
                 }
             }
@@ -641,7 +643,7 @@ fn column_row(
     name: &str,
     ty: &LogicalType,
     nullable: bool,
-    default: Option<&str>,
+    (default, generated): (Option<&str>, bool),
 ) -> Vec<Value> {
     let (precision, radix, scale) = numeric_facts(ty);
     vec![
@@ -668,8 +670,8 @@ fn column_row(
         radix.map_or(Value::Null, Value::Integer),
         scale.map_or(Value::Null, Value::Integer),
         empty(),
-        Value::Boolean(false),
-        Value::Null,
+        Value::Boolean(generated),
+        default.filter(|_| generated).map_or(Value::Null, text),
     ]
 }
 
@@ -868,6 +870,9 @@ fn create_table(catalog: &Catalog, table: &Table) -> String {
         .enumerate()
         .map(|(at, column)| {
             let mut part = format!("{} {}", quoted(&column.name), column.ty);
+            if let Some(generated) = table.generated(at) {
+                part.push_str(&format!(" GENERATED ALWAYS AS({generated})"));
+            }
             if let Some(default) = table.default(at) {
                 part.push_str(&format!(" DEFAULT({default})"));
             }
