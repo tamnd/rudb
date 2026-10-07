@@ -1780,6 +1780,8 @@ fn command_tag(sql: &str, result: &QueryResult, before: Transaction) -> CommandT
         "END" | "COMMIT" if before == Transaction::Aborted => CommandTag::Rollback,
         "END" => CommandTag::Commit,
         "ABORT" => CommandTag::Rollback,
+        // `TABLE` is optional in the statement and always in the tag.
+        "TRUNCATE" => CommandTag::TruncateTable,
         _ => (1..=words.len())
             .rev()
             .map(|n| CommandTag::from_name(&words[..n].join(" ")))

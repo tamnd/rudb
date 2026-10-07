@@ -56,7 +56,7 @@ pub fn parse_ast_postgres(query: &str, identifier_case: IdentifierCase) -> Resul
     let mut tokens = tokenize(query)?;
     crate::dialect::postgres_tokens(query, &mut tokens);
     let tree = parse_tokens(query, &tokens, PROGRAM, true)?;
-    transform_with_case(query, &tokens, &tree, identifier_case)
+    transform_dialect(query, &tokens, &tree, identifier_case, true)
 }
 
 /// Transform a parse tree that has already been produced.
@@ -71,6 +71,16 @@ pub fn transform_with_case(
     tree: &Tree,
     identifier_case: IdentifierCase,
 ) -> Result<Ast> {
+    transform_dialect(query, tokens, tree, identifier_case, false)
+}
+
+fn transform_dialect(
+    query: &str,
+    tokens: &[Token],
+    tree: &Tree,
+    identifier_case: IdentifierCase,
+    postgres: bool,
+) -> Result<Ast> {
     let mut transform = Transform {
         query,
         tokens,
@@ -79,6 +89,7 @@ pub fn transform_with_case(
         interned: HashMap::new(),
         anonymous: 0,
         identifier_case,
+        postgres,
         current_span: Span::new(0, 0),
         ctes: Vec::new(),
         named_windows: Vec::new(),
@@ -134,6 +145,9 @@ struct Transform<'a> {
     /// How many bare `?` parameters have been seen, which is what numbers the next one.
     anonymous: u32,
     identifier_case: IdentifierCase,
+    /// Whether a PostgreSQL session sent the script. Only the parts of a statement that PostgreSQL
+    /// accepts and that change nothing here read it, such as the storage options of a table.
+    postgres: bool,
     current_span: Span,
     /// Non-recursive CTEs visible while their containing query is transformed.
     ///
@@ -466,10 +480,52 @@ impl<'a> Transform<'a> {
             let Some(statement) = self.kids(top).find(|&kid| self.name(kid) == "Statement") else {
                 continue;
             };
+            let truncated = self.truncated_too(statement);
+            let inner = self.first(statement);
             let statement = self.statement(statement)?;
             self.ast.statements.push(statement);
+            for name in truncated {
+                let name = self.part_slice(name);
+                let statement = self.changed_rows(inner, name, NONE, Vec::new(), true)?;
+                self.ast.statements.push(statement);
+            }
         }
         Ok(())
+    }
+
+    /// The tables after the first one in a `TRUNCATE a, b, c` that a PostgreSQL session sent.
+    ///
+    /// [`crate::dialect::postgres_tokens`] takes `, b, c` out of the tokens, so the statement
+    /// parses as `TRUNCATE a`, and the names are read back here from the text between the end of
+    /// the statement and the next token. Each table is truncated by its own statement, in the
+    /// order they were written.
+    fn truncated_too(&mut self, statement: u32) -> Vec<Vec<StrRef>> {
+        let inner = self.first(statement);
+        if !self.postgres || self.name(inner) != "TruncateStatement" {
+            return Vec::new();
+        }
+        let end = self.tree.node(inner).end as usize;
+        let (Some(last), Some(next)) = (self.tokens.get(end.wrapping_sub(1)), self.tokens.get(end))
+        else {
+            return Vec::new();
+        };
+        let gap = &self.query[last.end as usize..next.start as usize];
+        let Ok(tokens) = tokenize(gap) else { return Vec::new() };
+        let mut names = Vec::new();
+        for token in &tokens {
+            match token.text(gap) {
+                "," => names.push(Vec::new()),
+                "." | "" => {}
+                text => {
+                    let part = self.fold_identifier(text);
+                    let part = self.intern(&part);
+                    if let Some(name) = names.last_mut() {
+                        name.push(part);
+                    }
+                }
+            }
+        }
+        names
     }
 
     /// `Statement <- SelectStatement / ...`, twenty seven alternatives of which ten are done.
@@ -1800,6 +1856,7 @@ impl<'a> Transform<'a> {
             interned: std::mem::take(&mut self.interned),
             anonymous: self.anonymous,
             identifier_case: self.identifier_case,
+            postgres: self.postgres,
             current_span: self.current_span,
             ctes: Vec::new(),
             named_windows: Vec::new(),
@@ -1827,6 +1884,10 @@ impl<'a> Transform<'a> {
         (keys, primary, checks, foreign, order): Constraints<'_>,
     ) -> Result<Slice> {
         for kid in self.kids(node) {
+            if self.postgres && self.name(kid) == "WithList" {
+                self.table_options(kid)?;
+                continue;
+            }
             if matches!(self.name(kid), "PartitionOptions" | "SortedOptions" | "WithList") {
                 return self.unsupported(kid);
             }
@@ -2053,6 +2114,55 @@ impl<'a> Transform<'a> {
         Ok((ColumnDef { name, ty, not_null, default }, keys))
     }
 
+    /// `WithList <- 'WITH' RelOptionOrOids` of a table, in a PostgreSQL session.
+    ///
+    /// The options are checked as PostgreSQL checks them and then dropped, see
+    /// [`crate::reloptions`]. `WITH WITH OIDS` and `WITH WITHOUT OIDS` are syntax errors in
+    /// PostgreSQL, so the `Oids` form stays refused.
+    fn table_options(&mut self, node: u32) -> Result<()> {
+        let list = self.descendant(node, "RelOptionList");
+        if list == NONE {
+            return self.unsupported(node);
+        }
+        let mut found = Vec::new();
+        self.named_nodes(list, "RelOption", &mut found);
+        let mut options = Vec::with_capacity(found.len());
+        for option in found {
+            let name = self.find(option, "RelOptionName");
+            let range = self.tree.node(name);
+            let mut parts: Vec<String> = self.tokens[range.start as usize..range.end as usize]
+                .iter()
+                .map(|token| token.text(self.query))
+                .filter(|text| *text != ".")
+                // PostgreSQL folds an unquoted name to lower case whatever the session does.
+                .map(|text| {
+                    if text.starts_with(['"', '\'']) {
+                        unquote(text)
+                    } else {
+                        text.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            let name = parts.pop().unwrap_or_default();
+            let namespace = parts.pop();
+            let argument = self.find(option, "RelOptionArgumentOpt");
+            let value = (argument != NONE).then(|| {
+                let value = self.find(argument, "DefArg");
+                let inner = self.first(value);
+                let text = self.text(value);
+                if self.name(inner) == "DefArgStringLiteral" {
+                    unquote(text)
+                } else if text.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                    text.to_lowercase()
+                } else {
+                    text.to_string()
+                }
+            });
+            options.push(crate::reloptions::Written { namespace, name, value });
+        }
+        crate::reloptions::check_table(&options)
+    }
+
     /// `CreateTableAs <- IdentifierList? PartitionSortedOptions? WithList? 'AS' Statement
     /// WithData?`.
     ///
@@ -2060,6 +2170,10 @@ impl<'a> Transform<'a> {
     /// are the query's and only the names are the syntax's to say.
     fn create_table_as(&mut self, node: u32) -> Result<(Slice, QueryRef)> {
         for kid in self.kids(node) {
+            if self.postgres && self.name(kid) == "WithList" {
+                self.table_options(kid)?;
+                continue;
+            }
             if matches!(
                 self.name(kid),
                 "PartitionOptions" | "SortedOptions" | "WithList" | "WithData"

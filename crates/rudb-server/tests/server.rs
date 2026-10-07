@@ -1123,6 +1123,45 @@ fn a_value_of_no_type_takes_the_type_of_a_bytea_or_of_the_elements_of_an_array()
 }
 
 #[test]
+fn the_storage_options_of_a_table_and_a_truncate_of_several_tables_are_those_of_pgbench() {
+    let dirs = Dirs::new("pgbench");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // `pgbench -i` makes its tables with a fill factor and empties them with one truncate.
+    let messages =
+        client.query("create table a (i int) with (FillFactor=100, toast.vacuum_truncate)");
+    assert_eq!(tags(&messages), "CZ");
+    let messages = client.query("create table b with (fillfactor=50) as select 1 i");
+    assert_eq!(tags(&messages), "CZ");
+    let errors = [
+        ("fillfactor=5", "22023", "value 5 out of bounds for option \"fillfactor\""),
+        ("foo=1", "22023", "unrecognized parameter \"foo\""),
+        ("x.y=1", "22023", "unrecognized parameter namespace \"x\""),
+        ("oids=true", "0A000", "tables declared WITH OIDS are not supported"),
+    ];
+    for (options, code, message) in errors {
+        let messages = client.query(&format!("create table c (i int) with ({options})"));
+        assert_eq!(tags(&messages), "EZ", "{options}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{options}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{options}");
+    }
+    client.query("insert into a values (1)");
+    // A table that is not there truncates none of them.
+    let messages = client.query("truncate a, c");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(scalar(&mut client, "select count(*) from a"), "1");
+    let messages = client.query("truncate a, b");
+    assert_eq!(tags(&messages), "CZ");
+    assert_eq!(messages[0].body, b"TRUNCATE TABLE\0");
+    assert_eq!(
+        scalar(&mut client, "select (select count(*) from a) + (select count(*) from b)"),
+        "0"
+    );
+    server.stop().unwrap();
+}
+
+#[test]
 fn fetch_first_is_a_limit_and_a_negative_count_is_the_error_of_postgres() {
     let dirs = Dirs::new("fetch_first");
     let server = Server::start(dirs.config()).unwrap();

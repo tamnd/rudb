@@ -18,6 +18,7 @@ pub mod generate;
 pub mod generated;
 pub mod matcher;
 pub mod parameters;
+mod reloptions;
 pub mod rules;
 pub mod token;
 pub mod tokenize;
