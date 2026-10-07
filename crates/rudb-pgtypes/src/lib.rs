@@ -41,6 +41,10 @@
 //! with p up to 38 as a scaled `i128`, and [`decimal_out`] and [`decimal_send`] write that integer
 //! with no allocation.
 //!
+//! `to_char` of a number and `to_number` with a [`NumberTemplate`]: [`int4_to_char`],
+//! [`int8_to_char`], [`numeric_to_char`], [`float4_to_char`], [`float8_to_char`] and
+//! [`to_number`], as `formatting.c` writes and reads them in the C locale.
+//!
 //! `date`, `time`, `timetz`, `timestamp`, `timestamptz` and `interval` in the layout of
 //! PostgreSQL: days or microseconds since 2000-01-01, with the infinities at the ends of the
 //! integer range. The output functions take the `DateStyle` as a [`DateFormat`] and the
@@ -109,6 +113,7 @@ mod generated;
 mod json;
 mod jsonb;
 mod number;
+mod number_format;
 mod numeric;
 mod param;
 mod reg;
@@ -143,9 +148,13 @@ pub use generated::oids as oid;
 pub use json::json_in;
 pub use jsonb::{jsonb_in, jsonb_recv, jsonb_send};
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
+pub use number_format::{
+    NumberTemplate, float4_to_char, float8_to_char, int4_to_char, int8_to_char, numeric_to_char,
+    to_number,
+};
 pub use numeric::{
-    Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_recv,
-    numeric_send,
+    Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_out_sci,
+    numeric_recv, numeric_send,
 };
 pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,

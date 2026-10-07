@@ -23,6 +23,8 @@ const HALF_NBASE: i32 = 5000;
 const DEC_DIGITS: i64 = 4;
 /// `NUMERIC_DSCALE_MAX`, the largest display scale that the format can hold.
 const DSCALE_MAX: i64 = 0x3fff;
+/// `NUMERIC_MAX_DISPLAY_SCALE`.
+const NUMERIC_MAX_DISPLAY_SCALE: i64 = 1000;
 /// `NUMERIC_MAX_RESULT_SCALE`: the most digits that `round` and `trunc` keep after the point.
 const NUMERIC_MAX_RESULT_SCALE: i32 = 2000;
 /// `round_powers` in `numeric.c`.
@@ -338,6 +340,24 @@ impl Numeric {
         let mut product = Var::from(self).mul(&Var::from(other));
         product.round(rscale);
         product.make()
+    }
+
+    /// `power(10, exponent)` with an integer exponent, as `power_var_int` gives it: the scale gives
+    /// at least 16 significant digits, so `power(10, -2)` is `0.010000000000000000`. A result
+    /// below `10^-1001` is a zero with a scale of 1000, and a result past the format is an error.
+    pub fn power_of_ten(exponent: i32) -> Result<Numeric, TypeError> {
+        // The decimal weight of the result, which is the estimate of the server with no error.
+        let weight = i64::from(exponent);
+        if weight > (i64::from(i16::MAX) + 1) * DEC_DIGITS {
+            return Err(overflow());
+        }
+        if weight + 1 < -NUMERIC_MAX_DISPLAY_SCALE {
+            let zero =
+                Var { sign: NumericSign::Positive, weight: 0, dscale: 0, digits: Vec::new() };
+            return Var { dscale: NUMERIC_MAX_DISPLAY_SCALE, ..zero }.make();
+        }
+        let rscale = (MIN_SIG_DIGITS - weight).clamp(0, NUMERIC_MAX_DISPLAY_SCALE);
+        Var::from_decimal_digits(&[1], weight, rscale).make()
     }
 
     /// `numeric_div`: the result scale is the one `select_div_scale` picks, and the last digit is
@@ -1075,11 +1095,51 @@ pub fn numeric_out(v: &Numeric, out: &mut Vec<u8>) {
         NumericSign::Negative => out.push(b'-'),
         NumericSign::Positive => {}
     }
-    let at = |d: i32| match usize::try_from(d) {
+    let at = |d: i64| match usize::try_from(d) {
         Ok(d) if d < v.digits.len() => i32::from(v.digits[d]),
         _ => 0,
     };
-    let weight = i32::from(v.weight);
+    digits_out(i64::from(v.weight), usize::from(v.dscale), at, out);
+}
+
+/// `numeric_out_sci`: the value as one digit before the point, `scale` digits after it and a
+/// power of ten, such as `1.23e+03`. The digits are rounded half away from zero, so `9.99` with
+/// one digit is `10.0e+00`, as on the server.
+pub fn numeric_out_sci(v: &Numeric, scale: i32, out: &mut Vec<u8>) {
+    match v.sign {
+        NumericSign::NaN => return out.extend_from_slice(b"NaN"),
+        NumericSign::Infinity => return out.extend_from_slice(b"Infinity"),
+        NumericSign::NegativeInfinity => return out.extend_from_slice(b"-Infinity"),
+        _ => {}
+    }
+    let rscale = i64::from(scale.max(0));
+    // The decimal digits, which divide by any power of ten with no remainder.
+    let mut dec = Vec::with_capacity(v.digits.len() * DEC_DIGITS as usize);
+    for &d in &v.digits {
+        let d = d as u16;
+        dec.extend_from_slice(&[(d / 1000) as u8, (d / 100 % 10) as u8, (d / 10 % 10) as u8]);
+        dec.push((d % 10) as u8);
+    }
+    let lead = dec.iter().take_while(|&&d| d == 0).count();
+    let exponent = match dec.len() {
+        0 => 0,
+        _ => i64::from(v.weight) * DEC_DIGITS + DEC_DIGITS - 1 - lead as i64,
+    };
+    let mut significand = Var::from_decimal_digits(&dec[lead..], 0, rscale);
+    if !significand.digits.is_empty() {
+        significand.sign = v.sign;
+    }
+    significand.round(rscale);
+    if significand.sign == NumericSign::Negative {
+        out.push(b'-');
+    }
+    let at = |d: i64| significand.digit(significand.weight - d);
+    digits_out(significand.weight, rscale as usize, at, out);
+    out.extend_from_slice(format!("e{exponent:+03}").as_bytes());
+}
+
+/// `get_str_from_var` after the sign: the base-10000 digit `at(d)` has the power `weight - d`.
+fn digits_out(weight: i64, dscale: usize, at: impl Fn(i64) -> i32, out: &mut Vec<u8>) {
     if weight < 0 {
         out.push(b'0');
     } else {
@@ -1089,7 +1149,6 @@ pub fn numeric_out(v: &Numeric, out: &mut Vec<u8>) {
             four(at(d), out);
         }
     }
-    let dscale = usize::from(v.dscale);
     if dscale > 0 {
         out.push(b'.');
         let end = out.len() + dscale;

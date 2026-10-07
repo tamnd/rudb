@@ -2894,6 +2894,39 @@ fn to_char_to_timestamp_and_to_date_follow_the_templates_of_postgresql() {
 }
 
 #[test]
+fn to_char_of_a_number_and_to_number_follow_the_templates_of_postgresql() {
+    let dirs = Dirs::new("numformat");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values of the PostgreSQL 19 oracle.
+    for (sql, value) in [
+        ("select to_char(-1234567, 'FMS9,999,999')", "-1,234,567"),
+        ("select to_char(12345678901::int8, '99999999999th')", " 12345678901st"),
+        ("select to_char(-12.5::numeric, '999.99PR')", " <12.50>"),
+        ("select to_char(1234.5::float8, '9.99EEEE')", " 1.23e+03"),
+        ("select to_char(1.23456::float4, '9.999999')", " 1.23456"),
+        ("select to_char(123::int2, '999')", " 123"),
+        ("select to_char(485, 'FMRN')", "CDLXXXV"),
+        ("select to_char(a, '9,999.99') from (values (1234.5::numeric(10, 2))) v(a)", " 1,234.50"),
+        ("select to_number('<12.5>', '99.9PR')", "-12.5"),
+        ("select to_number('12345', '999V99')", "123.450000000000000000"),
+        ("select pg_typeof(to_number('12', '99'))", "numeric"),
+        ("select to_number(s, f) from (values ('1,234', '9G999')) v(s, f)", "1234"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    let messages = client.query("select to_number('12', '99.99.9')");
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("42601"));
+    assert_eq!(error.field(b'M').as_deref(), Some("multiple decimal points"));
+    let messages = client.query("select to_number('IIII', 'RN')");
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("22P02"));
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();
