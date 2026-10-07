@@ -4034,13 +4034,30 @@ impl Vector {
         if !below(indices, self.len) {
             return None;
         }
+        // Rows spread further apart than a few to a cache line each miss it, and on q21 the wait
+        // on those reads was nearly all of this gather. Asked for some rows ahead, the misses
+        // overlap. Rows close together are read straight, since there the lines are already in.
+        let sparse = extent(indices)
+            .is_some_and(|(low, high)| (high - low) as usize >= indices.len().saturating_mul(4));
         macro_rules! gathered {
             ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
                 match data {
                     $(Data::$variant(values) => {
                         let values = values.as_slice();
-                        let out: Vec<$native> =
-                            indices.iter().map(|&index| values[index as usize]).collect();
+                        let out: Vec<$native> = if sparse {
+                            indices
+                                .iter()
+                                .enumerate()
+                                .map(|(slot, &index)| {
+                                    if let Some(&ahead) = indices.get(slot + PREFETCH_AHEAD) {
+                                        prefetch(values, ahead as usize);
+                                    }
+                                    values[index as usize]
+                                })
+                                .collect()
+                        } else {
+                            indices.iter().map(|&index| values[index as usize]).collect()
+                        };
                         Data::$variant(Buffer::from_vec(out))
                     })+
                     Data::Empty | Data::Varlen(_) => return None,
