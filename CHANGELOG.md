@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.38
+
+This release fixes the release itself, continues the PostgreSQL work inside PG2 (#2490), and has engine speed work.
+
+#2645 makes the release gate pass again. Every tag from 0.8.2 to 0.8.37 failed `cargo xtask ci` in the verify job of the release workflow, on clippy, rustdoc and rustc warnings that run with `-D warnings` there, so those releases have a GitHub page but no archives, and nothing after 0.8.1 went to crates.io. The source checks the gate runs now also run on every pull request. This is the first release since 0.8.1 with archives and crates.
+
+#2700 reads `min` and `max` over an enum as label positions. #2701 reads `FETCH FIRST` as a limit and gives a negative limit or offset the error of PostgreSQL. #2702 keeps a type that `CREATE TYPE` made in a database file, where before the statement was refused. #2703 gives a parameter alone in the select list the type that PostgreSQL gives it, and #2707 types a value of no type next to a `bytea` or an array as PostgreSQL does and joins two blobs as a blob. #2709 accepts the storage options of a table and a truncate of several tables, so `pgbench -i` gets past its first statements, and #2710 adds the `pg_catalog` views. #2712 gives `now()` the start of the transaction in a block, as PostgreSQL does, and adds `statement_timestamp()` and `clock_timestamp()`. #2713 adds `pg_sleep()`. #2714 makes `synchronous_commit = off` do what it says, with a log writer that syncs the commits that did not wait. #2715 fills constant, `nextval` and `now()` defaults on the short insert path, so an insert from an ORM that leaves those columns out no longer goes to the planner.
+
+#2705 adds the L0 of the key index, a B+tree under optimistic lock coupling. #2711 runs a link join over a parent that has filters, and #2708 keeps a column that is one constant on a join side as one value. #2704 holds a sibling value beside a flag and reads a packed code in one load. #2706 counts one sync at least on each thread of the scaling probe of the device card.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.37
 
 This release continues the PostgreSQL work inside PG2 (#2490), stores the nested types in a database file, and has engine speed work.
