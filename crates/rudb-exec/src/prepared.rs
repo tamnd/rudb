@@ -1539,6 +1539,16 @@ impl Prepared {
             };
             return Ok(self.place(plan, expr, step, ty));
         }
+        if let Some((call, one, other)) = widened(plan, expr) {
+            let (start, len) = self.push_list(plan, &[one, other], schema)?;
+            let step = Step::Function {
+                recipe: Recipe::plain(call),
+                written: written(plan, expr, schema),
+                start,
+                len,
+            };
+            return Ok(self.place(plan, expr, step, ty));
+        }
         let step = match *plan.expr(expr) {
             Expr::Column(binding) => {
                 let position = schema.position_of(binding).ok_or_else(|| {
@@ -1805,6 +1815,41 @@ fn stamped_seconds(plan: &Plan, expr: ExprRef) -> Option<(ExprRef, ExprRef)> {
     );
     (plan.string(name) == "to_seconds" && plan.expr_type(cast) == &LogicalType::Double && whole)
         .then_some((stamp, input))
+}
+
+/// The call and the two sides of a decimal `+` or `-` the binder widened past 18 digits, taken
+/// from under the widening, and `None` for anything else.
+///
+/// Two `DECIMAL(18, 4)` added or subtracted are a `DECIMAL(19, 4)`, which is stored in 128 bits, so
+/// the binder casts both sides to it first. That is two passes making a vector of `i128` each and a
+/// third subtracting them, where the sides were 64 bit numbers whose sum or difference is under
+/// twice 10^18 and so cannot overflow either the 64 bits it is computed in or the 19 digits it is
+/// stored as. TPC-H q09's `amount` is this, at 319 thousand rows a run, and the two casts were
+/// about 27 million of its 366 million instructions. It runs as one call, [`rudb_kernels`]'s
+/// `__rudb_widened_add` or `__rudb_widened_subtract`, which reads the 64 bit sides and writes the
+/// answer once.
+fn widened(plan: &Plan, expr: ExprRef) -> Option<(&'static str, ExprRef, ExprRef)> {
+    let Expr::Function { name, args } = *plan.expr(expr) else { return None };
+    let call = match plan.string(name) {
+        "+" => "__rudb_widened_add",
+        "-" => "__rudb_widened_subtract",
+        _ => return None,
+    };
+    let answer = plan.expr_type(expr);
+    let LogicalType::Decimal { width, scale } = *answer else { return None };
+    if width <= 18 {
+        return None;
+    }
+    let &[one, other] = plan.expr_list(args) else { return None };
+    let narrow = |side: ExprRef| {
+        let Expr::Cast { input, try_cast: false } = *plan.expr(side) else { return None };
+        let held = matches!(
+            *plan.expr_type(input),
+            LogicalType::Decimal { width: under, scale: at } if under <= 18 && at == scale
+        );
+        (held && plan.expr_type(side) == answer).then_some(input)
+    };
+    Some((call, narrow(one)?, narrow(other)?))
 }
 
 /// The text and the character count of `substring(text, 1, count)`, when that is what `expr` is.
