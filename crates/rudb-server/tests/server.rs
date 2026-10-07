@@ -2804,3 +2804,41 @@ fn the_values_of_a_case_a_coalesce_and_an_array_take_the_common_type_of_postgres
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_cast_between_timestamptz_and_a_type_without_a_zone_reads_the_time_zone_setting() {
+    let dirs = Dirs::new("session-zone");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values of the PostgreSQL 19 oracle. The zone of the server process is not read, so the
+    // first cast is midnight UTC on any machine.
+    for (sql, value) in [
+        ("select '2024-01-01'::date::timestamptz", "2024-01-01 00:00:00+00"),
+        ("set timezone = 'America/New_York'", ""),
+        ("select '2024-01-01'::date::timestamptz", "2024-01-01 00:00:00-05"),
+        ("select '2024-07-01 23:30+00'::timestamptz::date", "2024-07-01"),
+        ("select '2024-07-01 23:30+00'::timestamptz::timestamp", "2024-07-01 19:30:00"),
+        ("select '2024-07-01 12:00'::timestamp::timestamptz", "2024-07-01 12:00:00-04"),
+        ("select '2024-07-01 12:00+00'::timestamptz::text", "2024-07-01 08:00:00-04"),
+        ("set time zone -3", ""),
+        ("select '2024-01-01'::date::timestamptz", "2024-01-01 00:00:00-03"),
+        ("select '2024-07-01 01:30+00'::timestamptz::date", "2024-06-30"),
+        ("set time zone interval '+05:30'", ""),
+        ("select '2024-01-01'::date::timestamptz", "2024-01-01 00:00:00+05:30"),
+        ("set time zone interval '-02:30'", ""),
+        (
+            "select date_trunc('day', '2024-07-01 01:00+00'::timestamptz)",
+            "2024-06-30 00:00:00-02:30",
+        ),
+        ("reset timezone", ""),
+        ("select '2024-01-01'::date::timestamptz", "2024-01-01 00:00:00+00"),
+    ] {
+        if value.is_empty() {
+            assert_eq!(tags(&client.query(sql)), "CSZ", "{sql}");
+        } else {
+            assert_eq!(scalar(&mut client, sql), value, "{sql}");
+        }
+    }
+    server.stop().unwrap();
+}
