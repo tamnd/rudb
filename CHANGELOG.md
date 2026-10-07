@@ -8,6 +8,18 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+## 0.8.42
+
+This release takes work out of the serial step a consistent join runs before each scan, for J7 (#1851), continues the PostgreSQL session work, and makes packed codes and LIKE prefixes faster to read.
+
+#2786 walks the starts of an adjacency once to count and read the lists a scan is handed, stops that walk at the rows the caller would turn down, shares the push of the lists over the scan's threads, and gives each bucket room for its share before dealing. #2787 takes a relation of one chunk or less as soon as it is an ear in the order search. #2788 cuts stripes into quarter shares when a scan has fewer than four for each worker. #2789 keeps a relationship's counts in a section of their own when its link and adjacency are over the budget, so a parent nothing reads is dropped when every key that is not null found it, which is `char_name` in JOB 19a to 19d. #2790 reads the parents of a reduction's kept keys off the key map a word at a time, #2791 sets the rows of a value straight into the form the key set settles in, and #2795 asks for the values of a gather of rows far apart a few rows ahead. On the J7 gate at a load of about six on server2 the hot total was 0.069 of DuckDB's, and 33a was the one query over a third.
+
+#2764 parses the queries of a PostgreSQL session with the PostgreSQL grammar, and #2766 transforms INSERT, UPDATE, DELETE and TRUNCATE from its raw parse tree. #2769, #2772, #2774, #2776, #2779, #2780, #2781, #2782, #2783, #2793 and #2794 bring names, types, operators, conflict targets and error texts in a PostgreSQL session in line with PostgreSQL. #2762 adds generated columns, worked out when a row is written, and #2777 names the column in an error working its value out raises.
+
+#2773, #2775 and #2778 widen and pack bit packed codes a block or a word at a time, with AVX2 where it is there, and #2785 compares sixteen bit dates with one widening load. #2767 compares a LIKE prefix's first four bytes as one masked number, and #2771 reads a column's text sketch only once a LIKE meets compressed text. #2792 prefetches ahead when unpacking runs. #2765 implies the one range a disjunction's ranges of a column cover, #2763 works out which distinct calls keep BIGINT sets once per aggregate, and #2770 fixes how a lane's spares are left and taken.
+
+The link counts section of #2789 is optional, and a file without it reads as before. The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.41
 
 This release makes the release gate pass again, continues the PostgreSQL parser inside PG4 (#2492), and makes several TPC-H and ClickBench queries faster.
