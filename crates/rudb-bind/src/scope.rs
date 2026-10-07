@@ -374,6 +374,88 @@ impl Scope {
     }
 }
 
+/// The hint of PostgreSQL for a column name that is in no table here, as `errorMissingColumn` in
+/// `parse_relation.c` makes it: the one or two columns whose names are nearest to the name.
+///
+/// `scopes` has the scope of the name first and then each outer scope, innermost first, which is
+/// the order that PostgreSQL searches its range tables in. The distance of a column is the
+/// Levenshtein distance of its name, plus the distance of its table name from `table` when the
+/// name has a table. A column is a candidate when the distance of its name is at most half of the
+/// length of the name and the full distance is at most 3. Two candidates at the best distance are
+/// both named, and three or more are none. A column that the merge of a join made belongs to no
+/// table and is not searched, because PostgreSQL searches no join. When a column has the exact
+/// name in a table of the exact name, the reference fails for a different reason and this gives
+/// no hint.
+pub(crate) fn nearest<'a>(
+    scopes: impl IntoIterator<Item = &'a Scope>,
+    table: Option<&str>,
+    column: &str,
+) -> Option<String> {
+    const MOST: usize = 3;
+    let mut best = MOST + 1;
+    let mut first: Option<&Visible> = None;
+    let mut second: Option<&Visible> = None;
+    let mut exact = false;
+    let held = scopes.into_iter().flat_map(|scope| scope.columns.iter());
+    for held in held.filter(|held| !held.table.is_empty()) {
+        if matches!(held.using, Some(Joined::Merged(_))) {
+            continue;
+        }
+        let penalty = table.map_or(0, |table| distance(table, &held.table));
+        exact |= penalty == 0 && held.name == column;
+        if penalty > best {
+            continue;
+        }
+        let near = distance(&held.name, column);
+        if near > column.len() / 2 {
+            continue;
+        }
+        let near = near + penalty;
+        if near < best {
+            best = near;
+            first = Some(held);
+            second = None;
+        } else if near == best {
+            if second.is_some() {
+                first = None;
+                second = None;
+            } else if first.is_some() {
+                second = Some(held);
+            }
+        }
+    }
+    if exact {
+        return None;
+    }
+    match (first, second) {
+        (Some(first), None) => Some(format!(
+            "Perhaps you meant to reference the column \"{}.{}\".",
+            first.table, first.name
+        )),
+        (Some(first), Some(second)) => Some(format!(
+            "Perhaps you meant to reference the column \"{}.{}\" or the column \"{}.{}\".",
+            first.table, first.name, second.table, second.name
+        )),
+        _ => None,
+    }
+}
+
+/// The fewest inserts, deletes and substitutions of characters that turn one name into the other.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0; b.len() + 1];
+    for (i, left) in a.chars().enumerate() {
+        current[0] = i + 1;
+        for (j, &right) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left != right);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

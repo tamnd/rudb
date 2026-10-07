@@ -13906,6 +13906,43 @@ fn each_dialect_has_its_functions_errors_and_sequence_owners() {
 }
 
 #[test]
+fn a_postgres_session_hints_the_nearest_column_names() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    connection.execute("CREATE TABLE tt (alpha int, beta int, \"Gamma\" int)").expect("tt");
+    connection.execute("CREATE TABLE uu (alpha int, delta int)").expect("uu");
+    let hint = |sql: &str| {
+        let error = connection.execute(sql).expect_err(sql);
+        assert_eq!(error.reported_state().as_str(), "42703", "{sql}");
+        error.fields().and_then(|fields| fields.hint.clone())
+    };
+    let one =
+        |column: &str| Some(format!("Perhaps you meant to reference the column \"{column}\"."));
+    assert_eq!(hint("SELECT alpah FROM tt"), one("tt.alpha"));
+    assert_eq!(hint("SELECT tt.alpah FROM tt"), one("tt.alpha"));
+    assert_eq!(hint("SELECT gamma FROM tt"), one("tt.Gamma"));
+    assert_eq!(hint("SELECT x FROM tt"), None);
+    assert_eq!(hint("SELECT delta FROM tt"), one("tt.beta"));
+    assert_eq!(hint("SELECT bet FROM tt, uu"), one("tt.beta"));
+    let both = "Perhaps you meant to reference the column \"tt.alpha\" or the column \"uu.alpha\".";
+    assert_eq!(hint("SELECT alphaa FROM tt JOIN uu USING (alpha)"), Some(both.into()));
+    assert_eq!(hint("SELECT tt FROM uu"), None);
+    assert_eq!(hint("SELECT (SELECT bta FROM uu) FROM tt"), one("tt.beta"));
+    connection.execute("CREATE TABLE vv (alpha int)").expect("vv");
+    assert_eq!(hint("SELECT alphx FROM tt, uu, vv"), None);
+    assert_eq!(hint("SELECT vv.alph FROM tt, uu, vv"), one("vv.alpha"));
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
