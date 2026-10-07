@@ -47,6 +47,17 @@ impl Binder<'_> {
         if expr == NONE {
             return None;
         }
+        // `(x).a[1]` is named for the last field it selects, and a subscript alone for what it
+        // subscripts.
+        if let Some(field) = ast.indirection(expr) {
+            return match ast.expr(expr) {
+                _ if field != NONE => Some((ast.string(field).to_owned(), 2)),
+                ast::Expr::Function { args, .. } => {
+                    self.figure(ast, ast.expr_list(args).first().copied().unwrap_or(NONE), input)
+                }
+                _ => None,
+            };
+        }
         match ast.expr(expr) {
             ast::Expr::Column { .. } | ast::Expr::Positional { .. } => {
                 Some((self.output_name(ast, expr, input).trim_matches('"').to_owned(), 2))

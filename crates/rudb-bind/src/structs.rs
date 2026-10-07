@@ -9,7 +9,7 @@
 //! since which field it names decides the type of the answer, so the binder checks it against the
 //! struct's fields and the kernel finds the same field again by name.
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, RowFields, SqlState, Value};
 use rudb_plan::{Expr, ExprRef};
 
 use crate::binder::Binder;
@@ -320,7 +320,29 @@ impl Binder<'_> {
     }
 
     /// Where the field of that name is, found without case, or the pin's refusal naming them all.
+    /// In PostgreSQL the name must be the same, and the fields of `row(...)` are `f1`, `f2` and so
+    /// on.
     fn field_named(&self, fields: &[Field], name: &str) -> Result<usize> {
+        if self.semantics.row_fields() == RowFields::Postgres {
+            let numbered = || {
+                let digits = name.strip_prefix('f')?;
+                if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let at = digits.parse::<usize>().ok()?;
+                (Field::unnamed(fields) && (1..=fields.len()).contains(&at)).then(|| at - 1)
+            };
+            return fields
+                .iter()
+                .position(|field| field.name == name)
+                .or_else(numbered)
+                .ok_or_else(|| {
+                    Error::binder(format!(
+                        "could not identify column \"{name}\" in record data type"
+                    ))
+                    .state(SqlState::UNDEFINED_COLUMN)
+                });
+        }
         fields.iter().position(|field| field.name.eq_ignore_ascii_case(name)).ok_or_else(|| {
             let entries: Vec<String> =
                 fields.iter().map(|field| format!("\"{}\"", field.name)).collect();

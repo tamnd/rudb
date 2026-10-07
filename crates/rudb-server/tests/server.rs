@@ -3007,6 +3007,68 @@ fn pg_input_is_valid_and_pg_input_error_info_catch_the_error_of_the_input() {
 }
 
 #[test]
+fn a_function_in_from_is_a_relation_and_a_row_has_the_fields_f1_to_fn() {
+    let dirs = Dirs::new("fromfn");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        let shape = messages.iter().find(|m| m.tag == b'T').unwrap();
+        let names: Vec<String> = row_shape(shape).into_iter().map(|(name, ..)| name).collect();
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(String::new, |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        (names.join(","), rows.join(";"))
+    };
+    // The values and the names of the columns of the PostgreSQL 19 oracle.
+    for (sql, names, rows) in [
+        ("select * from upper('abc')", "upper", "ABC"),
+        ("select * from upper('abc') u", "u", "ABC"),
+        ("select * from upper('abc') u(x)", "x", "ABC"),
+        ("select u.* from abs(-3) a, lower('X') u", "u", "x"),
+        (
+            "select * from pg_input_error_info('x', 'int4')",
+            "message,detail,hint,sql_error_code",
+            "invalid input syntax for type integer: \"x\"|||22P02",
+        ),
+        ("select * from regexp_split_to_table('a,b,c', ',') t(x) where x <> 'b'", "x", "a;c"),
+        ("select * from (values (1), (2)) v(n), lateral upper('x' || n) u", "n,u", "1|X1;2|X2"),
+        ("select (row(1, 'a'::text)).f2, (r).f1 from (select row(2, 'b') r) s", "f2,f1", "a|2"),
+    ] {
+        assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
+    }
+    for (sql, code, message, position) in [
+        (
+            "select (row(1, 'a')).f3",
+            "42703",
+            "could not identify column \"f3\" in record data type",
+            Some("9"),
+        ),
+        (
+            "select * from upper('a') u(a, b)",
+            "42P10",
+            "table \"u\" has 1 columns available but 2 columns specified",
+            None,
+        ),
+    ] {
+        let messages = client.query(sql);
+        let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();

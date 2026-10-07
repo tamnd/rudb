@@ -61,10 +61,10 @@ pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
     AggregateTypes, CastInput, CastOutput, CharacterTypes, ColumnNames, CommonTypes,
     ConditionTypes, ConflictArbiter, CountTypes, DefaultNullOrder, DistinctOrder, ErrorTexts,
-    FunctionRules, IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns, NumberCasts,
-    NumberLiterals, OperatorRules, PlanErrors, PreparedStatement, QueryColumns, Semantics,
-    SequenceOwners, Session, SessionTimeZone, SetFunctions, ShowBehavior, TableNames, TypeNames,
-    UnknownTypes, ValuesNames, Variable,
+    FromFunctions, FunctionRules, IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns,
+    NumberCasts, NumberLiterals, OperatorRules, PlanErrors, PreparedStatement, QueryColumns,
+    RowFields, Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions, ShowBehavior,
+    TableNames, TypeNames, UnknownTypes, ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

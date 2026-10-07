@@ -200,6 +200,7 @@ pub struct Semantics {
     error_texts: ErrorTexts,
     errors_as_json: bool,
     function_rules: FunctionRules,
+    from_functions: FromFunctions,
     integer_division: bool,
     ieee_floating_point_ops: bool,
     identifier_case: IdentifierCase,
@@ -213,6 +214,7 @@ pub struct Semantics {
     pivot_limit: u64,
     plan_errors: PlanErrors,
     regex_match_full: bool,
+    row_fields: RowFields,
     scalar_subquery_error_on_multiple_rows: bool,
     sequence_owners: SequenceOwners,
     set_functions: SetFunctions,
@@ -238,6 +240,8 @@ impl Default for Semantics {
             count_types: CountTypes::Pin,
             query_columns: QueryColumns::Pin,
             conflict_arbiter: ConflictArbiter::Pin,
+            from_functions: FromFunctions::Pin,
+            row_fields: RowFields::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -402,6 +406,16 @@ impl Semantics {
     #[must_use]
     pub fn conflict_arbiter(self) -> ConflictArbiter {
         self.conflict_arbiter
+    }
+    /// What a function in `FROM` that is not a table function is.
+    #[must_use]
+    pub fn from_functions(self) -> FromFunctions {
+        self.from_functions
+    }
+    /// What the fields of a row value are named, and how a field is found by its name.
+    #[must_use]
+    pub fn row_fields(self) -> RowFields {
+        self.row_fields
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -779,6 +793,28 @@ pub enum QueryColumns {
     Pin,
     /// As in PostgreSQL: the statement is `42701 column "x" specified more than once`, after the
     /// column list renames the first columns.
+    Postgres,
+}
+
+/// What a function in `FROM` that is not a table function is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FromFunctions {
+    /// As in DuckDB: only a table function can be in `FROM`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: any function can be in `FROM`. A function that gives one value is a
+    /// relation of one row, and a function that gives a row has a column for each field.
+    Postgres,
+}
+
+/// What the fields of a row value are named, and how a field is found by its name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowFields {
+    /// As in DuckDB: the fields of `row(...)` have no names, and a name is found without case.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the fields of `row(...)` are `f1`, `f2` and so on, a name must be the
+    /// same, and a name that no field has is `42703`.
     Postgres,
 }
 
@@ -1339,6 +1375,8 @@ impl Session {
             self.semantics.count_types = CountTypes::Postgres;
             self.semantics.query_columns = QueryColumns::Postgres;
             self.semantics.conflict_arbiter = ConflictArbiter::Postgres;
+            self.semantics.from_functions = FromFunctions::Postgres;
+            self.semantics.row_fields = RowFields::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }

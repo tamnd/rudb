@@ -1757,6 +1757,14 @@ pub struct Ast {
     /// The `EXCLUDE` and `RENAME` lists of the stars written with either, beside the star they
     /// belong to. Kept to one side because a star with neither is by far the usual one.
     pub star_lists: Vec<(ExprRef, StarLists)>,
+    /// The function sources of the PostgreSQL grammar, each with its call as an expression. In
+    /// PostgreSQL a function that is not a table function can be written in `FROM`, and it gives
+    /// one row with its value.
+    pub source_calls: Vec<(SourceRef, ExprRef)>,
+    /// The calls that the PostgreSQL transform makes of a field selection or a subscript, each
+    /// with the field it selects, or [`NONE`] for a subscript. `(x).a` names its column `a`, and
+    /// a call of `struct_extract` written by hand names it for the function.
+    pub indirections: Vec<(ExprRef, StrRef)>,
     /// The text the statements were parsed from, which `current_query()` answers with. Shared,
     /// so the binder can keep it for the statement without copying it.
     pub source: Arc<str>,
@@ -1992,6 +2000,17 @@ impl Ast {
     /// Whether a call was written with `EXPORT_STATE` after it.
     pub fn exports_state(&self, call: ExprRef) -> bool {
         self.exported.contains(&call)
+    }
+
+    /// The call of a function source as an expression, when the grammar kept one.
+    pub fn source_call(&self, source: SourceRef) -> Option<ExprRef> {
+        self.source_calls.iter().find(|(held, _)| *held == source).map(|&(_, call)| call)
+    }
+
+    /// The field that a call made of a field selection selects, [`NONE`] for a call made of a
+    /// subscript, and `None` for any other call.
+    pub fn indirection(&self, call: ExprRef) -> Option<StrRef> {
+        self.indirections.iter().find(|(held, _)| *held == call).map(|&(_, field)| field)
     }
 
     /// The `ORDER BY` written inside a call, empty when it has none.
