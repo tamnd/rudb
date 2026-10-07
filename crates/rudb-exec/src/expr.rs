@@ -101,6 +101,14 @@ pub(crate) fn evaluate_in_time_zone(
                     evaluate_in_time_zone(plan, only, schema, rows, time_zone)
                 });
             }
+            if let (name, [only, column]) = (plan.string(name), plan.expr_list(args))
+                && name == rudb_plan::GENERATED
+                && let Expr::Constant(column) = *plan.expr(*column)
+            {
+                let column = plan.value(column).as_str().unwrap_or_default();
+                return evaluate_in_time_zone(plan, *only, schema, chunk, time_zone)
+                    .map_err(|error| rudb_plan::incorrect_generated(column, error));
+            }
             if let Some((lambda, inputs)) = crate::lambda::lambda_call(plan, args) {
                 let runner =
                     crate::lambda::Lambda::new(plan, plan.string(name), lambda, &inputs, schema)?;

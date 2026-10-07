@@ -272,6 +272,25 @@ impl ConjunctionOp {
     }
 }
 
+/// The call a generated column's value is wrapped in where a write works it out. It answers its
+/// first operand, and an error that operand raises comes out as [`incorrect_generated`] for the
+/// column its second operand, a string constant, describes.
+pub const GENERATED: &str = "generated_column";
+
+/// The error a write raises when working out a generated column raised `error`. The pin names the
+/// column with its type and expression, as `b INTEGER AS (CAST((a + 1) AS INTEGER))`, and keeps
+/// the message of the error but not its kind. A cancel is passed on as it is.
+#[must_use]
+pub fn incorrect_generated(column: &str, error: rudb_common::Error) -> rudb_common::Error {
+    if error.code() == rudb_common::ErrorCode::Interrupt {
+        return error;
+    }
+    rudb_common::Error::constraint(format!(
+        "Incorrect value for generated column '{column}' : {}",
+        error.message()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
