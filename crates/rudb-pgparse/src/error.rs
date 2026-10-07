@@ -103,6 +103,27 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<Error> for rudb_common::Error {
+    /// The error of the engine with the SQLSTATE, the message, the detail, the hint and the
+    /// position that PostgreSQL gives, which a PostgreSQL session sends as they are.
+    fn from(error: Error) -> Self {
+        let mut common = rudb_common::Error::parser(error.message);
+        if let Some(state) = rudb_common::sqlstate::SqlState::parse(error.code) {
+            common = common.state(state);
+        }
+        if let Some(detail) = error.detail {
+            common = common.detail(detail);
+        }
+        if let Some(hint) = error.hint {
+            common = common.hint(hint);
+        }
+        match error.location.and_then(|location| u32::try_from(location).ok()) {
+            Some(location) => common.with_span(rudb_common::Span::new(location, location)),
+            None => common.unplaced(),
+        }
+    }
+}
+
 /// A notice or a warning of the lexer or the parser, for example for an identifier that is too
 /// long.
 #[derive(Clone, Debug, PartialEq, Eq)]

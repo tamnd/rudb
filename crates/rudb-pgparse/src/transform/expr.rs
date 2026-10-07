@@ -608,9 +608,10 @@ impl Transform<'_> {
             return false;
         };
         let (open, close) = (crate::character(b'('), crate::character(b')'));
-        let start = self.tokens.partition_point(|&(start, _, _)| start < location);
+        let tokens = self.tokens();
+        let start = tokens.partition_point(|&(start, _, _)| start < location);
         let mut depth = 0_i32;
-        for &(_, _, found) in &self.tokens[start..] {
+        for &(_, _, found) in &tokens[start..] {
             match Some(found) {
                 written if written == open => depth += 1,
                 written if written == close => {

@@ -8697,13 +8697,14 @@ fn optimized(plan: &mut Plan, context: &rudb_opt::pass::Context) -> Result<(u64,
 }
 
 /// Parse a script in the dialect of the session. Every parse of a statement that a session runs
-/// comes through here, `08-the-dialect.md` section 8.1.
+/// comes through here, `08-the-dialect.md` section 8.1. A PostgreSQL session parses with the
+/// PostgreSQL grammar, which folds unquoted names itself, so the identifier case of the session
+/// is for the DuckDB grammar only.
 pub(crate) fn parse(session: &Session, sql: &str) -> Result<Ast> {
-    let case = session.semantics().identifier_case();
     if session.postgres().is_some() {
-        rudb_parse::parse_ast_postgres(sql, case)
+        rudb_pgparse::transform::parse_ast(sql)
     } else {
-        rudb_parse::parse_ast_with_case(sql, case)
+        rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())
     }
 }
 

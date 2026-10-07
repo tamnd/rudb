@@ -558,6 +558,7 @@ dependencies = [
  "rudb-opt",
  "rudb-parquet",
  "rudb-parse",
+ "rudb-pgparse",
  "rudb-pipeline",
  "rudb-plan",
  "rudb-qc",

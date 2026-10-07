@@ -1245,9 +1245,17 @@ fn column_type(
     home: Option<&QualifiedName>,
 ) -> Result<LogicalType> {
     if session.postgres().is_some()
-        && let Some(ty) = rudb_pgtypes::declared_type(text).and_then(rudb_pgtypes::session_type)
+        && let Some(declared) = rudb_pgtypes::declared_type(text)
     {
-        return Ok(ty);
+        if let Some(ty) = rudb_pgtypes::session_type(declared) {
+            return Ok(ty);
+        }
+        // A built-in type is in `pg_catalog`, and the grammar names each type of the SQL syntax
+        // there, so `integer` is `pg_catalog.int4`. The name in `pg_type` is also a name of the
+        // type here, so the type is the one of that name.
+        if let Some(name) = text.strip_prefix("pg_catalog.") {
+            return typed_in(catalog, name, home).map(|(ty, _)| ty);
+        }
     }
     typed_in(catalog, text, home).map(|(ty, _)| ty)
 }
