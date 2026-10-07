@@ -82,10 +82,13 @@
 //! The input functions take a string in the server encoding, which is UTF-8. The caller converts
 //! from the client encoding first.
 //!
-//! Only [`FixedZone`] implements [`TimeZone`], and only [`NoZones`] implements [`ZoneLookup`]. So
-//! a zone with daylight saving time, a zone name in the input such as `Europe/Paris`, and an
-//! abbreviation whose offset changed over time such as `MSK` need the tz database, which comes
-//! later. Until then the input refuses a zone name with the error of an unknown zone.
+//! [`FixedZone`] and the session zone of the engine, `rudb_common::SessionTimeZone`, implement
+//! [`TimeZone`]. [`NoZones`] and [`SessionZones`] implement [`ZoneLookup`]. The session zone gives
+//! no meaning of its own to an abbreviation, so an abbreviation is read from
+//! `timezone_abbreviations` only.
+//!
+//! The `TM` prefix of a `to_char` template gives the names of the C locale, which are the English
+//! names, because the engine has no `lc_time`.
 //!
 //! [`RowEncoder`] writes text in UTF-8 and does not convert to the client encoding. It flattens a
 //! constant or dictionary vector before it writes the rows, so it does not yet use the shape of
@@ -124,13 +127,14 @@ pub use binary::{Recv, name_recv};
 pub use coerce::{Mismatch, can_coerce_assigned, can_coerce_implicitly, common_type, is_preferred};
 pub use datetime::{
     Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
-    DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
-    TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone, UNIX_EPOCH_JDATE,
+    DateTemplate, DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
+    SessionZones, TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone, UNIX_EPOCH_JDATE,
     UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS, USECS_PER_DAY, USECS_PER_SEC, ZoneAbbrevs,
     ZoneLookup, date_from_unix, date_in, date_out, date_recv, date2j, interval_in, interval_out,
-    interval_recv, interval_send, j2date, time_in, time_out, time_recv, timestamp_from_unix,
-    timestamp_in, timestamp_out, timestamp_recv, timestamptz_in, timestamptz_out, timetz_in,
-    timetz_out, timetz_recv,
+    interval_recv, interval_send, interval_to_char, j2date, time_in, time_out, time_recv,
+    timestamp_from_unix, timestamp_in, timestamp_out, timestamp_recv, timestamp_to_char,
+    timestamp_to_unix, timestamptz_in, timestamptz_out, timestamptz_to_char, timetz_in, timetz_out,
+    timetz_recv, to_date, to_timestamp,
 };
 pub use declared::{declared_type, session_type};
 pub use error::TypeError;

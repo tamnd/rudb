@@ -180,6 +180,11 @@ impl Binder<'_> {
             let constant = self.add_constant(value);
             return Ok(Some(self.cast_to(constant, &LogicalType::Varchar)));
         }
+        if let [value, template] = arguments
+            && let Some(call) = self.formatting_call(ast, written, *value, *template, scope)?
+        {
+            return Ok(Some(call));
+        }
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = match texts.as_slice() {
@@ -262,6 +267,58 @@ impl Binder<'_> {
             _ => return Ok(None),
         };
         self.bind_macro_body(written, &text, scope).map(Some)
+    }
+
+    /// `to_char` of a date and a time, `to_timestamp(text, text)` and `to_date(text, text)`, as
+    /// the kernels that port `formatting.c`. `None` for any other call.
+    ///
+    /// PostgreSQL has `to_char` over `timestamp`, `timestamptz` and `interval`. A `date` reaches the
+    /// `timestamptz` form by its implicit cast, and a `time` reaches the `interval` form, which the
+    /// kernel takes as it is.
+    fn formatting_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        value: ast::ExprRef,
+        template: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let kernel = match () {
+            () if same_name(written, "to_char") => "__rudb_pg_to_char",
+            () if same_name(written, "to_timestamp") => "__rudb_pg_to_timestamp",
+            () if same_name(written, "to_date") => "__rudb_pg_to_date",
+            () => return Ok(None),
+        };
+        let value = self.bind_expr(ast, value, scope)?;
+        let template = self.bind_expr(ast, template, scope)?;
+        let text = |ty: &LogicalType| matches!(ty, LogicalType::Varchar | LogicalType::Null);
+        if !text(self.plan().expr_type(template)) {
+            return Ok(None);
+        }
+        let given = self.plan().expr_type(value).clone();
+        let (value, returns) = match (kernel, &given) {
+            (
+                "__rudb_pg_to_char",
+                LogicalType::Timestamp
+                | LogicalType::TimestampTz
+                | LogicalType::Interval
+                | LogicalType::Time,
+            ) => (value, LogicalType::Varchar),
+            ("__rudb_pg_to_char", LogicalType::Date) => {
+                (self.cast_to(value, &LogicalType::TimestampTz), LogicalType::Varchar)
+            }
+            ("__rudb_pg_to_timestamp", ty) if text(ty) => {
+                (self.cast_to(value, &LogicalType::Varchar), LogicalType::TimestampTz)
+            }
+            ("__rudb_pg_to_date", ty) if text(ty) => {
+                (self.cast_to(value, &LogicalType::Varchar), LogicalType::Date)
+            }
+            _ => return Ok(None),
+        };
+        let template = self.cast_to(template, &LogicalType::Varchar);
+        let name = self.plan_mut().intern(kernel);
+        let args = self.plan_mut().add_expr_list(&[value, template]);
+        Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
     }
 
     /// The number of dimensions of the array that `argument` is, from its type.

@@ -46,6 +46,10 @@ pub fn call_in_time_zone<V: AsRef<Vector>>(
     if name == "make_timestamptz" && args.len() > 1 {
         return Some(rows(&args, returns, |row| made_instant(row, zone)));
     }
+    // `to_timestamp` reads a string with no zone in the session zone, from text arguments.
+    if crate::pgformat::formats(name) {
+        return Some(crate::pgformat::call_vectors(name, &args, returns, zone));
+    }
     if !args.iter().any(|arg| zoned(arg)) {
         return None;
     }

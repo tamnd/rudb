@@ -91,6 +91,7 @@ mod normalize;
 mod number;
 mod path;
 mod peel;
+mod pgformat;
 pub mod prepare;
 mod printf;
 mod quantile;

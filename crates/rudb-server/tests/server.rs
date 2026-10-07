@@ -2844,6 +2844,56 @@ fn a_cast_between_timestamptz_and_a_type_without_a_zone_reads_the_time_zone_sett
 }
 
 #[test]
+fn to_char_to_timestamp_and_to_date_follow_the_templates_of_postgresql() {
+    let dirs = Dirs::new("formatting");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values of the PostgreSQL 19 oracle.
+    for (sql, value) in [
+        (
+            "select to_char(timestamp '2024-03-10 13:04:06', 'FMDay, FMMonth DDth YYYY HH12:MI PM')",
+            "Sunday, March 10th 2024 01:04 PM",
+        ),
+        ("select to_char(date '2024-03-10', 'YYYY-MM-DD HH24:MI TZ')", "2024-03-10 00:00 UTC"),
+        ("select to_char(time '13:04:05.5', 'HH24:MI:SS.MS HH12 AM')", "13:04:05.500 01 PM"),
+        ("select to_char(interval '100 hours', 'HH24 HH12 SSSS')", "100 04 360000"),
+        ("select to_timestamp('2024 070', 'YYYY DDD')", "2024-03-10 00:00:00+00"),
+        ("select to_date('20240701', 'YYYYMMDD')", "2024-07-01"),
+        ("set timezone = 'America/New_York'", ""),
+        ("select to_char(timestamptz '2024-03-10 07:00:00+00', 'HH24:MI TZ OF')", "03:00 EDT -04"),
+        ("select to_timestamp('2024-07-01 12:00', 'YYYY-MM-DD HH24:MI')", "2024-07-01 12:00:00-04"),
+        (
+            "select to_timestamp('2024-07-01 12:00 EST', 'YYYY-MM-DD HH24:MI TZ')",
+            "2024-07-01 13:00:00-04",
+        ),
+        ("reset timezone", ""),
+        ("select to_char(d, f) from (values (date '2024-03-04', 'DD/MM')) v(d, f)", "04/03"),
+    ] {
+        if value.is_empty() {
+            assert_eq!(tags(&client.query(sql)), "CSZ", "{sql}");
+        } else {
+            assert_eq!(scalar(&mut client, sql), value, "{sql}");
+        }
+    }
+    let messages = client.query("select to_char(timestamp 'infinity', 'YYYY') is null");
+    assert_eq!(data_row(&messages[1]), [Some(b"t".to_vec())]);
+    let messages = client.query("select to_timestamp('2024-07-01 1', 'YYYY-MM-DD HH24MI')");
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("22007"));
+    let message = error.field(b'M');
+    assert_eq!(message.as_deref(), Some("source string too short for \"HH24\" formatting field"));
+    let messages = client.query("select to_char(interval '1 day', 'Day')");
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("22007"));
+    assert_eq!(
+        error.field(b'H').as_deref(),
+        Some("Intervals are not tied to specific calendar dates.")
+    );
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();
@@ -3299,4 +3349,3 @@ fn an_index_with_no_name_is_named_as_postgres_names_it() {
     }
     server.stop().unwrap();
 }
-
