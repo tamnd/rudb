@@ -7862,7 +7862,7 @@ impl Shared {
         let table = catalog.table(name)?;
         let types = table.types();
         let fields = table.columns().to_vec();
-        let keys = table.keys().to_vec();
+        let keys = table.guards();
         let all: Vec<usize> = (0..fields.len()).collect();
         let mut stored = Vec::with_capacity(table.rows().chunk_count());
         for at in 0..table.rows().chunk_count() {

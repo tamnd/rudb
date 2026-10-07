@@ -3312,6 +3312,13 @@ impl<'a> Transform<'a> {
     /// OnConflictTarget? OnConflictAction`, or `None` when the statement has neither.
     fn conflict(&mut self, node: u32, name: Slice, alias: StrRef) -> Result<Option<Conflict>> {
         let or = self.find(node, "OrAction");
+        let clause = self.find(node, "OnConflictClause");
+        if or != NONE && clause != NONE {
+            return Err(Error::parser(
+                "You can not provide both OR REPLACE|IGNORE and an ON CONFLICT clause, please \
+                 remove the first if you want to have more granular control",
+            ));
+        }
         if or != NONE {
             let action = match self.name(self.first(or)) {
                 "InsertOrReplace" => ConflictAction::Replace,
@@ -3319,7 +3326,6 @@ impl<'a> Transform<'a> {
             };
             return Ok(Some(Conflict { target: Slice::default(), action }));
         }
-        let clause = self.find(node, "OnConflictClause");
         if clause == NONE {
             return Ok(None);
         }
@@ -3327,6 +3333,11 @@ impl<'a> Transform<'a> {
         let written = self.find(clause, "OnConflictTarget");
         if written != NONE {
             let inner = self.first(written);
+            if self.name(inner) == "OnConflictIndexTarget" {
+                return Err(Error::not_implemented(
+                    "ON CONSTRAINT conflict target is not supported yet",
+                ));
+            }
             if self.name(inner) != "OnConflictExpressionTarget" {
                 return self.unsupported(inner);
             }
