@@ -3207,7 +3207,7 @@ fn appended(
     let declared = |name: &str| {
         names.iter().any(|held| {
             held.table == name
-                && catalog.table(held).is_ok_and(|table| table.clustering_is_stored())
+                && catalog.table(held).is_ok_and(|table| table.file_declares_clustering())
         })
     };
     let native = names
@@ -3226,7 +3226,7 @@ fn appended(
     for name in &dirty {
         let table = catalog.table(name)?;
         let Some((rows, parts)) = table.rows().grown_from() else { continue };
-        if !table.clustering_is_stored() {
+        if !table.file_declares_clustering() {
             continue;
         }
         let marked = marks.iter().any(|(marked, _)| *marked == name.table);

@@ -1995,6 +1995,22 @@ impl Table {
         }
     }
 
+    /// Whether the entry the file has for this table records the declaration the table holds, with
+    /// no regard to rows that came since.
+    ///
+    /// What a checkpoint asks before it carries an entry forward or extends it, since either keeps
+    /// the declaration the entry has. Not [`Self::clustering_is_stored`], which is false for any
+    /// table with rows the file does not have, and would write every such table again whole.
+    #[must_use]
+    pub fn file_declares_clustering(&self) -> bool {
+        match &self.rows {
+            Rows::Memory(_) => false,
+            Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, ..) => {
+                reader.table().clustering() == self.clustering.as_ref()
+            }
+        }
+    }
+
     /// How many distinct values each column holds, named, for the columns something can say.
     ///
     /// Here rather than on [`Rows`] because half of it needs the column names and only this type has
