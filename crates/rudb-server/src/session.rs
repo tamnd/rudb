@@ -668,6 +668,19 @@ fn serve(
                 session.set_utf8(runner.utf8);
             }
         }
+        // PostgreSQL takes the start of a statement when it reads the message, and `now()` and
+        // `statement_timestamp()` give it.
+        if let Some(Ok(
+            Frontend::Query(_)
+            | Frontend::Parse { .. }
+            | Frontend::Bind(_)
+            | Frontend::Execute { .. },
+        )) = read.message
+        {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH);
+            let micros = now.map_or(0, |now| i64::try_from(now.as_micros()).unwrap_or(i64::MAX));
+            runner.connection.set_statement_start(micros);
+        }
         let failed = match read.message {
             None => {
                 input.consume(used);

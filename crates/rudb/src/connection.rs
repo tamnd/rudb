@@ -120,6 +120,13 @@ impl Connection {
         self.shared.set_postgres(postgres);
     }
 
+    /// Records when the client sent the statement that runs next, in microseconds since the epoch.
+    /// `statement_timestamp()` gives it, and a `BEGIN` takes it as the start of the transaction
+    /// that `now()` gives. A server calls this each time it reads a statement.
+    pub fn set_statement_start(&self, micros: i64) {
+        self.shared.set_statement_start(micros);
+    }
+
     /// The rows that the last statement of this thread made before it failed, once.
     ///
     /// Only a statement of a PostgreSQL session keeps them, see [`Connection::set_postgres`],

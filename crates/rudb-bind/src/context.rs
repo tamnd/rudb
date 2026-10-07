@@ -228,7 +228,7 @@ impl Binder<'_> {
 /// The epoch for a clock set before it, which is a machine whose time is wrong rather than a case
 /// worth an error. Nothing sensible can be returned for it and refusing to bind a query over it
 /// would be a strange way to find out.
-pub(crate) fn micros_now() -> i64 {
+pub fn micros_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(i64::MAX))

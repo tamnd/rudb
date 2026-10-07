@@ -1162,6 +1162,36 @@ fn the_storage_options_of_a_table_and_a_truncate_of_several_tables_are_those_of_
 }
 
 #[test]
+fn now_is_the_start_of_the_transaction_and_the_clock_moves() {
+    let dirs = Dirs::new("instants");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // A statement of a simple query starts when the server reads the message.
+    let same = "select now() = statement_timestamp() and now() = transaction_timestamp()";
+    assert_eq!(scalar(&mut client, same), "t");
+    client.query("begin");
+    let begun = scalar(&mut client, "select now()");
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(scalar(&mut client, "select now()"), begun);
+    assert_eq!(scalar(&mut client, "select current_timestamp"), begun);
+    assert_eq!(scalar(&mut client, "select statement_timestamp() > now()"), "t");
+    assert_eq!(scalar(&mut client, "select clock_timestamp() >= statement_timestamp()"), "t");
+    client.query("commit");
+    assert_eq!(scalar(&mut client, "select now() > timestamptz '2020-01-01'"), "t");
+    // The clock is read again for each row.
+    let moved = "select count(distinct clock_timestamp()) > 1 from generate_series(1, 50000)";
+    assert_eq!(scalar(&mut client, moved), "t");
+    let messages =
+        client.query("select pg_typeof(clock_timestamp()), pg_typeof(statement_timestamp())");
+    assert_eq!(
+        data_row(&messages[1]),
+        [Some(b"timestamp with time zone".to_vec()), Some(b"timestamp with time zone".to_vec())]
+    );
+    server.stop().unwrap();
+}
+
+#[test]
 fn fetch_first_is_a_limit_and_a_negative_count_is_the_error_of_postgres() {
     let dirs = Dirs::new("fetch_first");
     let server = Server::start(dirs.config()).unwrap();

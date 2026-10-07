@@ -87,7 +87,7 @@ pub fn random(rows: usize) -> Result<Vector> {
 /// Whether `name` is a call with no arguments that the executor has to give a row count to.
 #[must_use]
 pub fn draws(name: &str) -> bool {
-    matches!(name, "random" | "gen_random_uuid" | "uuid" | "uuidv4" | "uuidv7")
+    matches!(name, "random" | "gen_random_uuid" | "uuid" | "uuidv4" | "uuidv7" | "clock_timestamp")
 }
 
 /// `rows` answers for one call to `name`, which [`draws`] said yes to.
@@ -104,8 +104,20 @@ pub fn drawn(name: &str, rows: usize) -> Result<Vector> {
             let millis = now.map_or(0, |now| now.as_millis());
             uuids(rows, |own| version7(own, millis))
         }
+        // The clock of PostgreSQL, read again for each row as `clock_timestamp()` reads it there.
+        "clock_timestamp" => {
+            let values: Vec<i64> = (0..rows).map(|_| micros_now()).collect();
+            Vector::flat(LogicalType::TimestampTz, Data::Int64(values.into()))
+        }
         _ => Err(Error::internal(format!("{name} is not drawn"))),
     }
+}
+
+/// The time now, in microseconds since the epoch, or the epoch for a clock set before it.
+fn micros_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(i64::MAX))
 }
 
 /// `rows` UUIDs, each made by `make` from a generator seeded the way `random()` seeds its own.

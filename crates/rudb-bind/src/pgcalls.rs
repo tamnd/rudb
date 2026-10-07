@@ -65,6 +65,19 @@ impl Binder<'_> {
             let backend = self.session.postgres().map_or(0, |postgres| postgres.backend);
             return Ok(Some(self.add_constant(Value::Integer(backend))));
         }
+        // `now()` gives the start of the transaction, `statement_timestamp()` the start of this
+        // statement and `clock_timestamp()` the clock at each row.
+        if arguments.is_empty() && named("statement_timestamp") {
+            let started = self.session.statement_start().unwrap_or_else(crate::context::micros_now);
+            return Ok(Some(self.add_constant(Value::TimestampTz(started))));
+        }
+        if arguments.is_empty() && named("clock_timestamp") {
+            let args = self.plan_mut().add_expr_list(&[]);
+            let name = self.plan_mut().intern("clock_timestamp");
+            return Ok(Some(
+                self.add_expr(Expr::Function { name, args }, LogicalType::TimestampTz),
+            ));
+        }
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = match texts.as_slice() {

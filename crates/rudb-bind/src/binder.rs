@@ -580,7 +580,8 @@ impl<'a> Binder<'a> {
     /// in the `stability` column of `duckdb_functions()`, where every one of these is
     /// `CONSISTENT_WITHIN_QUERY`. A query that never asks never reads the clock.
     pub(crate) fn instant(&mut self) -> i64 {
-        *self.started.get_or_insert_with(crate::context::micros_now)
+        let begun = self.session.begun().or(self.session.statement_start());
+        *self.started.get_or_insert_with(|| begun.unwrap_or_else(crate::context::micros_now))
     }
 
     pub(crate) fn plan(&self) -> &Plan {
