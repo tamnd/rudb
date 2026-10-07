@@ -13726,6 +13726,42 @@ fn a_join_puts_its_merged_columns_where_each_dialect_does() {
 }
 
 #[test]
+fn each_dialect_types_sum_and_avg_and_names_the_columns_of_values() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let types = |connection: &crate::Connection| {
+        let mut types = Vec::new();
+        for sql in [
+            "SELECT typeof(sum(x)), typeof(sum(y)), typeof(avg(x)) \
+             FROM (VALUES (1::int, 1.5::real)) v(x, y)",
+            "SELECT typeof(avg(x) OVER ()) FROM (VALUES (1::int)) v(x)",
+        ] {
+            let result = connection.execute(sql).expect(sql);
+            types.extend(result.rows().next().expect("a row").to_vec());
+        }
+        types
+    };
+    let text = |text: &str| Value::Varchar(text.into());
+    let db = Database::new();
+    let connection = db.connect();
+    let pin = [text("HUGEINT"), text("DOUBLE"), text("DOUBLE"), text("DOUBLE")];
+    assert_eq!(types(&connection), pin);
+    let names = connection.execute("SELECT * FROM (VALUES (1, 2))").expect("values");
+    assert_eq!(names.names(), ["col0", "col1"]);
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let postgres = [text("BIGINT"), text("FLOAT"), text("PG_NUMERIC"), text("PG_NUMERIC")];
+    assert_eq!(types(&connection), postgres);
+    let names = connection.execute("SELECT * FROM (VALUES (1, 2)) v").expect("values");
+    assert_eq!(names.names(), ["column1", "column2"]);
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
