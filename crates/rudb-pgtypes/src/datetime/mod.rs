@@ -14,6 +14,8 @@
 //! to the typmod.
 
 mod decode;
+mod format;
+mod session;
 
 use rudb_common::SqlState;
 
@@ -21,6 +23,10 @@ pub use decode::{
     Abbrev, DateTimeInput, NoZones, ZoneAbbrevs, ZoneLookup, date_in, interval_in, time_in,
     timestamp_in, timestamptz_in, timetz_in,
 };
+pub use format::{
+    DateTemplate, interval_to_char, timestamp_to_char, timestamptz_to_char, to_date, to_timestamp,
+};
+pub use session::SessionZones;
 
 use crate::binary::Recv;
 use crate::error::TypeError;
@@ -107,10 +113,35 @@ pub enum IntervalStyle {
 pub trait TimeZone {
     fn at(&self, unix_seconds: i64) -> (i32, &str);
 
+    /// The offset east of UTC at an instant, when the caller does not need the abbreviation.
+    fn offset_at(&self, unix_seconds: i64) -> i32 {
+        self.at(unix_seconds).0
+    }
+
     /// The offset east of UTC before the first change of the rules after an instant, and the
     /// instant and the offset of that change, as `pg_next_dst_boundary` gives them.
     fn next_change(&self, unix_seconds: i64) -> (i32, Option<(i64, i32)>) {
         (self.at(unix_seconds).0, None)
+    }
+
+    /// The offset east of UTC of a wall clock in seconds since 1970-01-01, as
+    /// `DetermineTimeZoneOffsetInternal` finds it from [`TimeZone::next_change`]. A wall clock
+    /// that the clocks skipped over has the offset from before the change, and a wall clock that
+    /// the clocks passed twice has the offset from after the change.
+    fn local_offset(&self, local_seconds: i64) -> i32 {
+        let (before, change) = self.next_change(local_seconds - 86400);
+        let before_time = local_seconds - i64::from(before);
+        let Some((boundary, after)) = change else {
+            return before;
+        };
+        let after_time = local_seconds - i64::from(after);
+        if before_time < boundary && after_time < boundary {
+            return before;
+        }
+        if before_time > boundary && after_time >= boundary {
+            return after;
+        }
+        if before_time > after_time { before } else { after }
     }
 
     /// The meaning of an abbreviation in upper case in this zone over all of its history, as
@@ -214,6 +245,20 @@ pub fn timestamp_from_unix(micros: i64) -> Result<i64, TypeError> {
         micros => micros
             .checked_add(UNIX_TO_POSTGRES_USECS)
             .filter(|ts| (MIN_TIMESTAMP..END_TIMESTAMP).contains(ts))
+            .ok_or_else(|| out_of_range("timestamp")),
+    }
+}
+
+/// A `timestamp` or a `timestamptz` of PostgreSQL as the engine holds it, the inverse of
+/// [`timestamp_from_unix`]. The engine counts from 1970, so the last years that PostgreSQL holds,
+/// after the year 294246, do not fit in it and are an error.
+pub fn timestamp_to_unix(ts: i64) -> Result<i64, TypeError> {
+    match ts {
+        TIMESTAMP_INFINITY => Ok(i64::MAX),
+        TIMESTAMP_NEGATIVE_INFINITY => Ok(-i64::MAX),
+        ts => ts
+            .checked_sub(UNIX_TO_POSTGRES_USECS)
+            .filter(|micros| (-i64::MAX + 1..i64::MAX).contains(micros))
             .ok_or_else(|| out_of_range("timestamp")),
     }
 }

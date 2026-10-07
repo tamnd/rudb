@@ -4293,6 +4293,12 @@ pub fn call_values(
     {
         return Ok(value);
     }
+    // The binder folds only the calls that read no `timestamptz`, which read no zone.
+    if let Some(value) =
+        crate::pgformat::call_value(name, args, rudb_common::SessionTimeZone::default())?
+    {
+        return Ok(value);
+    }
     if let Some(value) = crate::variant::call(name, args)? {
         return Ok(value);
     }

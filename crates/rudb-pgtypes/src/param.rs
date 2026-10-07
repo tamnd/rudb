@@ -15,9 +15,8 @@ use crate::array::{
 use crate::binary::Recv;
 use crate::datetime::{
     DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateTimeInput, Interval, IntervalStyle,
-    TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS,
-    date_in, date_recv, interval_in, interval_recv, time_in, time_recv, timestamp_in,
-    timestamp_recv, timestamptz_in,
+    UNIX_TO_POSTGRES_DAYS, date_in, date_recv, interval_in, interval_recv, time_in, time_recv,
+    timestamp_in, timestamp_recv, timestamp_to_unix, timestamptz_in,
 };
 use crate::declared::declared_type;
 use crate::error::TypeError;
@@ -199,8 +198,8 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::JSONB => Value::Varchar(jsonb_in(text)?),
         oids::DATE => date(date_in(text, cx)?),
         oids::TIME => Value::Time(time_in(text, -1, cx)?),
-        oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_in(text, -1, cx)?)),
-        oids::TIMESTAMPTZ => Value::TimestampTz(timestamp(timestamptz_in(text, -1, cx)?)),
+        oids::TIMESTAMP => Value::Timestamp(timestamp_to_unix(timestamp_in(text, -1, cx)?)?),
+        oids::TIMESTAMPTZ => Value::TimestampTz(timestamp_to_unix(timestamptz_in(text, -1, cx)?)?),
         oids::INTERVAL => interval(interval_in(text, -1, settings.interval_style)?),
         _ => match element(oid) {
             Some((element, delim)) => {
@@ -300,8 +299,8 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::UUID => Value::Uuid(uuid::from_bytes(recv.uuid()?)),
         oids::DATE => date(date_recv(recv)?),
         oids::TIME => Value::Time(time_recv(recv, -1)?),
-        oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_recv(recv, -1)?)),
-        oids::TIMESTAMPTZ => Value::TimestampTz(timestamp(timestamp_recv(recv, -1)?)),
+        oids::TIMESTAMP => Value::Timestamp(timestamp_to_unix(timestamp_recv(recv, -1)?)?),
+        oids::TIMESTAMPTZ => Value::TimestampTz(timestamp_to_unix(timestamp_recv(recv, -1)?)?),
         oids::INTERVAL => interval(interval_recv(recv, -1)?),
         _ => {
             if let Some((element, _)) = element(oid) {
@@ -345,15 +344,6 @@ fn date(days: i32) -> Value {
         DATE_NEGATIVE_INFINITY => -i32::MAX,
         days => days - UNIX_TO_POSTGRES_DAYS,
     })
-}
-
-/// A timestamp of PostgreSQL as rudb counts it, with the infinities of rudb.
-fn timestamp(micros: i64) -> i64 {
-    match micros {
-        TIMESTAMP_INFINITY => i64::MAX,
-        TIMESTAMP_NEGATIVE_INFINITY => -i64::MAX,
-        micros => micros - UNIX_TO_POSTGRES_USECS,
-    }
 }
 
 fn interval(value: Interval) -> Value {

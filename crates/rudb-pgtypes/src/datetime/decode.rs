@@ -221,9 +221,9 @@ const DTK_TZ_VALUE: i32 = 4;
 
 // The token types. Each one is also the bit of the field in a mask.
 const RESERV: i32 = 0;
-const MONTH: i32 = 1;
-const YEAR: i32 = 2;
-const DAY: i32 = 3;
+pub(super) const MONTH: i32 = 1;
+pub(super) const YEAR: i32 = 2;
+pub(super) const DAY: i32 = 3;
 const TZ: i32 = 5;
 const DTZ: i32 = 6;
 const DYNTZ: i32 = 7;
@@ -247,11 +247,11 @@ const MILLENNIUM: i32 = 27;
 const DTZMOD: i32 = 28;
 const UNKNOWN_FIELD: i32 = 31;
 
-const fn m(t: i32) -> u32 {
+pub(super) const fn m(t: i32) -> u32 {
     1 << t
 }
 
-const DATE_M: u32 = m(YEAR) | m(MONTH) | m(DAY);
+pub(super) const DATE_M: u32 = m(YEAR) | m(MONTH) | m(DAY);
 const ALL_SECS_M: u32 = m(SECOND) | m(MILLISECOND) | m(MICROSECOND);
 const TIME_M: u32 = m(HOUR) | m(MINUTE) | ALL_SECS_M;
 
@@ -275,7 +275,7 @@ const MAX_TZDISP_HOUR: i32 = 15;
 
 /// The errors of the decode functions, the `DTERR` codes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DtErr {
+pub(super) enum DtErr {
     BadFormat,
     FieldOverflow,
     MdFieldOverflow,
@@ -289,7 +289,7 @@ use DtErr::{BadFormat, FieldOverflow};
 
 impl DtErr {
     /// `DateTimeParseError`.
-    fn into_error(self, input: &str, type_name: &str) -> TypeError {
+    pub(super) fn into_error(self, input: &str, type_name: &str) -> TypeError {
         let overflow = || {
             TypeError::new(
                 SqlState::DATETIME_FIELD_OVERFLOW,
@@ -432,7 +432,7 @@ fn c_string(input: &str) -> &[u8] {
 
 /// `strtol` in base 10 from `start`: the value, the end, and whether the value saturated. With
 /// no digits the end is `start`.
-fn strtol(s: &[u8], start: usize) -> (i64, usize, bool) {
+pub(super) fn strtol(s: &[u8], start: usize) -> (i64, usize, bool) {
     let mut i = start;
     while is_space(at(s, i)) {
         i += 1;
@@ -664,14 +664,14 @@ fn parse_date_time(s: &[u8], buflen: usize) -> Result<Parsed, DtErr> {
 
 /// `struct pg_tm`, with only the fields that the input uses.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Tm {
-    year: i32,
-    mon: i32,
-    mday: i32,
-    hour: i32,
-    min: i32,
-    sec: i32,
-    yday: i32,
+pub(super) struct Tm {
+    pub(super) year: i32,
+    pub(super) mon: i32,
+    pub(super) mday: i32,
+    pub(super) hour: i32,
+    pub(super) min: i32,
+    pub(super) sec: i32,
+    pub(super) yday: i32,
 }
 
 /// The result of `DecodeDateTime`: the kind of value, the fields, the microseconds and the zone
@@ -684,13 +684,13 @@ struct Decoded {
 }
 
 /// A zone that the input named: the session zone or a zone from [`ZoneLookup`].
-enum ZoneRef {
+pub(super) enum ZoneRef {
     Session,
     Other(Arc<dyn TimeZone + Send + Sync>),
 }
 
 impl ZoneRef {
-    fn get<'z>(&'z self, session: &'z dyn TimeZone) -> &'z dyn TimeZone {
+    pub(super) fn get<'z>(&'z self, session: &'z dyn TimeZone) -> &'z dyn TimeZone {
         match self {
             ZoneRef::Session => session,
             ZoneRef::Other(zone) => &**zone,
@@ -698,7 +698,7 @@ impl ZoneRef {
     }
 }
 
-fn is_leap(year: i32) -> bool {
+pub(super) fn is_leap(year: i32) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
@@ -708,13 +708,13 @@ fn days_in_month(year: i32, month: i32) -> i32 {
 }
 
 /// `IS_VALID_JULIAN`: the date is in the range of the Julian day functions, to the month.
-fn is_valid_julian(year: i32, month: i32) -> bool {
+pub(super) fn is_valid_julian(year: i32, month: i32) -> bool {
     (year > -4713 || (year == -4713 && month >= 11))
         && (year < 5874898 || (year == 5874898 && month < 6))
 }
 
 /// `j2date` into the fields.
-fn set_date(tm: &mut Tm, julian: i32) {
+pub(super) fn set_date(tm: &mut Tm, julian: i32) {
     let (year, month, day) = j2date(julian);
     (tm.year, tm.mon, tm.mday) = (year, month as i32, day as i32);
 }
@@ -759,30 +759,19 @@ fn current_time(cx: &DateTimeInput<'_>) -> (Tm, i32, i32) {
 
 /// `DetermineTimeZoneOffsetInternal`: the offset west of UTC of a local time in a zone, and the
 /// instant in seconds since 1970-01-01 UTC.
-fn determine_offset(tm: &Tm, zone: &dyn TimeZone) -> (i32, i64) {
+pub(super) fn determine_offset(tm: &Tm, zone: &dyn TimeZone) -> (i32, i64) {
     if !is_valid_julian(tm.year, tm.mon) {
         return (0, 0);
     }
     let day = i64::from(date2j(tm.year, tm.mon, tm.mday) - UNIX_EPOCH_JDATE) * 86400;
     let mytime = day + i64::from(tm.sec) + (i64::from(tm.min) + i64::from(tm.hour) * 60) * 60;
-    let (before, change) = zone.next_change(mytime - 86400);
-    let before_time = mytime - i64::from(before);
-    let Some((boundary, after)) = change else {
-        return (-before, before_time);
-    };
-    let after_time = mytime - i64::from(after);
-    if before_time < boundary && after_time < boundary {
-        return (-before, before_time);
-    }
-    if before_time > boundary && after_time >= boundary {
-        return (-after, after_time);
-    }
-    if before_time > after_time { (-before, before_time) } else { (-after, after_time) }
+    let offset = zone.local_offset(mytime);
+    (-offset, mytime - i64::from(offset))
 }
 
 /// `DetermineTimeZoneAbbrevOffset`: the offset west of UTC of a local time with an abbreviation
 /// whose meaning changed over time.
-fn determine_abbrev_offset(tm: &Tm, abbrev: &[u8], zone: &dyn TimeZone) -> i32 {
+pub(super) fn determine_abbrev_offset(tm: &Tm, abbrev: &[u8], zone: &dyn TimeZone) -> i32 {
     let (offset, instant) = determine_offset(tm, zone);
     match zone.abbrev_at(&text(abbrev).to_ascii_uppercase(), instant) {
         Some((east, _)) => -east,
@@ -1126,7 +1115,7 @@ fn decode_date(
 
 /// `ValidateDate`: the checks and the changes of the year, the month and the day after all the
 /// fields are read.
-fn validate_date(
+pub(super) fn validate_date(
     fmask: u32,
     isjulian: bool,
     is2digits: bool,
@@ -2189,7 +2178,7 @@ fn decode_iso8601_interval(s: &[u8]) -> Result<(i32, Itm), DtErr> {
 
 /// `tm2timestamp`: the timestamp of the fields, with the zone in seconds west of UTC for a
 /// `timestamptz`.
-fn tm2timestamp(tm: &Tm, fsec: i32, tz: Option<i32>) -> Option<i64> {
+pub(super) fn tm2timestamp(tm: &Tm, fsec: i32, tz: Option<i32>) -> Option<i64> {
     if !is_valid_julian(tm.year, tm.mon) {
         return None;
     }
