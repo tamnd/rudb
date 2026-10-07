@@ -818,9 +818,10 @@ impl Binder<'_> {
     fn bind_list(&mut self, ast: &Ast, items: ast::Slice, scope: &Scope) -> Result<ExprRef> {
         let written = ast.expr_list(items).to_vec();
         let mut args = Vec::with_capacity(written.len());
-        for item in written {
+        for &item in &written {
             args.push(self.bind_expr(ast, item, scope)?);
         }
+        self.adopt_integer_literals(ast, &written, &mut args);
         self.call("list_value", args)
     }
 
@@ -951,6 +952,22 @@ impl Binder<'_> {
         let written = [left, right];
         let mut left = self.bind_expr(ast, left, scope)?;
         let mut right = self.bind_expr(ast, right, scope)?;
+        if matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::IntegerDivide
+                | BinaryOp::Modulo
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+        ) {
+            let mut sides = [left, right];
+            self.adopt_integer_literals(ast, &written, &mut sides);
+            [left, right] = sides;
+        }
         let mut op = op;
         if self.session.postgres().is_some() {
             self.unknown_operand(op, &mut left, &mut right);
@@ -1559,6 +1576,25 @@ impl Binder<'_> {
                 *bound = self.cast_to(*bound, &ty);
             }
         }
+        if [
+            "add",
+            "subtract",
+            "multiply",
+            "divide",
+            "mod",
+            "xor",
+            "greatest",
+            "least",
+            "coalesce",
+            "ifnull",
+            "nullif",
+            "list_value",
+        ]
+        .iter()
+        .any(|name| rudb_catalog::same_name(&written, name))
+        {
+            self.adopt_integer_literals(ast, &arguments, &mut bound);
+        }
         if let Some(function) = ["coalesce", "greatest", "least", "unpivot_list"]
             .into_iter()
             .find(|name| rudb_catalog::same_name(&written, name))
@@ -1850,16 +1886,26 @@ impl Binder<'_> {
                 None => self.as_boolean(when, "CASE")?,
             };
             let then = self.bind_expr(ast, arm.then, scope)?;
-            result = meet(&result, self.plan().expr_type(then))?;
             bound.push(Arm { when, then });
         }
-        let fallback = if otherwise == NONE {
-            None
-        } else {
-            let bound = self.bind_expr(ast, otherwise, scope)?;
-            result = meet(&result, self.plan().expr_type(bound))?;
-            Some(bound)
-        };
+        let fallback =
+            if otherwise == NONE { None } else { Some(self.bind_expr(ast, otherwise, scope)?) };
+        // The results meet at one type, which a whole number literal among them takes when it
+        // fits, so `CASE WHEN c THEN x ELSE 1 END` over a `UTINYINT` is a `UTINYINT`.
+        let mut spelled: Vec<ast::ExprRef> = written.iter().map(|arm| arm.then).collect();
+        let mut results: Vec<ExprRef> = bound.iter().map(|arm| arm.then).collect();
+        if let Some(fallback) = fallback {
+            spelled.push(otherwise);
+            results.push(fallback);
+        }
+        self.adopt_integer_literals(ast, &spelled, &mut results);
+        for (arm, &then) in bound.iter_mut().zip(&results) {
+            arm.then = then;
+        }
+        let fallback = fallback.map(|_| results[results.len() - 1]);
+        for &then in &results {
+            result = meet(&result, self.plan().expr_type(then))?;
+        }
         // Every arm and the else have to hand back the same type, since a CASE produces one column.
         for arm in &mut bound {
             arm.then = self.checked_cast_to(arm.then, &result, false)?;
@@ -3227,6 +3273,78 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// Reads the whole number literals among `bound` as the integer type the other arguments meet
+    /// at, when the number fits in it, which is how the pin types `x + 1` over a `UTINYINT` as a
+    /// `UTINYINT` rather than an `INTEGER`, and `x << 100` over a `UHUGEINT` at all.
+    ///
+    /// A literal is an `INTEGER_LITERAL` on the pin until it meets a type, and it reads as any
+    /// integer type that holds its value for nothing. One that does not fit, the `1000` of
+    /// `x * 1000` over a `UTINYINT`, keeps the type it was written as, and so do literals with no
+    /// integer to meet. A null meets nothing and is passed over. `written` is the query's spelling
+    /// of each argument, since a constant `1::INTEGER` is not a literal. PostgreSQL reads `int2 +
+    /// 1` as an `int4`, so this is the pin's rule only.
+    fn adopt_integer_literals(
+        &mut self,
+        ast: &Ast,
+        written: &[ast::ExprRef],
+        bound: &mut [ExprRef],
+    ) {
+        if self.session.postgres().is_some() || written.len() != bound.len() {
+            return;
+        }
+        let literals: Vec<Option<i128>> = written
+            .iter()
+            .zip(bound.iter())
+            .map(|(&written, &bound)| self.integer_literal(ast, written, bound))
+            .collect();
+        let mut target: Option<LogicalType> = None;
+        for (&arg, literal) in bound.iter().zip(&literals) {
+            let ty = self.plan().expr_type(arg);
+            if literal.is_some() || *ty == LogicalType::Null {
+                continue;
+            }
+            if !ty.is_integer() {
+                return;
+            }
+            target = match target {
+                None => Some(ty.clone()),
+                Some(before) => match before.promote(ty) {
+                    Some(common) => Some(common),
+                    None => return,
+                },
+            };
+        }
+        let Some(target) = target else { return };
+        for (arg, literal) in bound.iter_mut().zip(literals) {
+            if let Some(value) = literal.and_then(|literal| integer_as(literal, &target)) {
+                *arg = self.add_constant(value);
+            }
+        }
+    }
+
+    /// The value of a whole number written in the query, or of one with a minus in front, once it
+    /// is bound to the constant it reads as.
+    fn integer_literal(&self, ast: &Ast, written: ast::ExprRef, bound: ExprRef) -> Option<i128> {
+        let text = match ast.expr(written) {
+            ast::Expr::Literal { kind: LiteralKind::Number, text } => text,
+            ast::Expr::Unary { op: UnaryOp::Negate, operand } => match ast.expr(operand) {
+                ast::Expr::Literal { kind: LiteralKind::Number, text } => text,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !ast.string(text).bytes().all(|byte| byte.is_ascii_digit() || byte == b'_') {
+            return None;
+        }
+        let Expr::Constant(value) = *self.plan().expr(bound) else { return None };
+        match *self.plan().value(value) {
+            Value::Integer(value) => Some(value.into()),
+            Value::BigInt(value) => Some(value.into()),
+            Value::HugeInt(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// A `coalesce` whose later arguments could fail on a row it never reads, written as the `CASE`
     /// it means so that they are only read where every argument before them was null.
     ///
@@ -4110,6 +4228,23 @@ fn function_of(op: BinaryOp) -> Option<&'static str> {
         BinaryOp::ILike => "~~*",
         BinaryOp::NotILike => "!~~*",
         BinaryOp::Glob => "~~~",
+        _ => return None,
+    })
+}
+
+/// `value` as a constant of the integer type `ty`, or `None` when it does not fit in one.
+fn integer_as(value: i128, ty: &LogicalType) -> Option<Value> {
+    Some(match ty {
+        LogicalType::TinyInt => Value::TinyInt(value.try_into().ok()?),
+        LogicalType::SmallInt => Value::SmallInt(value.try_into().ok()?),
+        LogicalType::Integer => Value::Integer(value.try_into().ok()?),
+        LogicalType::BigInt => Value::BigInt(value.try_into().ok()?),
+        LogicalType::HugeInt => Value::HugeInt(value),
+        LogicalType::UTinyInt => Value::UTinyInt(value.try_into().ok()?),
+        LogicalType::USmallInt => Value::USmallInt(value.try_into().ok()?),
+        LogicalType::UInteger => Value::UInteger(value.try_into().ok()?),
+        LogicalType::UBigInt => Value::UBigInt(value.try_into().ok()?),
+        LogicalType::UHugeInt => Value::UHugeInt(value.try_into().ok()?),
         _ => return None,
     })
 }
