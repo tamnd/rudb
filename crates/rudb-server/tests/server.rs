@@ -2679,6 +2679,16 @@ fn a_condition_must_be_a_boolean_as_in_postgresql() {
             "argument of WHERE must be type boolean, not type timestamp with time zone",
             "23",
         ),
+        (
+            "select count(*) filter (where b || 'z') from t",
+            "argument of FILTER must be type boolean, not type text",
+            "31",
+        ),
+        (
+            "select sum(a) filter (where a + 1) over () from t",
+            "argument of FILTER must be type boolean, not type integer",
+            "29",
+        ),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "EZ", "{sql}");
@@ -2693,6 +2703,8 @@ fn a_condition_must_be_a_boolean_as_in_postgresql() {
         ("select count(*) from t where c", "1"),
         ("select count(*) from t where c is not unknown and 'on'", "1"),
         ("select case when 'true' then 1 end", "1"),
+        ("select count(*) filter (where 'yes') from t", "2"),
+        ("select count(*) filter (where null) from t", "0"),
     ] {
         assert_eq!(scalar(&mut client, sql), value, "{sql}");
     }

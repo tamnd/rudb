@@ -17,9 +17,9 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    AggregateTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, JoinColumns,
-    LogicalType, Origin, Result, Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey,
-    UnknownTypes, Value, ValuesNames,
+    AggregateTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules,
+    JoinColumns, LogicalType, Origin, Result, Semantics, Session, ShowBehavior, Span, SqlState,
+    Stat, StateKey, UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -4818,6 +4818,7 @@ impl<'a> Binder<'a> {
     /// The predicate is a condition over the input rows and not over the answer, so it is bound in
     /// the scope the arguments are bound in, and it is cast to `BOOLEAN` the way a `WHERE` is:
     /// `FILTER (WHERE i)` over an integer column is a filter on whether the integer is not zero.
+    /// PostgreSQL casts no condition, so a PostgreSQL session reads it as any other condition.
     fn bind_filter(
         &mut self,
         ast: &Ast,
@@ -4828,6 +4829,9 @@ impl<'a> Binder<'a> {
             return Ok(None);
         }
         let bound = self.bind_expr(ast, filter, scope)?;
+        if self.semantics.condition_types() == ConditionTypes::Postgres {
+            return Ok(Some(self.as_boolean(ast, filter, bound, "FILTER")?));
+        }
         Ok(Some(self.checked_cast_to(bound, &LogicalType::Boolean, false)?))
     }
 
