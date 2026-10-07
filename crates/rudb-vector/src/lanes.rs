@@ -109,6 +109,7 @@ const fn narrow_lanes() -> [([u8; 32], [u16; 16]); 17] {
 /// the packed form numbers its bits in, so bit `b` of the codes is bit `b % 8` of byte `b / 8`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[allow(unsafe_code)]
+#[inline]
 pub(crate) fn bytes_of(words: &[u64]) -> &[u8] {
     // SAFETY: a `u8` has no alignment requirement and every bit pattern is one, and the slice
     // covers exactly the bytes of `words` for as long as `words` is borrowed.

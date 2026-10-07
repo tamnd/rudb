@@ -158,8 +158,10 @@ pub(crate) struct Walking {
     spans: Vec<(u32, u32, u32)>,
     /// The row's side of the comparison, `None` for a null.
     sides: Vec<Option<i64>>,
-    /// The sibling's side at each of `rids`, `None` for one that failed a condition or is null.
-    values: Vec<Option<i64>>,
+    /// The sibling's side at each of `rids`, whatever it is where `pass` is false.
+    values: Vec<i64>,
+    /// Whether the sibling at each of `rids` passed every condition on it and is not null.
+    pass: Vec<bool>,
     /// Where each of `rids` went when they were read in order.
     moved: Vec<u32>,
     other: Scratch,
@@ -654,14 +656,13 @@ impl Siblings {
         }
         let read = self.read(&local.runs, &mut local.part, &mut local.within)?;
         let length = local.runs.iter().map(|&(_, length)| length as usize).sum();
-        local.values.clear();
         values_of(
             Chunk::with_rows(read, length)?,
             own,
             column,
             &mut local.scratch,
-            &mut local.block,
             &mut local.values,
+            &mut local.pass,
         )?;
         // The operator is settled once for the batch, so that the loop over the siblings has no
         // match in it.
@@ -684,11 +685,15 @@ fn found(local: &mut Walking, holds: impl Fn(i64, i64) -> bool) {
         let Some(side) = local.sides[row as usize] else { continue };
         let places = start as usize..(start + len) as usize;
         let found = if local.rising {
-            local.values[places].iter().any(|value| value.is_some_and(|value| holds(value, side)))
-        } else {
-            local.moved[places]
+            local.values[places.clone()]
                 .iter()
-                .any(|&at| local.values[at as usize].is_some_and(|value| holds(value, side)))
+                .zip(&local.pass[places])
+                .any(|(&value, &pass)| pass & holds(value, side))
+        } else {
+            local.moved[places].iter().any(|&at| {
+                let at = at as usize;
+                local.pass[at] & holds(local.values[at], side)
+            })
         };
         if found {
             local.hit[row as usize] = true;
@@ -723,47 +728,67 @@ fn coalesce(rids: &[u32], runs: &mut Vec<(u64, u32)>) {
     }
 }
 
-/// The integer `column` of `chunk` at each row, appended to `out`, `None` for a row that fails one
-/// of `own` or is null.
+/// The integer `column` of `chunk` at each row in `values`, and in `pass` whether the row passed
+/// every one of `own` and is not null.
+///
+/// A flag and a value rather than an `Option` a row, and the rows a test keeps marked rather than
+/// the ones it drops cleared one at a time. On TPC-H q21 the walk to the late lines of an order has
+/// one condition on the sibling, and writing a `None` over each sibling it failed was most of what
+/// the batch cost outside the reads. The last test does not cut the chunk down either, because
+/// nothing evaluates over what it would keep.
 fn values_of(
     chunk: Chunk,
     own: &[Prepared],
     column: usize,
     scratch: &mut [Scratch],
-    block: &mut Vec<i64>,
-    out: &mut Vec<Option<i64>>,
+    values: &mut Vec<i64>,
+    pass: &mut Vec<bool>,
 ) -> Result<()> {
     let length = chunk.len();
     let vector = chunk
         .column(column)
-        .cloned()
         .map_err(|_| Error::internal("a sibling walk compares a column it did not read"))?;
+    pass.clear();
+    if !vector.validity().has_nulls(length) && vector.signed_block(values) && values.len() >= length
+    {
+        values.truncate(length);
+        pass.resize(length, true);
+    } else {
+        values.clear();
+        for at in 0..length {
+            let value = vector.signed_at(at).and_then(|value| i64::try_from(value).ok());
+            values.push(value.unwrap_or(0));
+            pass.push(value.is_some());
+        }
+    }
     let mut sibling = chunk;
-    // Which rows are left, as positions in `chunk`, rising.
+    // Which rows are left, as positions in `chunk`, rising, once a test has dropped one.
     let mut left: Option<Vec<u32>> = None;
-    for (test, scratch) in own.iter().zip(scratch) {
+    // The rows of `chunk` the tests so far kept.
+    let mut kept_rows: Vec<bool> = Vec::new();
+    for (at, (test, scratch)) in own.iter().zip(scratch).enumerate() {
         if sibling.is_empty() {
             break;
         }
         let kept = test.evaluate_filter(&sibling, scratch)?;
-        if kept.len() != sibling.len() {
+        if kept.len() == sibling.len() {
+            continue;
+        }
+        kept_rows.clear();
+        kept_rows.resize(length, false);
+        match &left {
+            None => kept.indices().iter().for_each(|&row| kept_rows[row as usize] = true),
+            Some(before) => {
+                kept.iter().for_each(|row| kept_rows[before[row] as usize] = true);
+            }
+        }
+        pass.iter_mut().zip(&kept_rows).for_each(|(pass, &kept)| *pass &= kept);
+        if at + 1 < own.len() {
             left = Some(match left {
                 None => kept.indices().to_vec(),
-                Some(before) => kept.iter().map(|at| before[at]).collect(),
+                Some(before) => kept.iter().map(|row| before[row]).collect(),
             });
             sibling = sibling.select(&kept)?;
-        }
-    }
-    let from = out.len();
-    signed(&vector, length, block, out);
-    if let Some(left) = left {
-        let mut next = left.iter().peekable();
-        for (at, value) in out[from..].iter_mut().enumerate() {
-            if next.peek().is_some_and(|&&kept| kept as usize == at) {
-                next.next();
-            } else {
-                *value = None;
-            }
         }
     }
     Ok(())
@@ -866,6 +891,7 @@ impl Stream for Siblings {
             spans: Vec::new(),
             sides: Vec::new(),
             values: Vec::new(),
+            pass: Vec::new(),
             moved: Vec::new(),
             other: match &self.tests {
                 Tests::Pairs { .. } | Tests::Bare => Scratch::default(),

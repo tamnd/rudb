@@ -3863,18 +3863,13 @@ impl Vector {
             // instructions a value for what `code_at` does in ten.
             let words = packed.words;
             let width = packed.width as usize;
-            let mask = u64::MAX >> (u64::BITS - packed.width);
             let mut out = vec![T::default(); rows];
             let mut at = 0;
             for &(start, length) in runs {
                 let length = length as usize;
                 let mut bit = (packed.offset + start as usize) * width;
                 for slot in &mut out[at..at + length] {
-                    let word = bit / u64::BITS as usize;
-                    let low = words.get(word).copied().unwrap_or(0);
-                    let high = words.get(word + 1).copied().unwrap_or(0);
-                    let both = u128::from(high) << u64::BITS | u128::from(low);
-                    *slot = value((both >> (bit % u64::BITS as usize)) as u64 & mask);
+                    *slot = value(code_at(words, bit, packed.width));
                     bit += width;
                 }
                 at += length;
@@ -5452,9 +5447,21 @@ fn prefetch_word(words: &[u64], word: usize) {
 /// gather's samples sat on the load of the word.
 #[inline]
 fn code_at(words: &[u64], bit: usize, width: u32) -> u64 {
+    let mask = u64::MAX >> (u64::BITS - width);
+    // The eight bytes from the one a code starts in hold all of it while it is at most 57 bits
+    // wide, since it starts at most seven bits into that byte. That is one load and a shift, where
+    // two words joined into 128 bits and shifted was about twice the instructions, and on TPC-H
+    // q21 the walk to an order's lines read two and a half million codes this way.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if width <= 57
+        && let Some(eight) = crate::lanes::bytes_of(words)
+            .get(bit / 8..bit / 8 + 8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+    {
+        return u64::from_le_bytes(eight) >> (bit % 8) & mask;
+    }
     let word = bit / u64::BITS as usize;
     let shift = bit % u64::BITS as usize;
-    let mask = u64::MAX >> (u64::BITS - width);
     let low = words.get(word).copied().unwrap_or(0);
     let high = words.get(word + 1).copied().unwrap_or(0);
     let both = u128::from(high) << u64::BITS | u128::from(low);
