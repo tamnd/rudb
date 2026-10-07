@@ -182,6 +182,7 @@ impl Eq for Variables {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Semantics {
     aggregate_types: AggregateTypes,
+    cast_input: CastInput,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -218,6 +219,7 @@ impl Default for Semantics {
     fn default() -> Self {
         Self {
             aggregate_types: AggregateTypes::Pin,
+            cast_input: CastInput::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -332,6 +334,11 @@ impl Semantics {
     #[must_use]
     pub fn plan_errors(self) -> PlanErrors {
         self.plan_errors
+    }
+    /// How an explicit cast reads a string.
+    #[must_use]
+    pub fn cast_input(self) -> CastInput {
+        self.cast_input
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -605,6 +612,17 @@ pub enum PlanErrors {
     Pin,
     /// As in PostgreSQL: the planner folds each call whose arguments are all constants, and an
     /// error there fails the statement before it makes a row.
+    Postgres,
+}
+
+/// How an explicit cast reads a string.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CastInput {
+    /// As in DuckDB: the cast of the engine reads the string, so `'1.5'::text::int` is 2.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the input function of the type reads the string, with its rules and its
+    /// errors, so `'1.5'::text::int` is `22P02 invalid input syntax for type integer`.
     Postgres,
 }
 
@@ -1036,6 +1054,7 @@ impl Session {
             self.semantics.error_texts = ErrorTexts::Postgres;
             self.semantics.function_rules = FunctionRules::Postgres;
             self.semantics.plan_errors = PlanErrors::Postgres;
+            self.semantics.cast_input = CastInput::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }

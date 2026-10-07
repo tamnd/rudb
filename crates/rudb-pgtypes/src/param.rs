@@ -181,12 +181,10 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
     if let Some(kind) = RegKind::from_oid(oid) {
         return Ok(Value::UInteger(reg_value(kind, text)?));
     }
+    if let Some(value) = plain_text_value(oid, text) {
+        return value;
+    }
     Ok(match oid {
-        oids::BOOL => Value::Boolean(bool_in(text)?),
-        oids::INT2 => Value::SmallInt(int2_in(text)?),
-        oids::INT4 => Value::Integer(int4_in(text)?),
-        oids::INT8 => Value::BigInt(int8_in(text)?),
-        oids::OID => Value::UInteger(oid_in(text)?),
         oids::CHAR => Value::UTinyInt(char_in(text)),
         oids::INT2VECTOR => {
             let values = int2vector_in(text)?;
@@ -197,12 +195,8 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
             vector(LogicalType::UInteger, values.into_iter().map(Value::UInteger))
         }
         oids::NAME => Value::Varchar(name_in(text).to_owned()),
-        oids::FLOAT4 => Value::Float(float4_in(text)?),
-        oids::FLOAT8 => Value::Double(float8_in(text)?),
         oids::NUMERIC => Value::Numeric(numeric_in(text, -1)?.to_bytes()),
-        oids::BYTEA => Value::Blob(bytea_in(text)?),
         oids::JSONB => Value::Varchar(jsonb_in(text)?),
-        oids::UUID => Value::Uuid(uuid::from_bytes(uuid_in(text)?)),
         oids::DATE => date(date_in(text, cx)?),
         oids::TIME => Value::Time(time_in(text, -1, cx)?),
         oids::TIMESTAMP => Value::Timestamp(timestamp(timestamp_in(text, -1, cx)?)),
@@ -216,6 +210,44 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
             }
             None => Value::Varchar(text.to_owned()),
         },
+    })
+}
+
+/// Whether the input function of the type `oid` reads no setting of the session and no catalog,
+/// which is the types that [`plain_text_value`] reads.
+#[must_use]
+pub fn has_plain_input(oid: Oid) -> bool {
+    matches!(
+        oid,
+        oids::BOOL
+            | oids::INT2
+            | oids::INT4
+            | oids::INT8
+            | oids::OID
+            | oids::FLOAT4
+            | oids::FLOAT8
+            | oids::BYTEA
+            | oids::UUID
+    )
+}
+
+/// The value that the input function of the type `oid` reads from `text`, or its error with the
+/// SQLSTATE and the text of PostgreSQL. This is for the types whose input reads no setting of the
+/// session and no catalog: `bool`, the integers, `oid`, the floats, `bytea` and `uuid`. `None`
+/// for another type.
+#[must_use]
+pub fn plain_text_value(oid: Oid, text: &str) -> Option<Result<Value, TypeError>> {
+    Some(match oid {
+        oids::BOOL => bool_in(text).map(Value::Boolean),
+        oids::INT2 => int2_in(text).map(Value::SmallInt),
+        oids::INT4 => int4_in(text).map(Value::Integer),
+        oids::INT8 => int8_in(text).map(Value::BigInt),
+        oids::OID => oid_in(text).map(Value::UInteger),
+        oids::FLOAT4 => float4_in(text).map(Value::Float),
+        oids::FLOAT8 => float8_in(text).map(Value::Double),
+        oids::BYTEA => bytea_in(text).map(Value::Blob),
+        oids::UUID => uuid_in(text).map(|bytes| Value::Uuid(uuid::from_bytes(bytes))),
+        _ => return None,
     })
 }
 
@@ -332,6 +364,19 @@ fn interval(value: Interval) -> Value {
 mod tests {
     use super::*;
     use crate::datetime::{DateOrder, FixedZone, NoZones, ZoneAbbrevs};
+
+    #[test]
+    fn the_plain_inputs_are_the_types_that_plain_text_value_reads() {
+        for oid in 0..10_000 {
+            assert_eq!(has_plain_input(oid), plain_text_value(oid, "1").is_some(), "{oid}");
+        }
+        let read = |oid, text| plain_text_value(oid, text).unwrap().map_err(|e| e.message);
+        assert_eq!(read(oids::INT4, " 12 "), Ok(Value::Integer(12)));
+        assert_eq!(read(oids::INT4, "1_000"), Ok(Value::Integer(1000)));
+        let refused = "invalid input syntax for type integer: \"1.5\"";
+        assert_eq!(read(oids::INT4, "1.5"), Err(refused.to_owned()));
+        assert_eq!(read(oids::BOOL, "yes"), Ok(Value::Boolean(true)));
+    }
 
     fn read(oid: Oid, binary: bool, data: &[u8]) -> Result<Value, TypeError> {
         let zone = FixedZone::utc();
