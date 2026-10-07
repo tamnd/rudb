@@ -13880,6 +13880,30 @@ fn a_whole_number_literal_takes_the_integer_type_it_meets_when_it_fits() {
 }
 
 #[test]
+fn an_error_working_out_a_generated_column_names_the_column() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t (a INTEGER, b AS (a + 1), c VARCHAR, d BOOLEAN AS (c))").unwrap();
+    let error = db.execute("INSERT INTO t VALUES (2147483647, 'true')").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Constraint Error: Incorrect value for generated column 'b INTEGER AS (CAST((a + 1) AS \
+         INTEGER))' : Overflow in addition of INT32 (2147483647 + 1)!"
+    );
+    assert_eq!(
+        refusal(&db, "INSERT INTO t VALUES (1, 'test')"),
+        "Incorrect value for generated column 'd BOOLEAN AS (CAST(c AS BOOLEAN))' : Could not \
+         convert string 'test' to BOOL"
+    );
+    assert_eq!(rows(&db, "SELECT count(*) FROM t"), vec![vec![Value::BigInt(0)]]);
+    db.execute("CREATE TABLE u (price INTEGER, total DATE AS (price * 5))").unwrap();
+    assert_eq!(
+        refusal(&db, "INSERT INTO u VALUES (5)"),
+        "Incorrect value for generated column 'total DATE AS (CAST((price * 5) AS DATE))' : \
+         Unimplemented type for cast (INTEGER -> DATE)"
+    );
+}
+
+#[test]
 fn a_generated_column_is_worked_out_from_the_row_it_is_in() {
     let db = Database::new();
     db.execute(

@@ -263,6 +263,11 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
             {
                 return Ok(None);
             }
+            // A generated column's value is left to the write, which names the column in an error
+            // its operand raises.
+            if name == rudb_plan::GENERATED {
+                return Ok(None);
+            }
             if let ("try", [only]) = (name, plan.expr_list(args)) {
                 return match evaluate(plan, *only, lambdas) {
                     Err(error) if caught(&error) => Ok(Some(Value::Null)),

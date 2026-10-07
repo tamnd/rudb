@@ -238,6 +238,14 @@ enum Step {
         /// The operand.
         inner: Box<Prepared>,
     },
+    /// A generated column's value, whose operand is a prepared expression of its own so an error
+    /// it raises can be told apart and named for the column.
+    Generated {
+        /// The operand.
+        inner: Box<Prepared>,
+        /// The column, as the error names it.
+        column: String,
+    },
     /// A tree of decimal arithmetic over columns and literals, run as one loop when the columns'
     /// ranges prove it cannot overflow.
     ///
@@ -478,7 +486,8 @@ impl Prepared {
             | Step::Constant(_)
             | Step::Case { .. }
             | Step::Fused { .. }
-            | Step::Try { .. } => {}
+            | Step::Try { .. }
+            | Step::Generated { .. } => {}
             Step::Cast { input, .. } | Step::InSet { input, .. } => visit(*input),
             Step::Lambda { inputs, .. } => inputs.iter().for_each(|&input| visit(input)),
             Step::Compare { left, right, .. } => {
@@ -1191,7 +1200,9 @@ impl Prepared {
             // about the order, which is that a `CASE` is not what you want in front.
             Step::Case { arms, .. } => 4.0 * arms.len() as f64,
             // The operand once, which is what it costs on every chunk that raises nothing.
-            Step::Try { inner } => (0..inner.steps.len()).map(|step| inner.weight(step)).sum(),
+            Step::Try { inner } | Step::Generated { inner, .. } => {
+                (0..inner.steps.len()).map(|step| inner.weight(step)).sum()
+            }
             // A run of the body per element, which is several a row, and a list to take apart and
             // put back together around it.
             Step::Lambda { .. } => 16.0,
@@ -1374,6 +1385,12 @@ impl Prepared {
                 let mut scratch = inner.scratch();
                 Some(attempt(chunk, ty, |rows| inner.evaluate_one(rows, &mut scratch).cloned())?)
             }
+            Step::Generated { inner, column } => Some(
+                inner
+                    .evaluate_one(chunk, &mut inner.scratch())
+                    .cloned()
+                    .map_err(|error| rudb_plan::incorrect_generated(column, error))?,
+            ),
             Step::Fused { fused, fallback } => Some(match fused.run(chunk) {
                 Some(answer) => answer,
                 None => fallback.evaluate_one(chunk, &mut fallback.scratch())?.clone(),
@@ -1665,6 +1682,19 @@ impl Prepared {
                     return Err(Error::internal("a TRY without exactly one operand"));
                 };
                 Step::Try { inner: Box::new(Self::one(plan, only, schema)?) }
+            }
+            Expr::Function { name, args } if plan.string(name) == rudb_plan::GENERATED => {
+                let [only, column] = plan.expr_list(args)[..] else {
+                    return Err(Error::internal("a generated column without its operand and name"));
+                };
+                let column = match *plan.expr(column) {
+                    Expr::Constant(column) => plan.value(column).as_str().map(str::to_owned),
+                    _ => None,
+                };
+                let Some(column) = column else {
+                    return Err(Error::internal("a generated column named by an expression"));
+                };
+                Step::Generated { inner: Box::new(Self::one(plan, only, schema)?), column }
             }
             Expr::Function { name, args } => {
                 let (start, len) = self.push_list(plan, plan.expr_list(args), schema)?;

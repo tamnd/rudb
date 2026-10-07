@@ -1769,6 +1769,9 @@ impl Gen<'_> {
         if name == "try" {
             return Err(refuse("TRY is not generated"));
         }
+        if name == rudb_plan::GENERATED {
+            return Err(refuse("a generated column's value is not generated"));
+        }
         let ty = qir_type(&e.ty)?;
         for a in args {
             qir_type(&a.ty)?;

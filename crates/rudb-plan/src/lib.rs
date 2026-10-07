@@ -71,7 +71,9 @@ mod seams;
 mod shape;
 mod unique;
 
-pub use expr::{Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, SortKey};
+pub use expr::{
+    Arm, ColumnBinding, CompareOp, ConjunctionOp, Expr, GENERATED, SortKey, incorrect_generated,
+};
 pub use node::{
     Bound, BuildSide, JoinKind, Node, SetOpKind, Share, WindowBound, WindowExclude, WindowFrame,
     WindowUnit,

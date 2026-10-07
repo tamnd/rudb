@@ -3426,8 +3426,24 @@ fn generate(
                 using: None,
             });
         }
-        let value = binder.bind_expr(&parsed, expr, &scope)?;
-        let value = binder.checked_cast_to(value, &fields[at].ty, false)?;
+        // The pin names the column in any error that working its value out raises, a cast to a
+        // type there is no cast to among them, and that is one the binder raises here.
+        let field = &fields[at];
+        let column = format!(
+            "{} {} AS ({})",
+            field.name,
+            field.ty,
+            table.generation(at).unwrap_or_default()
+        );
+        let value = binder
+            .bind_expr(&parsed, expr, &scope)
+            .and_then(|value| binder.checked_cast_to(value, &field.ty, false))
+            .map_err(|error| rudb_plan::incorrect_generated(&column, error))?;
+        let ty = binder.plan().expr_type(value).clone();
+        let name = binder.add_constant(Value::Varchar(column));
+        let args = binder.plan_mut().add_expr_list(&[value, name]);
+        let function = binder.plan_mut().intern(rudb_plan::GENERATED);
+        let value = binder.add_expr(Expr::Function { name: function, args }, ty);
         let mut exprs = Vec::with_capacity(width);
         let mut names = Vec::with_capacity(width);
         for (place, ty) in types.iter().enumerate() {
