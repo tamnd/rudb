@@ -2932,3 +2932,48 @@ fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgres
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_name_in_from_is_the_name_of_one_item_only() {
+    let dirs = Dirs::new("table-names");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in ["create temp table t (a int, b text)", "create temp table u (a int, d int)"] {
+        assert_eq!(tags(&client.query(sql)), "CZ", "{sql}");
+    }
+    // The cases of the PostgreSQL 19 oracle. A name is the alias of an item, or the name of a
+    // table, a function or a `WITH` that has no alias. Two tables with no alias are two names
+    // only when they are two tables.
+    for sql in [
+        "select 1 from t, t x",
+        "select 1 from t x join t y on true",
+        "select 1 from (select 1), (select 2)",
+    ] {
+        assert!(!tags(&client.query(sql)).contains('E'), "{sql}");
+    }
+    for (sql, name) in [
+        ("select * from t join u on true join t on true", "t"),
+        ("with w as (select 1) select * from w, w", "w"),
+        ("select 1 from t, t", "t"),
+        ("select 1 from t x, u x", "x"),
+        ("select 1 from (select 1) s, (select 2) s", "s"),
+        ("select 1 from generate_series(1, 2), generate_series(1, 3)", "generate_series"),
+        ("select 1 from generate_series(1, 2) g, t g", "g"),
+        ("select 1 from t join t on nope", "t"),
+        ("select 1 from t, pg_catalog.pg_class, pg_class", "pg_class"),
+        ("select 1 from t natural join t", "t"),
+        ("select 1 from (values (1)) v, (values (2)) v", "v"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42712"), "{sql}");
+        let message = format!("table name \"{name}\" specified more than once");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message.as_str()), "{sql}");
+        assert_eq!(messages[0].field(b'P'), None, "{sql}");
+    }
+    // The first name that is not found is the error, before the names are compared.
+    let messages = client.query("select 1 from nope, nope");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42P01"));
+    server.stop().unwrap();
+}

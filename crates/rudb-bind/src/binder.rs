@@ -19,7 +19,7 @@ use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, CommonTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field,
     FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session, ShowBehavior,
-    Span, SqlState, Stat, StateKey, UnknownTypes, Value, ValuesNames,
+    Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -2860,8 +2860,9 @@ impl<'a> Binder<'a> {
             return Ok((self.add_node(Node::Dummy), Scope::empty()));
         };
         let (mut node, mut scope) = self.bind_source(ast, *first)?;
-        for source in rest {
+        for (at, source) in rest.iter().enumerate() {
             let (right, right_scope, correlations) = self.bind_lateral(ast, *source, &scope)?;
+            self.distinct_table_names(ast, &sources[..=at], *source)?;
             node = if correlations.is_empty() {
                 self.add_node(Node::CrossProduct { left: node, right })
             } else {
@@ -2972,6 +2973,88 @@ impl<'a> Binder<'a> {
                 self.bind_join(ast, left, right, kind, natural, on, using)
             }
             ast::Source::Pivot { pivot } => self.bind_pivot(ast, pivot),
+        }
+    }
+
+    /// The check of `checkNameSpaceConflicts` in a PostgreSQL session: an item of `FROM`, bound
+    /// after the items `held`, has no name that one of them has. This is the rule for the items
+    /// of one `FROM` and for the two sides of a join.
+    fn distinct_table_names(
+        &self,
+        ast: &Ast,
+        held: &[ast::SourceRef],
+        added: ast::SourceRef,
+    ) -> Result<()> {
+        if self.semantics.table_names() != TableNames::Postgres {
+            return Ok(());
+        }
+        let mut before = Vec::new();
+        for &source in held {
+            self.table_names(ast, source, &mut before);
+        }
+        let mut after = Vec::new();
+        self.table_names(ast, added, &mut after);
+        for (name, table) in &after {
+            let twice = before.iter().any(|(other, other_table)| {
+                // Two tables with no alias can be two different tables of one name.
+                name == other
+                    && !matches!((table, other_table), (Some(one), Some(other)) if one != other)
+            });
+            if twice {
+                return Err(Error::binder(format!(
+                    "table name \"{name}\" specified more than once"
+                ))
+                .state(SqlState::DUPLICATE_ALIAS)
+                .unplaced());
+            }
+        }
+        Ok(())
+    }
+
+    /// The names that an item of `FROM` is reached by, the `refname` of PostgreSQL. Each one has the
+    /// table that it names with it when the item is a table with no alias. A join has the names
+    /// of both of its sides, and a subquery or a `VALUES` with no alias has none.
+    fn table_names(
+        &self,
+        ast: &Ast,
+        source: ast::SourceRef,
+        names: &mut Vec<(String, Option<String>)>,
+    ) {
+        let alias = match ast.source(source) {
+            ast::Source::Table { name, alias: NONE, .. } => {
+                let parts: Vec<&str> = ast.name(name).collect();
+                let table = match self.catalog.resolve(&parts) {
+                    Ok(resolved) => {
+                        format!("{}.{}.{}", resolved.catalog, resolved.schema, resolved.table)
+                    }
+                    Err(_) => parts.join("."),
+                };
+                if let Some(last) = parts.last() {
+                    names.push(((*last).to_string(), Some(table)));
+                }
+                return;
+            }
+            ast::Source::Function { name, alias: NONE, .. } => {
+                if let Some(last) = ast.name(name).last() {
+                    names.push((last.to_string(), None));
+                }
+                return;
+            }
+            ast::Source::Cte { cte, alias: NONE, .. } => ast.cte(cte).name,
+            ast::Source::Join { left, right, .. } => {
+                self.table_names(ast, left, names);
+                self.table_names(ast, right, names);
+                return;
+            }
+            ast::Source::Pivot { pivot } => ast.pivot(pivot).alias,
+            ast::Source::Table { alias, .. }
+            | ast::Source::Function { alias, .. }
+            | ast::Source::Cte { alias, .. }
+            | ast::Source::Subquery { alias, .. }
+            | ast::Source::Values { alias, .. } => alias,
+        };
+        if alias != NONE {
+            names.push((ast.string(alias).to_string(), None));
         }
     }
 
@@ -4586,6 +4669,7 @@ impl<'a> Binder<'a> {
                 "The combining JOIN type must be INNER or LEFT for a LATERAL reference",
             ));
         }
+        self.distinct_table_names(ast, &[left], right)?;
         let split = left_scope.len();
         // Which table index came from which side, kept before the two scopes become one. A query
         // written in the `ON` is joined into one of the inputs rather than above the join, and this
