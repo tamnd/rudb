@@ -40,6 +40,7 @@ mod statement;
 mod structs;
 mod typed;
 mod unnest;
+mod value_source;
 mod vector_types;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};

@@ -3,7 +3,7 @@
 use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Cte, Distinct, JoinKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
+    Cte, Distinct, Expr, JoinKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
     Select, SetOp, Slice, Source, SourceRef, Target, WindowBound, WindowExclude, WindowRef,
     WindowSpec, WindowUnit,
 };
@@ -524,6 +524,23 @@ impl Transform<'_> {
             || call.funcformat != crate::nodes::CoercionForm::COERCE_EXPLICIT_CALL
         {
             return clause("FuncCall");
+        }
+        // A call with no named argument is kept as an expression too, for a function that is not
+        // a table function, and its arguments are the ones of the source.
+        let named = call.args.iter().flatten().any(|node| matches!(node, Node::NamedArgExpr(_)));
+        if !named {
+            let expr = self.function(call)?;
+            let Expr::Function { name, args, .. } = self.ast.expr(expr) else {
+                return clause("FuncCall");
+            };
+            let args: Vec<Target> =
+                self.ast.expr_list(args).iter().map(|&expr| Target { expr, alias: NONE }).collect();
+            let args = self.ast.target_slice(args);
+            let (alias, columns) = self.alias(function.alias.as_deref())?;
+            let function = Source::Function { name, args, alias, columns, pragma: false };
+            let source = self.ast.push_source(function, self.span);
+            self.ast.source_calls.push((source, expr));
+            return Ok(source);
         }
         let name = self.names(&call.funcname)?;
         let mut args = Vec::with_capacity(call.args.len());

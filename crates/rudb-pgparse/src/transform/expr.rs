@@ -423,8 +423,10 @@ impl Transform<'_> {
         let mut target = self.expr(arg)?;
         let span = self.ast.expr_span(target);
         for node in indirection.indirection.iter().flatten() {
+            let mut selected = NONE;
             let (name, args) = match node {
                 Node::String(field) => {
+                    selected = self.intern(field);
                     let field = self.string(field, -1);
                     ("struct_extract", vec![target, field])
                 }
@@ -452,6 +454,7 @@ impl Transform<'_> {
             let name = self.ast.part_slice([part]);
             let call = Expr::Function { name, args, distinct: false, filter: NONE };
             target = self.ast.push_expr(call, span);
+            self.ast.indirections.push((target, selected));
         }
         Ok(target)
     }
@@ -497,7 +500,7 @@ impl Transform<'_> {
         Ok(self.push(Expr::Column { name }, location))
     }
 
-    fn function(&mut self, call: &FuncCall) -> Made<ExprRef> {
+    pub(super) fn function(&mut self, call: &FuncCall) -> Made<ExprRef> {
         let location = call.location;
         if call.funcformat == CoercionForm::COERCE_SQL_SYNTAX {
             return self.syntax_call(call);

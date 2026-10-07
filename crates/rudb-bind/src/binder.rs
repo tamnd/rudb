@@ -668,7 +668,7 @@ impl<'a> Binder<'a> {
     /// queries to the rows the whole `FROM` produced. It attaches them to one of the join's two
     /// inputs, since a join condition is evaluated by the join and can only read what the join was
     /// given.
-    fn attach_subquery(&mut self, input: NodeRef, pending: PendingSubquery) -> NodeRef {
+    pub(crate) fn attach_subquery(&mut self, input: NodeRef, pending: PendingSubquery) -> NodeRef {
         let PendingSubquery {
             node: mut right,
             kind,
@@ -3008,7 +3008,10 @@ impl<'a> Binder<'a> {
                 .bind_table(ast, name, alias, columns)
                 .map_err(|error| error.with_fallback_span(ast.source_span(source))),
             ast::Source::Function { name, args, alias, columns, pragma } => {
-                self.bind_table_function(ast, name, args, alias, columns, pragma)
+                match self.value_call(ast, source, name) {
+                    Some(call) => self.bind_value_source(ast, call, alias, columns),
+                    None => self.bind_table_function(ast, name, args, alias, columns, pragma),
+                }
             }
             ast::Source::Subquery { query, alias, columns } => {
                 let (node, mut scope) = self.bind_query(ast, query)?;
