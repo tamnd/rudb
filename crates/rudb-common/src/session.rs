@@ -191,6 +191,7 @@ pub struct Semantics {
     distinct_order: DistinctOrder,
     count_types: CountTypes,
     query_columns: QueryColumns,
+    conflict_arbiter: ConflictArbiter,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -236,6 +237,7 @@ impl Default for Semantics {
             distinct_order: DistinctOrder::Pin,
             count_types: CountTypes::Pin,
             query_columns: QueryColumns::Pin,
+            conflict_arbiter: ConflictArbiter::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -395,6 +397,11 @@ impl Semantics {
     #[must_use]
     pub fn query_columns(self) -> QueryColumns {
         self.query_columns
+    }
+    /// Which key an `ON CONFLICT` can name and when a target that matches no key is refused.
+    #[must_use]
+    pub fn conflict_arbiter(self) -> ConflictArbiter {
+        self.conflict_arbiter
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -772,6 +779,19 @@ pub enum QueryColumns {
     Pin,
     /// As in PostgreSQL: the statement is `42701 column "x" specified more than once`, after the
     /// column list renames the first columns.
+    Postgres,
+}
+
+/// Which key an `ON CONFLICT` can name, and when a target that matches no key is refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConflictArbiter {
+    /// As in DuckDB: a target that matches no key is refused before the `DO UPDATE` is read, and
+    /// an `ON CONFLICT` with no target is refused when the table has no key.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the `DO UPDATE` is read first, so an error in it comes first. A target
+    /// that matches no key is then `42P10`. An `ON CONFLICT DO NOTHING` with no target is allowed
+    /// when the table has no key, and it skips no row.
     Postgres,
 }
 
@@ -1282,6 +1302,7 @@ impl Session {
             self.semantics.distinct_order = DistinctOrder::Postgres;
             self.semantics.count_types = CountTypes::Postgres;
             self.semantics.query_columns = QueryColumns::Postgres;
+            self.semantics.conflict_arbiter = ConflictArbiter::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }

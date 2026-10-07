@@ -3164,3 +3164,72 @@ fn a_written_column_is_placed_at_its_name() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn on_conflict_reads_its_action_before_it_matches_a_key() {
+    let dirs = Dirs::new("conflict-arbiter");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in [
+        "create temp table t (a int, b text)",
+        "create temp table u (a int primary key, b text)",
+        "insert into t (a) values (1) on conflict do nothing",
+        "insert into t (a) values (1) on conflict do nothing",
+        "insert into u (a) values (1) on conflict (a, a) do nothing",
+    ] {
+        assert!(!tags(&client.query(sql)).contains('E'), "{sql}");
+    }
+    assert_eq!(scalar(&mut client, "select count(*) from t"), "2");
+    // The cases of the PostgreSQL 19 oracle. An error in the target or in the DO UPDATE comes
+    // before the target is matched to a key.
+    let unmatched =
+        "there is no unique or exclusion constraint matching the ON CONFLICT specification";
+    for (sql, state, message, position) in [
+        (
+            "insert into t (a) values (1) on conflict (a) do update set z = 1",
+            "42703",
+            "column \"z\" of relation \"t\" does not exist",
+            Some("60"),
+        ),
+        (
+            "insert into t (a) values (1) on conflict (a) do update set b = 'x'",
+            "42P10",
+            unmatched,
+            None,
+        ),
+        (
+            "insert into t (a) values (1) on conflict (q) do update set z = 1",
+            "42703",
+            "column \"q\" does not exist",
+            Some("43"),
+        ),
+        ("insert into t (a) values (1) on conflict (a) do nothing", "42P10", unmatched, None),
+        ("insert into u (a) values (1) on conflict (b) do nothing", "42P10", unmatched, None),
+        (
+            "insert into u (a) values (1) on conflict (b) do update set z = 1",
+            "42703",
+            "column \"z\" of relation \"u\" does not exist",
+            Some("60"),
+        ),
+        (
+            "insert into u (a) values (1) on conflict (a) do update set a = 1, z = 2",
+            "42703",
+            "column \"z\" of relation \"u\" does not exist",
+            Some("67"),
+        ),
+        (
+            "insert into u (a) values (1) on conflict (a) do update set a = 1, a = 2",
+            "42601",
+            "multiple assignments to same column \"a\"",
+            None,
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}

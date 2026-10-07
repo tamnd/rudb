@@ -240,9 +240,9 @@ impl Transform<'_> {
                 if !element.collation.is_empty() || !element.opclass.is_empty() {
                     return clause("IndexElemOptions");
                 }
-                parts.push(self.intern(column));
+                parts.push((self.intern(column), Some(self.at(element.location))));
             }
-            target = self.ast.part_slice(parts);
+            target = self.ast.placed_part_slice(parts);
         }
         let action = match conflict.action {
             OnConflictAction::ONCONFLICT_NOTHING => ConflictAction::Nothing,
