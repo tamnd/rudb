@@ -19,7 +19,8 @@ pub use format::{
     decode_record, encode_record, record_bytes, seed,
 };
 pub use lane::{
-    Block, CommitSync, Lane, Options, Stats, parse_segment_name, segment_name, segments, spares,
+    Block, CommitSync, Lane, Options, Stats, parse_segment_name, remove_spare, segment_name,
+    segments, spares,
 };
 pub use replay::{Committed, Payload, Record, Replayed, replay};
 

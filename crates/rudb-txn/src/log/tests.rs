@@ -8,8 +8,8 @@ use std::time::Duration;
 use rudb_io::{Crash, Filesystem, Op, OpenMode, SimFilesystem};
 
 use super::{
-    Block, CommitSync, Committed, Kind, Lane, Options, SEGMENT_HEADER, SegmentHeader, replay,
-    segment_name, spares,
+    Block, CommitSync, Committed, Kind, Lane, Options, SEGMENT_HEADER, SegmentHeader,
+    parse_segment_name, remove_spare, replay, segment_name, spares,
 };
 
 const DATABASE: u64 = 0x5EED;
@@ -530,6 +530,42 @@ fn a_reopened_lane_takes_up_the_spares_it_made_and_names_new_ones_apart() {
     let after = spares(&sim, &dir(), 0).expect("spares");
     assert_eq!(after.len(), 2);
     assert!(after.iter().filter(|spare| before.contains(spare)).count() == 1, "{after:?}");
+}
+
+/// A second lane on the same directory, such as the lane of a database that a test drops without
+/// closing, can make a spare under the name that this lane makes next. This lane leaves that file
+/// alone and names its next spare after it.
+#[test]
+fn a_lane_leaves_a_spare_that_it_did_not_make() {
+    let sim = SimFilesystem::new();
+    let lane = open(&sim, Options { spare_ahead: true, ..options(CommitSync::Full) });
+    made(&lane, 2);
+    let next = spares(&sim, &dir(), 0)
+        .expect("spares")
+        .iter()
+        .filter_map(|spare| {
+            parse_segment_name(spare.file_name()?.to_str()?.strip_suffix(".spare")?)
+        })
+        .map(|(_, sequence)| sequence + 1)
+        .max()
+        .expect("a spare");
+    let other = dir().join(format!("{}.spare", segment_name(0, next)));
+    sim.open(&other, OpenMode::CreateNew).expect("the spare of the other lane");
+    // The blocks cross segments, so the lane takes its spares and its thread makes more.
+    for n in 0..200 {
+        lane.commit(&block(n)).expect("commit");
+    }
+    lane.stop();
+    assert!(lane.stats().recycled >= 2, "{:?}", lane.stats());
+    assert!(sim.exists(&other), "the spare of the other lane is still there");
+}
+
+#[test]
+fn a_spare_that_is_gone_already_is_no_error_to_remove() {
+    let sim = SimFilesystem::new();
+    sim.create_dir_all(&dir()).expect("the directory");
+    let spare = dir().join(format!("{}.spare", segment_name(0, 1)));
+    remove_spare(&sim, &spare).expect("nothing to remove");
 }
 
 #[test]
