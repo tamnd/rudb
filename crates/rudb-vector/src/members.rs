@@ -27,6 +27,7 @@ pub struct Members<'a> {
     /// The offset of the last bit of `words`.
     last: u32,
     /// Whether every set bit is among the first 256, which [`Self::avx2`] then holds in a register.
+    #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
     narrow: bool,
 }
 

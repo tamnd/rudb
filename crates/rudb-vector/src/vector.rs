@@ -4824,6 +4824,8 @@ impl Packed<'_> {
             return 0;
         }
         let span = span.min(self.mask());
+        // Only the AVX2 build writes these before the loop below.
+        #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(unused_mut))]
         let mut done = 0;
         let mut kept = 0;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -4874,6 +4876,8 @@ impl Packed<'_> {
     /// last few rows go a code at a time. `rows` are in order and inside the vector, and `bits`
     /// holds bit `range`.
     pub fn retain_set(&self, rows: &mut Vec<u32>, bits: &[u64], shift: u64, range: u64) {
+        // Only the AVX2 build writes these before the loop below.
+        #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(unused_mut))]
         let (mut kept, mut at) = (0, 0);
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
@@ -4940,6 +4944,8 @@ impl Packed<'_> {
         words: &mut [u64],
         fresh: bool,
     ) {
+        // Only the AVX2 build writes these before the loop below.
+        #[cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(unused_mut))]
         let mut done = 0;
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
