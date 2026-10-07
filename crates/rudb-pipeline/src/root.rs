@@ -517,7 +517,7 @@ impl RootReader {
     }
 
     /// Lets the reader take the chunks that arrived in source order before the query failed. See
-    /// [`Order::failed`]. A root that does not restore the order queues each chunk as it comes and
+    /// `Order::failed`. A root that does not restore the order queues each chunk as it comes and
     /// has nothing held.
     ///
     /// # Errors

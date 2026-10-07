@@ -4434,7 +4434,7 @@ pub fn add_packed_pairs_by_place(
     {
         fn side<'a>(packed: &Packed<'a>) -> Option<(&'a [u8], usize, usize)> {
             let width = packed.width as usize;
-            ((1..=crate::lanes::LANE_WIDTH_MAX).contains(&width) && packed.offset % 8 == 0)
+            ((1..=crate::lanes::LANE_WIDTH_MAX).contains(&width) && packed.offset.is_multiple_of(8))
                 .then(|| (crate::lanes::bytes_of(packed.words), packed.offset * width / 8, width))
         }
         if let (Some(one), Some(two)) = (side(first), side(second)) {
@@ -4816,7 +4816,7 @@ impl Packed<'_> {
     /// With `fresh` each word is set to what its rows hold, and without it each word is narrowed to
     /// that and an empty word is skipped. The caller has `64 * words.len()` rows. The blocks the
     /// lanes take are done in one call into them rather than one each, see
-    /// [`crate::lanes::within_words`] for why, and the rest a block at a time as before.
+    /// `lanes::within_words` for why, and the rest a block at a time as before.
     #[must_use]
     pub fn within_words(&self, words: &mut [u64], fresh: bool, low: u64, span: u64) -> usize {
         if low > self.mask() {
@@ -4829,7 +4829,7 @@ impl Packed<'_> {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
             let width = self.width as usize;
-            if self.offset % 64 == 0 && width <= crate::lanes::LANE_WIDTH_MAX {
+            if self.offset.is_multiple_of(64) && width <= crate::lanes::LANE_WIDTH_MAX {
                 let start = self.offset / 64 * width * size_of::<u64>();
                 let bytes = crate::lanes::bytes_of(self.words).get(start..).unwrap_or_default();
                 // The last block the bytes hold with the sixteen the loads read past it, and
@@ -4870,7 +4870,7 @@ impl Packed<'_> {
     /// TPC-H q20, where lineitem's part and supplier keys are tested on the seventh of its rows the
     /// date range keeps. A code at a time was a word to find, a load, a shift and a mask to read the
     /// code and another load to test its bit, and those tests were a seventh of the query. In lanes
-    /// both reads are gathers for eight rows at once, see [`crate::lanes::retain_set`], and only the
+    /// both reads are gathers for eight rows at once, see `lanes::retain_set`, and only the
     /// last few rows go a code at a time. `rows` are in order and inside the vector, and `bits`
     /// holds bit `range`.
     pub fn retain_set(&self, rows: &mut Vec<u32>, bits: &[u64], shift: u64, range: u64) {
@@ -4947,8 +4947,8 @@ impl Packed<'_> {
             let lanes = 1..=crate::lanes::LANE_WIDTH_MAX;
             let fits = i32::try_from(shift).ok().filter(|shift| shift.unsigned_abs() < 1 << 30);
             if let Some(shift) = fits
-                && self.offset % 64 == 0
-                && other.offset % 64 == 0
+                && self.offset.is_multiple_of(64)
+                && other.offset.is_multiple_of(64)
                 && lanes.contains(&one)
                 && lanes.contains(&two)
             {

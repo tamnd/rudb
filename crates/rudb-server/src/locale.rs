@@ -158,7 +158,7 @@ pub(crate) fn check(category: Category, name: &str) -> Option<String> {
         if locale.is_null() {
             return None;
         }
-        let _ = libc::freelocale(locale);
+        libc::freelocale(locale);
     }
     Some(name)
 }
@@ -200,7 +200,7 @@ pub(crate) fn encoding(name: &str) -> Codeset {
             CStr::from_ptr(codeset).to_string_lossy().into_owned()
         };
         libc::uselocale(old);
-        let _ = libc::freelocale(locale);
+        libc::freelocale(locale);
         codeset
     };
     if let Some((_, encoding)) =

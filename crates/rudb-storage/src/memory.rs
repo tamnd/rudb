@@ -158,7 +158,7 @@ impl Zones {
     }
 
     fn push(&mut self, zone: Zone) {
-        if self.len % ZONE_BLOCK == 0 {
+        if self.len.is_multiple_of(ZONE_BLOCK) {
             self.blocks.push(Arc::new(Vec::with_capacity(ZONE_BLOCK)));
         }
         Arc::make_mut(self.blocks.last_mut().expect("a block for the zone")).push(zone);
@@ -2909,7 +2909,11 @@ mod tests {
     fn rows_read_where_they_are_are_the_rows_of_the_chunk_read_whole() {
         let types = vec![LogicalType::BigInt, LogicalType::Varchar];
         let row = |id: usize| {
-            let name = if id % 7 == 0 { Value::Null } else { Value::Varchar(format!("name {id}")) };
+            let name = if id.is_multiple_of(7) {
+                Value::Null
+            } else {
+                Value::Varchar(format!("name {id}"))
+            };
             vec![Value::BigInt(i64::try_from(id).expect("small")), name]
         };
         let mut table = MemoryTable::new(types);

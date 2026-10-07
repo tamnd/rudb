@@ -56,6 +56,20 @@ jobs:
         run: cargo xtask layers
       - name: prose style
         run: cargo xtask style
+      # The rest of what `cargo xtask ci` asks of the source before a tag becomes a release. Every
+      # release from 0.8.2 to 0.8.34 failed one of these after the tag was pushed, because nothing
+      # asked them of a pull request, so the GitHub release went out without its archives and
+      # nothing went to crates.io.
+      - name: the source checks the release gate runs
+        run: |
+          set -euo pipefail
+          cargo xtask rowloop
+          cargo xtask flatten
+          cargo xtask rids
+          cargo xtask seams
+          cargo xtask grammar
+          cargo xtask pg-check
+          cargo metadata --locked --format-version 1 > /dev/null
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features
 

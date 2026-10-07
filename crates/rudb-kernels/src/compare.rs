@@ -556,7 +556,7 @@ fn against_kept(
     fresh: bool,
 ) -> usize {
     one.against_words(other, shift, test, words, fresh);
-    if len % 64 != 0
+    if !len.is_multiple_of(64)
         && let Some(last) = words.last_mut()
     {
         *last &= (1 << (len % 64)) - 1;
@@ -571,7 +571,7 @@ fn against_kept(
 /// `l_commitdate < l_receiptdate` and `l_shipdate < l_commitdate` in q12 narrow the mask the range
 /// on `l_receiptdate` wrote, and the rows come out of the mask once at the end rather than once
 /// after every conjunct. `fresh` is as there. `None` for either side with nulls, `words` of the
-/// wrong length, and anything [`packed_kept`] has no lanes for, and then nothing was written.
+/// wrong length, and anything `packed_kept` has no lanes for, and then nothing was written.
 pub fn mask_against(
     op: Comparison,
     left: &Vector,

@@ -3610,6 +3610,9 @@ mod tests {
 
     use super::*;
 
+    /// A key column of the tests below, with the value each row number gives it.
+    type KeyColumn = (LogicalType, fn(i64) -> Value);
+
     fn hits() -> Table {
         Table::new(
             QualifiedName::new("memory", "main", "hits"),
@@ -3752,7 +3755,7 @@ mod tests {
     /// taken out can be added again, and a delete of most of the rows builds the rest again.
     #[test]
     fn rows_taken_out_by_number_leave_the_reads_and_the_keys() {
-        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+        let keys: [KeyColumn; 2] = [
             (LogicalType::BigInt, Value::BigInt),
             (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
         ];
@@ -3825,7 +3828,7 @@ mod tests {
     /// original keeps its own.
     #[test]
     fn rows_taken_out_leave_where_the_keys_are_built() {
-        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+        let keys: [KeyColumn; 2] = [
             (LogicalType::BigInt, Value::BigInt),
             (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
         ];
@@ -3907,7 +3910,7 @@ mod tests {
     /// once the original is gone.
     #[test]
     fn a_copy_notes_the_keys_it_appends_apart_from_the_original() {
-        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+        let keys: [KeyColumn; 2] = [
             (LogicalType::BigInt, Value::BigInt),
             (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
         ];
@@ -3948,7 +3951,7 @@ mod tests {
     /// rows and of one, and after the copy settles.
     #[test]
     fn a_copy_reads_a_range_of_the_keys_it_appends_beside_the_original() {
-        let keys: [(LogicalType, fn(i64) -> Value); 2] = [
+        let keys: [KeyColumn; 2] = [
             (LogicalType::BigInt, Value::BigInt),
             (LogicalType::Varchar, |at| Value::Varchar(format!("user{at}"))),
         ];
