@@ -84,7 +84,7 @@ use crate::jsonwalk::LateralJson;
 use crate::key::{Digest, Key, RowMap};
 use crate::keywords::keywords;
 use crate::lateral::LateralSeries;
-use crate::linkjoin::{LinkJoin, Resolve};
+use crate::linkjoin::{LinkJoin, Resolve, Tested};
 use crate::links::links;
 use crate::percent::{LimitPercent, Portion};
 use crate::prepared::{Prepared, Scratch};
@@ -2283,6 +2283,8 @@ struct Linked {
     parent_schema: Schema,
     /// The equalities the join is on, each as the child's column and the parent's.
     keys: Vec<(ColumnBinding, ColumnBinding)>,
+    /// The filters the parent's scan was under, when there were any.
+    tested: Option<Tested>,
 }
 
 /// A materialised `WITH` that has been built, for the reads of it under the body being walked.
@@ -3123,6 +3125,15 @@ impl<'a> Building<'a, '_> {
         let (plan, catalog) = (self.plan, self.catalog);
         let refuse =
             |why: &str| Error::internal(format!("a link join over {why}, which cannot be read"));
+        // The filters over the parent's scan are run on the parent of each child row, see
+        // `crate::linkjoin` on what that means for each kind.
+        let mut tests = Vec::new();
+        let mut parent = parent;
+        while let Node::Filter { input, predicate } = *plan.node(parent) {
+            tests.push(predicate);
+            parent = input;
+        }
+        tests.reverse();
         let Some((parent_table, parent_index, parent_columns)) =
             whole_table(plan, catalog, parent)?
         else {
@@ -3175,12 +3186,47 @@ impl<'a> Building<'a, '_> {
         let budget = self.memory.limit().map_or(usize::MAX, |limit| {
             usize::try_from(limit.saturating_sub(self.memory.used())).unwrap_or(usize::MAX)
         });
+        let tested = if tests.is_empty() {
+            None
+        } else {
+            let scanned = plan.field_list(parent_columns).to_vec();
+            let mut read = vec![false; scanned.len()];
+            for &test in &tests {
+                crate::join::columns(plan, test, &mut |binding| {
+                    if binding.table == parent_index
+                        && let Some(slot) = read.get_mut(binding.column as usize)
+                    {
+                        *slot = true;
+                    }
+                });
+            }
+            let mut columns = Vec::with_capacity(scanned.len());
+            for (field, &read) in scanned.iter().zip(&read) {
+                let at = if read {
+                    Some(
+                        parent_table
+                            .column_index(&field.name)
+                            .ok_or_else(|| refuse("a filter on a column the parent does not have"))?,
+                    )
+                } else {
+                    None
+                };
+                columns.push((at, field.ty.clone()));
+            }
+            let schema = Schema::numbered(scanned, parent_index);
+            let tests = tests
+                .iter()
+                .map(|&test| Prepared::one(plan, test, &schema))
+                .collect::<Result<Vec<_>>>()?;
+            Some(Tested { columns, tests })
+        };
         Ok(Linked {
             by,
             parent: Arc::new(Parent::new(parent_table.rows().clone(), budget)),
             projected,
             parent_schema: Schema::numbered(fields, parent_index),
             keys: oriented,
+            tested,
         })
     }
 
@@ -3685,6 +3731,7 @@ impl<'a> Building<'a, '_> {
                     self.cancel.clone(),
                 )?
                 .taking_keys(&keys)
+                .testing(found.tested)
                 .in_session(self.session);
                 let schema = operator.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "LinkJoin", None);

@@ -31,6 +31,17 @@
 //! Right and full need the parent rows that nothing pointed at, which is the backward direction and
 //! is not this operator. `Plan::check` refuses them, so this never sees one.
 //!
+//! # A filtered parent
+//!
+//! A filter between the parent's scan and the join is a set of tests on the parent row, and a child
+//! whose parent fails one has no parent as far as the join is concerned. So the tests are run on the
+//! parent columns they read, gathered at the parent of each child row, and a child whose parent
+//! failed gets the sentinel. Each kind then does what it does for a child with no parent, which is
+//! what each kind means over a filtered parent: inner and semi drop the row, anti keeps it and left
+//! pads it with null. TPC-H q21 is the case: its last join keeps the 8,357 lines left after the
+//! anti and semi joins whose order is `'F'`, and the hash join read 1.5 million orders to build a
+//! table of 729,413 of them for it.
+//!
 //! # What makes this safe to run at all
 //!
 //! Two checks, neither of them optional, both of them section 3.1's rule that a graph section
@@ -48,7 +59,7 @@
 use std::sync::{Arc, Mutex};
 
 use rudb_catalog::Parent;
-use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Session};
+use rudb_common::{Cancel, Error, LogicalType, Memory, Reservation, Result, Session, Value};
 use rudb_graph::{Link, NO_PARENT, Rid};
 use rudb_pipeline::{Compaction, Gauge, Lease, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, JoinKind, Plan};
@@ -99,11 +110,23 @@ pub(crate) struct LinkJoin {
     keys: Vec<Option<usize>>,
     /// The child column holding the row id, which the plan named.
     rid: Prepared,
+    /// The filters over the parent, when the plan put any between its scan and the join.
+    tested: Option<Tested>,
     schema: Schema,
     compaction: &'static dyn Compaction,
     /// What the parent's columns are charged, held for as long as they are readable.
     held: Mutex<Reservation>,
     cancel: Cancel,
+}
+
+/// The filters a parent's scan was under, run on the parent of each child row.
+#[derive(Debug)]
+pub(crate) struct Tested {
+    /// Each column of the parent's scan, as the stored column it is when a test reads it and with
+    /// its type. One no test reads is a null of its type rather than a gather nobody looks at.
+    pub(crate) columns: Vec<(Option<usize>, LogicalType)>,
+    /// One per filter, over the parent's scan as its schema, innermost first.
+    pub(crate) tests: Vec<Prepared>,
 }
 
 /// Everything one instance of a link join mutates.
@@ -118,6 +141,8 @@ pub(crate) struct Linking {
     /// The chunk's child row ids and the parents the link answered for them, reused per chunk.
     children: Vec<Rid>,
     parents: Vec<Rid>,
+    /// One per test of a filtered parent.
+    tested: Vec<Scratch>,
     gauge: Gauge,
 }
 
@@ -126,6 +151,17 @@ impl LinkJoin {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.rid = self.rid.in_session(session);
+        if let Some(tested) = &mut self.tested {
+            let tests = std::mem::take(&mut tested.tests);
+            tested.tests = tests.into_iter().map(|test| test.in_session(session)).collect();
+        }
+        self
+    }
+
+    /// Runs `tested` on the parent of each child row first, see the module note.
+    #[must_use]
+    pub(crate) fn testing(mut self, tested: Option<Tested>) -> Self {
+        self.tested = tested;
         self
     }
 
@@ -164,6 +200,7 @@ impl LinkJoin {
             keys: vec![None; projected.len()],
             projected,
             rid,
+            tested: None,
             // The child's columns and then the parent's, which is the order a join binds its
             // output in and the order the gathers are pushed on below.
             schema: Schema::concat(child, gathered),
@@ -284,6 +321,53 @@ impl LinkJoin {
         Ok(())
     }
 
+    /// Turns the parent of each child row whose parent fails a test into no parent at all.
+    ///
+    /// A row that had no parent to begin with is gathered as nulls, and whatever the tests say
+    /// about it it keeps the sentinel, since nothing here writes anything else.
+    fn test(&self, tested: &Tested, rows: usize, local: &mut Linking) -> Result<()> {
+        let placement = self.parent.place(&local.rids)?;
+        let mut columns = Vec::with_capacity(tested.columns.len());
+        for (column, ty) in &tested.columns {
+            columns.push(match column {
+                Some(column) => self.parent.gather(*column, ty, &placement)?.ok_or_else(|| {
+                    Error::out_of_memory(
+                        "a link join could not hold the parent columns it tests".to_string(),
+                    )
+                })?,
+                None => Vector::constant(ty.clone(), Value::Null, rows),
+            });
+        }
+        let mut parents = Chunk::with_rows(columns, rows)?;
+        // Which rows are left, as positions in the chunk, once a test has dropped one.
+        let mut left: Option<Vec<u32>> = None;
+        for (test, scratch) in tested.tests.iter().zip(&mut local.tested) {
+            if parents.is_empty() {
+                break;
+            }
+            let kept = test.evaluate_filter(&parents, scratch)?;
+            if kept.len() == parents.len() {
+                continue;
+            }
+            left = Some(match left {
+                None => kept.indices().to_vec(),
+                Some(before) => kept.iter().map(|row| before[row]).collect(),
+            });
+            parents = parents.select(&kept)?;
+        }
+        if let Some(left) = left {
+            let mut next = left.iter().copied().peekable();
+            for (row, rid) in local.rids.iter_mut().enumerate() {
+                if next.peek() == Some(&(row as u32)) {
+                    next.next();
+                } else {
+                    *rid = NO_ROW;
+                }
+            }
+        }
+        self.charge()
+    }
+
     /// Puts the gathered parent columns beside the child's.
     ///
     /// Only the parts of the parent the chunk's ids land in are read, in the form they were
@@ -351,6 +435,10 @@ impl Stream for LinkJoin {
             rids: Vec::new(),
             children: Vec::new(),
             parents: Vec::new(),
+            tested: self
+                .tested
+                .as_ref()
+                .map_or_else(Vec::new, |tested| tested.tests.iter().map(Prepared::scratch).collect()),
             gauge: Gauge::new(1),
         }
     }
@@ -373,6 +461,9 @@ impl Stream for LinkJoin {
             return Ok(Progress::More);
         }
         self.resolve(chunk, local)?;
+        if let Some(tested) = &self.tested {
+            self.test(tested, rows, local)?;
+        }
         match self.kind {
             // Neither of these looks at the parent. The whole operator is the sentinel test, which
             // is why section 5.2 calls them nearly free.
@@ -437,12 +528,13 @@ mod tests {
     use rudb_common::{Cancel, Field, LogicalType, Memory, Session, Value};
     use rudb_graph::{Link, NO_PARENT};
     use rudb_pipeline::Stream;
-    use rudb_plan::{ColumnBinding, Expr, JoinKind, Plan};
+    use rudb_plan::{ColumnBinding, CompareOp, Expr, JoinKind, Plan};
     use rudb_seam::Settings;
     use rudb_storage::MemoryTable;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{LinkJoin, Resolve};
+    use super::{LinkJoin, Resolve, Tested};
+    use crate::prepared::Prepared;
     use crate::schema::Schema;
 
     /// A parent of `rows` rows whose one column is its own row number, so that a gathered value
@@ -522,6 +614,54 @@ mod tests {
         )
         .expect("the operator is buildable")
         .in_session(&Session::default())
+    }
+
+    /// The same through the link, over a parent filtered to the rows whose one column is over one.
+    fn filtered(kind: JoinKind, parents: &[Option<u64>], rows: i32) -> LinkJoin {
+        let mut plan = Plan::new();
+        let column = plan.add_expr(Expr::Column(ColumnBinding::new(1, 0)), LogicalType::Integer);
+        let one = plan.add_constant(Value::Integer(1));
+        let over = plan.add_expr(
+            Expr::Compare { op: CompareOp::Greater, left: column, right: one },
+            LogicalType::Boolean,
+        );
+        let test = Prepared::one(&plan, over, &gathered_schema(true)).expect("a test");
+        operator(kind, parents, rows)
+            .testing(Some(Tested { columns: vec![(Some(0), LogicalType::Integer)], tests: vec![test] }))
+            .in_session(&Session::default())
+    }
+
+    /// A parent that fails the filter is no parent, so each kind answers for it the way it answers
+    /// for a child with none: inner and semi drop the row, anti keeps it, left pads it with null.
+    #[test]
+    fn a_parent_that_fails_its_filter_is_answered_as_no_parent() {
+        let parents = [Some(2), Some(0), None, Some(3), Some(1)];
+        let keys = |rows: Vec<Vec<Value>>| -> Vec<Value> {
+            rows.into_iter().map(|row| row[0].clone()).collect()
+        };
+        let price = |prices: &[i32]| -> Vec<Value> {
+            prices.iter().map(|&price| Value::Integer(price)).collect()
+        };
+        assert_eq!(
+            run(&filtered(JoinKind::Inner, &parents, 4), child(5)),
+            vec![
+                vec![Value::Integer(100), Value::BigInt(0), Value::Integer(2)],
+                vec![Value::Integer(103), Value::BigInt(3), Value::Integer(3)],
+            ]
+        );
+        assert_eq!(keys(run(&filtered(JoinKind::Semi, &parents, 4), child(5))), price(&[100, 103]));
+        assert_eq!(
+            keys(run(&filtered(JoinKind::Anti, &parents, 4), child(5))),
+            price(&[101, 102, 104])
+        );
+        let left: Vec<Value> = run(&filtered(JoinKind::Left, &parents, 4), child(5))
+            .into_iter()
+            .map(|row| row[2].clone())
+            .collect();
+        assert_eq!(
+            left,
+            vec![Value::Integer(2), Value::Null, Value::Null, Value::Integer(3), Value::Null]
+        );
     }
 
     /// Pushes one chunk through and hands back what came out, as values.
