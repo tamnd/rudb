@@ -2977,3 +2977,91 @@ fn a_name_in_from_is_the_name_of_one_item_only() {
     assert_eq!(messages[0].field(b'C').as_deref(), Some("42P01"));
     server.stop().unwrap();
 }
+
+#[test]
+fn distinct_sorts_on_what_it_selects_and_a_count_is_a_bigint() {
+    let dirs = Dirs::new("distinct-order");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in [
+        "create temp table t (a int, b text, c numeric)",
+        "insert into t values (1, 'x', 1), (2, 'y', 2), (3, 'z', 3)",
+    ] {
+        assert_eq!(tags(&client.query(sql)), "CZ", "{sql}");
+    }
+    // The values and the errors of the PostgreSQL 19 oracle.
+    for (sql, value) in [
+        (
+            "select string_agg(x::text, ',') from (select distinct a as x from t order by a) s",
+            "1,2,3",
+        ),
+        (
+            "select string_agg(x::text, ',') from (select distinct a + 1 x from t order by a + 1) s",
+            "2,3,4",
+        ),
+        (
+            "select string_agg(b, ',') from (select distinct on (a, b) a, b from t order by b, a, c) s",
+            "x,y,z",
+        ),
+        (
+            "select string_agg(b, ',') from (select distinct on (a) a, b from t order by a, b, a) s",
+            "x,y,z",
+        ),
+        ("select count(*) from (select a from t limit '2') s", "2"),
+        ("select count(*) from (select a from t limit 2.5) s", "3"),
+        ("select count(*) from (select a from t limit 2.5::float8) s", "2"),
+        ("select count(*) from (select a from t limit 2::int2) s", "2"),
+        ("select count(*) from (select a from t limit (select 1)) s", "1"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    let distinct = "for SELECT DISTINCT, ORDER BY expressions must appear in select list";
+    let on = "SELECT DISTINCT ON expressions must match initial ORDER BY expressions";
+    for (sql, code, message, position) in [
+        ("select distinct a from t order by b", "42P10", distinct, "35"),
+        ("select distinct a from t order by a + 1", "42P10", distinct, "35"),
+        ("select distinct on (a) a, b from t order by b", "42P10", on, "21"),
+        ("select distinct on (a, b) a, b from t order by b, c, a", "42P10", on, "21"),
+        ("select distinct on (a, b) a, b from t order by a, c", "42P10", on, "24"),
+        ("select distinct on (b, a) a, b from t order by a, c", "42P10", on, "21"),
+        ("select a from t limit 'x'", "22P02", "invalid input syntax for type bigint: \"x\"", "23"),
+        (
+            "select a from t offset 'x'",
+            "22P02",
+            "invalid input syntax for type bigint: \"x\"",
+            "24",
+        ),
+        (
+            "select a from t limit true",
+            "42804",
+            "argument of LIMIT must be type bigint, not type boolean",
+            "23",
+        ),
+        (
+            "select a from t offset true",
+            "42804",
+            "argument of OFFSET must be type bigint, not type boolean",
+            "24",
+        ),
+        (
+            "select a from t limit '2'::text",
+            "42804",
+            "argument of LIMIT must be type bigint, not type text",
+            "23",
+        ),
+        (
+            "select a from t limit (select true)",
+            "42804",
+            "argument of LIMIT must be type bigint, not type boolean",
+            "23",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}

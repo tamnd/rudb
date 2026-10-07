@@ -11,10 +11,10 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, DeclaredType, Error,
-    ErrorTexts, Field, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals,
-    OperatorRules, Result, Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames,
-    UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
+    CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, CountTypes, DeclaredType,
+    Error, ErrorTexts, Field, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts,
+    NumberLiterals, OperatorRules, Result, Semantics, Session, SetFunctions, SqlState, StateKey,
+    TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -3778,6 +3778,40 @@ impl Binder<'_> {
             }
         }
         self.boolean_cast(expr, what)
+    }
+
+    /// The count of a `LIMIT` or an `OFFSET`, which is a `bigint` in a session with
+    /// [`CountTypes::Postgres`], as `coerce_to_specific_type` makes it. A string literal is read
+    /// with the input function of `bigint`, and a type with no implicit or assignment cast to
+    /// `bigint` is the error of PostgreSQL. `what` is the clause.
+    pub(crate) fn as_count(
+        &mut self,
+        ast: &Ast,
+        written: ast::ExprRef,
+        expr: ExprRef,
+        what: &str,
+    ) -> Result<ExprRef> {
+        if self.semantics.count_types() != CountTypes::Postgres {
+            return Ok(expr);
+        }
+        if let Some(value) = self.read_literal(ast, written, rudb_pgtypes::oid::INT8) {
+            return Ok(self.cast_to(value?, &LogicalType::BigInt));
+        }
+        let ty = self.plan().expr_type(expr).clone();
+        if ty == LogicalType::Null || self.is_placeholder(expr) {
+            return Ok(expr);
+        }
+        if let Some(oid) = written_oid(ast, written, &ty)
+            && !rudb_pgtypes::can_coerce_assigned(oid, rudb_pgtypes::oid::INT8)
+        {
+            let name = rudb_pgtypes::format_type(oid);
+            return Err(Error::binder(format!(
+                "argument of {what} must be type bigint, not type {name}"
+            ))
+            .state(SqlState::DATATYPE_MISMATCH)
+            .with_span(ast.leftmost_span(written)));
+        }
+        Ok(expr)
     }
 
     /// Brings the values that must have one type to the type that PostgreSQL gives them, in a
