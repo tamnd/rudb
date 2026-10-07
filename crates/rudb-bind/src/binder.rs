@@ -1734,7 +1734,7 @@ impl<'a> Binder<'a> {
                 self.bind_star_predicate(ast, written.filter, &input)?
             } else {
                 let predicate = self.bind_expr(ast, written.filter, &input)?;
-                self.as_boolean(predicate, "WHERE")?
+                self.as_boolean(ast, written.filter, predicate, "WHERE")?
             };
             node = self.attach_scalar_subqueries(node);
             node = self.add_node(Node::Filter { input: node, predicate });
@@ -1801,7 +1801,7 @@ impl<'a> Binder<'a> {
             let predicate = self.bind_expr(ast, written.having, &input)?;
             self.lift_over_aggregate(before, &mut above, &input)?;
             let predicate = self.over_aggregate(predicate, &input)?;
-            having = Some(self.as_boolean(predicate, "HAVING")?);
+            having = Some(self.as_boolean(ast, written.having, predicate, "HAVING")?);
         }
 
         // `QUALIFY` filters the rows after the windows have run over them, so it is bound with the
@@ -1845,7 +1845,7 @@ impl<'a> Binder<'a> {
                     "at least one window function must appear in the SELECT column or QUALIFY clause",
                 ));
             }
-            qualify = Some(self.as_boolean(predicate, "QUALIFY")?);
+            qualify = Some(self.as_boolean(ast, written.qualify, predicate, "QUALIFY")?);
         }
 
         // The projection's index has to exist before the sort keys are built, because a key is a
@@ -4608,7 +4608,7 @@ impl<'a> Binder<'a> {
             self.clause = "JOIN condition";
             let waiting = self.scalar_subqueries.len();
             let predicate = self.bind_expr(ast, on, &scope)?;
-            conditions.push(self.as_boolean(predicate, "JOIN")?);
+            conditions.push(self.as_boolean(ast, on, predicate, "JOIN/ON")?);
             for pending in self.scalar_subqueries.split_off(waiting) {
                 match self.side_of(&pending, &left_tables, &right_tables) {
                     Some(Side::Right) => right_node = self.attach_subquery(right_node, pending),

@@ -534,9 +534,9 @@ impl Binder<'_> {
         let first = parts
             .next()
             .ok_or_else(|| Error::parser("COLUMNS expansion resulted in empty set of columns"))?;
-        let mut predicate = self.as_boolean(first, "WHERE")?;
+        let mut predicate = self.as_boolean(ast, expr, first, "WHERE")?;
         for next in parts {
-            let next = self.as_boolean(next, "WHERE")?;
+            let next = self.as_boolean(ast, expr, next, "WHERE")?;
             let children = self.plan_mut().add_expr_list(&[predicate, next]);
             let conjunction = Expr::Conjunction { op: ConjunctionOp::And, children };
             predicate = self.add_expr(conjunction, LogicalType::Boolean);

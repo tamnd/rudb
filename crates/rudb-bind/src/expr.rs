@@ -11,9 +11,9 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CastInput, CastOutput, CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules,
-    LogicalType, MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, Result, Semantics,
-    Session, SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value,
+    CastInput, CastOutput, CharacterTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field,
+    FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules,
+    Result, Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value,
     is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
@@ -949,23 +949,31 @@ impl Binder<'_> {
         let bound = self.bind_expr(ast, operand, scope)?;
         match op {
             UnaryOp::Not => {
-                let condition = self.as_boolean(bound, "NOT")?;
+                let condition = self.as_boolean(ast, operand, bound, "NOT")?;
                 self.call("not", vec![condition])
             }
             UnaryOp::Negate => self.call("-", vec![bound]),
             UnaryOp::Plus => self.call("+", vec![bound]),
             UnaryOp::IsNull => self.against_null(CompareOp::NotDistinctFrom, bound),
             UnaryOp::IsNotNull => self.against_null(CompareOp::DistinctFrom, bound),
-            UnaryOp::IsTrue => self.against_boolean(CompareOp::NotDistinctFrom, bound, true),
-            UnaryOp::IsNotTrue => self.against_boolean(CompareOp::DistinctFrom, bound, true),
-            UnaryOp::IsFalse => self.against_boolean(CompareOp::NotDistinctFrom, bound, false),
-            UnaryOp::IsNotFalse => self.against_boolean(CompareOp::DistinctFrom, bound, false),
+            UnaryOp::IsTrue => {
+                self.against_boolean(ast, operand, CompareOp::NotDistinctFrom, bound, true)
+            }
+            UnaryOp::IsNotTrue => {
+                self.against_boolean(ast, operand, CompareOp::DistinctFrom, bound, true)
+            }
+            UnaryOp::IsFalse => {
+                self.against_boolean(ast, operand, CompareOp::NotDistinctFrom, bound, false)
+            }
+            UnaryOp::IsNotFalse => {
+                self.against_boolean(ast, operand, CompareOp::DistinctFrom, bound, false)
+            }
             UnaryOp::IsUnknown => {
-                let condition = self.as_boolean(bound, "IS UNKNOWN")?;
+                let condition = self.as_boolean(ast, operand, bound, "IS UNKNOWN")?;
                 self.against_null(CompareOp::NotDistinctFrom, condition)
             }
             UnaryOp::IsNotUnknown => {
-                let condition = self.as_boolean(bound, "IS UNKNOWN")?;
+                let condition = self.as_boolean(ast, operand, bound, "IS NOT UNKNOWN")?;
                 self.against_null(CompareOp::DistinctFrom, condition)
             }
             UnaryOp::BitNot => self.call("~", vec![bound]),
@@ -991,10 +999,10 @@ impl Binder<'_> {
             let connective =
                 if op == BinaryOp::And { ConjunctionOp::And } else { ConjunctionOp::Or };
             let word = if op == BinaryOp::And { "AND" } else { "OR" };
-            let left = self.bind_expr(ast, left, scope)?;
-            let left = self.as_boolean(left, word)?;
-            let right = self.bind_expr(ast, right, scope)?;
-            let right = self.as_boolean(right, word)?;
+            let bound = self.bind_expr(ast, left, scope)?;
+            let left = self.as_boolean(ast, left, bound, word)?;
+            let bound = self.bind_expr(ast, right, scope)?;
+            let right = self.as_boolean(ast, right, bound, word)?;
             return Ok(self.conjunction(connective, vec![left, right]));
         }
         // The grammar reads `a -> b ->> c` as `a -> (b ->> c)`, since what follows an arrow is a
@@ -2028,7 +2036,7 @@ impl Binder<'_> {
             let when = self.bind_expr(ast, arm.when, scope)?;
             let when = match subject {
                 Some(subject) => self.compare(CompareOp::Equal, subject, when)?,
-                None => self.as_boolean(when, "CASE")?,
+                None => self.as_boolean(ast, arm.when, when, "CASE/WHEN")?,
             };
             let then = self.bind_expr(ast, arm.then, scope)?;
             bound.push(Arm { when, then });
@@ -2069,7 +2077,7 @@ impl Binder<'_> {
                  explicit type casts.\nCandidate macros:\n\t\"if\"(a, b, c)",
             ));
         };
-        let when = self.as_boolean(condition, "CASE")?;
+        let when = self.boolean_cast(condition, "CASE")?;
         let result = meet(&LogicalType::Null, self.plan().expr_type(then))?;
         let result = meet(&result, self.plan().expr_type(otherwise))?;
         let then = self.checked_cast_to(then, &result, false)?;
@@ -3726,9 +3734,46 @@ impl Binder<'_> {
         }
     }
 
-    /// Brings a predicate to `BOOLEAN`, which is what every place that takes one requires.
-    pub(crate) fn as_boolean(&mut self, expr: ExprRef, what: &str) -> Result<ExprRef> {
+    /// Brings a predicate to `BOOLEAN`, which is what every place that takes one requires. `what`
+    /// is the clause, as PostgreSQL names it in its error: `WHERE`, `JOIN/ON`, `CASE/WHEN`, `IS
+    /// NOT TRUE` and so on. `written` is the predicate as it was written.
+    pub(crate) fn as_boolean(
+        &mut self,
+        ast: &Ast,
+        written: ast::ExprRef,
+        expr: ExprRef,
+        what: &str,
+    ) -> Result<ExprRef> {
         let ty = self.plan().expr_type(expr).clone();
+        if self.semantics.condition_types() == ConditionTypes::Postgres
+            && !matches!(ty, LogicalType::Boolean | LogicalType::Null)
+        {
+            if let Some(value) = self.read_literal(ast, written, rudb_pgtypes::oid::BOOL) {
+                return Ok(self.cast_to(value?, &LogicalType::Boolean));
+            }
+            if !matches!(ast.expr(written), ast::Expr::Literal { kind: LiteralKind::String, .. }) {
+                let name = rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&ty).oid);
+                return Err(Error::binder(format!(
+                    "argument of {what} must be type boolean, not type {name}"
+                ))
+                .state(SqlState::DATATYPE_MISMATCH)
+                .with_span(ast.leftmost_span(written)));
+            }
+        }
+        self.boolean_cast(expr, what)
+    }
+
+    /// Brings a predicate to `BOOLEAN` as the pin does: a number, a string and NULL are cast.
+    fn boolean_cast(&mut self, expr: ExprRef, what: &str) -> Result<ExprRef> {
+        let ty = self.plan().expr_type(expr).clone();
+        // The words of the pin, which name fewer clauses.
+        let what = match what {
+            "JOIN/ON" => "JOIN",
+            "CASE/WHEN" => "CASE",
+            "IS UNKNOWN" | "IS NOT UNKNOWN" => "IS UNKNOWN",
+            is if is.starts_with("IS ") => "IS",
+            other => other,
+        };
         match ty {
             LogicalType::Boolean => Ok(expr),
             LogicalType::Null | LogicalType::Varchar => {
@@ -3746,8 +3791,21 @@ impl Binder<'_> {
         self.compare(op, expr, null)
     }
 
-    fn against_boolean(&mut self, op: CompareOp, expr: ExprRef, wanted: bool) -> Result<ExprRef> {
-        let condition = self.as_boolean(expr, "IS")?;
+    fn against_boolean(
+        &mut self,
+        ast: &Ast,
+        written: ast::ExprRef,
+        op: CompareOp,
+        expr: ExprRef,
+        wanted: bool,
+    ) -> Result<ExprRef> {
+        let what = match (op == CompareOp::DistinctFrom, wanted) {
+            (false, true) => "IS TRUE",
+            (true, true) => "IS NOT TRUE",
+            (false, false) => "IS FALSE",
+            (true, false) => "IS NOT FALSE",
+        };
+        let condition = self.as_boolean(ast, written, expr, what)?;
         let constant = self.add_constant(Value::Boolean(wanted));
         self.compare(op, condition, constant)
     }

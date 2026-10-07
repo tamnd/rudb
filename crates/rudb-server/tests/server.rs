@@ -2596,3 +2596,113 @@ fn a_cursor_moves_and_ends_as_in_postgresql() {
     client.query("rollback");
     server.stop().unwrap();
 }
+
+#[test]
+fn a_condition_must_be_a_boolean_as_in_postgresql() {
+    let dirs = Dirs::new("condition");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table t (a int, b text, c bool)");
+    client.query("insert into t values (1, 'x', true), (0, 'y', null)");
+    // The errors and the positions of the PostgreSQL 19 oracle. The position is the first token
+    // of the condition.
+    for (sql, message, position) in [
+        (
+            "select 1 from t where a",
+            "argument of WHERE must be type boolean, not type integer",
+            "23",
+        ),
+        (
+            "select case when 1 then 2 end",
+            "argument of CASE/WHEN must be type boolean, not type integer",
+            "18",
+        ),
+        (
+            "select 1 from t having 1",
+            "argument of HAVING must be type boolean, not type integer",
+            "24",
+        ),
+        (
+            "select 1 from t join t s on s.a",
+            "argument of JOIN/ON must be type boolean, not type integer",
+            "29",
+        ),
+        ("select 1 from t where b", "argument of WHERE must be type boolean, not type text", "23"),
+        (
+            "select 1 from t where c and a",
+            "argument of AND must be type boolean, not type integer",
+            "29",
+        ),
+        (
+            "select 1 from t where not a",
+            "argument of NOT must be type boolean, not type integer",
+            "27",
+        ),
+        (
+            "select 1 from t where a or c",
+            "argument of OR must be type boolean, not type integer",
+            "23",
+        ),
+        (
+            "select a is true from t",
+            "argument of IS TRUE must be type boolean, not type integer",
+            "8",
+        ),
+        (
+            "select a is not false from t",
+            "argument of IS NOT FALSE must be type boolean, not type integer",
+            "8",
+        ),
+        (
+            "select a is unknown from t",
+            "argument of IS UNKNOWN must be type boolean, not type integer",
+            "8",
+        ),
+        (
+            "select 1 where null::int",
+            "argument of WHERE must be type boolean, not type integer",
+            "16",
+        ),
+        (
+            "select 1 where 1.5::float8",
+            "argument of WHERE must be type boolean, not type double precision",
+            "16",
+        ),
+        (
+            "select 1 from t where a + 1",
+            "argument of WHERE must be type boolean, not type integer",
+            "23",
+        ),
+        (
+            "select 1 from t where now()",
+            "argument of WHERE must be type boolean, not type timestamp with time zone",
+            "23",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42804"), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    // A string literal is read as a boolean, and a null is no row.
+    for (sql, value) in [
+        ("select count(*) from t where 'yes'", "2"),
+        ("select count(*) from t where null", "0"),
+        ("select count(*) from t where c", "1"),
+        ("select count(*) from t where c is not unknown and 'on'", "1"),
+        ("select case when 'true' then 1 end", "1"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    let messages = client.query("select count(*) from t where 'x'");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22P02"));
+    assert_eq!(
+        messages[0].field(b'M').as_deref(),
+        Some("invalid input syntax for type boolean: \"x\"")
+    );
+    assert_eq!(messages[0].field(b'P').as_deref(), Some("30"));
+    server.stop().unwrap();
+}

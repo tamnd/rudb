@@ -185,6 +185,7 @@ pub struct Semantics {
     cast_input: CastInput,
     number_casts: NumberCasts,
     cast_output: CastOutput,
+    condition_types: ConditionTypes,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -224,6 +225,7 @@ impl Default for Semantics {
             cast_input: CastInput::Pin,
             number_casts: NumberCasts::Pin,
             cast_output: CastOutput::Pin,
+            condition_types: ConditionTypes::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -353,6 +355,11 @@ impl Semantics {
     #[must_use]
     pub fn cast_output(self) -> CastOutput {
         self.cast_output
+    }
+    /// What type a condition takes.
+    #[must_use]
+    pub fn condition_types(self) -> ConditionTypes {
+        self.condition_types
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -661,6 +668,19 @@ pub enum CastOutput {
     Pin,
     /// As in PostgreSQL: the output function of the type writes it, so `array[1, 2]::text` is
     /// `{1,2}` and `'NaN'::float8::text` is `NaN`.
+    Postgres,
+}
+
+/// What type a condition takes, in `WHERE`, `HAVING`, `JOIN ... ON`, `CASE WHEN`, `AND`, `OR`,
+/// `NOT` and `IS TRUE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConditionTypes {
+    /// As in DuckDB: a number or a string is cast to a boolean, so `WHERE 1` keeps each row.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a boolean, a NULL, or a string literal that the input function of
+    /// `boolean` reads. Any other type is `42804 argument of WHERE must be type boolean, not type
+    /// integer`.
     Postgres,
 }
 
@@ -1095,6 +1115,7 @@ impl Session {
             self.semantics.cast_input = CastInput::Postgres;
             self.semantics.number_casts = NumberCasts::Postgres;
             self.semantics.cast_output = CastOutput::Postgres;
+            self.semantics.condition_types = ConditionTypes::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }
