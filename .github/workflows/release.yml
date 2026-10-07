@@ -44,6 +44,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # The test binaries, about three hundred of them, each link the whole workspace, and with full
+  # debug info they filled the disk of a hosted runner in October 2026. Line tables keep the file
+  # and line of a panic and of a backtrace at a fraction of the size. Release builds are untouched.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # A tag that does not pass the gate does not become a release. Cheaper to find out here than

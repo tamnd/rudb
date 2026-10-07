@@ -1706,7 +1706,7 @@ fn window(words: &[u64], from: i128, len: u64) -> Option<Vec<u64>> {
         .map(|at| bits(from + 64 * at as i128))
         .collect();
     if let Some(last) = out.last_mut()
-        && len % 64 != 0
+        && !len.is_multiple_of(64)
     {
         *last &= (1 << (len % 64)) - 1;
     }
