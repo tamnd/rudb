@@ -1,5 +1,5 @@
-//! The actions of the type names: `Typename` with its array bounds, the numeric, bit, character,
-//! date and time, interval and JSON types, and the generic type names.
+//! The actions of the type names that the translator cannot write: the generic, bit and character
+//! types, the interval fields, and the interval of `SET TIME ZONE`.
 
 use super::*;
 use crate::error::Error;
@@ -21,88 +21,6 @@ fn system_type_mods(name: &str, typmods: List, location: i32) -> Option<Box<Type
     Some(Box::new(TypeName { typmods, location, ..SystemTypeName(name) }))
 }
 
-impl rules::Typename for Parser<'_> {
-    fn Typename_1(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v2: List,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v1, |t| t.arrayBounds = v2))
-    }
-
-    fn Typename_2(
-        &mut self,
-        v2: Option<Box<TypeName>>,
-        v3: List,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v2, |t| {
-            t.arrayBounds = v3;
-            t.setof = true;
-        }))
-    }
-
-    fn Typename_3(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v4: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v1, |t| t.arrayBounds = list_make1(Some(makeInteger(v4)))))
-    }
-
-    fn Typename_4(
-        &mut self,
-        v2: Option<Box<TypeName>>,
-        v5: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v2, |t| {
-            t.arrayBounds = list_make1(Some(makeInteger(v5)));
-            t.setof = true;
-        }))
-    }
-
-    fn Typename_5(&mut self, v1: Option<Box<TypeName>>) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v1, |t| t.arrayBounds = list_make1(Some(makeInteger(-1)))))
-    }
-
-    fn Typename_6(&mut self, v2: Option<Box<TypeName>>) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v2, |t| {
-            t.arrayBounds = list_make1(Some(makeInteger(-1)));
-            t.setof = true;
-        }))
-    }
-}
-
-impl rules::opt_array_bounds for Parser<'_> {
-    fn opt_array_bounds_1(&mut self, v1: List) -> Result<List, Error> {
-        Ok(lappend(v1, Some(makeInteger(-1))))
-    }
-
-    fn opt_array_bounds_2(&mut self, v1: List, v3: i32) -> Result<List, Error> {
-        Ok(lappend(v1, Some(makeInteger(v3))))
-    }
-}
-
-impl rules::SimpleTypename for Parser<'_> {
-    fn SimpleTypename_6(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v2: List,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v1, |t| t.typmods = v2))
-    }
-
-    fn SimpleTypename_7(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v3: i32,
-        at3: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        let typmods =
-            list_make2(Some(makeIntConst(INTERVAL_FULL_RANGE, -1)), Some(makeIntConst(v3, at3)));
-        Ok(change(v1, |t| t.typmods = typmods))
-    }
-}
-
 impl rules::GenericType for Parser<'_> {
     fn GenericType_1(
         &mut self,
@@ -112,90 +30,6 @@ impl rules::GenericType for Parser<'_> {
     ) -> Result<Option<Box<TypeName>>, Error> {
         let t = makeTypeName(v1.as_deref().unwrap_or_default());
         Ok(Some(Box::new(TypeName { typmods: v2, location: at1, ..t })))
-    }
-
-    fn GenericType_2(
-        &mut self,
-        v1: Option<Str>,
-        v2: List,
-        v3: List,
-        at1: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        let t = makeTypeNameFromNameList(lcons(Some(makeString(v1)), v2));
-        Ok(Some(Box::new(TypeName { typmods: v3, location: at1, ..t })))
-    }
-}
-
-impl rules::Numeric for Parser<'_> {
-    fn Numeric_1(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("int4", at1))
-    }
-
-    fn Numeric_2(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("int4", at1))
-    }
-
-    fn Numeric_3(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("int2", at1))
-    }
-
-    fn Numeric_4(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("int8", at1))
-    }
-
-    fn Numeric_5(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("float4", at1))
-    }
-
-    fn Numeric_6(
-        &mut self,
-        v2: Option<Box<TypeName>>,
-        at1: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v2, |t| t.location = at1))
-    }
-
-    fn Numeric_7(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("float8", at1))
-    }
-
-    fn Numeric_8(&mut self, v2: List, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type_mods("numeric", v2, at1))
-    }
-
-    fn Numeric_9(&mut self, v2: List, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type_mods("numeric", v2, at1))
-    }
-
-    fn Numeric_10(&mut self, v2: List, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type_mods("numeric", v2, at1))
-    }
-
-    fn Numeric_11(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("bool", at1))
-    }
-}
-
-impl rules::opt_float for Parser<'_> {
-    fn opt_float_1(&mut self, v2: i32, at2: i32) -> Result<Option<Box<TypeName>>, Error> {
-        // The precision limits of the IEEE floating point types.
-        let name = match v2 {
-            ..1 => "precision for type float must be at least 1 bit",
-            1..=24 => return Ok(Some(Box::new(SystemTypeName("float4")))),
-            25..=53 => return Ok(Some(Box::new(SystemTypeName("float8")))),
-            _ => "precision for type float must be less than 54 bits",
-        };
-        Err(self.error(ERRCODE_INVALID_PARAMETER_VALUE, name, at2))
-    }
-
-    fn opt_float_2(&mut self) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(Some(Box::new(SystemTypeName("float8"))))
-    }
-}
-
-impl rules::ConstBit for Parser<'_> {
-    fn ConstBit_2(&mut self, v1: Option<Box<TypeName>>) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(change(v1, |t| t.typmods = List::new()))
     }
 }
 
@@ -208,28 +42,6 @@ impl rules::BitWithLength for Parser<'_> {
     ) -> Result<Option<Box<TypeName>>, Error> {
         let typname = if v2 { "varbit" } else { "bit" };
         Ok(system_type_mods(typname, v4, at1))
-    }
-}
-
-impl rules::BitWithoutLength for Parser<'_> {
-    fn BitWithoutLength_1(&mut self, v2: bool, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        // `bit` is `bit(1)`, and `varbit` has no limit.
-        if v2 {
-            Ok(system_type("varbit", at1))
-        } else {
-            Ok(system_type_mods("bit", list_make1(Some(makeIntConst(1, -1))), at1))
-        }
-    }
-}
-
-impl rules::ConstCharacter for Parser<'_> {
-    fn ConstCharacter_2(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        // With no length the type has no limit. In a column definition a `bpchar` with no length
-        // is `bpchar(1)`, but a constant must not get that limit.
-        Ok(change(v1, |t| t.typmods = List::new()))
     }
 }
 
@@ -259,71 +71,6 @@ impl rules::CharacterWithoutLength for Parser<'_> {
         } else {
             Ok(system_type(name, at1))
         }
-    }
-}
-
-/// `$k ? "varchar" : "bpchar"`.
-fn character(varying: bool) -> Option<Str> {
-    Some(if varying { "varchar" } else { "bpchar" }.into())
-}
-
-impl rules::character for Parser<'_> {
-    fn character_1(&mut self, v2: bool) -> Result<Option<Str>, Error> {
-        Ok(character(v2))
-    }
-
-    fn character_2(&mut self, v2: bool) -> Result<Option<Str>, Error> {
-        Ok(character(v2))
-    }
-
-    fn character_4(&mut self, v3: bool) -> Result<Option<Str>, Error> {
-        Ok(character(v3))
-    }
-
-    fn character_5(&mut self, v3: bool) -> Result<Option<Str>, Error> {
-        Ok(character(v3))
-    }
-
-    fn character_6(&mut self, v2: bool) -> Result<Option<Str>, Error> {
-        Ok(character(v2))
-    }
-}
-
-impl rules::ConstDatetime for Parser<'_> {
-    fn ConstDatetime_1(
-        &mut self,
-        v3: i32,
-        v5: bool,
-        at1: i32,
-        at3: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        let name = if v5 { "timestamptz" } else { "timestamp" };
-        Ok(system_type_mods(name, list_make1(Some(makeIntConst(v3, at3))), at1))
-    }
-
-    fn ConstDatetime_2(&mut self, v2: bool, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type(if v2 { "timestamptz" } else { "timestamp" }, at1))
-    }
-
-    fn ConstDatetime_3(
-        &mut self,
-        v3: i32,
-        v5: bool,
-        at1: i32,
-        at3: i32,
-    ) -> Result<Option<Box<TypeName>>, Error> {
-        let name = if v5 { "timetz" } else { "time" };
-        Ok(system_type_mods(name, list_make1(Some(makeIntConst(v3, at3))), at1))
-    }
-
-    fn ConstDatetime_4(&mut self, v2: bool, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type(if v2 { "timetz" } else { "time" }, at1))
-    }
-}
-
-impl rules::ConstInterval for Parser<'_> {
-    fn ConstInterval_1(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("interval", at1))
     }
 }
 
@@ -407,8 +154,24 @@ impl rules::interval_second for Parser<'_> {
     }
 }
 
-impl rules::JsonType for Parser<'_> {
-    fn JsonType_1(&mut self, at1: i32) -> Result<Option<Box<TypeName>>, Error> {
-        Ok(system_type("json", at1))
+impl rules::zone_value for Parser<'_> {
+    fn zone_value_3(
+        &mut self,
+        v1: Option<Box<TypeName>>,
+        v2: Option<Str>,
+        v3: List,
+        at2: i32,
+        at3: i32,
+    ) -> Result<Option<Node>, Error> {
+        let mut t = v1;
+        if !v3.is_empty() {
+            let n = castRef::<A_Const>(linitial(&v3))?;
+            if (intVal(n.val.as_ref())? & !(INTERVAL_MASK(HOUR) | INTERVAL_MASK(MINUTE))) != 0 {
+                let message = "time zone interval must be HOUR or HOUR TO MINUTE";
+                return Err(self.error(ERRCODE_SYNTAX_ERROR, message, at3));
+            }
+        }
+        pointee_mut(&mut t)?.typmods = v3;
+        Ok(Some(makeStringConstCast(v2, at2, t)))
     }
 }

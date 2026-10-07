@@ -1,70 +1,12 @@
-//! The actions of the names and the constants: the qualified names, the function names, the
-//! literal constants and the role names.
+//! The actions of the names and the constants that the translator cannot write: the literal
+//! constants, the role names and the negative float constants of `NumericOnly`.
 
 use super::*;
 use crate::error::Error;
 use crate::generated::glue::rules;
 use crate::nodes::*;
 
-impl rules::qualified_name for Parser<'_> {
-    fn qualified_name_1(
-        &mut self,
-        v1: Option<Str>,
-        at1: i32,
-    ) -> Result<Option<Box<RangeVar>>, Error> {
-        Ok(Some(Box::new(makeRangeVar(None, v1, at1))))
-    }
-
-    fn qualified_name_2(
-        &mut self,
-        v1: Option<Str>,
-        v2: List,
-        at1: i32,
-    ) -> Result<Option<Box<RangeVar>>, Error> {
-        Ok(Some(Box::new(makeRangeVarFromQualifiedName(v1, v2, at1, self)?)))
-    }
-}
-
-impl rules::func_name for Parser<'_> {
-    fn func_name_2(&mut self, v1: Option<Str>, v2: List) -> Result<List, Error> {
-        check_func_name(lcons(Some(makeString(v1)), v2), self)
-    }
-}
-
 impl rules::AexprConst for Parser<'_> {
-    fn AexprConst_1(&mut self, v1: i32, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeIntConst(v1, at1)))
-    }
-
-    fn AexprConst_2(&mut self, v1: Option<Str>, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeFloatConst(v1, at1)))
-    }
-
-    fn AexprConst_3(&mut self, v1: Option<Str>, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeStringConst(v1, at1)))
-    }
-
-    fn AexprConst_4(&mut self, v1: Option<Str>, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeBitStringConst(v1, at1)))
-    }
-
-    fn AexprConst_5(&mut self, v1: Option<Str>, at1: i32) -> Result<Option<Node>, Error> {
-        // A hexadecimal string is a bit string constant, as in SQL99.
-        Ok(Some(makeBitStringConst(v1, at1)))
-    }
-
-    fn AexprConst_6(
-        &mut self,
-        v1: List,
-        v2: Option<Str>,
-        at1: i32,
-        at2: i32,
-    ) -> Result<Option<Node>, Error> {
-        // The `type 'literal'` syntax for any type.
-        let t = TypeName { location: at1, ..makeTypeNameFromNameList(v1) };
-        Ok(Some(makeStringConstCast(v2, at2, Some(Box::new(t)))))
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn AexprConst_7(
         &mut self,
@@ -94,64 +36,6 @@ impl rules::AexprConst for Parser<'_> {
         }
         let t = TypeName { typmods: v3, location: at1, ..makeTypeNameFromNameList(v1) };
         Ok(Some(makeStringConstCast(v6, at6, Some(Box::new(t)))))
-    }
-
-    fn AexprConst_8(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v2: Option<Str>,
-        at2: i32,
-    ) -> Result<Option<Node>, Error> {
-        Ok(Some(makeStringConstCast(v2, at2, v1)))
-    }
-
-    fn AexprConst_9(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v2: Option<Str>,
-        v3: List,
-        at2: i32,
-    ) -> Result<Option<Node>, Error> {
-        let t = change(v1, |t| t.typmods = v3);
-        Ok(Some(makeStringConstCast(v2, at2, t)))
-    }
-
-    fn AexprConst_10(
-        &mut self,
-        v1: Option<Box<TypeName>>,
-        v3: i32,
-        v5: Option<Str>,
-        at3: i32,
-        at5: i32,
-    ) -> Result<Option<Node>, Error> {
-        let typmods =
-            list_make2(Some(makeIntConst(INTERVAL_FULL_RANGE, -1)), Some(makeIntConst(v3, at3)));
-        let t = change(v1, |t| t.typmods = typmods);
-        Ok(Some(makeStringConstCast(v5, at5, t)))
-    }
-
-    fn AexprConst_11(&mut self, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeBoolAConst(true, at1)))
-    }
-
-    fn AexprConst_12(&mut self, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeBoolAConst(false, at1)))
-    }
-
-    fn AexprConst_13(&mut self, at1: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(makeNullAConst(at1)))
-    }
-}
-
-impl rules::SignedIconst for Parser<'_> {
-    fn SignedIconst_2(&mut self, v2: i32) -> Result<i32, Error> {
-        Ok(v2)
-    }
-
-    fn SignedIconst_3(&mut self, v2: i32) -> Result<i32, Error> {
-        // The lexer gives an `Iconst` only for a value that fits in an `int4`, so the negation
-        // cannot overflow.
-        Ok(-v2)
     }
 }
 
@@ -192,16 +76,12 @@ impl rules::RoleSpec for Parser<'_> {
         };
         Ok(Some(Box::new(n)))
     }
+}
 
-    fn RoleSpec_2(&mut self, at1: i32) -> Result<Option<Box<RoleSpec>>, Error> {
-        Ok(Some(Box::new(makeRoleSpec(RoleSpecType::ROLESPEC_CURRENT_ROLE, at1))))
-    }
-
-    fn RoleSpec_3(&mut self, at1: i32) -> Result<Option<Box<RoleSpec>>, Error> {
-        Ok(Some(Box::new(makeRoleSpec(RoleSpecType::ROLESPEC_CURRENT_USER, at1))))
-    }
-
-    fn RoleSpec_4(&mut self, at1: i32) -> Result<Option<Box<RoleSpec>>, Error> {
-        Ok(Some(Box::new(makeRoleSpec(RoleSpecType::ROLESPEC_SESSION_USER, at1))))
+impl rules::NumericOnly for Parser<'_> {
+    fn NumericOnly_3(&mut self, v2: Option<Str>) -> Result<Option<Node>, Error> {
+        let mut f = v2.unwrap_or_default();
+        doNegateFloat(&mut f);
+        Ok(Some(makeFloat(Some(f))))
     }
 }

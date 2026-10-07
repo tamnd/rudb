@@ -15,12 +15,12 @@ fn leftmostLoc(loc1: i32, loc2: i32) -> i32 {
 }
 
 /// `exprLocation` of a node that can be `NULL`.
-pub(crate) fn exprLocation(expr: Option<&Node>) -> i32 {
+pub(super) fn exprLocation(expr: Option<&Node>) -> i32 {
     expr.map_or(-1, nodeLocation)
 }
 
 /// `exprLocation` of a list: the location of its first element that has one.
-pub(crate) fn listLocation(list: &List) -> i32 {
+pub(super) fn listLocation(list: &List) -> i32 {
     list.iter().map(|item| exprLocation(item.as_ref())).find(|&loc| loc >= 0).unwrap_or(-1)
 }
 

@@ -26,6 +26,7 @@ mod guc;
 mod lalr;
 mod nodes;
 mod pgparse;
+mod translate;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -87,6 +88,8 @@ const VENDORS: [Vendor; 5] = [
             ("src/include/utils/datetime.h", "datetime.h"),
             ("src/include/utils/timestamp.h", "timestamp.h"),
             ("src/include/utils/xml.h", "xml.h"),
+            ("src/include/storage/lockdefs.h", "lockdefs.h"),
+            ("src/include/common/relpath.h", "relpath.h"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
@@ -170,6 +173,8 @@ const GENERATED: [Generated; 10] = [
             "crates/rudb-pgparse/vendor/datetime.h",
             "crates/rudb-pgparse/vendor/timestamp.h",
             "crates/rudb-pgparse/vendor/xml.h",
+            "crates/rudb-pgparse/vendor/lockdefs.h",
+            "crates/rudb-pgparse/vendor/relpath.h",
             "crates/rudb-common/vendor/errcodes.txt",
             "crates/rudb-pgtypes/vendor/pg_type.dat",
             "crates/rudb-pgparse/vendor/gram.y",
@@ -193,6 +198,8 @@ const GENERATED: [Generated; 10] = [
             "crates/rudb-pgparse/vendor/datetime.h",
             "crates/rudb-pgparse/vendor/timestamp.h",
             "crates/rudb-pgparse/vendor/xml.h",
+            "crates/rudb-pgparse/vendor/lockdefs.h",
+            "crates/rudb-pgparse/vendor/relpath.h",
             "crates/rudb-common/vendor/errcodes.txt",
             "crates/rudb-pgtypes/vendor/pg_type.dat",
             "crates/rudb-pgparse/vendor/gram.y",

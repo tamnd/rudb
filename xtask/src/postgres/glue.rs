@@ -6,10 +6,11 @@
 //! of a rule on the values of its right side and gives the value of its left side.
 //!
 //! An action that only moves a value or makes a constant, for example `{ $$ = $1; }`,
-//! `{ $$ = NIL; }` or `{ $$ = lappend($1, $3); }`, is written into `reduce` here. Every other
-//! action is a method of a trait, one trait for each rule of `gram.y`, with the values that the
-//! action uses as typed arguments. The default of each method gives the error that the action is
-//! not ported. `src/actions` has the ported methods, with the C of `gram.y` ported line by line.
+//! `{ $$ = NIL; }` or `{ $$ = lappend($1, $3); }`, is written into `reduce` here. The translator
+//! of `translate.rs` writes most other actions into `reduce` too. An action that it cannot write
+//! is a method of a trait, one trait for each rule of `gram.y`, with the values that the action
+//! uses as typed arguments. The default of each method gives the error that the action is not
+//! ported. `src/actions` has the ported methods, with the C of `gram.y` ported line by line.
 //!
 //! The plan is `08-the-dialect.md` section 8.8 of the PostgreSQL compatibility notes.
 
@@ -17,7 +18,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use super::gram::{self, Grammar};
-use super::nodes::{self, Headers, Kind, Model, RUST_KEYWORDS};
+use super::nodes::{self, Headers, Model, RUST_KEYWORDS};
+use super::translate::{self, Context, Slot, Ty};
 
 /// One member of `%union`.
 struct Member {
@@ -229,6 +231,7 @@ struct Glue<'a> {
     members: Vec<Member>,
     member_of: HashMap<String, usize>,
     constants: HashMap<String, Constant>,
+    context: Context,
 }
 
 impl Glue<'_> {
@@ -294,8 +297,27 @@ impl Glue<'_> {
                 Ok(Action::Inline { expression, values })
             }
             Some(Err(e)) => Err(e),
-            None => Ok(Action::Method(uses)),
+            None => match translate::translate(
+                &self.context,
+                &body,
+                &self.slots(rule)?,
+                lhs.map(|m| self.slot(m)).as_ref(),
+            ) {
+                Ok((expression, values)) => Ok(Action::Inline { expression, values }),
+                Err(_) => Ok(Action::Method(uses)),
+            },
         }
+    }
+
+    /// The slot of a value of a member, for the translator.
+    fn slot(&self, member: &Member) -> Slot {
+        let ty = Ty::of(&member.rust, &self.context);
+        Slot { member: member.name.clone(), rust: member.rust.clone(), ty: ty.unwrap_or(Ty::Unit) }
+    }
+
+    /// The slots of the right side of a rule. A symbol with no type has none.
+    fn slots(&self, rule: &gram::Rule) -> Result<Vec<Option<Slot>>, String> {
+        rule.rhs.iter().map(|&s| Ok(self.member(s)?.map(|m| self.slot(m)))).collect()
     }
 
     /// The expression for `$$ = expression;`, or `None` when the action needs a method.
@@ -478,7 +500,46 @@ pub(super) fn glue(texts: &[String]) -> Result<String, String> {
     for d in defines.chain(&local.defines) {
         constants.insert(d.name.clone(), Constant::Define(d.rust().0));
     }
-    let glue = Glue { grammar: &grammar, members, member_of, constants };
+    // What the translator knows: the fields of the structs, the constants and the functions.
+    let mut context = Context::default();
+    for (name, fields) in &model.layouts {
+        context.add_struct(name, fields.iter().map(|(f, k)| (f.name.as_str(), k.clone())));
+    }
+    let locals: BTreeSet<String> = local.structs.iter().map(|s| s.name.clone()).collect();
+    let pointees: BTreeSet<String> = model.emitted.union(&locals).cloned().collect();
+    let mut local_kinds = Vec::new();
+    for s in &local.structs {
+        let mut kinds = Vec::new();
+        for field in &s.fields {
+            let kind = nodes::kind(&field.ctype, &pointees, &model.enum_names, &model.nodes)
+                .map_err(|e| format!("{}.{}: {e}", s.name, field.name))?;
+            kinds.push((field.name.as_str(), kind));
+        }
+        context.add_struct(&s.name, kinds.iter().cloned());
+        local_kinds.push((s.name.as_str(), kinds));
+    }
+    context.nodes = model.emitted.clone();
+    context.enums = model.used_enums.clone();
+    for (name, constant) in &constants {
+        context.constants.insert(
+            name.clone(),
+            match constant {
+                Constant::Enum(e) => (format!("{e}::{name}"), Ty::Enum(e.clone())),
+                Constant::Define(rust) => {
+                    let ty = match *rust {
+                        "u8" => Ty::Char,
+                        "&str" => Ty::Keyword,
+                        "i64" => Ty::Int("i64"),
+                        "u32" => Ty::Int("u32"),
+                        _ => Ty::Int("i32"),
+                    };
+                    (name.clone(), ty)
+                }
+            },
+        );
+    }
+    context.add_functions(&texts[nodes::GRAM + 1]);
+    let glue = Glue { grammar: &grammar, members, member_of, constants, context };
 
     let mut out = String::new();
     out.push_str(
@@ -503,29 +564,13 @@ pub(super) fn glue(texts: &[String]) -> Result<String, String> {
     );
 
     // The structs and the constants of the prologue.
-    let locals: BTreeSet<String> = local.structs.iter().map(|s| s.name.clone()).collect();
-    let pointees: BTreeSet<String> = model.emitted.union(&locals).cloned().collect();
-    for s in &local.structs {
+    for (name, kinds) in &local_kinds {
         let _ = write!(
             out,
-            "\n/// The struct `{}` of the prologue of `gram.y`.\n#[derive(Clone, Debug, Default, PartialEq)]\npub(crate) struct {} {{\n",
-            s.name, s.name
+            "\n/// The struct `{name}` of the prologue of `gram.y`.\n#[derive(Clone, Debug, Default, PartialEq)]\npub(crate) struct {name} {{\n",
         );
-        for field in &s.fields {
-            let kind = nodes::kind(&field.ctype, &pointees, &model.enum_names, &model.nodes)
-                .map_err(|e| format!("{}.{}: {e}", s.name, field.name))?;
-            let rust = match kind {
-                Kind::Bool => "bool".to_string(),
-                Kind::Char => "u8".to_string(),
-                Kind::Int(t) => t.to_string(),
-                Kind::Location => "i32".to_string(),
-                Kind::Text => "Option<Str>".to_string(),
-                Kind::List => "List".to_string(),
-                Kind::Node | Kind::Value => "Option<Node>".to_string(),
-                Kind::Boxed(t) => format!("Option<Box<{t}>>"),
-                Kind::Embedded(t) | Kind::Enum(t) => t,
-            };
-            let _ = writeln!(out, "    pub(crate) {}: {rust},", nodes::field_name(&field.name));
+        for (field, kind) in kinds {
+            let _ = writeln!(out, "    pub(crate) {}: {},", nodes::field_name(field), kind.rust());
         }
         out.push_str("}\n");
     }

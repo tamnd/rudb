@@ -100,12 +100,28 @@ impl Define {
 const LIMITS: [(&str, i64); 3] =
     [("PG_INT16_MAX", i16::MAX as i64), ("PG_INT32_MAX", i32::MAX as i64), ("LONG_MAX", i64::MAX)];
 
+/// The invalid values of the `uint32` ID types of `c.h` that `gram.y` uses. `c.h` is not in the
+/// vendored headers, because it has nothing else that the parser needs.
+const INVALID_IDS: [&str; 1] = ["InvalidSubTransactionId"];
+
 /// One field of a C struct, with the type as `gen_node_support.pl` normalizes it.
 #[derive(Clone)]
 pub(super) struct Field {
     pub(super) name: String,
     pub(super) ctype: String,
     ignored: bool,
+    /// What `equal()` of `equalfuncs.c` does with the field.
+    equal: Equality,
+}
+
+/// What `equal()` does with a field, from `pg_node_attr`. It never compares a location.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Equality {
+    Compare,
+    /// `equal_ignore`.
+    Ignore,
+    /// `equal_ignore_if_zero`: the field is the same when one of the two is zero.
+    IgnoreIfZero,
 }
 
 /// One C struct and the attributes that `pg_node_attr` gives it.
@@ -135,6 +151,20 @@ pub(super) fn strip_comments(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The value of a define of an OID, as `((RelFileNumber) InvalidOid)`: a cast to an OID type of
+/// a number or of `InvalidOid`.
+fn oid(text: &str) -> Option<u32> {
+    let inner = text.strip_prefix("((")?.strip_suffix(')')?;
+    let (ctype, value) = inner.split_once(')')?;
+    if !matches!(ctype.trim(), "Oid" | "RelFileNumber") {
+        return None;
+    }
+    match value.trim() {
+        "InvalidOid" => Some(0),
+        value => value.parse().ok(),
+    }
 }
 
 /// Evaluates the value of an enum constant: a number, a character, a constant before it, or the
@@ -286,6 +316,8 @@ pub(super) fn read_header(
                 && !t.contains(['"', '\\'])
             {
                 DefineValue::Text(t.to_string())
+            } else if let Some(oid) = oid(&value) {
+                DefineValue::Oid(oid)
             } else if let Ok(number) = evaluate(&value, &known) {
                 known.insert(name.to_string(), number);
                 match u8::try_from(number) {
@@ -403,6 +435,13 @@ pub(super) fn read_header(
                     name: field,
                     ctype,
                     ignored: field_attributes.contains("read_write_ignore"),
+                    equal: if field_attributes.contains("equal_ignore_if_zero") {
+                        Equality::IgnoreIfZero
+                    } else if field_attributes.contains("equal_ignore") {
+                        Equality::Ignore
+                    } else {
+                        Equality::Compare
+                    },
                 });
             }
             headers.structs.push(Struct { name, fields, attributes });
@@ -425,6 +464,23 @@ pub(super) enum Kind {
     Embedded(String),
     Enum(String),
     Value,
+}
+
+impl Kind {
+    /// The Rust type of a field of the kind.
+    pub(super) fn rust(&self) -> String {
+        match self {
+            Kind::Bool => "bool".to_string(),
+            Kind::Char => "u8".to_string(),
+            Kind::Int(t) => (*t).to_string(),
+            Kind::Location => "i32".to_string(),
+            Kind::Text => "Option<Str>".to_string(),
+            Kind::List => "List".to_string(),
+            Kind::Node | Kind::Value => "Option<Node>".to_string(),
+            Kind::Boxed(t) => format!("Option<Box<{t}>>"),
+            Kind::Embedded(t) | Kind::Enum(t) => t.clone(),
+        }
+    }
 }
 
 /// The kind of a field of a C type.
@@ -481,7 +537,7 @@ pub(super) struct Model {
     /// The `#define` constants that `gram.y` names.
     pub(super) used_defines: BTreeSet<String>,
     /// The fields of each emitted struct, with their kinds.
-    layouts: BTreeMap<String, Vec<(Field, Kind)>>,
+    pub(super) layouts: BTreeMap<String, Vec<(Field, Kind)>>,
 }
 
 /// What the generator reads in a header.
@@ -495,7 +551,7 @@ pub(super) enum Read {
 }
 
 /// The vendored headers, in the order that `GENERATED` gives them.
-pub(super) const HEADERS: [(&str, Read); 14] = [
+pub(super) const HEADERS: [(&str, Read); 16] = [
     ("nodes.h", Read::Nodes),
     ("lockoptions.h", Read::Nodes),
     ("primnodes.h", Read::Nodes),
@@ -510,6 +566,8 @@ pub(super) const HEADERS: [(&str, Read); 14] = [
     ("datetime.h", Read::Constants),
     ("timestamp.h", Read::Constants),
     ("xml.h", Read::Constants),
+    ("lockdefs.h", Read::Constants),
+    ("relpath.h", Read::Constants),
 ];
 
 /// The vendored data files that give constants, after the headers: `errcodes.txt` gives the
@@ -531,6 +589,9 @@ pub(super) fn model(texts: &[String]) -> Result<Model, String> {
     }
     read_errcodes(&texts[HEADERS.len()], &mut headers)?;
     read_types(&texts[HEADERS.len() + 1], &mut headers)?;
+    for name in INVALID_IDS {
+        headers.defines.push(Define { name: name.to_string(), value: DefineValue::Oid(0) });
+    }
     let gram = strip_comments(&texts[GRAM]);
 
     let structs: HashMap<&str, &Struct> =
@@ -649,7 +710,7 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
          \n\
          #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, missing_docs)]\n\
          \n\
-         use crate::nodes::{List, NodeType, Out, Str, w};\n",
+         use crate::nodes::{Equal, List, NodeType, Out, Str, w};\n",
     );
 
     if !used_defines.is_empty() {
@@ -691,18 +752,7 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
             out.push('\n');
         }
         for (field, kind) in fields {
-            let rust = match kind {
-                Kind::Bool => "bool".to_string(),
-                Kind::Char => "u8".to_string(),
-                Kind::Int(t) => (*t).to_string(),
-                Kind::Location => "i32".to_string(),
-                Kind::Text => "Option<Str>".to_string(),
-                Kind::List => "List".to_string(),
-                Kind::Node | Kind::Value => "Option<Node>".to_string(),
-                Kind::Boxed(t) => format!("Option<Box<{t}>>"),
-                Kind::Embedded(t) | Kind::Enum(t) => t.clone(),
-            };
-            let _ = writeln!(out, "    pub {}: {rust},", field_name(&field.name));
+            let _ = writeln!(out, "    pub {}: {},", field_name(&field.name), kind.rust());
         }
         out.push_str("}\n");
     }
@@ -749,6 +799,40 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
         out.push_str("    }\n}\n");
     }
 
+    // The equality of `equalfuncs.c`, which does not compare the locations. The lines break where
+    // rustfmt breaks them.
+    for (name, fields) in &layouts {
+        let mut terms = Vec::new();
+        for (field, kind) in fields {
+            let f = field_name(&field.name);
+            let term = match (kind, field.equal) {
+                (Kind::Location, _) | (_, Equality::Ignore) => continue,
+                (_, Equality::IgnoreIfZero) => {
+                    format!("(self.{f} == other.{f} || self.{f} == 0 || other.{f} == 0)")
+                }
+                (Kind::List | Kind::Node | Kind::Value | Kind::Boxed(_) | Kind::Embedded(_), _) => {
+                    format!("self.{f}.equal(&other.{f})")
+                }
+                _ => format!("self.{f} == other.{f}"),
+            };
+            terms.push(term);
+        }
+        let other = if terms.is_empty() { "_" } else { "other" };
+        let _ = write!(
+            out,
+            "\nimpl Equal for {name} {{\n    fn equal(&self, {other}: &Self) -> bool {{\n"
+        );
+        let line = format!("        {}", terms.join(" && "));
+        if terms.is_empty() {
+            out.push_str("        true\n");
+        } else if line.len() <= 100 {
+            let _ = writeln!(out, "{line}");
+        } else {
+            let _ = writeln!(out, "        {}", terms.join("\n            && "));
+        }
+        out.push_str("    }\n}\n");
+    }
+
     // The node enum, its writer and the conversions.
     out.push_str(
         "\n/// A node of the raw parse tree. The nodes of `value.h` hold their value, and the other\n\
@@ -768,6 +852,24 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
         let _ = writeln!(out, "            Node::{name}(node) => w::braced(s, &**node),");
     }
     out.push_str("        }\n    }\n}\n");
+    out.push_str(
+        "\nimpl Equal for Node {\n    fn equal(&self, other: &Node) -> bool {\n        match (self, other) {\n            \
+         (Node::List(a), Node::List(b)) => a.equal(b),\n            (Node::Integer(a), Node::Integer(b)) => a == b,\n            \
+         (Node::Float(a), Node::Float(b)) => a == b,\n            (Node::Boolean(a), Node::Boolean(b)) => a == b,\n            \
+         (Node::String(a), Node::String(b)) => a == b,\n            (Node::BitString(a), Node::BitString(b)) => a == b,\n",
+    );
+    for name in layouts.keys() {
+        let arm = format!("            (Node::{name}(a), Node::{name}(b)) => a.equal(b),");
+        if arm.len() <= 100 {
+            let _ = writeln!(out, "{arm}");
+        } else {
+            let _ = writeln!(
+                out,
+                "            (Node::{name}(a), Node::{name}(b)) => {{\n                a.equal(b)\n            }}"
+            );
+        }
+    }
+    out.push_str("            _ => false,\n        }\n    }\n}\n");
     for name in layouts.keys() {
         let _ = write!(
             out,

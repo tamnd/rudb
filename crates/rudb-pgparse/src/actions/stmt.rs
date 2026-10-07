@@ -1,7 +1,8 @@
-//! The actions of the statement lists, `parse_toplevel` and `stmtmulti`, and of the small
-//! statements that have no file of their own: `WAIT FOR`.
+//! The actions of the statements that the translator cannot write: the statement lists,
+//! `parse_toplevel` and `stmtmulti`, `CHECKPOINT`, the hash partition bound and the
+//! multiple-column `SET` of `UPDATE`.
 
-use super::{Parser, makeRawStmt, updateRawStmtEnd};
+use super::{Parser, castMut, castRef, defGetInt32, list_length, makeRawStmt, updateRawStmtEnd};
 use crate::error::Error;
 use crate::generated::glue::rules;
 use crate::nodes::*;
@@ -65,14 +66,75 @@ impl rules::stmtmulti for Parser<'_> {
         }
         Ok(list)
     }
+}
 
-    fn stmtmulti_2(&mut self, v1: Option<Node>, at1: i32) -> Result<List, Error> {
-        if v1.is_some() { Ok(vec![Some(makeRawStmt(v1, at1).into())]) } else { Ok(List::new()) }
+impl rules::CheckPointStmt for Parser<'_> {
+    fn CheckPointStmt_1(&mut self, v2: List) -> Result<Option<Node>, Error> {
+        // C sets the options after `$$ = n`, through the pointer that it still has.
+        Ok(Some(CheckPointStmt { options: v2 }.into()))
     }
 }
 
-impl rules::WaitStmt for Parser<'_> {
-    fn WaitStmt_1(&mut self, v4: Option<Str>, v5: List, at4: i32) -> Result<Option<Node>, Error> {
-        Ok(Some(WaitStmt { lsn_literal: v4, options: v5, lsn_location: at4 }.into()))
+impl rules::PartitionBoundSpec for Parser<'_> {
+    fn PartitionBoundSpec_1(
+        &mut self,
+        v5: List,
+        at3: i32,
+    ) -> Result<Option<Box<PartitionBoundSpec>>, Error> {
+        let mut n = PartitionBoundSpec {
+            strategy: PartitionStrategy::PARTITION_STRATEGY_HASH.0 as u8,
+            modulus: -1,
+            remainder: -1,
+            ..Default::default()
+        };
+        for cell in &v5 {
+            let opt = castRef::<DefElem>(cell.as_ref())?;
+            let duplicate =
+                |message| Err(self.error(ERRCODE_DUPLICATE_OBJECT, message, opt.location));
+            match opt.defname.as_deref() {
+                Some("modulus") => {
+                    if n.modulus != -1 {
+                        return duplicate("modulus for hash partition provided more than once");
+                    }
+                    n.modulus = defGetInt32(opt)?;
+                }
+                Some("remainder") => {
+                    if n.remainder != -1 {
+                        return duplicate("remainder for hash partition provided more than once");
+                    }
+                    n.remainder = defGetInt32(opt)?;
+                }
+                name => {
+                    let name = name.unwrap_or_default();
+                    let message =
+                        format!("unrecognized hash partition bound specification \"{name}\"");
+                    return Err(self.error(ERRCODE_SYNTAX_ERROR, &message, opt.location));
+                }
+            }
+        }
+        if n.modulus == -1 {
+            let message = "modulus for hash partition must be specified";
+            return Err(self.error(ERRCODE_SYNTAX_ERROR, message, at3));
+        }
+        if n.remainder == -1 {
+            let message = "remainder for hash partition must be specified";
+            return Err(self.error(ERRCODE_SYNTAX_ERROR, message, at3));
+        }
+        n.location = at3;
+        Ok(Some(Box::new(n)))
+    }
+}
+
+impl rules::set_clause for Parser<'_> {
+    fn set_clause_2(&mut self, mut v2: List, v5: Option<Node>) -> Result<List, Error> {
+        let ncolumns = list_length(&v2);
+        // Each column gets a `MultiAssignRef` with the same source. C has the pointer to the
+        // source in each one, and the Rust has a copy.
+        for (colno, col_cell) in (1..).zip(&mut v2) {
+            let res_col = castMut::<ResTarget>(col_cell)?;
+            let r = MultiAssignRef { source: v5.clone(), colno, ncolumns };
+            res_col.val = Some(r.into());
+        }
+        Ok(v2)
     }
 }
