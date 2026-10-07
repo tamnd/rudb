@@ -9959,9 +9959,7 @@ impl Reader {
                 // that pays otherwise: on JOB the second run of each query cost 60 billion cycles
                 // across the suite against 35 for the third, nearly all of it decoding again the
                 // parts the first run had decoded and let go.
-                if before >= rows
-                    || (positions.is_none() && !self.last_for(column))
-                {
+                if before >= rows || (positions.is_none() && !self.last_for(column)) {
                     return Err(Undecoded::Keep);
                 }
                 // With no statement after this one, a whole read only counts its rows, and a
