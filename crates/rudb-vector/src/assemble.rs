@@ -150,6 +150,23 @@ impl Assembly {
             }
             return Ok(());
         }
+        // A constant is one value for every row it claims, so the value is laid once and every one
+        // of those rows reads it there. Flattening it first wrote the value out again for each row,
+        // and the `ELSE 0` of TPC-H q14's conditional sum was a tenth of the query that way.
+        if piece.form() == Form::Constant && !positions.is_empty() {
+            let one = piece.slice(0, 1)?.flatten()?;
+            let Some(from) = one.data() else {
+                return Err(Error::internal("a flattened vector with no run of data in it"));
+            };
+            let start = self.data.len();
+            let laid = extend(&mut self.data, from, &mut Arenas::default())? == 1;
+            let live = laid && !piece.is_null_at(0);
+            for &row in positions {
+                self.at[row as usize] = if laid { start } else { NOWHERE };
+                self.live[row as usize] = live;
+            }
+            return Ok(());
+        }
         // flatten: the copy loop that does the interleave reads a run of data, and a piece can
         // arrive constant, dictionary encoded or bit packed. Flattening is itself a typed loop per
         // layout, so writing the piece out once here is what stops it being read a value at a time
@@ -160,13 +177,14 @@ impl Assembly {
         };
         let start = self.data.len();
         let appended = extend(&mut self.data, from, &mut Arenas::default())?;
+        let all_live = piece.none_null();
         for (slot, &row) in positions.iter().enumerate() {
             let row = row as usize;
             // A piece whose data is empty is the untyped null, so it claims its rows and they are
             // null, which is what leaving them at `NOWHERE` says.
             if slot < appended {
                 self.at[row] = start + slot;
-                self.live[row] = !piece.is_null_at(slot);
+                self.live[row] = all_live || !piece.is_null_at(slot);
             } else {
                 self.at[row] = NOWHERE;
                 self.live[row] = false;
@@ -1390,6 +1408,30 @@ mod tests {
         assert_eq!(
             values(&built),
             vec![Value::BigInt(0), Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)]
+        );
+    }
+
+    /// A constant is laid once and read by every row it claims, beside a piece that is not one, for
+    /// a number, a string, a null of a type and a constant of no rows.
+    #[test]
+    fn a_constant_piece_is_every_row_it_claims() {
+        let ty = LogicalType::Varchar;
+        let text = |text: &str| Value::Varchar(text.to_string());
+        let arm = Vector::from_values(ty.clone(), &[text("promo"), Value::Null, text("x")])
+            .expect("a vector");
+        let otherwise = Vector::constant(ty.clone(), text("a string longer than twelve bytes"), 3);
+        agrees(&ty, 6, &[(vec![4, 0, 2], arm), (vec![1, 5, 3], otherwise)]);
+        let zero = Vector::constant(LogicalType::BigInt, Value::BigInt(0), 2);
+        let none = Vector::constant(LogicalType::BigInt, Value::Null, 2);
+        let empty = Vector::constant(LogicalType::BigInt, Value::BigInt(9), 0);
+        let built = agrees(
+            &LogicalType::BigInt,
+            5,
+            &[(vec![3, 1], zero), (vec![], empty), (vec![0, 4], none)],
+        );
+        assert_eq!(
+            values(&built),
+            vec![Value::Null, Value::BigInt(0), Value::Null, Value::BigInt(0), Value::Null]
         );
     }
 
