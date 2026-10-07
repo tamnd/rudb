@@ -285,6 +285,7 @@ impl Binder<'_> {
     ) -> Result<Option<ExprRef>> {
         let kernel = match () {
             () if same_name(written, "to_char") => "__rudb_pg_to_char",
+            () if same_name(written, "to_number") => "__rudb_pg_to_number",
             () if same_name(written, "to_timestamp") => "__rudb_pg_to_timestamp",
             () if same_name(written, "to_date") => "__rudb_pg_to_date",
             () => return Ok(None),
@@ -306,6 +307,22 @@ impl Binder<'_> {
             ) => (value, LogicalType::Varchar),
             ("__rudb_pg_to_char", LogicalType::Date) => {
                 (self.cast_to(value, &LogicalType::TimestampTz), LogicalType::Varchar)
+            }
+            (
+                "__rudb_pg_to_char",
+                LogicalType::Integer
+                | LogicalType::BigInt
+                | LogicalType::Numeric
+                | LogicalType::Decimal { .. }
+                | LogicalType::Float
+                | LogicalType::Double,
+            ) => (value, LogicalType::Varchar),
+            // PostgreSQL has no `to_char(int2, text)` and resolves the call to `float8`.
+            ("__rudb_pg_to_char", LogicalType::SmallInt) => {
+                (self.cast_to(value, &LogicalType::Double), LogicalType::Varchar)
+            }
+            ("__rudb_pg_to_number", ty) if text(ty) => {
+                (self.cast_to(value, &LogicalType::Varchar), LogicalType::Numeric)
             }
             ("__rudb_pg_to_timestamp", ty) if text(ty) => {
                 (self.cast_to(value, &LogicalType::Varchar), LogicalType::TimestampTz)
