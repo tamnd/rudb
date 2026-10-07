@@ -2928,10 +2928,16 @@ impl<'a> Building<'a, '_> {
             // exactly the rows that match, is a join that only has to hand its rows on. The plan
             // cannot tell which joins those are, because the reduction is decided once the build
             // side has finished, so the probe asks then. See `crate::join::Probe::settled_by`.
-            let probe = if rudb_opt::eliminate::unread_side(plan, reference, parent) {
-                probe.settled_by(Arc::clone(&sideways))
-            } else {
-                probe
+            let read = rudb_opt::eliminate::read_above(plan, reference, parent);
+            // Only the gathered columns something above reads are gathered, and none at all when
+            // the join can hand its driving rows on. See `crate::join::Probe::read_above`.
+            let probe = match read {
+                Some(read) => {
+                    let flags = held_schema.bindings().iter().map(|at| read.contains(at)).collect();
+                    let probe = probe.read_above(flags);
+                    if read.is_empty() { probe.settled_by(Arc::clone(&sideways)) } else { probe }
+                }
+                None => probe,
             };
             let schema = probe.schema().clone();
             let counters = self.watch(reference, id, pipeline, "Probe", None);

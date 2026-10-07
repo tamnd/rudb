@@ -964,6 +964,10 @@ pub(crate) struct Probe<'a> {
     settling: Option<Arc<Sideways<'a>>>,
     /// Whether the driving rows are known to match, decided once the table is built.
     settled: OnceLock<bool>,
+    /// Which of the gathered side's columns something above reads, empty for all of them.
+    ///
+    /// See [`Probe::read_above`].
+    read: Vec<bool>,
 }
 
 /// The gathered side and the table that finds rows in it.
@@ -1264,6 +1268,7 @@ impl<'a> Probe<'a> {
             narrowing: Vec::new(),
             settling: None,
             settled: OnceLock::new(),
+            read: Vec::new(),
         })
     }
 
@@ -1280,6 +1285,22 @@ impl<'a> Probe<'a> {
     #[must_use]
     pub(crate) fn settled_by(mut self, sideways: Arc<Sideways<'a>>) -> Self {
         self.settling = Some(sideways);
+        self
+    }
+
+    /// Gathers only the columns of the gathered side that `read` marks, and a constant for the rest.
+    ///
+    /// The builder calls this for an inner join whose answer is narrowed by a projection or an
+    /// aggregate above it, with a flag per gathered column for whether anything up to there reads
+    /// it. The rest are still in the chunk so that the column numbers line up, and a constant
+    /// lines them up for nothing rather than for a pass over the matched rows. TPC-H q09 is the
+    /// case: four columns of `supplier` joined to `nation` were gathered for 319 thousand rows and
+    /// only `n_name` was read.
+    #[must_use]
+    pub(crate) fn read_above(mut self, read: Vec<bool>) -> Self {
+        if self.kind == JoinKind::Inner && self.marker.is_none() {
+            self.read = read;
+        }
         self
     }
 
@@ -1693,7 +1714,7 @@ impl Probe<'_> {
         // A semi or an anti join answers with the driving row alone, so there is no gathered half
         // to put beside it and no positions were written for one.
         if !matches!(self.kind, JoinKind::Semi | JoinKind::Anti) {
-            columns.extend(built.rows.gather(&local.right_at)?);
+            columns.extend(built.rows.gather_wanted(&local.right_at, &self.read)?);
         }
         Ok(columns)
     }
