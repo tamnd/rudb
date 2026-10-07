@@ -13844,6 +13844,68 @@ fn each_dialect_types_unknown_values_and_operators() {
 }
 
 #[test]
+fn each_dialect_has_its_functions_errors_and_sequence_owners() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let rows = |connection: &crate::Connection, sql: &str| -> Vec<Vec<Value>> {
+        connection.execute(sql).expect(sql).rows().map(|row| row.to_vec()).collect()
+    };
+    let failed = |connection: &crate::Connection, sql: &str| {
+        let error = connection.execute(sql).expect_err(sql);
+        (error.message().to_string(), error.reported_state().as_str().to_string())
+    };
+    let setup = |connection: &crate::Connection| {
+        for sql in ["CREATE TABLE z (x int)", "CREATE TABLE o (id int)", "CREATE SEQUENCE q"] {
+            connection.execute(sql).expect(sql);
+        }
+    };
+    let parameter = "SELECT $1";
+    let limit = "SELECT 1 LIMIT -1";
+    let part = "SELECT typeof(date_part('year', DATE '2020-01-01'))";
+    let constant = "SELECT 'a'::int + x FROM z";
+    let owned = "ALTER SEQUENCE q OWNED BY o.id";
+    let series = "SELECT generate_series(1, 3)";
+    let db = Database::new();
+    let connection = db.connect();
+    setup(&connection);
+    assert!(failed(&connection, parameter).0.starts_with("Prepared statement parameters"));
+    assert_eq!(failed(&connection, limit).0, "LIMIT/OFFSET cannot be negative");
+    let every = failed(&connection, "SELECT every(true)");
+    assert_eq!(every.0, "Scalar Function with name every does not exist!");
+    assert_eq!(rows(&connection, part), [[Value::Varchar("BIGINT".into())]]);
+    assert!(rows(&connection, constant).is_empty());
+    assert_eq!(failed(&connection, owned).0, "CatalogElement \"o.id\" does not exist!");
+    let list = Value::List {
+        element: LogicalType::BigInt,
+        values: vec![Value::BigInt(1), Value::BigInt(2), Value::BigInt(3)],
+    };
+    assert_eq!(rows(&connection, series), [[list]]);
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    setup(&connection);
+    let undefined = ("there is no parameter $1".to_string(), "42P02".to_string());
+    assert_eq!(failed(&connection, parameter), undefined);
+    let negative = ("LIMIT must not be negative".to_string(), "2201W".to_string());
+    assert_eq!(failed(&connection, limit), negative);
+    assert_eq!(rows(&connection, "SELECT every(true)"), [[Value::Boolean(true)]]);
+    assert_eq!(rows(&connection, part), [[Value::Varchar("DOUBLE".into())]]);
+    connection.execute(constant).expect_err("folded when planned");
+    rows(&connection, owned);
+    let missing = failed(&connection, "ALTER SEQUENCE q OWNED BY o.nope");
+    assert_eq!(missing.0, "column \"nope\" of relation \"o\" does not exist");
+    assert_eq!(missing.1, "42703");
+    let each = [[Value::Integer(1)], [Value::Integer(2)], [Value::Integer(3)]];
+    assert_eq!(rows(&connection, series), each);
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
