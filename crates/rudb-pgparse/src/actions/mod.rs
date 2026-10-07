@@ -34,6 +34,7 @@ mod select;
 mod stmt;
 mod types;
 
+pub(crate) use funcs::exprLocation;
 pub(crate) use gram::*;
 pub(crate) use list::*;
 pub(crate) use make::*;

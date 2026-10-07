@@ -28,7 +28,7 @@ use crate::ast::{
     TriggerEvent, TriggerTiming, Truncate, UnaryOp, WindowBound, WindowExclude, WindowRef,
     WindowSpec, WindowUnit,
 };
-use crate::build::Interner;
+use crate::build::{Change, Interner};
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
 use crate::parameters::{self, Arranged, Refilled, Slot};
@@ -3354,36 +3354,17 @@ impl<'a> Transform<'a> {
         }
         let sets = self.set_clause(self.find(action, "UpdateSetClause"))?;
         let filter = self.find(action, "WhereClause");
-        let condition = if filter == NONE {
-            self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
-        } else {
-            self.expr(self.find(filter, "Expression"))?
-        };
-        let mut targets = Vec::with_capacity(sets.len() + 1);
-        let mut columns = Vec::with_capacity(sets.len());
-        for (column, value) in sets {
-            columns.push(column);
-            targets.push(Target { expr: value, alias: NONE });
-        }
-        targets.push(Target { expr: condition, alias: NONE });
-        let targets = self.target_slice(targets);
-        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
-        let excluded = self.intern("excluded");
-        let right =
-            self.push_source(Source::Table { name, alias: excluded, columns: Slice::default() });
-        let joined = self.push_source(Source::Join {
-            left,
-            right,
-            kind: JoinKind::Positional,
-            natural: false,
-            on: NONE,
-            using: Slice::default(),
-        });
-        let from = self.ast.source_slice([joined]);
-        let select = self.push_select(Select { targets, from, ..Select::empty() });
-        let query = self.push_query(Query::bare(QueryBody::Select(select)));
-        let columns = self.part_slice(columns);
-        Ok(Some(Conflict { target, action: ConflictAction::Update { columns, query } }))
+        let condition =
+            if filter == NONE { NONE } else { self.expr(self.find(filter, "Expression"))? };
+        let action = self.ast.conflict_update(
+            &mut self.interned,
+            name,
+            alias,
+            sets,
+            condition,
+            self.current_span,
+        );
+        Ok(Some(Conflict { target, action }))
     }
 
     /// `ReturningClause <- 'RETURNING' TargetList`, as `SELECT list FROM table [AS alias]`, or
@@ -3398,15 +3379,7 @@ impl<'a> Transform<'a> {
             targets.push(self.target(kid)?);
         }
         let targets = self.target_slice(targets);
-        let from = self.written_table(name, alias);
-        let select = self.push_select(Select { targets, from, ..Select::empty() });
-        Ok(Some(self.push_query(Query::bare(QueryBody::Select(select)))))
-    }
-
-    /// A `FROM` of the one table a writing statement names.
-    fn written_table(&mut self, name: Slice, alias: StrRef) -> Slice {
-        let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
-        self.ast.source_slice([source])
+        Ok(Some(self.ast.returning(name, alias, targets, self.current_span)))
     }
 
     /// An `INSERT`, `UPDATE` or `DELETE`, with the definitions of a `WITH` ahead of it in scope.
@@ -3424,32 +3397,8 @@ impl<'a> Transform<'a> {
         };
         self.ctes.truncate(mark);
         let statement = statement?;
-        self.carry_definitions(statement, &once);
+        self.ast.carry_definitions(statement, &once);
         Ok(statement)
-    }
-
-    /// Puts the held definitions `once` ahead of the ones each query of a written statement already
-    /// carries, its source, its `RETURNING` and the values of an `ON CONFLICT DO UPDATE`.
-    fn carry_definitions(&mut self, statement: Statement, once: &[u32]) {
-        if let (
-            false,
-            Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index),
-        ) = (once.is_empty(), statement)
-        {
-            let insert = self.ast.inserts[index as usize];
-            let update = match insert.conflict.map(|conflict| conflict.action) {
-                Some(ConflictAction::Update { query, .. }) => Some(query),
-                _ => None,
-            };
-            for query in std::iter::once(insert.source).chain(insert.returning).chain(update) {
-                // Outermost first, so the statement's own come ahead of any the query wrote.
-                let own = self.ast.queries[query as usize].ctes;
-                let mut all = once.to_vec();
-                all.extend_from_slice(self.ast.cte_list(own));
-                let slice = self.cte_slice(all);
-                self.ast.queries[query as usize].ctes = slice;
-            }
-        }
     }
 
     /// `UpdateStatement <- WithClause? 'UPDATE' UpdateTarget UpdateSetClause FromClause?
@@ -3536,15 +3485,7 @@ impl<'a> Transform<'a> {
         self.changed_rows(node, name, alias, Vec::new(), true)
     }
 
-    /// The source an `UPDATE` or a `DELETE` is held with, which is `SELECT *, condition, values...
-    /// FROM table`. With no `WHERE` the condition is `TRUE`, since every row is the one meant.
-    ///
-    /// `UPDATE ... FROM` and `DELETE ... USING` are the same thing with the condition and the values
-    /// read from a lateral join instead, `SELECT t.*, m.hit, m.values... FROM table AS t LEFT JOIN
-    /// (SELECT true AS hit, values... FROM sources WHERE condition LIMIT 1) AS m ON true`. The
-    /// `LIMIT 1` is what makes a table row that several source rows match change once, to the
-    /// values of one of them, which is what the pin does. A row nothing matches has a null for the
-    /// flag and is left alone.
+    /// An `UPDATE` or a `DELETE`, held as [`crate::build::Change`] tells.
     fn changed_rows(
         &mut self,
         node: u32,
@@ -3554,120 +3495,15 @@ impl<'a> Transform<'a> {
         delete: bool,
     ) -> Result<Statement> {
         let returning = self.returning(node, name, alias)?;
-        let filter = self.find(node, "WhereClause");
-        let using = match self.find(node, "FromClause") {
+        let written = match self.find(node, "FromClause") {
             NONE => self.find(node, "DeleteUsingClause"),
             clause => clause,
         };
-        if using != NONE {
-            return self.changed_rows_using(name, alias, filter, using, sets, returning, delete);
-        }
-        let hit = if filter == NONE {
-            self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
-        } else {
-            self.expr(self.first(filter))?
-        };
-        let star =
-            self.push(Expr::Star { qualifier: Slice::default(), replacements: Slice::default() });
-        let mut targets =
-            vec![Target { expr: star, alias: NONE }, Target { expr: hit, alias: NONE }];
-        let mut columns = Vec::with_capacity(sets.len());
-        for (column, value) in sets {
-            columns.push(column);
-            targets.push(Target { expr: value, alias: NONE });
-        }
-        let targets = self.target_slice(targets);
-        let from = self.written_table(name, alias);
-        let select = self.push_select(Select { targets, from, ..Select::empty() });
-        let source = self.push_query(Query::bare(QueryBody::Select(select)));
-        let columns = self.part_slice(columns);
-        Ok(self.changed_statement(name, columns, source, returning, delete))
-    }
-
-    /// The lateral form of [`Self::changed_rows`], for a statement with a `FROM` or a `USING`.
-    #[allow(clippy::too_many_arguments)]
-    fn changed_rows_using(
-        &mut self,
-        name: Slice,
-        alias: StrRef,
-        filter: u32,
-        using: u32,
-        sets: Vec<(StrRef, ExprRef)>,
-        returning: Option<QueryRef>,
-        delete: bool,
-    ) -> Result<Statement> {
-        let hit = self.intern("__rudb_hit");
-        let matched = self.intern("__rudb_matched");
-        let alias = if alias == NONE {
-            self.ast.parts[(name.start + name.len - 1) as usize]
-        } else {
-            alias
-        };
-        let yes = self.push(Expr::Literal { kind: LiteralKind::True, text: NONE });
-        let mut inner = vec![Target { expr: yes, alias: hit }];
-        let mut outer_names = vec![hit];
-        let mut columns = Vec::with_capacity(sets.len());
-        for (at, (column, value)) in sets.into_iter().enumerate() {
-            columns.push(column);
-            let named = self.intern(&format!("__rudb_value_{at}"));
-            inner.push(Target { expr: value, alias: named });
-            outer_names.push(named);
-        }
-        let inner = self.target_slice(inner);
-        let from = self.sources(using)?;
+        let using = if written == NONE { None } else { Some(self.sources(written)?) };
+        let filter = self.find(node, "WhereClause");
         let filter = if filter == NONE { NONE } else { self.expr(self.first(filter))? };
-        let select = self.push_select(Select { targets: inner, from, filter, ..Select::empty() });
-        let one = self.intern("1");
-        let limit = self.push(Expr::Literal { kind: LiteralKind::Number, text: one });
-        let query = self.push_query(Query { limit, ..Query::bare(QueryBody::Select(select)) });
-        let right =
-            self.push_source(Source::Subquery { query, alias: matched, columns: Slice::default() });
-        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
-        let on = self.push(Expr::Literal { kind: LiteralKind::True, text: NONE });
-        let join = self.push_source(Source::Join {
-            left,
-            right,
-            kind: JoinKind::Left,
-            natural: false,
-            on,
-            using: Slice::default(),
-        });
-        let from = self.ast.source_slice([join]);
-        let qualifier = self.part_slice(vec![alias]);
-        let star = self.push(Expr::Star { qualifier, replacements: Slice::default() });
-        let mut targets = vec![Target { expr: star, alias: NONE }];
-        for named in outer_names {
-            let name = self.part_slice(vec![matched, named]);
-            let column = self.push(Expr::Column { name });
-            targets.push(Target { expr: column, alias: NONE });
-        }
-        let targets = self.target_slice(targets);
-        let select = self.push_select(Select { targets, from, ..Select::empty() });
-        let source = self.push_query(Query::bare(QueryBody::Select(select)));
-        let columns = self.part_slice(columns);
-        Ok(self.changed_statement(name, columns, source, returning, delete))
-    }
-
-    fn changed_statement(
-        &mut self,
-        name: Slice,
-        columns: Slice,
-        source: QueryRef,
-        returning: Option<QueryRef>,
-        delete: bool,
-    ) -> Statement {
-        let index = self.ast.inserts.len() as u32;
-        self.ast.inserts.push(Insert {
-            name,
-            columns,
-            source,
-            returning,
-            conflict: None,
-            copy: false,
-            overriding: Overriding::None,
-            truncate: None,
-        });
-        if delete { Statement::Delete(index) } else { Statement::Update(index) }
+        let change = Change { name, alias, sets, filter, using, returning, delete, truncate: None };
+        Ok(self.ast.changed_rows(&mut self.interned, change, self.current_span))
     }
 
     /// `SelectStatementInternal <- WithClause? SelectSetOpChain ResultModifiers?`.
@@ -3835,7 +3671,7 @@ impl<'a> Transform<'a> {
                 Held::Inline(_) => None,
             })
             .collect();
-        self.carry_definitions(statement, &earlier);
+        self.ast.carry_definitions(statement, &earlier);
         let (Statement::Insert(at) | Statement::Update(at) | Statement::Delete(at)) = statement
         else {
             unreachable!("a written statement is an insert, an update or a delete")

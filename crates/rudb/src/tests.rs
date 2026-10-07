@@ -13343,6 +13343,62 @@ fn a_postgres_session_reads_the_types_of_the_sql_syntax() {
 }
 
 #[test]
+fn a_postgres_session_writes_rows() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let run = |sql: &str| connection.execute(sql).expect(sql);
+    let rows = |sql: &str| run(sql).rows().map(|row| row.to_vec()).collect::<Vec<_>>();
+    let int = Value::Integer;
+    run("CREATE TABLE t (a int PRIMARY KEY, b int DEFAULT 7, c int)");
+    run("CREATE TABLE u (a int, b int)");
+    assert_eq!(
+        rows("INSERT INTO t VALUES (1, DEFAULT, 1), (2, 2, 2) RETURNING a, b"),
+        [vec![int(1), int(7)], vec![int(2), int(2)]]
+    );
+    assert_eq!(
+        rows(
+            "INSERT INTO t AS x VALUES (1, 5, 0) ON CONFLICT (a) DO UPDATE SET b = excluded.b + x.b \
+             WHERE x.a > 0 RETURNING a, b"
+        ),
+        [vec![int(1), int(12)]]
+    );
+    assert_eq!(
+        rows("INSERT INTO t VALUES (2, 0, 0) ON CONFLICT DO NOTHING RETURNING a"),
+        Vec::<Vec<Value>>::new()
+    );
+    run("UPDATE t SET (b, c) = (20, 30), a = a + 10 WHERE a = 2");
+    run("INSERT INTO u VALUES (1, 100), (12, 200)");
+    run("UPDATE t SET c = u.b FROM u WHERE t.a = u.a");
+    assert_eq!(
+        rows("SELECT a, b, c FROM t ORDER BY a"),
+        [vec![int(1), int(12), int(100)], vec![int(12), int(20), int(200)]]
+    );
+    assert_eq!(
+        rows(
+            "WITH q AS MATERIALIZED (SELECT 12 AS a) DELETE FROM t AS x USING q WHERE x.a = q.a \
+             RETURNING x.a, (SELECT count(*) FROM q)"
+        ),
+        [vec![int(12), Value::BigInt(1)]]
+    );
+    assert_eq!(rows("SELECT a FROM t"), [vec![int(1)]]);
+    let error = connection
+        .execute("UPDATE t SET (a, b) = (1, 2, 3)")
+        .expect_err("three values for two columns");
+    assert_eq!(error.message(), "number of columns does not match number of values");
+    assert_eq!(error.reported_state().as_str(), "42601");
+}
+
+#[test]
 fn a_result_knows_the_table_column_of_each_plain_column() {
     let db = Database::new();
     let connection = db.connect();

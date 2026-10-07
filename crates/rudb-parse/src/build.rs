@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use rudb_common::Span;
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, ColumnDef, Expr, ExprRef, OrderItem, Query, QueryRef, Select,
-    SelectRef, Slice, Source, SourceRef, StrRef, Target, WindowRef, WindowSpec,
+    Ast, BinaryOp, CaseArm, ColumnDef, ConflictAction, Expr, ExprRef, Insert, JoinKind,
+    LiteralKind, OrderItem, Overriding, Query, QueryBody, QueryRef, Select, SelectRef, Slice,
+    Source, SourceRef, Statement, StrRef, Target, Truncate, WindowRef, WindowSpec,
 };
 use crate::matcher::NONE;
 
@@ -147,6 +148,236 @@ impl Ast {
         let start = self.rows.len();
         self.rows.extend(items);
         tail(&self.rows, start)
+    }
+}
+
+/// An `UPDATE`, a `DELETE` or one table of a `TRUNCATE`, as the two transforms read it.
+#[derive(Debug)]
+pub struct Change {
+    /// The name of the table, as a run of parts.
+    pub name: Slice,
+    /// The alias of the table, or `NONE`.
+    pub alias: StrRef,
+    /// Each column that `SET` names, with its new value. Empty for a `DELETE`.
+    pub sets: Vec<(StrRef, ExprRef)>,
+    /// The condition of the `WHERE`, or `NONE`.
+    pub filter: ExprRef,
+    /// The from items of `UPDATE ... FROM` or `DELETE ... USING`, or `None`.
+    pub using: Option<Slice>,
+    /// The `RETURNING` query from [`Ast::returning`], or `None`.
+    pub returning: Option<QueryRef>,
+    /// Whether the statement is a `DELETE`.
+    pub delete: bool,
+    /// The options of the `TRUNCATE` that this `DELETE` stands for, or `None`.
+    pub truncate: Option<Truncate>,
+}
+
+// The writing statements. An `UPDATE`, a `DELETE` and the `DO UPDATE` of an `INSERT` are held as
+// queries over the table that they write, as [`Statement::Update`] tells. These calls make those
+// queries, so that both transforms give the binder the same form.
+impl Ast {
+    /// Add an `INSERT`, an `UPDATE` or a `DELETE`, and give its index in `Ast::inserts`.
+    pub fn push_insert(&mut self, insert: Insert) -> u32 {
+        let index = self.inserts.len() as u32;
+        self.inserts.push(insert);
+        index
+    }
+
+    /// The `FROM` of the one table that a writing statement names.
+    pub fn written_table(&mut self, name: Slice, alias: StrRef) -> Slice {
+        let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        self.source_slice([source])
+    }
+
+    /// The query of a `RETURNING` list, which is `SELECT list FROM table [AS alias]`.
+    pub fn returning(
+        &mut self,
+        name: Slice,
+        alias: StrRef,
+        targets: Slice,
+        span: Span,
+    ) -> QueryRef {
+        let from = self.written_table(name, alias);
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        self.push_query(Query::bare(QueryBody::Select(select)), span)
+    }
+
+    /// The action of `ON CONFLICT DO UPDATE SET ... WHERE condition`, held as `SELECT values...,
+    /// condition FROM table AS alias POSITIONAL JOIN table AS excluded`. The condition is `NONE`
+    /// when the statement has no `WHERE`, and is then true.
+    pub fn conflict_update(
+        &mut self,
+        interned: &mut Interner,
+        name: Slice,
+        alias: StrRef,
+        sets: Vec<(StrRef, ExprRef)>,
+        condition: ExprRef,
+        span: Span,
+    ) -> ConflictAction {
+        let condition = if condition == NONE { self.true_literal(span) } else { condition };
+        let mut targets = Vec::with_capacity(sets.len() + 1);
+        let mut columns = Vec::with_capacity(sets.len());
+        for (column, value) in sets {
+            columns.push(column);
+            targets.push(Target { expr: value, alias: NONE });
+        }
+        targets.push(Target { expr: condition, alias: NONE });
+        let targets = self.target_slice(targets);
+        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let excluded = interned.intern(self, "excluded");
+        let right =
+            self.push_source(Source::Table { name, alias: excluded, columns: Slice::default() });
+        let joined = self.push_source(Source::Join {
+            left,
+            right,
+            kind: JoinKind::Positional,
+            natural: false,
+            on: NONE,
+            using: Slice::default(),
+        });
+        let from = self.source_slice([joined]);
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        let query = self.push_query(Query::bare(QueryBody::Select(select)), span);
+        let columns = self.part_slice(columns);
+        ConflictAction::Update { columns, query }
+    }
+
+    /// An `UPDATE` or a `DELETE`, held with the source `SELECT *, condition, values... FROM table`.
+    /// With no `WHERE` the condition is true, because every row is the one meant.
+    ///
+    /// `UPDATE ... FROM` and `DELETE ... USING` read the condition and the values from a lateral
+    /// join instead, `SELECT t.*, m.hit, m.values... FROM table AS t LEFT JOIN (SELECT true AS hit,
+    /// values... FROM sources WHERE condition LIMIT 1) AS m ON true`. The `LIMIT 1` makes a table
+    /// row that several source rows match change once, to the values of one of them, which is what
+    /// DuckDB and PostgreSQL both do. A row that nothing matches has a null for the flag and is left
+    /// alone.
+    pub fn changed_rows(
+        &mut self,
+        interned: &mut Interner,
+        change: Change,
+        span: Span,
+    ) -> Statement {
+        let Change { name, alias, sets, filter, using, returning, delete, truncate } = change;
+        let columns: Vec<StrRef> = sets.iter().map(|&(column, _)| column).collect();
+        let source = match using {
+            None => {
+                let hit = if filter == NONE { self.true_literal(span) } else { filter };
+                let star = self.push_expr(
+                    Expr::Star { qualifier: Slice::default(), replacements: Slice::default() },
+                    span,
+                );
+                let mut targets =
+                    vec![Target { expr: star, alias: NONE }, Target { expr: hit, alias: NONE }];
+                targets.extend(sets.iter().map(|&(_, expr)| Target { expr, alias: NONE }));
+                let targets = self.target_slice(targets);
+                let from = self.written_table(name, alias);
+                let select = self.push_select(Select { targets, from, ..Select::empty() });
+                self.push_query(Query::bare(QueryBody::Select(select)), span)
+            }
+            Some(from) => self.changed_rows_using(interned, name, alias, &sets, filter, from, span),
+        };
+        let columns = self.part_slice(columns);
+        let index = self.push_insert(Insert {
+            name,
+            columns,
+            source,
+            returning,
+            conflict: None,
+            copy: false,
+            overriding: Overriding::None,
+            truncate,
+        });
+        if delete { Statement::Delete(index) } else { Statement::Update(index) }
+    }
+
+    /// The lateral source of [`Ast::changed_rows`], for a statement with a `FROM` or a `USING`.
+    #[allow(clippy::too_many_arguments)]
+    fn changed_rows_using(
+        &mut self,
+        interned: &mut Interner,
+        name: Slice,
+        alias: StrRef,
+        sets: &[(StrRef, ExprRef)],
+        filter: ExprRef,
+        from: Slice,
+        span: Span,
+    ) -> QueryRef {
+        let hit = interned.intern(self, "__rudb_hit");
+        let matched = interned.intern(self, "__rudb_matched");
+        let alias =
+            if alias == NONE { self.parts[(name.start + name.len - 1) as usize] } else { alias };
+        let yes = self.true_literal(span);
+        let mut inner = vec![Target { expr: yes, alias: hit }];
+        let mut outer_names = vec![hit];
+        for (at, &(_, value)) in sets.iter().enumerate() {
+            let named = interned.intern(self, &format!("__rudb_value_{at}"));
+            inner.push(Target { expr: value, alias: named });
+            outer_names.push(named);
+        }
+        let inner = self.target_slice(inner);
+        let select = self.push_select(Select { targets: inner, from, filter, ..Select::empty() });
+        let one = interned.intern(self, "1");
+        let limit = self.push_expr(Expr::Literal { kind: LiteralKind::Number, text: one }, span);
+        let query =
+            self.push_query(Query { limit, ..Query::bare(QueryBody::Select(select)) }, span);
+        let right =
+            self.push_source(Source::Subquery { query, alias: matched, columns: Slice::default() });
+        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let on = self.true_literal(span);
+        let join = self.push_source(Source::Join {
+            left,
+            right,
+            kind: JoinKind::Left,
+            natural: false,
+            on,
+            using: Slice::default(),
+        });
+        let from = self.source_slice([join]);
+        let qualifier = self.part_slice([alias]);
+        let star = self.push_expr(Expr::Star { qualifier, replacements: Slice::default() }, span);
+        let mut targets = vec![Target { expr: star, alias: NONE }];
+        for named in outer_names {
+            let name = self.part_slice([matched, named]);
+            let column = self.push_expr(Expr::Column { name }, span);
+            targets.push(Target { expr: column, alias: NONE });
+        }
+        let targets = self.target_slice(targets);
+        let select = self.push_select(Select { targets, from, ..Select::empty() });
+        self.push_query(Query::bare(QueryBody::Select(select)), span)
+    }
+
+    /// Puts the held `WITH` definitions `once` of a writing statement ahead of the ones that each
+    /// of its queries carries already: the source, the `RETURNING` and the values of an `ON
+    /// CONFLICT DO UPDATE`. Each of these queries is bound on its own, so each carries them.
+    pub fn carry_definitions(&mut self, statement: Statement, once: &[u32]) {
+        let (Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index)) =
+            statement
+        else {
+            return;
+        };
+        if once.is_empty() {
+            return;
+        }
+        let insert = self.inserts[index as usize];
+        let update = match insert.conflict.map(|conflict| conflict.action) {
+            Some(ConflictAction::Update { query, .. }) => Some(query),
+            _ => None,
+        };
+        for query in std::iter::once(insert.source).chain(insert.returning).chain(update) {
+            if query == NONE {
+                continue;
+            }
+            // Outermost first, so the statement's own come ahead of any the query wrote.
+            let own = self.queries[query as usize].ctes;
+            let mut all = once.to_vec();
+            all.extend_from_slice(self.cte_list(own));
+            let slice = self.cte_slice(all);
+            self.queries[query as usize].ctes = slice;
+        }
+    }
+
+    fn true_literal(&mut self, span: Span) -> ExprRef {
+        self.push_expr(Expr::Literal { kind: LiteralKind::True, text: NONE }, span)
     }
 }
 
