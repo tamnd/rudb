@@ -407,7 +407,71 @@ fn source(ast: &Ast, index: SourceRef) -> String {
             }
             out + ")"
         }
+        Source::Pivot { pivot } => pivot_source(ast, pivot),
     }
+}
+
+/// A `PIVOT` or an `UNPIVOT`, the way the pin's `PivotRef::ToString` writes one.
+///
+/// A bare name in a pivot's `IN` list is the string it spells, so it is written as one.
+fn pivot_source(ast: &Ast, index: u32) -> String {
+    let pivot = ast.pivot(index);
+    let group = |list: Slice| {
+        if list.len == 1 { names(ast, list) } else { format!("({})", names(ast, list)) }
+    };
+    let mut out = source(ast, pivot.source);
+    if pivot.unpivot {
+        out += " UNPIVOT ";
+        if pivot.include_nulls {
+            out += "INCLUDE NULLS ";
+        }
+        out += &format!("({}", group(pivot.values));
+    } else {
+        let written: Vec<String> =
+            ast.target_list(pivot.aggregates).iter().map(|target| aliased(ast, target)).collect();
+        out += &format!(" PIVOT ({}", written.join(", "));
+    }
+    out += " FOR";
+    for column in ast.pivot_column_list(pivot.columns) {
+        if pivot.unpivot {
+            out += &format!(" {} IN ", group(column.names));
+        } else {
+            out += &format!(" ({}) IN ", exprs(ast, column.exprs));
+        }
+        if column.enum_name != NONE {
+            out += &quoted(ast.string(column.enum_name));
+            continue;
+        }
+        let entries: Vec<String> = ast
+            .target_list(column.entries)
+            .iter()
+            .map(|entry| {
+                let written = match ast.expr(entry.expr) {
+                    Expr::Column { name } if !pivot.unpivot && name.len == 1 => {
+                        string(&ast.name_text(name))
+                    }
+                    _ => expr(ast, entry.expr),
+                };
+                if entry.alias == NONE {
+                    written
+                } else {
+                    format!("{written} AS {}", quoted(ast.string(entry.alias)))
+                }
+            })
+            .collect();
+        out += &format!("({})", entries.join(", "));
+    }
+    if !pivot.groups.is_empty() {
+        out += &format!(" GROUP BY {}", names(ast, pivot.groups));
+    }
+    out += ")";
+    if pivot.alias != NONE {
+        out += &format!(" AS {}", quoted(ast.string(pivot.alias)));
+        if !pivot.columns_alias.is_empty() {
+            out += &format!("({})", names(ast, pivot.columns_alias));
+        }
+    }
+    out
 }
 
 /// One argument of a table function, which is an expression or a name and an expression.

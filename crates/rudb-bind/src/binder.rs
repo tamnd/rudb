@@ -495,6 +495,9 @@ pub(crate) struct Binder<'a> {
     /// The written sources that are held, with what a read of one is, so binding the same source
     /// again reads what was held rather than running the source a second time.
     held_sources: Vec<(ast::SourceRef, HeldSide, Scope)>,
+    /// The sources of the pivots being bound, innermost last, each under the name the query written
+    /// for its pivot reads it by. See `crate::pivot`.
+    pub(crate) pivot_sources: Vec<(String, NodeRef, Scope)>,
 }
 
 /// One side of a join that is materialised so it runs once.
@@ -570,6 +573,7 @@ impl<'a> Binder<'a> {
             source: None,
             held: Vec::new(),
             held_sources: Vec::new(),
+            pivot_sources: Vec::new(),
         }
     }
 
@@ -1858,12 +1862,15 @@ impl<'a> Binder<'a> {
         self.unnest_grouping = outer_unnest_grouping;
         self.grouped_unnests = outer_grouped_unnests;
         self.joined_above = outer_joined_above;
-        if !extra.is_empty() && written.distinct != Distinct::No {
-            return Err(Error::binder(
-                "For SELECT DISTINCT, ORDER BY expressions must appear in the select list",
-            ));
+        let mut on = self.distinct_on(ast, written.distinct, &output)?;
+        // A plain DISTINCT sorted on something it does not select is, as on the pin, a DISTINCT ON
+        // what it selects, keeping the first row of each.
+        if !extra.is_empty() && written.distinct == Distinct::Yes {
+            for column in &output.columns[..visible] {
+                let (binding, ty) = (column.binding, column.ty.clone());
+                on.push(self.plan.add_expr(Expr::Column(binding), ty));
+            }
         }
-        let on = self.distinct_on(ast, written.distinct, &output)?;
 
         node = self.attach_scalar_subqueries(node);
 
@@ -2765,7 +2772,11 @@ impl<'a> Binder<'a> {
         Ok((node, scope, here))
     }
 
-    fn bind_source(&mut self, ast: &Ast, source: ast::SourceRef) -> Result<(NodeRef, Scope)> {
+    pub(crate) fn bind_source(
+        &mut self,
+        ast: &Ast,
+        source: ast::SourceRef,
+    ) -> Result<(NodeRef, Scope)> {
         match ast.source(source) {
             ast::Source::Table { name, alias, columns } => {
                 self.bind_table(ast, name, alias, columns)
@@ -2805,6 +2816,7 @@ impl<'a> Binder<'a> {
             ast::Source::Join { left, right, kind, natural, on, using } => {
                 self.bind_join(ast, left, right, kind, natural, on, using)
             }
+            ast::Source::Pivot { pivot } => self.bind_pivot(ast, pivot),
         }
     }
 
@@ -2866,6 +2878,15 @@ impl<'a> Binder<'a> {
         columns: ast::Slice,
     ) -> Result<(NodeRef, Scope)> {
         let parts: Vec<&str> = ast.name(name).collect();
+        // The source of a pivot, read by the query written for the pivot.
+        if let [single] = parts[..]
+            && let Some((node, mut scope)) = self.pivot_source(single)
+        {
+            let label =
+                if alias == NONE { single.to_string() } else { ast.string(alias).to_string() };
+            scope.relabel(&label);
+            return Ok((node, scope));
+        }
         // Rows the statement was handed under a name, which a trigger's body reads the rows that
         // fired it through, and which hide a table of the same name the way a `WITH` does.
         if let [single] = parts[..]

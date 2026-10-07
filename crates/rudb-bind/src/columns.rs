@@ -209,59 +209,8 @@ pub(crate) fn has_star(ast: &Ast, expr: ast::ExprRef) -> bool {
 }
 
 /// The expressions directly under `expr`, leaving out the body of a subquery.
-fn children(ast: &Ast, expr: ast::ExprRef) -> Vec<ast::ExprRef> {
-    let list = |slice: ast::Slice| ast.expr_list(slice).to_vec();
-    let mut out = match ast.expr(expr) {
-        ast::Expr::Star { .. }
-        | ast::Expr::Column { .. }
-        | ast::Expr::Positional { .. }
-        | ast::Expr::Literal { .. }
-        | ast::Expr::Parameter { .. }
-        | ast::Expr::Default
-        | ast::Expr::Subquery { .. }
-        | ast::Expr::Exists { .. } => Vec::new(),
-        ast::Expr::Columns { inner, .. } => vec![inner],
-        ast::Expr::Unary { operand, .. }
-        | ast::Expr::Cast { operand, .. }
-        | ast::Expr::InSubquery { operand, .. }
-        | ast::Expr::QuantifiedSubquery { operand, .. } => vec![operand],
-        ast::Expr::Lambda { body, .. } => vec![body],
-        ast::Expr::Binary { left, right, .. }
-        | ast::Expr::QuantifiedArray { operand: left, array: right, .. } => vec![left, right],
-        ast::Expr::Function { args, filter, .. } => {
-            let mut out = list(args);
-            out.push(filter);
-            out.extend(ast.named_args(expr).iter().map(|target| target.expr));
-            out.extend(ast.aggregate_order(expr).iter().map(|item| item.expr));
-            out
-        }
-        ast::Expr::Window { args, filter, order, spec, .. } => {
-            let held = ast.window(spec);
-            let mut out = list(args);
-            out.push(filter);
-            out.extend(ast.order_list(order).iter().map(|item| item.expr));
-            out.extend(list(held.partition));
-            out.extend(ast.order_list(held.order).iter().map(|item| item.expr));
-            out
-        }
-        ast::Expr::Case { operand, arms, otherwise } => {
-            let mut out = vec![operand, otherwise];
-            for arm in ast.arm_list(arms) {
-                out.extend([arm.when, arm.then]);
-            }
-            out
-        }
-        ast::Expr::Between { operand, low, high, .. } => vec![operand, low, high],
-        ast::Expr::In { operand, list: items, .. } => {
-            let mut out = vec![operand];
-            out.extend(list(items));
-            out
-        }
-        ast::Expr::List { items } | ast::Expr::Row { items } => list(items),
-        ast::Expr::Struct { values, .. } => list(values),
-    };
-    out.retain(|&child| child != NONE);
-    out
+pub(crate) fn children(ast: &Ast, expr: ast::ExprRef) -> Vec<ast::ExprRef> {
+    ast.children(expr)
 }
 
 /// A name written in an `EXCLUDE` or a `RENAME` list, the way the pin prints one.

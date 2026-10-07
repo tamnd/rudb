@@ -215,6 +215,8 @@ pub(crate) struct Settings {
     null_on_division_by_zero: RwLock<bool>,
     /// Whether an `ORDER BY` may name a non-integer literal that cannot affect the order.
     order_by_non_integer_literal: RwLock<bool>,
+    /// The most columns a pivot may make.
+    pivot_limit: RwLock<u64>,
     /// Whether regex match operators require the entire string to match.
     regex_match_operator_semantics: RwLock<String>,
     /// Whether a lambda may be written with the deprecated arrow, kept as it was written.
@@ -366,6 +368,7 @@ impl Settings {
             preserve_identifier_case: RwLock::new("preserve_case".to_string()),
             null_on_division_by_zero: RwLock::new(false),
             order_by_non_integer_literal: RwLock::new(false),
+            pivot_limit: RwLock::new(100_000),
             regex_match_operator_semantics: RwLock::new("partial".to_string()),
             lambda_syntax: RwLock::new("DEFAULT".to_string()),
             scalar_subquery_error_on_multiple_rows: RwLock::new(true),
@@ -888,6 +891,18 @@ impl Settings {
                     .write()
                     .unwrap_or_else(|held| held.into_inner()) = enabled;
             }
+            "pivot_limit" => {
+                let limit = match value {
+                    Some(value) => u64::try_from(integer_of(value, "UINT64")?).map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Failed to cast value: Could not convert string '{}' to UINT64",
+                            text_of(value)
+                        ))
+                    })?,
+                    None => 100_000,
+                };
+                *self.pivot_limit.write().unwrap_or_else(|held| held.into_inner()) = limit;
+            }
             "preserve_identifier_case" => {
                 if matches!(value, Some(Value::Null)) {
                     return Err(Error::invalid_input(
@@ -1297,6 +1312,9 @@ impl Settings {
                 .read()
                 .unwrap_or_else(|held| held.into_inner())
                 .to_string()),
+            "pivot_limit" => {
+                Ok(self.pivot_limit.read().unwrap_or_else(|held| held.into_inner()).to_string())
+            }
             "preserve_identifier_case" => Ok(self
                 .preserve_identifier_case
                 .read()
@@ -1404,6 +1422,7 @@ impl Settings {
             *self.null_on_division_by_zero.read().unwrap_or_else(|held| held.into_inner());
         let order_by_non_integer_literal =
             *self.order_by_non_integer_literal.read().unwrap_or_else(|held| held.into_inner());
+        let pivot_limit = *self.pivot_limit.read().unwrap_or_else(|held| held.into_inner());
         let preserve_identifier_case =
             self.preserve_identifier_case.read().unwrap_or_else(|held| held.into_inner()).clone();
         let regex_match_operator_semantics = self
@@ -1436,6 +1455,7 @@ impl Settings {
         session.set_integer_division(integer_division);
         session.set_null_on_division_by_zero(null_on_division_by_zero);
         session.set_order_by_non_integer_literal(order_by_non_integer_literal);
+        session.set_pivot_limit(pivot_limit);
         session.set_identifier_case(match preserve_identifier_case.as_str() {
             "lowercase" => IdentifierCase::Lower,
             "uppercase" => IdentifierCase::Upper,
@@ -1478,6 +1498,7 @@ impl Settings {
                     "null_on_division_by_zero" => null_on_division_by_zero.to_string(),
                     "memory_limit" => memory.clone(),
                     "order_by_non_integer_literal" => order_by_non_integer_literal.to_string(),
+                    "pivot_limit" => pivot_limit.to_string(),
                     "preserve_identifier_case" => preserve_identifier_case.clone(),
                     "lambda_syntax" => lambda_syntax.clone(),
                     "regex_match_operator_semantics" => regex_match_operator_semantics.clone(),

@@ -1559,7 +1559,7 @@ impl Binder<'_> {
                 *bound = self.cast_to(*bound, &ty);
             }
         }
-        if let Some(function) = ["coalesce", "greatest", "least"]
+        if let Some(function) = ["coalesce", "greatest", "least", "unpivot_list"]
             .into_iter()
             .find(|name| rudb_catalog::same_name(&written, name))
         {
@@ -1590,6 +1590,15 @@ impl Binder<'_> {
             for arg in &mut bound {
                 *arg = self.cast_to(*arg, &LogicalType::Varchar);
             }
+        }
+        // The list an unpivot writes of the columns it takes apart, which is a `list_value` that
+        // refuses columns with nothing in common rather than reading them all as text.
+        if rudb_catalog::same_name(&written, "unpivot_list") {
+            return self.call("list_value", bound);
+        }
+        // `row` is the function a row is written as, which builds a struct with unnamed fields.
+        if rudb_catalog::same_name(&written, "row") {
+            return self.pack_struct(&vec![String::new(); bound.len()], &bound);
         }
         if rudb_catalog::same_name(&written, "coalesce") && bound.len() > 1 {
             let call = self.call(&written, bound)?;
@@ -3192,6 +3201,10 @@ impl Binder<'_> {
                         return Err(Error::binder(if function == "coalesce" {
                             format!(
                                 "Cannot mix values of type {left} and {right} in COALESCE operator - an explicit cast is required"
+                            )
+                        } else if function == "unpivot_list" {
+                            format!(
+                                "Cannot unpivot columns of types {left} and {right} - an explicit cast is required"
                             )
                         } else {
                             format!(

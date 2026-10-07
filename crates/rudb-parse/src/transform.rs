@@ -24,11 +24,11 @@ use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 use crate::ast::{
     AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
     CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
-    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Overriding,
-    Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice,
-    Source, SourceRef, StarLists, Statement, StrRef, Target, Transaction, Trigger, TriggerEvent,
-    TriggerTiming, Truncate, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec,
-    WindowUnit,
+    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Overriding, Pivot,
+    PivotColumn, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting,
+    Slice, Source, SourceRef, StarLists, Statement, StrRef, Target, Transaction, Trigger,
+    TriggerEvent, TriggerTiming, Truncate, UnaryOp, WindowBound, WindowExclude, WindowRef,
+    WindowSpec, WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -97,6 +97,7 @@ fn transform_dialect(
         query_depth: 0,
         recursing: Vec::new(),
         self_reads: Vec::new(),
+        pivot_enums: Vec::new(),
     };
     transform.program(tree.root())?;
     Ok(transform.ast)
@@ -183,7 +184,27 @@ struct Transform<'a> {
     /// query existed and a read inside the right side was made after. The flag says the read was
     /// written `recurring.name`.
     self_reads: Vec<(u32, Span, u32, bool)>,
+    /// The enum types the pivots of the statement being transformed take their values from, which
+    /// are made by statements of their own run before it.
+    pivot_enums: Vec<PivotEnum>,
 }
+
+/// An enum type made from the data for a pivot that does not list its values.
+#[derive(Debug, Clone, Copy)]
+struct PivotEnum {
+    /// The made up name of the type.
+    name: StrRef,
+    /// What the pivot spreads out on, for the messages.
+    column: ExprRef,
+    /// The query whose rows are the labels.
+    query: QueryRef,
+    /// Whether the source of the pivot holds a parameter, which there is no value for yet when
+    /// the type is made.
+    parameters: bool,
+}
+
+/// How many enum types pivots have made, which is what keeps their names apart.
+static PIVOT_ENUMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What a `WITH` name stands for.
 #[derive(Debug, Clone, Copy)]
@@ -485,6 +506,7 @@ impl<'a> Transform<'a> {
             let inner = self.first(statement);
             let first = self.ast.statements.len();
             let statement = self.statement(statement)?;
+            self.pivot_types()?;
             self.ast.statements.push(statement);
             let Some((names, options)) = truncated else { continue };
             for name in names {
@@ -497,6 +519,38 @@ impl<'a> Transform<'a> {
                     self.ast.inserts[at as usize].truncate = Some(options);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The `CREATE TEMP TYPE ... AS ENUM (...)` statements the pivots of the statement just read
+    /// take their values from, pushed in front of it.
+    ///
+    /// The pin writes the same statements and runs them first, so the types hold the values the
+    /// data has when the statement runs. A source with a parameter in it cannot be read before the
+    /// statement has its values, which is the pin's refusal.
+    fn pivot_types(&mut self) -> Result<()> {
+        for made in std::mem::take(&mut self.pivot_enums) {
+            if made.parameters {
+                return Err(Error::parser(format!(
+                    "PIVOT statements with pivot elements extracted from the data cannot have \
+                     parameters in their source.\nIn order to use parameters the PIVOT values must \
+                     be manually specified, e.g.:\nPIVOT ... ON {} IN (val1, val2, ...)",
+                    crate::deparse::expression(&self.ast, made.column)
+                )));
+            }
+            let name = self.part_slice(vec![made.name]);
+            let statement = self.type_statement(crate::ast::TypeDef {
+                name,
+                drop: false,
+                quiet: false,
+                or_replace: true,
+                temporary: true,
+                cascade: false,
+                ty: NONE,
+                query: made.query,
+            });
+            self.ast.statements.push(statement);
         }
         Ok(())
     }
@@ -1921,6 +1975,7 @@ impl<'a> Transform<'a> {
         } else {
             (self.text(body).to_string(), self.query(body)?)
         };
+        self.no_pivot_enums("view")?;
         if self.ast.ctes[before..].iter().any(|cte| cte.dml.is_some()) {
             return Err(Error::binder(
                 "DML statements (INSERT/UPDATE/DELETE) are not allowed as CTE bodies inside a VIEW",
@@ -1981,6 +2036,7 @@ impl<'a> Transform<'a> {
             query_depth: self.query_depth,
             recursing: Vec::new(),
             self_reads: Vec::new(),
+            pivot_enums: Vec::new(),
         };
         let mut found = Vec::new();
         nested.named_nodes(tree.root(), "SelectStatementInternal", &mut found);
@@ -2524,6 +2580,7 @@ impl<'a> Transform<'a> {
                 let expr = self.expr(self.find(body, "Expression"))?;
                 (false, crate::deparse::expression(&self.ast, expr))
             };
+            self.no_pivot_enums("macro")?;
             overloads.push(MacroOverload { parameters, table, body });
         }
         let made = MacroDef {
@@ -4028,6 +4085,8 @@ impl<'a> Transform<'a> {
                         Ok(self.push_query(Query::bare(QueryBody::Values(rows))))
                     }
                     "DescribeStatement" => self.describe_statement(kind),
+                    "PivotStatement" => self.pivot_statement(kind),
+                    "UnpivotStatement" => self.unpivot_statement(kind),
                     // `TableStatement <- 'TABLE' BaseTableName` is `SELECT * FROM` the name, and
                     // the pin writes a view over it back in that longer form.
                     "TableStatement" => {
@@ -4570,10 +4629,12 @@ impl<'a> Transform<'a> {
         let mut left = self.inner_table_ref(head)?;
         for tail in kids {
             let clause = self.first(tail);
-            if self.name(clause) != "JoinClause" {
-                return self.unsupported(clause);
-            }
-            left = self.join(left, self.first(clause))?;
+            left = match self.name(clause) {
+                "JoinClause" => self.join(left, self.first(clause))?,
+                "TablePivotClause" => self.table_pivot(left, clause)?,
+                "TableUnpivotClause" => self.table_unpivot(left, clause)?,
+                _ => return self.unsupported(clause),
+            };
         }
         Ok(left)
     }
@@ -4673,6 +4734,393 @@ impl<'a> Transform<'a> {
             columns.push(name);
         }
         (alias, self.part_slice(columns))
+    }
+
+    /// `TablePivotClause <- 'PIVOT' Parens(TablePivotClauseBody) TableAlias?`, where the body is
+    /// `TargetList 'FOR' PivotValueList+ PivotGroupByList?`.
+    fn table_pivot(&mut self, source: SourceRef, node: u32) -> Result<SourceRef> {
+        let body = self.find(node, "TablePivotClauseBody");
+        let mut aggregates = Vec::new();
+        for kid in self.kids(self.find(body, "TargetList")) {
+            aggregates.push(self.target(kid)?);
+        }
+        let mut columns = Vec::new();
+        for kid in self.kids(body) {
+            if self.name(kid) == "PivotValueList" {
+                columns.push(self.pivot_value_list(kid)?);
+            }
+        }
+        let groups = self.pivot_names(self.find(body, "PivotGroupByList"));
+        let (alias, columns_alias) = self.table_alias(self.find(node, "TableAlias"));
+        let aggregates = self.target_slice(aggregates);
+        Ok(self.push_pivot(
+            Pivot {
+                source,
+                unpivot: false,
+                aggregates,
+                columns: Slice::default(),
+                groups,
+                values: Slice::default(),
+                include_nulls: false,
+                alias,
+                columns_alias,
+            },
+            columns,
+        ))
+    }
+
+    /// `TableUnpivotClause <- 'UNPIVOT' IncludeOrExcludeNulls? Parens(TableUnpivotClauseBody)
+    /// TableAlias?`, where the body is `UnpivotHeader 'FOR' UnpivotValueList+` and each list is
+    /// `UnpivotHeader 'IN' UnpivotTargetList`.
+    fn table_unpivot(&mut self, source: SourceRef, node: u32) -> Result<SourceRef> {
+        let nulls = self.find(node, "IncludeOrExcludeNulls");
+        let include_nulls = nulls != NONE && self.name(self.first(nulls)) == "IncludeNulls";
+        let body = self.find(node, "TableUnpivotClauseBody");
+        let values = self.pivot_names(self.find(body, "UnpivotHeader"));
+        let lists: Vec<u32> =
+            self.kids(body).filter(|&kid| self.name(kid) == "UnpivotValueList").collect();
+        if lists.len() != 1 {
+            return Err(Error::parser("UNPIVOT requires a single pivot element"));
+        }
+        let names = self.pivot_names(self.find(lists[0], "UnpivotHeader"));
+        if names.len != 1 {
+            return Err(Error::parser(
+                "UNPIVOT requires a single column name for the PIVOT IN clause",
+            ));
+        }
+        let mut entries = Vec::new();
+        let list = self.descendant(self.find(lists[0], "UnpivotTargetList"), "TargetList");
+        for kid in self.kids(list) {
+            entries.push(self.target(kid)?);
+        }
+        let entries = self.target_slice(entries);
+        let column = PivotColumn { exprs: Slice::default(), entries, enum_name: NONE, names };
+        let (alias, columns_alias) = self.table_alias(self.find(node, "TableAlias"));
+        Ok(self.push_pivot(
+            Pivot {
+                source,
+                unpivot: true,
+                aggregates: Slice::default(),
+                columns: Slice::default(),
+                groups: Slice::default(),
+                values,
+                include_nulls,
+                alias,
+                columns_alias,
+            },
+            vec![column],
+        ))
+    }
+
+    /// `PivotValueList <- PivotHeader 'IN' PivotValueTarget`, where the target is the name of an
+    /// enum type or a parenthesised list.
+    ///
+    /// A parenthesised header is a column for each of its parts when some entry is a parenthesised
+    /// list as well, so `(a, b) IN ((1, 2))` spreads on two columns, and is one row value
+    /// otherwise, so `(a, b) IN (x)` spreads on one. That is the pin's rule. A qualified name in
+    /// the list is refused here as the pin refuses it, since a bare name there is a string.
+    fn pivot_value_list(&mut self, node: u32) -> Result<PivotColumn> {
+        let header = self.expr(self.first(self.find(node, "PivotHeader")))?;
+        let target = self.first(self.find(node, "PivotValueTarget"));
+        let mut enum_name = NONE;
+        let mut entries = Vec::new();
+        if self.name(target) == "PivotEnumTarget" {
+            enum_name = self.identifier(target);
+        } else {
+            for kid in self.kids(self.descendant(target, "TargetList")) {
+                let entry = self.target(kid)?;
+                if self.qualified_column(entry.expr) {
+                    return Err(Error::parser(
+                        "PIVOT IN list cannot contain qualified column references",
+                    ));
+                }
+                entries.push(entry);
+            }
+        }
+        let tuples =
+            entries.iter().any(|entry| matches!(self.ast.expr(entry.expr), Expr::Row { .. }));
+        let exprs = match self.ast.expr(header) {
+            Expr::Row { items } if tuples => self.ast.expr_list(items).to_vec(),
+            _ => vec![header],
+        };
+        let exprs = self.expr_slice(exprs);
+        let entries = self.target_slice(entries);
+        Ok(PivotColumn { exprs, entries, enum_name, names: Slice::default() })
+    }
+
+    /// Whether an entry of a pivot's `IN` list is a qualified name, there or in a row value.
+    fn qualified_column(&self, expr: ExprRef) -> bool {
+        match self.ast.expr(expr) {
+            Expr::Column { name } => name.len > 1,
+            Expr::Row { items } => {
+                self.ast.expr_list(items).iter().any(|&item| self.qualified_column(item))
+            }
+            _ => false,
+        }
+    }
+
+    /// The names under a `PivotGroupByList`, an `UnpivotHeader` or an `OptionalParensNameList`,
+    /// as a run of [`StrRef`], empty for `NONE`.
+    fn pivot_names(&mut self, node: u32) -> Slice {
+        let mut found = Vec::new();
+        self.named_nodes(node, "ColIdOrString", &mut found);
+        let names = found.into_iter().map(|name| self.identifier(name)).collect();
+        self.part_slice(names)
+    }
+
+    /// Push a pivot with its columns and return the from item that reads it.
+    fn push_pivot(&mut self, mut pivot: Pivot, columns: Vec<PivotColumn>) -> SourceRef {
+        let start = self.ast.pivot_columns.len() as u32;
+        self.ast.pivot_columns.extend(columns);
+        pivot.columns = Slice { start, len: self.ast.pivot_columns.len() as u32 - start };
+        let index = self.ast.pivots.len() as u32;
+        self.ast.pivots.push(pivot);
+        self.push_source(Source::Pivot { pivot: index })
+    }
+
+    /// `PivotStatement <- PivotKeyword TableRef PivotOn? PivotUsing? PivotGroupByList?`.
+    ///
+    /// Without `ON` it is the aggregate grouped by the names, so `PIVOT t USING sum(x) GROUP BY y`
+    /// is `SELECT y, sum(x) FROM t GROUP BY y`. With it, it is `SELECT *` from a pivot of the
+    /// source, counting the rows when no aggregate is named. A column whose values are not listed
+    /// takes them from the data, which the pin does by making an enum type of the distinct values
+    /// before the statement runs and reading its labels, and which is done the same way here: the
+    /// type is a statement of its own that [`Transform::program`] puts in front of this one.
+    fn pivot_statement(&mut self, node: u32) -> Result<QueryRef> {
+        let from = self.find(node, "TableRef");
+        let parameters = self.has_parameter(from);
+        let source = self.table_ref(from)?;
+        let mut aggregates = Vec::new();
+        let using = self.find(node, "PivotUsing");
+        if using != NONE {
+            for kid in self.kids(self.find(using, "TargetList")) {
+                aggregates.push(self.target(kid)?);
+            }
+        }
+        let groups = self.pivot_names(self.find(node, "PivotGroupByList"));
+        let on = self.find(node, "PivotOn");
+        if on == NONE {
+            let mut targets = Vec::new();
+            let mut grouped = Vec::new();
+            for at in groups.range() {
+                let group = self.ast.parts[at];
+                let name = self.part_slice(vec![group]);
+                let column = self.push(Expr::Column { name });
+                targets.push(Target { expr: column, alias: NONE });
+                grouped.push(column);
+            }
+            targets.extend(aggregates);
+            let targets = self.target_slice(targets);
+            let group_by = self.expr_slice(grouped);
+            let start = self.ast.source_lists.len() as u32;
+            self.ast.source_lists.push(source);
+            let from = Slice { start, len: 1 };
+            let select = self.push_select(Select { targets, from, group_by, ..Select::empty() });
+            return Ok(self.push_query(Query::bare(QueryBody::Select(select))));
+        }
+        if aggregates.is_empty() {
+            let count = self.call("count_star", Vec::new());
+            aggregates.push(Target { expr: count, alias: NONE });
+        }
+        let mut columns = Vec::new();
+        for kid in self.kids(self.find(on, "PivotColumnList")) {
+            let entry = self.first(kid);
+            let mut subquery = NONE;
+            let mut column = match self.name(entry) {
+                "PivotValueList" => self.pivot_value_list(entry)?,
+                kind => {
+                    let expr = self.expr(self.first(entry))?;
+                    if kind == "PivotColumnSubquery" {
+                        subquery = self.query(self.find(entry, "SelectStatementInternal"))?;
+                    }
+                    let exprs = self.expr_slice(vec![expr]);
+                    PivotColumn {
+                        exprs,
+                        entries: Slice::default(),
+                        enum_name: NONE,
+                        names: Slice::default(),
+                    }
+                }
+            };
+            for &expr in self.ast.expr_list(column.exprs) {
+                if self.scalar(expr) {
+                    return Err(Error::parser(format!(
+                        "Cannot pivot on constant value \"{}\"",
+                        crate::deparse::expression(&self.ast, expr)
+                    )));
+                }
+                if self.subquery_in(expr) {
+                    return Err(Error::parser(format!(
+                        "Cannot pivot on subquery \"{}\"",
+                        crate::deparse::expression(&self.ast, expr)
+                    )));
+                }
+            }
+            if column.entries.is_empty() && column.enum_name == NONE {
+                let expr = self.ast.expr_list(column.exprs)[0];
+                let query =
+                    if subquery == NONE { self.distinct_values(source, expr) } else { subquery };
+                let name = format!(
+                    "__pivot_enum_{}",
+                    PIVOT_ENUMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                column.enum_name = self.intern(&name);
+                self.pivot_enums.push(PivotEnum {
+                    name: column.enum_name,
+                    column: expr,
+                    query,
+                    parameters,
+                });
+            }
+            columns.push(column);
+        }
+        let aggregates = self.target_slice(aggregates);
+        let pivot = self.push_pivot(
+            Pivot {
+                source,
+                unpivot: false,
+                aggregates,
+                columns: Slice::default(),
+                groups,
+                values: Slice::default(),
+                include_nulls: false,
+                alias: NONE,
+                columns_alias: Slice::default(),
+            },
+            columns,
+        );
+        Ok(self.star_over(pivot))
+    }
+
+    /// `SELECT DISTINCT CAST(expr AS VARCHAR) FROM source WHERE expr IS NOT NULL ORDER BY 1`, the
+    /// query whose rows are the labels of the enum type a pivot reads its values from, with every
+    /// held `WITH` definition in scope carried along so the source can still read them.
+    fn distinct_values(&mut self, source: SourceRef, expr: ExprRef) -> QueryRef {
+        let ty = self.intern("VARCHAR");
+        let cast = self.push(Expr::Cast { operand: expr, ty, try_cast: false });
+        let filter = self.push(Expr::Unary { op: UnaryOp::IsNotNull, operand: expr });
+        let targets = self.target_slice(vec![Target { expr: cast, alias: NONE }]);
+        let start = self.ast.source_lists.len() as u32;
+        self.ast.source_lists.push(source);
+        let from = Slice { start, len: 1 };
+        let select = self.push_select(Select {
+            distinct: Distinct::Yes,
+            targets,
+            from,
+            filter,
+            ..Select::empty()
+        });
+        let text = self.intern("1");
+        let first = self.push(Expr::Literal { kind: LiteralKind::Number, text });
+        let order_by = self.order_slice(vec![OrderItem {
+            expr: first,
+            order: Order::Ascending,
+            nulls: Nulls::Unstated,
+        }]);
+        let mut held = Vec::new();
+        for &(_, cte, _) in &self.ctes {
+            if let Held::Once(cte) = cte
+                && !held.contains(&cte)
+            {
+                held.push(cte);
+            }
+        }
+        held.sort_unstable();
+        let ctes = self.cte_slice(held);
+        let query = Query { ctes, order_by, ..Query::bare(QueryBody::Select(select)) };
+        self.push_query(query)
+    }
+
+    /// `UnpivotStatement <- UnpivotKeyword TableRef 'ON' TargetList IntoNameValues?`, where
+    /// `IntoNameValues <- 'INTO' 'NAME' ColIdOrString ValueOrValues OptionalParensNameList`.
+    ///
+    /// The columns are `name` and `value` unless `INTO` names them, and the rows with a null value
+    /// are left out, as they are for the `UNPIVOT` written after a table.
+    fn unpivot_statement(&mut self, node: u32) -> Result<QueryRef> {
+        let source = self.table_ref(self.find(node, "TableRef"))?;
+        let mut entries = Vec::new();
+        for kid in self.kids(self.find(node, "TargetList")) {
+            entries.push(self.target(kid)?);
+        }
+        let entries = self.target_slice(entries);
+        let into = self.find(node, "IntoNameValues");
+        let (names, values) = if into == NONE {
+            let name = self.intern("name");
+            let value = self.intern("value");
+            (self.part_slice(vec![name]), self.part_slice(vec![value]))
+        } else {
+            let name = self.identifier(self.find(into, "ColIdOrString"));
+            let names = self.part_slice(vec![name]);
+            (names, self.pivot_names(self.find(into, "OptionalParensNameList")))
+        };
+        let column = PivotColumn { exprs: Slice::default(), entries, enum_name: NONE, names };
+        let pivot = self.push_pivot(
+            Pivot {
+                source,
+                unpivot: true,
+                aggregates: Slice::default(),
+                columns: Slice::default(),
+                groups: Slice::default(),
+                values,
+                include_nulls: false,
+                alias: NONE,
+                columns_alias: Slice::default(),
+            },
+            vec![column],
+        );
+        Ok(self.star_over(pivot))
+    }
+
+    /// Whether a parameter is written anywhere under a node.
+    fn has_parameter(&self, node: u32) -> bool {
+        [
+            "QuestionMarkNumberedParameter",
+            "AnonymousParameter",
+            "NumberedParameter",
+            "ColLabelParameter",
+        ]
+        .iter()
+        .any(|&rule| self.contains(node, rule))
+    }
+
+    /// Whether an expression reads nothing, which the pin calls scalar: no column, no star and no
+    /// subquery anywhere in it.
+    fn scalar(&self, expr: ExprRef) -> bool {
+        match self.ast.expr(expr) {
+            Expr::Column { .. }
+            | Expr::Star { .. }
+            | Expr::Columns { .. }
+            | Expr::Positional { .. }
+            | Expr::Window { .. }
+            | Expr::Subquery { .. }
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::QuantifiedSubquery { .. } => false,
+            _ => self.ast.children(expr).into_iter().all(|child| self.scalar(child)),
+        }
+    }
+
+    /// Whether a subquery is anywhere in an expression.
+    fn subquery_in(&self, expr: ExprRef) -> bool {
+        matches!(
+            self.ast.expr(expr),
+            Expr::Subquery { .. }
+                | Expr::Exists { .. }
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedSubquery { .. }
+        ) || self.ast.children(expr).into_iter().any(|child| self.subquery_in(child))
+    }
+
+    /// The pin's refusal of a pivot that takes its values from the data in a view or a macro, which
+    /// has no statement to run before it to make the type the values come from.
+    fn no_pivot_enums(&mut self, what: &str) -> Result<()> {
+        let Some(made) = self.pivot_enums.first() else { return Ok(()) };
+        let column = crate::deparse::expression(&self.ast, made.column);
+        Err(Error::parser(format!(
+            "PIVOT statements with pivot elements extracted from the data cannot be used in \
+             {what}s.\nIn order to use PIVOT in a {what} the PIVOT values must be manually \
+             specified, e.g.:\nPIVOT ... ON {column} IN (val1, val2, ...)"
+        )))
     }
 
     /// `JoinClause <- JoinByClause / RegularJoinClause / JoinWithoutOnClause / NearestJoinClause`.
@@ -7192,6 +7640,11 @@ mod tests {
                     show_source(ast, right)
                 )
             }
+            Source::Pivot { pivot } => {
+                let held = ast.pivot(pivot);
+                let word = if held.unpivot { "UNPIVOT" } else { "PIVOT" };
+                format!("{} {word}", show_source(ast, held.source))
+            }
         }
     }
 
@@ -8354,8 +8807,10 @@ mod tests {
         let mut done = 0;
         for query in CORPUS {
             match parse_ast(query) {
+                // A pivot that reads its values from the data has the type it makes in front.
                 Ok(ast) => {
-                    assert_eq!(ast.statements.len(), 1, "{query}");
+                    let pivot = query.starts_with("PIVOT") && !query.contains(" IN ");
+                    assert_eq!(ast.statements.len(), if pivot { 2 } else { 1 }, "{query}");
                     done += 1;
                 }
                 Err(error) => {

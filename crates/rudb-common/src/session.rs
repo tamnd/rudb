@@ -190,6 +190,7 @@ pub struct Semantics {
     identifier_case: IdentifierCase,
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
+    pivot_limit: u64,
     regex_match_full: bool,
     scalar_subquery_error_on_multiple_rows: bool,
     show_behavior: ShowBehavior,
@@ -209,6 +210,7 @@ impl Default for Semantics {
             identifier_case: IdentifierCase::Preserve,
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
+            pivot_limit: 100_000,
             regex_match_full: false,
             scalar_subquery_error_on_multiple_rows: true,
             show_behavior: ShowBehavior::Auto,
@@ -274,6 +276,12 @@ impl Semantics {
     #[must_use]
     pub fn order_by_non_integer_literal(self) -> bool {
         self.order_by_non_integer_literal
+    }
+
+    /// The most columns a pivot may make.
+    #[must_use]
+    pub fn pivot_limit(self) -> u64 {
+        self.pivot_limit
     }
 
     /// Whether regex match operators require the entire string to match.
@@ -568,6 +576,11 @@ impl Session {
     /// Sets whether a constant non-integer expression is accepted as a sort key.
     pub fn set_order_by_non_integer_literal(&mut self, enabled: bool) {
         self.semantics.order_by_non_integer_literal = enabled;
+    }
+
+    /// Sets the most columns a pivot may make.
+    pub fn set_pivot_limit(&mut self, limit: u64) {
+        self.semantics.pivot_limit = limit;
     }
 
     /// Sets whether casts from local timestamps to zoned timestamps are refused.
