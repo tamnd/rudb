@@ -60,6 +60,15 @@
 //! fetched for the rows the second sweep keeps, which is all the extreme needs. Such a relation
 //! holds its rows until that sweep, and a string held is a string decoded, copied and laid out
 //! again whether it survives or not.
+//!
+//! # Reading a relation twice
+//!
+//! The tree decides which relation can hand keys to which, and a relation that joins two sides of
+//! the query can only be read once every relation on one side of it is gone. A MIN or a MAX does
+//! not care how often a row turns up, so a small relation of that kind can also be read once more
+//! on its own, ahead of the tree, as a root of a tree of its own whose keys go to the next relation
+//! scanned in each of its classes. The answer is the same, since every row of the join has a
+//! partner in that copy, and the copy is empty exactly when the relation is. See [`shadowed`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -465,8 +474,33 @@ fn rewrite(
             }
         })
         .collect();
-    let weights = with_domains(weights);
-    let order = match gyo(&edges, &weights) {
+    let mut weights = with_domains(weights);
+
+    // The relations that may be read once more ahead of the tree, each after the real ones with
+    // the same classes and only the columns its keys and its filters read.
+    let shadows = shadowed(&edges, &weights);
+    let mut edges = edges;
+    let mut shown: Vec<BTreeSet<u32>> = Vec::with_capacity(shadows.len());
+    for &of in &shadows {
+        let keys: BTreeSet<u32> =
+            class_of.keys().filter(|&&(held, _)| held == of).map(|&(_, column)| column).collect();
+        let mut columns = keys.clone();
+        for &predicate in &relations[of].local {
+            walk::columns(plan, predicate, &mut |binding| {
+                if let Some((_, column)) = find.place(plan, binding) {
+                    columns.insert(column);
+                }
+            });
+        }
+        let width = columns
+            .difference(&keys)
+            .map(|&column| if keyed(&field(plan, &relations, (of, column)).ty) { 1 } else { 4 })
+            .sum();
+        edges.push(edges[of].clone());
+        weights.push(Weight { width, ..weights[of].clone() });
+        shown.push(columns);
+    }
+    let order = match gyo(&edges, &weights, &shadows) {
         Ok(order) => trail(&edges, &weights, order),
         Err(reason) => return because(reason),
     };
@@ -510,7 +544,8 @@ fn rewrite(
         .collect();
 
     // Each relation as a fresh scan of what is read of it, with its own filters over it.
-    let mut position = vec![0usize; relations.len()];
+    let real = relations.len();
+    let mut position = vec![0usize; edges.len()];
     for (at, &(relation, _)) in order.iter().enumerate() {
         position[relation] = at;
     }
@@ -525,13 +560,29 @@ fn rewrite(
         narrowed.push((fresh, moved));
         inputs.push(input);
     }
+    // And each copy the order reads, of its keys and what its filters read.
+    for (slot, &of) in shadows.iter().enumerate() {
+        if !order.iter().any(|&(relation, _)| relation == real + slot) {
+            narrowed.push((0, HashMap::new()));
+            inputs.push(inputs[of]);
+            continue;
+        }
+        let fresh = *next;
+        *next += 1;
+        let moved: HashMap<u32, u32> =
+            shown[slot].iter().enumerate().map(|(new, &old)| (old, count_u32(new))).collect();
+        let input = narrow(plan, &relations[of], fresh, &shown[slot], false, &moved, &find);
+        narrowed.push((fresh, moved));
+        inputs.push(input);
+    }
 
-    let mut leaves = Vec::with_capacity(relations.len());
+    let mut leaves = Vec::with_capacity(order.len());
     for &(relation, parent) in &order {
         let moved = &narrowed[relation].1;
+        let source = relation.checked_sub(real).map_or(relation, |slot| shadows[slot]);
         let mut keys: Vec<Key> = class_of
             .iter()
-            .filter(|((held, _), _)| *held == relation)
+            .filter(|((held, _), _)| *held == source)
             .map(|(&(_, column), &class)| Key { class, column: moved[&column] })
             .collect();
         keys.sort_by_key(|key| key.class);
@@ -1425,22 +1476,32 @@ const GATHER: f64 = 16.0;
 ///
 /// Each relation has to share exactly one class with its parent. Two would be a composite key, and
 /// the executor keys a set by one integer.
-fn gyo(edges: &[BTreeSet<u32>], weights: &[Weight]) -> std::result::Result<Order, String> {
-    let mut order = Vec::with_capacity(edges.len());
-    let mut left: Vec<usize> = (0..edges.len()).collect();
+///
+/// The last of `edges` and `weights` are copies of the relations `shadows` names, which the search
+/// may read ahead of the tree, each as a root of its own, while the relation it copies is not taken
+/// yet. See [`shadowed`].
+fn gyo(
+    edges: &[BTreeSet<u32>],
+    weights: &[Weight],
+    shadows: &[usize],
+) -> std::result::Result<Order, String> {
+    let real = edges.len() - shadows.len();
+    let mut order = Vec::with_capacity(real);
+    let mut left: Vec<usize> = (0..real).collect();
     let whole = |relation: usize| weights[relation].cost(&Standing::new(), &edges[relation]);
     left.sort_by(|&one, &other| whole(one).total_cmp(&whole(other)).then(one.cmp(&other)));
     if edges.len() > 64 {
         return Err("joins more than 64 relations".to_owned());
     }
-    // For each class of each relation, the relations that hold it, as bits.
+    // For each class of each relation, the relations that hold it, as bits. A copy holds no class
+    // here, since it is no relation's parent and nothing waits for it to be taken.
     let holders: Vec<Vec<u64>> = edges
         .iter()
         .map(|classes| {
             classes
                 .iter()
                 .map(|class| {
-                    edges
+                    edges[..real]
                         .iter()
                         .enumerate()
                         .filter(|(_, held)| held.contains(class))
@@ -1450,7 +1511,7 @@ fn gyo(edges: &[BTreeSet<u32>], weights: &[Weight]) -> std::result::Result<Order
         })
         .collect();
     let mut prices = Prices::new(edges, weights);
-    let searched = search(edges, weights, &holders, &left, &mut prices);
+    let searched = search(edges, weights, &holders, &left, shadows, &mut prices);
     if let Some((_, found, false)) = searched {
         return Ok(found);
     }
@@ -1512,18 +1573,22 @@ fn search(
     weights: &[Weight],
     holders: &[Vec<u64>],
     ranked: &[usize],
+    shadows: &[usize],
     prices: &mut Prices<'_>,
 ) -> Option<(f64, Order, bool)> {
     type Reached = (f64, Standing, Order);
-    let mut place = vec![0; edges.len()];
+    let real = ranked.len();
+    let mut place: Vec<usize> = (0..edges.len()).collect();
     for (at, &relation) in ranked.iter().enumerate() {
         place[relation] = at;
     }
     let rank = |relation: usize| place[relation];
+    let every = ranked.iter().fold(0_u64, |mask, &relation| mask | 1 << relation);
     let mut layer: BTreeMap<u64, Reached> =
         BTreeMap::from([(0, (0.0, Standing::new(), Vec::new()))]);
+    let mut done: Option<Reached> = None;
     let mut beamed = false;
-    for _ in 0..edges.len() {
+    while !layer.is_empty() {
         // The cheapest way to each set one more ear reaches, as the set it grew from and the ear.
         // What is left standing and the order are only built for the sets the beam keeps: in JOB
         // 29a building them for every set reached took most of its planning.
@@ -1546,6 +1611,13 @@ fn search(
                 found = vec![small];
             } else {
                 found.extend(waiting);
+                // A copy is worth reading only before the relation it copies.
+                for (slot, &of) in shadows.iter().enumerate() {
+                    let copy = real + slot;
+                    if taken & (1 << of | 1 << copy) == 0 {
+                        found.push((copy, None));
+                    }
+                }
             }
             for (ear, parent) in found {
                 let total = cost + prices.cost(ear, standing);
@@ -1588,9 +1660,46 @@ fn search(
                 (key, (total, after, longer))
             })
             .collect();
+        // A set that holds every relation is an order, and a copy read after that adds nothing.
+        let complete: Vec<u64> = layer.keys().copied().filter(|key| key & every == every).collect();
+        for key in complete {
+            let Some(reached) = layer.remove(&key) else { continue };
+            if done.as_ref().is_none_or(|best| reached.0 < best.0) {
+                done = Some(reached);
+            }
+        }
     }
-    layer.into_values().next().map(|(cost, _, order)| (cost, order, beamed))
+    done.map(|(cost, _, order)| (cost, order, beamed))
 }
+
+/// The relations the order may read once more ahead of the tree, see the module documentation.
+///
+/// A relation that joins two classes or more, small enough that a second read costs little. In JOB
+/// 33a `movie_link` joins the two movies and is an ear only once every relation on one side of
+/// it is gone, so the side of the second movie went first: `title` read whole for its years and
+/// its kind kept 15,807 rows in 8.8 ms at one thread, and `movie_info_idx` read for its ratings
+/// kept 1,182 in 4. The three kinds of link keep 2,315 rows of `movie_link` over 951 second
+/// movies, and `title` read at those took under a millisecond.
+///
+/// Only the smallest [`SHADOWS`] of them, since each one doubles the sets the search can reach.
+fn shadowed(edges: &[BTreeSet<u32>], weights: &[Weight]) -> Vec<usize> {
+    if edges.len() + SHADOWS > 64 {
+        return Vec::new();
+    }
+    let mut found: Vec<usize> = (0..edges.len())
+        .filter(|&at| edges[at].len() > 1 && (CHUNK + 1..=SHADOWED).contains(&weights[at].rows))
+        .collect();
+    found.sort_by_key(|&at| (weights[at].rows, at));
+    found.truncate(SHADOWS);
+    found
+}
+
+/// The most rows a relation [`shadowed`] offers to read twice can have. On the IMDb load that takes
+/// in `movie_link`, at 29,997 rows, and `complete_cast`, at 135,086.
+const SHADOWED: u64 = 1 << 18;
+
+/// How many relations [`shadowed`] offers at most.
+const SHADOWS: usize = 2;
 
 /// What [`Weight::cost`] came to for each relation, by what was left standing of the classes it
 /// reads, for [`search`] to ask again.
@@ -2127,7 +2236,7 @@ mod tests {
 
     #[test]
     fn a_star_is_one_tree_with_the_points_under_the_middle() {
-        let order = gyo(&edges(&[&[0], &[0, 1, 2], &[1], &[2]]), &even(4)).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1, 2], &[1], &[2]]), &even(4), &[]).expect("acyclic");
         // The middle is an ear of the last point once the others are gone, which is as good a
         // tree as the other way round, so what matters is one root and the points on the middle.
         let parents = parents(&order);
@@ -2137,7 +2246,7 @@ mod tests {
 
     #[test]
     fn a_triangle_is_a_cycle() {
-        let found = gyo(&edges(&[&[0, 1], &[1, 2], &[2, 0]]), &even(3));
+        let found = gyo(&edges(&[&[0, 1], &[1, 2], &[2, 0]]), &even(3), &[]);
         assert!(found.is_err_and(|reason| reason.contains("cycle")));
     }
 
@@ -2145,7 +2254,7 @@ mod tests {
     fn one_class_shared_by_many_is_a_line_from_the_cheapest_to_the_dearest() {
         let weights =
             [weight(30, 0, 0.5), weight(10, 0, 0.5), weight(40, 0, 0.5), weight(20, 0, 0.5)];
-        let order = gyo(&edges(&[&[0], &[0], &[0], &[0]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0], &[0], &[0]]), &weights, &[]).expect("acyclic");
         assert_eq!(order, [(1, Some(3)), (3, Some(0)), (0, Some(2)), (2, None)]);
     }
 
@@ -2161,7 +2270,7 @@ mod tests {
             Reach { parts: 4_425, values: 2_500_000, per_value: 1.0, wide: 0, wide_per_value: 0.0 },
         )];
         let weights = [weight(2_500_000, 0, 0.0001), clustered, weight(3_100_000, 4, 0.06)];
-        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights, &[]).expect("acyclic");
         let scanned: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         assert_eq!(scanned, [0, 1, 2]);
 
@@ -2180,7 +2289,7 @@ mod tests {
             },
         )];
         let weights = [weight(2_500_000, 0, 0.0001), spread, weight(3_100_000, 4, 0.06)];
-        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights, &[]).expect("acyclic");
         let scanned: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         assert_eq!(scanned, [0, 1, 2]);
     }
@@ -2203,7 +2312,7 @@ mod tests {
             },
         )];
         let weights = [weight(2_500_000, 0, 0.0001), spread, weight(4_000_000, 4, 0.4)];
-        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights, &[]).expect("acyclic");
         let scanned: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         assert_eq!(scanned, [0, 1, 2]);
     }
@@ -2277,13 +2386,32 @@ mod tests {
     /// leaves. Each step alone takes the cheap ones first and the dimension last, where it narrows
     /// nothing.
     #[test]
+    fn a_copy_of_a_small_link_goes_ahead_of_the_sides_it_joins() {
+        // Two sides with no filter of their own, joined by a link that keeps a hundredth of its
+        // rows. The link is an ear only once one side is gone, so without a copy one side is read
+        // whole. The copy is a root of its own, read first, and the link itself is still read.
+        let mut weights = vec![weight(2_500_000, 4, 1.0), weight(2_500_000, 4, 1.0)];
+        weights.push(weight(30_000, 1, 0.01));
+        weights.push(weight(30_000, 1, 0.01));
+        let edges = edges(&[&[0], &[1], &[0, 1], &[0, 1]]);
+        let order = gyo(&edges, &weights, &[2]).expect("acyclic");
+        let parents = parents(&order);
+        assert_eq!(order[0], (3, None), "{order:?}");
+        assert_eq!(parents[3], None, "{order:?}");
+        let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
+        assert!(taken.contains(&2), "{order:?}");
+        let alone = gyo(&edges[..3], &weights[..3], &[]).expect("acyclic");
+        assert!(priced(&edges, &weights, &order) < priced(&edges, &weights, &alone), "{alone:?}");
+    }
+
+    #[test]
     fn a_dear_filter_goes_first_when_the_hub_it_narrows_pays_for_it() {
         let mut weights = vec![weight(1_000_000, 4, 0.01), weight(1_000_000, 0, 1.0)];
         for _ in 0..2 {
             weights.push(weight(900_000, 4, 0.5));
         }
         let edges = edges(&[&[1], &[0, 1], &[0], &[0]]);
-        let order = gyo(&edges, &weights).expect("acyclic");
+        let order = gyo(&edges, &weights, &[]).expect("acyclic");
         parents(&order);
         let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         assert_eq!(taken[..2], [0, 1], "{order:?}");
@@ -2301,7 +2429,7 @@ mod tests {
             weight(3_000_000, 4, 0.06),
         ];
         let edges = edges(&[&[0], &[0, 1, 2], &[1], &[2]]);
-        let order = trail(&edges, &weights, gyo(&edges, &weights).expect("acyclic"));
+        let order = trail(&edges, &weights, gyo(&edges, &weights, &[]).expect("acyclic"));
         let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         let root = order.iter().position(|&(_, parent)| parent.is_none()).expect("a root");
         assert_eq!(order[root].0, 1, "{order:?}");
@@ -2310,7 +2438,7 @@ mod tests {
         // A leaf small enough to read whole costs less than holding the rows the root keeps.
         let mut weights = weights;
         weights[3] = weight(100, 4, 0.06);
-        let order = trail(&edges, &weights, gyo(&edges, &weights).expect("acyclic"));
+        let order = trail(&edges, &weights, gyo(&edges, &weights, &[]).expect("acyclic"));
         let taken: Vec<usize> = order.iter().map(|&(relation, _)| relation).collect();
         let root = order.iter().position(|&(_, parent)| parent.is_none()).expect("a root");
         assert!(taken[..root].contains(&3), "{order:?}");
@@ -2463,13 +2591,13 @@ mod tests {
 
     #[test]
     fn two_relations_sharing_two_classes_are_a_composite_key() {
-        let found = gyo(&edges(&[&[0, 1], &[0, 1]]), &even(2));
+        let found = gyo(&edges(&[&[0, 1], &[0, 1]]), &even(2), &[]);
         assert!(found.is_err_and(|reason| reason.contains("more than one")));
     }
 
     #[test]
     fn relations_that_share_nothing_are_each_a_tree() {
-        let order = gyo(&edges(&[&[0], &[1], &[]]), &even(3)).expect("a forest is acyclic");
+        let order = gyo(&edges(&[&[0], &[1], &[]]), &even(3), &[]).expect("a forest is acyclic");
         assert_eq!(parents(&order), [None, None, None]);
     }
 
@@ -2483,7 +2611,7 @@ mod tests {
             weight(2_500_000, 1, 0.7),
             weight(15_000_000, 4, 0.1),
         ];
-        let order = gyo(&edges(&[&[0], &[0, 1], &[1], &[1]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1], &[1], &[1]]), &weights, &[]).expect("acyclic");
         assert_eq!(order, [(0, Some(1)), (1, Some(2)), (2, Some(3)), (3, None)]);
     }
 
@@ -2494,7 +2622,7 @@ mod tests {
         // the role names last, read only at the roles the cast kept.
         let weights =
             [weight(3_000_000, 4, 1.0), weight(36_000_000, 0, 1.0), weight(2_500_000, 1, 0.01)];
-        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights, &[]).expect("acyclic");
         assert_eq!(order, [(2, Some(1)), (1, Some(0)), (0, None)]);
     }
 
@@ -2508,7 +2636,7 @@ mod tests {
             weight(36_000_000, 0, 1.0),
             weight(4_200_000, 8, 0.05),
         ];
-        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights).expect("acyclic");
+        let order = gyo(&edges(&[&[0], &[0, 1], &[1]]), &weights, &[]).expect("acyclic");
         assert_eq!(order, [(0, Some(1)), (1, Some(2)), (2, None)]);
     }
 
