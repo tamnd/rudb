@@ -757,6 +757,31 @@ impl Prepared {
         self.thread(root, 0, chunk, scratch, None)
     }
 
+    /// Narrows `words`, a bit a row of `chunk`, to the rows this filter keeps, when it is a single
+    /// comparison the mask kernels answer, and says how many rows are left. `fresh` writes the words
+    /// rather than narrowing them, as [`rudb_kernels::mask_within`] says.
+    ///
+    /// A caller that wants the rows of a whole part as flags, such as a sibling walk keeping a part
+    /// it reads again, has no use for the list of rows [`evaluate_filter`](Self::evaluate_filter)
+    /// builds out of the same mask. `None` for anything else, and then nothing was written.
+    ///
+    /// # Errors
+    ///
+    /// If a column the comparison reads is not in `chunk`.
+    pub fn mask(&self, chunk: &Chunk, words: &mut [u64], fresh: bool) -> Result<Option<usize>> {
+        let [root] = self.roots[..] else { return Ok(None) };
+        if let Some(Masking::Against(op, left, right)) = self.pairing(root) {
+            let (left, right) = (chunk.column(left)?, chunk.column(right)?);
+            return Ok(rudb_kernels::mask_against(op, left, right, words, fresh));
+        }
+        if let Some(column) = self.masking(root)
+            && let Some((_, bound)) = self.end(root)
+        {
+            return Ok(rudb_kernels::mask_within(chunk.column(column)?, &[bound], words, fresh));
+        }
+        Ok(None)
+    }
+
     /// How many operands the top level `AND` of a filter has, or `None` when it has no such `AND`.
     ///
     /// Operand `i` is the `i`th child of the conjunction in the plan, which is the numbering

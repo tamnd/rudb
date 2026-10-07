@@ -183,12 +183,69 @@ pub(crate) struct Walking {
 }
 
 /// A part's sibling side at each of its rows and whether the row passed every condition on the
-/// sibling alone, worked out once for the part rather than once for each batch that reaches it.
+/// sibling alone, a bit a row, worked out once for the part rather than once for each batch that
+/// reaches it.
 #[derive(Debug, Default)]
 struct Flat {
     part: Option<usize>,
     values: Vec<i64>,
-    pass: Vec<bool>,
+    words: Vec<u64>,
+}
+
+impl Flat {
+    /// The side and passes of `chunk`, a whole part, with `column` the sibling's side.
+    ///
+    /// A condition the mask kernels answer narrows the words straight, so that no list of rows is
+    /// built for a part only a few of whose rows are wanted. Any other goes through the filter and
+    /// its rows are set back as bits.
+    fn fill(
+        &mut self,
+        chunk: &Chunk,
+        own: &[Prepared],
+        column: usize,
+        scratch: &mut [Scratch],
+    ) -> Result<()> {
+        let length = chunk.len();
+        let vector = chunk
+            .column(column)
+            .map_err(|_| Error::internal("a sibling walk compares a column it did not read"))?;
+        self.words.clear();
+        self.words.resize(length.div_ceil(64), u64::MAX);
+        let mut fresh = true;
+        if vector.validity().has_nulls(length)
+            || !vector.signed_block(&mut self.values)
+            || self.values.len() < length
+        {
+            self.values.clear();
+            self.words.fill(0);
+            for at in 0..length {
+                let value = vector.signed_at(at).and_then(|value| i64::try_from(value).ok());
+                self.values.push(value.unwrap_or(0));
+                if value.is_some() {
+                    self.words[at / 64] |= 1 << (at % 64);
+                }
+            }
+            fresh = false;
+        }
+        self.values.truncate(length);
+        for (test, scratch) in own.iter().zip(scratch) {
+            if test.mask(chunk, &mut self.words, fresh)?.is_some() {
+                fresh = false;
+                continue;
+            }
+            let kept = test.evaluate_filter(chunk, scratch)?;
+            if kept.len() == length {
+                continue;
+            }
+            let mut words = vec![0_u64; self.words.len()];
+            for row in kept.iter() {
+                words[row / 64] |= 1 << (row % 64);
+            }
+            self.words.iter_mut().zip(&words).for_each(|(word, kept)| *word &= kept);
+            fresh = false;
+        }
+        Ok(())
+    }
 }
 
 impl Siblings {
@@ -717,8 +774,7 @@ impl Siblings {
             let length = starts[part + 1] - starts[part];
             if flat.part != Some(part) && wanted * DENSE >= length {
                 flat.part = None;
-                let whole = self.rows.read(part, &self.read)?;
-                values_of(whole, own, column, scratch, &mut flat.values, &mut flat.pass)?;
+                flat.fill(&self.rows.read(part, &self.read)?, own, column, scratch)?;
                 flat.part = Some(part);
             }
             if flat.part == Some(part) {
@@ -726,7 +782,7 @@ impl Siblings {
                 for &(start, length) in within {
                     let rows = start as usize..(start + length) as usize;
                     values.extend_from_slice(flat.values.get(rows.clone()).ok_or_else(short)?);
-                    pass.extend_from_slice(flat.pass.get(rows).ok_or_else(short)?);
+                    pass.extend(rows.map(|row| (flat.words[row / 64] >> (row % 64)) & 1 == 1));
                 }
             } else {
                 let positions: Vec<u32> =
