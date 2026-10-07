@@ -609,6 +609,10 @@ impl Parent {
         spread: &Spread<'_>,
     ) -> Result<Option<Arc<Vector>>> {
         let room = self.budget.saturating_sub(spent(held));
+        // Laid out by a statement before this one and held by the file's reader since.
+        if let Some(whole) = self.rows.held_whole(column) {
+            return Ok((whole.footprint() <= room).then_some(whole));
+        }
         let parts = self.rows.chunk_count();
         // A slot per part rather than one growing list, because the parts may be read in any order
         // and the run they make is in part order. A slot left empty is a part that said nothing or
@@ -660,7 +664,12 @@ impl Parent {
             return Ok(None);
         }
         if let Some(whole) = coded(&pieces)? {
-            return Ok((whole.footprint() <= room).then(|| Arc::new(whole)));
+            if whole.footprint() > room {
+                return Ok(None);
+            }
+            let whole = Arc::new(whole);
+            self.rows.hold_whole(column, &whole);
+            return Ok(Some(whole));
         }
         // Not codes into one dictionary all the way down, so the pieces that were left as codes on
         // the chance they were are strings like the rest.
@@ -696,7 +705,9 @@ impl Parent {
         // reached when it is not. Without this line every chunk copies, and on TPC-H q12 at scale
         // factor one that was fourteen hundred copies a query out of a column of five distinct
         // values.
-        Ok(Some(Arc::new(whole.into_pages())))
+        let whole = Arc::new(whole.into_pages());
+        self.rows.hold_whole(column, &whole);
+        Ok(Some(whole))
     }
 
     /// One part of one column, decoded unless it is codes into the table's dictionary, or nothing

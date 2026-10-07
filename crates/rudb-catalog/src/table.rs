@@ -1090,6 +1090,22 @@ impl Rows {
         }
     }
 
+    /// `column` laid end to end by a statement before this one, when the table is one file and the
+    /// file's reader still holds it. See [`NativeReader::hold_whole`].
+    #[must_use]
+    pub fn held_whole(&self, column: usize) -> Option<Arc<Vector>> {
+        self.stored()?.held_whole(column)
+    }
+
+    /// Hands `whole` to the file's reader to hold for the statements after this one, when the table
+    /// is one file. A table with rows in memory beside its file is not the file's column, so it is
+    /// held by nobody.
+    pub fn hold_whole(&self, column: usize, whole: &Arc<Vector>) {
+        if let Some(reader) = self.stored() {
+            reader.hold_whole(column, whole);
+        }
+    }
+
     /// Number of independently readable chunks or parts.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
