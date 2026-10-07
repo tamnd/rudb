@@ -1140,10 +1140,11 @@ mod tests {
     }
 
     /// A filter over the parent is run on the parent of each child row, so it does not stop the
-    /// link from being read, and a semi join over one is sized like an inner join since it now
-    /// reads the parent.
+    /// link from being read where more parents pass than child rows arrive. Where fewer pass, the
+    /// hash table over them is the better plan, and a semi join is no exception since it now reads
+    /// the parent.
     #[test]
-    fn a_parent_under_a_filter_reads_the_link_and_a_semi_join_over_one_is_sized() {
+    fn a_parent_under_a_filter_reads_the_link_only_where_more_parents_pass_than_children_arrive() {
         let filtered = |kind: &str| {
             let text = format!(
                 "Project #2 [#0.0::BIGINT AS k]\n  \
@@ -1154,17 +1155,22 @@ mod tests {
             );
             Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
         };
-        // Rows enough that a tenth of them do not fit either, whatever the filter is estimated at.
+        // Parents enough that what passes does not fit either, and few children.
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "lineitem", 1_000);
+        facts.record("memory", "main", "orders", 30_000_000);
+        let mut large = Context::new();
+        large.measure(Arc::new(facts));
+        large.relate(declared());
         let mut plan = filtered("INNER");
-        let large = context(30_000_000);
         let text = rewritten(&mut plan, &large);
         assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
         assert!(matches!(about(&plan, &large), Why::Narrow { .. }));
         let mut plan = filtered("SEMI");
         let small = context(1_000);
         let text = rewritten(&mut plan, &small);
-        assert!(!text.contains("LinkJoin"), "a filtered parent that fits was linked:\n{text}");
-        assert!(matches!(about(&plan, &small), Why::Fits { .. }));
+        assert!(!text.contains("LinkJoin"), "a selective parent filter was linked:\n{text}");
+        assert!(matches!(about(&plan, &small), Why::Filtered { .. }));
     }
 
     /// `lineitem` against `partsupp` over both halves of its key, with `on` as the conditions.
