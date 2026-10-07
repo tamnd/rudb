@@ -13399,6 +13399,71 @@ fn a_postgres_session_writes_rows() {
 }
 
 #[test]
+fn a_postgres_session_inserts_fewer_values_than_columns() {
+    use rudb_common::Span;
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+
+    let db = Database::new();
+    let duckdb = db.connect();
+    duckdb.execute("CREATE TABLE t (a int, b int DEFAULT 7, c int)").expect("creates");
+    let error = duckdb.execute("INSERT INTO t VALUES (1)").expect_err("one value");
+    assert_eq!(error.message(), "table \"t\" has 3 columns but 1 values were supplied");
+
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let run = |sql: &str| connection.execute(sql).expect(sql);
+    let rows = |sql: &str| run(sql).rows().map(|row| row.to_vec()).collect::<Vec<_>>();
+    let int = Value::Integer;
+    run("INSERT INTO t VALUES (1), (2)");
+    run("INSERT INTO t SELECT 3, 30");
+    run("INSERT INTO t VALUES (4, DEFAULT)");
+    run("CREATE TABLE g (a int, id int GENERATED ALWAYS AS IDENTITY)");
+    run("INSERT INTO g VALUES (5), (6)");
+    assert_eq!(
+        rows("SELECT a, id FROM g ORDER BY a"),
+        [vec![int(5), int(1)], vec![int(6), int(2)]]
+    );
+    assert_eq!(
+        rows("SELECT a, b, c FROM t ORDER BY a"),
+        [
+            vec![int(1), int(7), Value::Null],
+            vec![int(2), int(7), Value::Null],
+            vec![int(3), int(30), Value::Null],
+            vec![int(4), int(7), Value::Null],
+        ]
+    );
+    for (sql, message, span) in [
+        (
+            "INSERT INTO t VALUES (1, 2, 3, 4)",
+            "INSERT has more expressions than target columns",
+            Some(Span::new(31, 32)),
+        ),
+        (
+            "INSERT INTO t (a) SELECT 1, 2",
+            "INSERT has more expressions than target columns",
+            Some(Span::new(28, 29)),
+        ),
+        (
+            "INSERT INTO t (a, b) VALUES (1)",
+            "INSERT has more target columns than expressions",
+            None,
+        ),
+    ] {
+        let error = connection.execute(sql).expect_err(sql);
+        assert_eq!(error.message(), message, "{sql}");
+        assert_eq!(error.reported_state().as_str(), "42601", "{sql}");
+        assert_eq!(error.span(), span, "{sql}");
+    }
+}
+
+#[test]
 fn a_result_knows_the_table_column_of_each_plain_column() {
     let db = Database::new();
     let connection = db.connect();

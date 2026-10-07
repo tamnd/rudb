@@ -188,6 +188,7 @@ pub struct Semantics {
     integer_division: bool,
     ieee_floating_point_ops: bool,
     identifier_case: IdentifierCase,
+    insert_columns: InsertColumns,
     null_on_division_by_zero: bool,
     order_by_non_integer_literal: bool,
     pivot_limit: u64,
@@ -208,6 +209,7 @@ impl Default for Semantics {
             integer_division: false,
             ieee_floating_point_ops: true,
             identifier_case: IdentifierCase::Preserve,
+            insert_columns: InsertColumns::Exact,
             null_on_division_by_zero: false,
             order_by_non_integer_literal: false,
             pivot_limit: 100_000,
@@ -230,6 +232,11 @@ impl Semantics {
     #[must_use]
     pub fn identifier_case(self) -> IdentifierCase {
         self.identifier_case
+    }
+    /// How the values of an `INSERT` are matched to the columns of the table.
+    #[must_use]
+    pub fn insert_columns(self) -> InsertColumns {
+        self.insert_columns
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -326,6 +333,18 @@ pub enum IdentifierCase {
     Lower,
     /// Fold ASCII letters to uppercase.
     Upper,
+}
+
+/// How the values of an `INSERT` are matched to the columns of the table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InsertColumns {
+    /// Each row has one value for each column that the statement writes, as in DuckDB.
+    #[default]
+    Exact,
+    /// As in PostgreSQL: with no column list, a row can have fewer values than the table has
+    /// columns. The values go to the leading columns, and the other columns take their defaults.
+    /// The errors are the ones of PostgreSQL.
+    Leading,
 }
 
 /// How `SHOW name` chooses between a setting and a table.
@@ -694,12 +713,14 @@ impl Session {
     /// Records the PostgreSQL session that runs the statements, or none.
     ///
     /// A PostgreSQL session also takes the rules of PostgreSQL for division: `/` of two integers
-    /// is an integer, and a zero divisor is an error for every type.
+    /// is an integer, and a zero divisor is an error for every type. And it takes the rule of
+    /// PostgreSQL for the values of an `INSERT`.
     pub fn set_postgres(&mut self, postgres: Option<Arc<Postgres>>) {
         if postgres.is_some() {
             self.semantics.integer_division = true;
             self.semantics.ieee_floating_point_ops = false;
             self.semantics.null_on_division_by_zero = false;
+            self.semantics.insert_columns = InsertColumns::Leading;
         }
         self.postgres = Postgreses(postgres);
     }

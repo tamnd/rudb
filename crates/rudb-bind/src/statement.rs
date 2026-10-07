@@ -17,8 +17,8 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
-    Bound as ColumnBound, Clustering, DeclaredType, Error, Field, LogicalType, Result, Session,
-    SqlState, Stat, Value, Width,
+    Bound as ColumnBound, Clustering, DeclaredType, Error, Field, InsertColumns, LogicalType,
+    Result, Session, SqlState, Stat, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -3160,26 +3160,6 @@ fn insert(
         targets
     };
 
-    // A value for a `GENERATED ALWAYS` identity column is refused unless the statement said
-    // `OVERRIDING`, and `DEFAULT` is not a value. `COPY` puts the value in, as in PostgreSQL.
-    if !written.copy && written.overriding == ast::Overriding::None {
-        for (from, &at) in targets.iter().enumerate() {
-            if target.identity(at) == Some(rudb_catalog::Identity::Always)
-                && !all_default(ast, written.source, from)
-            {
-                let column = &fields[at].name;
-                return Err(Error::binder(format!(
-                    "cannot insert a non-DEFAULT value into column \"{column}\""
-                ))
-                .state(SqlState::GENERATED_ALWAYS)
-                .detail(format!(
-                    "Column \"{column}\" is an identity column defined as GENERATED ALWAYS."
-                ))
-                .hint("Use OVERRIDING SYSTEM VALUE to override.")
-                .unplaced());
-            }
-        }
-    }
     // `OVERRIDING USER VALUE` leaves out what the statement gives an identity column.
     let ignored =
         |at: usize| written.overriding == ast::Overriding::User && target.identity(at).is_some();
@@ -3217,25 +3197,69 @@ fn insert(
         binder.copy_into = None;
         bound
     };
-    let targets = if written.source == NONE { Vec::new() } else { targets };
-    // The pin's two sentences, lowercase `table` and all, for without a column list and with one.
+    let mut targets = if written.source == NONE { Vec::new() } else { targets };
     if scope.len() != targets.len() {
-        return Err(Error::binder(if written.columns.is_empty() {
-            format!(
-                "table \"{}\" has {} columns but {} values were supplied",
-                name.table,
-                targets.len(),
-                scope.len()
-            )
-        } else {
-            format!(
-                "Column name/value mismatch for insert on \"{}\": expected {} columns but {} \
-                 values were supplied",
-                name.table,
-                targets.len(),
-                scope.len()
-            )
-        }));
+        match session.semantics().insert_columns() {
+            // The pin's two sentences, lowercase `table` and all, for without a column list and
+            // with one.
+            InsertColumns::Exact => {
+                return Err(Error::binder(if written.columns.is_empty() {
+                    format!(
+                        "table \"{}\" has {} columns but {} values were supplied",
+                        name.table,
+                        targets.len(),
+                        scope.len()
+                    )
+                } else {
+                    format!(
+                        "Column name/value mismatch for insert on \"{}\": expected {} columns but \
+                         {} values were supplied",
+                        name.table,
+                        targets.len(),
+                        scope.len()
+                    )
+                }));
+            }
+            // PostgreSQL points at the first value that has no column. It points at the first
+            // column that has no value too, but the AST keeps no place for the column list.
+            InsertColumns::Leading if scope.len() > targets.len() => {
+                let error = Error::binder("INSERT has more expressions than target columns")
+                    .state(SqlState::SYNTAX_ERROR);
+                return Err(match extra_value(ast, written.source, targets.len()) {
+                    Some(expr) => error.with_span(ast.expr_span(expr)),
+                    None => error.unplaced(),
+                });
+            }
+            InsertColumns::Leading if !written.columns.is_empty() => {
+                return Err(Error::binder("INSERT has more target columns than expressions")
+                    .state(SqlState::SYNTAX_ERROR)
+                    .unplaced());
+            }
+            // With no column list, the values go to the leading columns and the others take
+            // their defaults in the projection below.
+            InsertColumns::Leading => targets.truncate(scope.len()),
+        }
+    }
+
+    // A value for a `GENERATED ALWAYS` identity column is refused unless the statement said
+    // `OVERRIDING`, and `DEFAULT` is not a value. `COPY` puts the value in, as in PostgreSQL.
+    if !written.copy && written.overriding == ast::Overriding::None {
+        for (from, &at) in targets.iter().enumerate() {
+            if target.identity(at) == Some(rudb_catalog::Identity::Always)
+                && !all_default(ast, written.source, from)
+            {
+                let column = &fields[at].name;
+                return Err(Error::binder(format!(
+                    "cannot insert a non-DEFAULT value into column \"{column}\""
+                ))
+                .state(SqlState::GENERATED_ALWAYS)
+                .detail(format!(
+                    "Column \"{column}\" is an identity column defined as GENERATED ALWAYS."
+                ))
+                .hint("Use OVERRIDING SYSTEM VALUE to override.")
+                .unplaced());
+            }
+        }
     }
 
     // A table that declared what order its rows go in gets the sort here, under the projection
@@ -3430,6 +3454,26 @@ fn regenerate(
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
     let root = generate(&mut binder, (root, index), fields, table, 0)?;
     finish(binder, root)
+}
+
+/// The value at `at` in the first row of the source of an `INSERT`, when the AST shows it. A star
+/// in the target list hides which value is where, so there is none then.
+fn extra_value(ast: &Ast, source: ast::QueryRef, at: usize) -> Option<ast::ExprRef> {
+    match ast.query(source).body {
+        ast::QueryBody::Values(rows) => {
+            let first = *ast.rows(rows).first()?;
+            ast.expr_list(first).get(at).copied()
+        }
+        ast::QueryBody::Select(select) => {
+            let targets = ast.target_list(ast.select(select).targets);
+            if targets.iter().any(|target| matches!(ast.expr(target.expr), ast::Expr::Star { .. }))
+            {
+                return None;
+            }
+            targets.get(at).map(|target| target.expr)
+        }
+        _ => None,
+    }
 }
 
 /// Whether every row of an `INSERT ... VALUES` writes `DEFAULT` for the value at `from`.

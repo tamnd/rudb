@@ -1435,8 +1435,14 @@ impl<'a> Binder<'a> {
         }
         // A row of a `VALUES` cannot see a column, because there is nothing under it to see.
         let empty = Scope::empty();
-        let defaults = self.insert_defaults.take();
-        let inputs = self.insert_inputs.take().unwrap_or_default();
+        // A row can be narrower than the columns of the `INSERT`, when the values go to the leading
+        // columns as in PostgreSQL. It lands in the first columns, so it reads only those.
+        let mut defaults = self.insert_defaults.take();
+        let mut inputs = self.insert_inputs.take().unwrap_or_default();
+        if let Some(defaults) = defaults.as_mut() {
+            defaults.truncate(width);
+        }
+        inputs.truncate(width);
         let previous = std::mem::replace(&mut self.clause, "VALUES clause");
         let mut bound: Vec<Vec<ExprRef>> = Vec::with_capacity(written.len());
         for row in &written {
