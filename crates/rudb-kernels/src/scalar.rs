@@ -1420,7 +1420,7 @@ fn widened_of(
         let validity = if rows == 0 { Validity::AllValid } else { base.normalize(rows) };
         return finish(returns, Data::Int128(out.into()), validity);
     }
-    let (left, right) = (cast::cast(left, returns, false)?, cast::cast(right, returns, false)?);
+    let (left, right) = (cast(left, returns, false)?, cast(right, returns, false)?);
     let name = if subtract { "-" } else { "+" };
     binary(name, &Hoisted::Nothing, &left, &right, returns, rows, written)
 }
