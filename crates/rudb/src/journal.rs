@@ -672,12 +672,23 @@ impl Journal {
     /// Removes every segment and spare of the lane.
     fn remove_all(&self) -> Result<()> {
         for (_, path) in segments(self.fs.as_ref(), &self.dir, LANE)? {
-            self.fs.remove(&path)?;
+            self.remove_if_there(&path)?;
         }
         for path in spares(self.fs.as_ref(), &self.dir, LANE)? {
-            self.fs.remove(&path)?;
+            self.remove_if_there(&path)?;
         }
         Ok(())
+    }
+
+    /// Removes `path`, where a file gone since it was listed is what removing it wanted. A lane
+    /// this journal did not open can still be at the directory: the spares thread of a database
+    /// dropped without closing, which a test does to stand in for a crash, renames and fills spares
+    /// under it.
+    fn remove_if_there(&self, path: &Path) -> Result<()> {
+        match self.fs.remove(path) {
+            Err(_) if !self.fs.exists(path) => Ok(()),
+            removed => removed,
+        }
     }
 }
 
