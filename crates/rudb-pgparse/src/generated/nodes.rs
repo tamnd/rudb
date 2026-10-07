@@ -95,6 +95,7 @@ pub const ERRCODE_SYNTAX_ERROR: &str = "42601";
 pub const ERRCODE_WINDOWING_ERROR: &str = "42P20";
 pub const ERRCODE_RESERVED_NAME: &str = "42939";
 pub const ERRCODE_DUPLICATE_OBJECT: &str = "42710";
+pub const InvalidOid: u32 = 0;
 pub const TEXTOID: u32 = 25;
 
 /// The C enum `CmdType`.

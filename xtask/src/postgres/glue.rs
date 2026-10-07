@@ -356,8 +356,12 @@ impl Glue<'_> {
         let numbers = |arguments: &[&str]| -> Option<Vec<usize>> {
             arguments.iter().map(|a| value_number(a)).collect()
         };
-        // An item of a list: `$k`, `makeString($k)` or `makeString("text")`.
+        // An item of a list: `$k`, `NULL`, `makeString($k)` or `makeString("text")`. An item `NIL`
+        // is an empty list, which is `NULL` too.
         let item = |argument: &str| -> Result<Option<String>, String> {
+            if argument == "NULL" || argument == "NIL" {
+                return Ok(Some("None".to_string()));
+            }
             if let Some(k) = value_number(argument) {
                 return node(k);
             }

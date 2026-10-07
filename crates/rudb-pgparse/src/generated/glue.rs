@@ -3085,7 +3085,7 @@ pub(crate) fn reduce(
             Value::list(vec![v2.into_node()?, v3.into_node()?])
         }
         // opt_column_and_period_list.2
-        578 => Value::list(rules::opt_column_and_period_list::opt_column_and_period_list_2(p)?),
+        578 => Value::list(vec![None, None]),
         // columnElem.1
         579 => {
             let [v1] = take(rhs);
@@ -5904,12 +5904,12 @@ pub(crate) fn reduce(
         // oper_argtypes.3
         1255 => {
             let [_, _, _, v4, _] = take(rhs);
-            Value::list(rules::oper_argtypes::oper_argtypes_3(p, v4.into_typnam()?)?)
+            Value::list(vec![None, v4.into_node()?])
         }
         // oper_argtypes.4
         1256 => {
             let [_, v2, _, _, _] = take(rhs);
-            Value::list(rules::oper_argtypes::oper_argtypes_4(p, v2.into_typnam()?)?)
+            Value::list(vec![v2.into_node()?, None])
         }
         // any_operator.1
         1257 => {
@@ -6015,12 +6015,12 @@ pub(crate) fn reduce(
         // transform_element_list.3
         1279 => {
             let [_, _, _, _, v5] = take(rhs);
-            Value::list(rules::transform_element_list::transform_element_list_3(p, v5.into_objwithargs()?)?)
+            Value::list(vec![v5.into_node()?, None])
         }
         // transform_element_list.4
         1280 => {
             let [_, _, _, _, v5] = take(rhs);
-            Value::list(rules::transform_element_list::transform_element_list_4(p, v5.into_objwithargs()?)?)
+            Value::list(vec![None, v5.into_node()?])
         }
         // DropTransformStmt.1
         1281 => {
@@ -8222,7 +8222,7 @@ pub(crate) fn reduce(
         // set_quantifier.3
         1783 => Value::setquantifier(SetQuantifier::SET_QUANTIFIER_DEFAULT),
         // distinct_clause.1
-        1784 => Value::list(rules::distinct_clause::distinct_clause_1(p)?),
+        1784 => Value::list(vec![None]),
         // distinct_clause.2
         1785 => {
             let [_, _, _, v4, _] = take(rhs);
@@ -8653,12 +8653,12 @@ pub(crate) fn reduce(
         // func_alias_clause.1
         1885 => {
             let [v1] = take(rhs);
-            Value::list(rules::func_alias_clause::func_alias_clause_1(p, v1.into_alias()?)?)
+            Value::list(vec![v1.into_node()?, None])
         }
         // func_alias_clause.2
         1886 => {
             let [_, _, v3, _] = take(rhs);
-            Value::list(rules::func_alias_clause::func_alias_clause_2(p, v3.into_list()?)?)
+            Value::list(vec![None, v3.into_node()?])
         }
         // func_alias_clause.3
         1887 => {
@@ -8671,7 +8671,7 @@ pub(crate) fn reduce(
             Value::list(rules::func_alias_clause::func_alias_clause_4(p, v1.into_str()?, v3.into_list()?)?)
         }
         // func_alias_clause.5
-        1889 => Value::list(rules::func_alias_clause::func_alias_clause_5(p)?),
+        1889 => Value::list(vec![None, None]),
         // join_type.1
         1890 => Value::jtype(JoinType::JOIN_FULL),
         // join_type.2
@@ -10845,12 +10845,12 @@ pub(crate) fn reduce(
         // json_behavior_clause_opt.1
         2409 => {
             let [v1, _, _] = take(rhs);
-            Value::list(rules::json_behavior_clause_opt::json_behavior_clause_opt_1(p, v1.into_node()?)?)
+            Value::list(vec![v1.into_node()?, None])
         }
         // json_behavior_clause_opt.2
         2410 => {
             let [v1, _, _] = take(rhs);
-            Value::list(rules::json_behavior_clause_opt::json_behavior_clause_opt_2(p, v1.into_node()?)?)
+            Value::list(vec![None, v1.into_node()?])
         }
         // json_behavior_clause_opt.3
         2411 => {
@@ -10858,7 +10858,7 @@ pub(crate) fn reduce(
             Value::list(vec![v1.into_node()?, v4.into_node()?])
         }
         // json_behavior_clause_opt.4
-        2412 => Value::list(rules::json_behavior_clause_opt::json_behavior_clause_opt_4(p)?),
+        2412 => Value::list(vec![None, None]),
         // json_on_error_clause_opt.1
         2413 => {
             let [v1, _, _] = take(rhs);
@@ -17688,14 +17688,6 @@ pub(crate) mod rules {
         }
     }
 
-    /// The actions of `opt_column_and_period_list`.
-    pub(crate) trait opt_column_and_period_list {
-        /// `opt_column_and_period_list: /* empty */`, line 4513 of `gram.y`.
-        fn opt_column_and_period_list_2(&mut self) -> Result<List, Error> {
-            Err(Error::not_ported("opt_column_and_period_list.2"))
-        }
-    }
-
     /// The actions of `columnElem`.
     pub(crate) trait columnElem {
         /// `columnElem: ColId`, line 4516 of `gram.y`.
@@ -19818,16 +19810,6 @@ pub(crate) mod rules {
         fn oper_argtypes_1(&mut self, _at3: i32) -> Result<List, Error> {
             Err(Error::not_ported("oper_argtypes.1"))
         }
-
-        /// `oper_argtypes: '(' NONE ',' Typename ')'`, line 9245 of `gram.y`.
-        fn oper_argtypes_3(&mut self, _4: Option<Box<crate::nodes::TypeName>>) -> Result<List, Error> {
-            Err(Error::not_ported("oper_argtypes.3"))
-        }
-
-        /// `oper_argtypes: '(' Typename ',' NONE ')'`, line 9247 of `gram.y`.
-        fn oper_argtypes_4(&mut self, _2: Option<Box<crate::nodes::TypeName>>) -> Result<List, Error> {
-            Err(Error::not_ported("oper_argtypes.4"))
-        }
     }
 
     /// The actions of `operator_with_argtypes`.
@@ -19890,19 +19872,6 @@ pub(crate) mod rules {
         /// `CreateTransformStmt: CREATE opt_or_replace TRANSFORM FOR Typename LANGUAGE name '(' transform_element_list ')'`, line 9383 of `gram.y`.
         fn CreateTransformStmt_1(&mut self, _2: bool, _5: Option<Box<crate::nodes::TypeName>>, _7: Option<Str>, _9: List) -> Result<Option<Node>, Error> {
             Err(Error::not_ported("CreateTransformStmt.1"))
-        }
-    }
-
-    /// The actions of `transform_element_list`.
-    pub(crate) trait transform_element_list {
-        /// `transform_element_list: FROM SQL_P WITH FUNCTION function_with_argtypes`, line 9404 of `gram.y`.
-        fn transform_element_list_3(&mut self, _5: Option<Box<crate::nodes::ObjectWithArgs>>) -> Result<List, Error> {
-            Err(Error::not_ported("transform_element_list.3"))
-        }
-
-        /// `transform_element_list: TO SQL_P WITH FUNCTION function_with_argtypes`, line 9408 of `gram.y`.
-        fn transform_element_list_4(&mut self, _5: Option<Box<crate::nodes::ObjectWithArgs>>) -> Result<List, Error> {
-            Err(Error::not_ported("transform_element_list.4"))
         }
     }
 
@@ -21810,14 +21779,6 @@ pub(crate) mod rules {
         }
     }
 
-    /// The actions of `distinct_clause`.
-    pub(crate) trait distinct_clause {
-        /// `distinct_clause: DISTINCT`, line 13477 of `gram.y`.
-        fn distinct_clause_1(&mut self) -> Result<List, Error> {
-            Err(Error::not_ported("distinct_clause.1"))
-        }
-    }
-
     /// The actions of `sortby`.
     pub(crate) trait sortby {
         /// `sortby: a_expr USING qual_all_Op opt_nulls_order`, line 13505 of `gram.y`.
@@ -22101,16 +22062,6 @@ pub(crate) mod rules {
 
     /// The actions of `func_alias_clause`.
     pub(crate) trait func_alias_clause {
-        /// `func_alias_clause: alias_clause`, line 14130 of `gram.y`.
-        fn func_alias_clause_1(&mut self, _1: Option<Box<crate::nodes::Alias>>) -> Result<List, Error> {
-            Err(Error::not_ported("func_alias_clause.1"))
-        }
-
-        /// `func_alias_clause: AS '(' TableFuncElementList ')'`, line 14134 of `gram.y`.
-        fn func_alias_clause_2(&mut self, _3: List) -> Result<List, Error> {
-            Err(Error::not_ported("func_alias_clause.2"))
-        }
-
         /// `func_alias_clause: AS ColId '(' TableFuncElementList ')'`, line 14138 of `gram.y`.
         fn func_alias_clause_3(&mut self, _2: Option<Str>, _4: List) -> Result<List, Error> {
             Err(Error::not_ported("func_alias_clause.3"))
@@ -22119,11 +22070,6 @@ pub(crate) mod rules {
         /// `func_alias_clause: ColId '(' TableFuncElementList ')'`, line 14145 of `gram.y`.
         fn func_alias_clause_4(&mut self, _1: Option<Str>, _3: List) -> Result<List, Error> {
             Err(Error::not_ported("func_alias_clause.4"))
-        }
-
-        /// `func_alias_clause: /* empty */`, line 14153 of `gram.y`.
-        fn func_alias_clause_5(&mut self) -> Result<List, Error> {
-            Err(Error::not_ported("func_alias_clause.5"))
         }
     }
 
@@ -23817,24 +23763,6 @@ pub(crate) mod rules {
         }
     }
 
-    /// The actions of `json_behavior_clause_opt`.
-    pub(crate) trait json_behavior_clause_opt {
-        /// `json_behavior_clause_opt: json_behavior ON EMPTY_P`, line 17339 of `gram.y`.
-        fn json_behavior_clause_opt_1(&mut self, _1: Option<Node>) -> Result<List, Error> {
-            Err(Error::not_ported("json_behavior_clause_opt.1"))
-        }
-
-        /// `json_behavior_clause_opt: json_behavior ON ERROR_P`, line 17341 of `gram.y`.
-        fn json_behavior_clause_opt_2(&mut self, _1: Option<Node>) -> Result<List, Error> {
-            Err(Error::not_ported("json_behavior_clause_opt.2"))
-        }
-
-        /// `json_behavior_clause_opt: /* empty */`, line 17346 of `gram.y`.
-        fn json_behavior_clause_opt_4(&mut self) -> Result<List, Error> {
-            Err(Error::not_ported("json_behavior_clause_opt.4"))
-        }
-    }
-
     /// The actions of `json_value_expr`.
     pub(crate) trait json_value_expr {
         /// `json_value_expr: a_expr json_format_clause_opt`, line 17357 of `gram.y`.
@@ -24289,18 +24217,6 @@ impl rules::index_partition_cmd for Parser<'_> {}
 impl rules::insert_column_item for Parser<'_> {}
 impl rules::insert_rest for Parser<'_> {}
 impl rules::insert_target for Parser<'_> {}
-impl rules::json_aggregate_func for Parser<'_> {}
-impl rules::json_argument for Parser<'_> {}
-impl rules::json_behavior for Parser<'_> {}
-impl rules::json_behavior_clause_opt for Parser<'_> {}
-impl rules::json_format_clause for Parser<'_> {}
-impl rules::json_format_clause_opt for Parser<'_> {}
-impl rules::json_name_and_value for Parser<'_> {}
-impl rules::json_returning_clause_opt for Parser<'_> {}
-impl rules::json_table for Parser<'_> {}
-impl rules::json_table_column_definition for Parser<'_> {}
-impl rules::json_table_column_path_clause_opt for Parser<'_> {}
-impl rules::json_value_expr for Parser<'_> {}
 impl rules::key_action for Parser<'_> {}
 impl rules::key_actions for Parser<'_> {}
 impl rules::key_match for Parser<'_> {}
@@ -24319,7 +24235,6 @@ impl rules::operator_def_elem for Parser<'_> {}
 impl rules::operator_with_argtypes for Parser<'_> {}
 impl rules::opt_binary for Parser<'_> {}
 impl rules::opt_collate_clause for Parser<'_> {}
-impl rules::opt_column_and_period_list for Parser<'_> {}
 impl rules::opt_conf_expr for Parser<'_> {}
 impl rules::opt_lock for Parser<'_> {}
 impl rules::opt_on_conflict for Parser<'_> {}
@@ -24346,7 +24261,6 @@ impl rules::set_target for Parser<'_> {}
 impl rules::stats_param for Parser<'_> {}
 impl rules::table_func_column for Parser<'_> {}
 impl rules::transaction_mode_item for Parser<'_> {}
-impl rules::transform_element_list for Parser<'_> {}
 impl rules::utility_option_arg for Parser<'_> {}
 impl rules::utility_option_elem for Parser<'_> {}
 impl rules::vacuum_relation for Parser<'_> {}

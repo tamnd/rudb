@@ -2,7 +2,9 @@
 //!
 //! `raw.txt` has a case for each statement: a line `> ` and the text, then the tree that
 //! PostgreSQL logs for the text with `debug_print_raw_parse` on and `debug_pretty_print` off, on
-//! one line, then an empty line. The trees come from the oracle server of `tamnd/rudb-postgres`.
+//! one line, then an empty line. For a text that the raw parser of PostgreSQL rejects, the line
+//! after the text is `ERROR`, the SQLSTATE, the position and the message. The trees and the errors
+//! come from the oracle server of `tamnd/rudb-postgres`.
 
 use rudb_pgparse::nodes::list_text;
 use rudb_pgparse::parse;
@@ -18,13 +20,15 @@ fn raw_trees() {
         };
         let text = text.strip_prefix("> ").expect("a case of raw.txt starts with `> `");
         count += 1;
-        match parse(text) {
-            Ok((tree, _)) if list_text(&tree) == expected => {}
-            Ok((tree, _)) => failures
-                .push(format!("{text}\n  expected {expected}\n  actual   {}", list_text(&tree))),
+        let actual = match parse(text) {
+            Ok((tree, _)) => list_text(&tree),
             Err(error) => {
-                failures.push(format!("{text}\n  error {} {}", error.code, error.message))
+                let position = error.position(text).unwrap_or(0);
+                format!("ERROR {} {position} {}", error.code, error.message)
             }
+        };
+        if actual != expected {
+            failures.push(format!("{text}\n  expected {expected}\n  actual   {actual}"));
         }
     }
     assert!(

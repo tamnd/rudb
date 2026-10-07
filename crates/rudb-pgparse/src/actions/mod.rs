@@ -20,6 +20,7 @@
 mod expr;
 mod funcs;
 mod gram;
+mod json;
 mod list;
 mod make;
 mod names;
