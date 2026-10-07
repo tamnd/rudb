@@ -364,6 +364,15 @@ pub enum Why {
     RowIdGone,
     /// The row id the link join carries would reach somewhere that counts its input's columns.
     ColumnWouldShow,
+    /// The parent is filtered to no more rows than the child brings, so a hash table over the rows
+    /// that passed is small and the reduction it sends to the child's scan reads less than a test
+    /// of every child row would.
+    Filtered {
+        /// The rows the child was estimated at.
+        child: u64,
+        /// The rows the filtered parent was estimated at.
+        parent: u64,
+    },
     /// The parent fits in cache after projection, so the build costs less than the gathers.
     Fits {
         /// The rows the parent was estimated at.
@@ -412,7 +421,7 @@ impl Why {
             Self::NotBuilt => 2,
             Self::RowIdGone => 3,
             Self::ColumnWouldShow => 4,
-            Self::Fits { .. } | Self::Wide { .. } => 5,
+            Self::Filtered { .. } | Self::Fits { .. } | Self::Wide { .. } => 5,
             Self::Narrow { .. } | Self::NeverRead | Self::Keyed => 6,
         }
     }
@@ -443,6 +452,11 @@ impl std::fmt::Display for Why {
             Self::ColumnWouldShow => {
                 write!(out, "the row id would reach an operator that counts its input's columns")
             }
+            Self::Filtered { child, parent } => write!(
+                out,
+                "the parent is filtered to {parent} rows, which is not more than the {child} rows \
+                 of the child"
+            ),
             Self::Fits { rows, bytes } => write!(
                 out,
                 "the parent is {rows} rows and {bytes} bytes projected, which fits in cache"
@@ -634,7 +648,7 @@ fn decided(
                 continue;
             }
         };
-        let why = worth_it(plan, parent, kind, &found, context);
+        let why = worth_it(plan, child, parent, kind, &found, context);
         // Asked after the rest of it on purpose. What is above a join is the same whichever way
         // round its sides are read, so asking first would report a shape complaint for a join that
         // has no relationship at all and bury the reason that was actually in the way.
@@ -837,7 +851,33 @@ fn get_under(plan: &Plan, at: NodeRef, index: u32) -> Option<NodeRef> {
 }
 
 /// Section 6.4, which is the whole of the choice.
-fn worth_it(plan: &Plan, parent: NodeRef, kind: JoinKind, found: &Match, context: &Context) -> Why {
+fn worth_it(
+    plan: &Plan,
+    child: NodeRef,
+    parent: NodeRef,
+    kind: JoinKind,
+    found: &Match,
+    context: &Context,
+) -> Why {
+    // A filtered parent is a hash join's chance to cut the child down: the parents that passed go
+    // into a small table, and the reduction that table sends to the child's scan reads only their
+    // children. The link join has to test the parent of every child row that arrives, so it only
+    // wins where more parents pass than child rows arrive. TPC-H q17 is the other case, where 204
+    // parts passed and testing the part of every one of six million lines cost 30 times the plan
+    // it replaced. A side nobody estimated is left to the hash join, which is the plan that ran
+    // before any of this.
+    if found.filtered {
+        let rows = |node| estimate::rows(plan, node, context.facts());
+        match (rows(child), rows(parent)) {
+            (Some(child), Some(parent)) if child < parent => {}
+            (child, parent) => {
+                return Why::Filtered {
+                    child: child.unwrap_or(u64::MAX),
+                    parent: parent.unwrap_or(0),
+                };
+            }
+        }
+    }
     // Nothing is built and nothing is read but the key, so there is no size this loses at. A hash
     // join over the same parent reads its whole key column to build a table that answers the same
     // subtraction.
