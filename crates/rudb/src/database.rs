@@ -4321,40 +4321,46 @@ impl Shared {
         // where they are. Anything else is gathered into rows of their own, which copies every
         // value.
         let built: Vec<Vec<Value>>;
-        let rows: Vec<&[Value]> = match as_given(direct, given, &targets, table) {
+        let mut filled = Ok(());
+        let rows: Vec<&[Value]> = match as_given(direct, given, &targets.at, table) {
             Some(values) => vec![values],
             None => {
-                built = direct
+                let mut typed = direct
                     .rows
                     .iter()
-                    .map(|items| typed_row(items, given, &targets, table))
-                    .collect::<Option<_>>()?;
+                    .map(|items| typed_row(items, given, &targets.at, table))
+                    .collect::<Option<Vec<_>>>()?;
+                // The defaults go in once every row is sure to go this way, so a statement that
+                // goes to the plan after all has moved no sequence.
+                filled = self.fill_defaults(&mut typed, &targets.fills, table);
+                built = typed;
                 built.iter().map(Vec::as_slice).collect()
             }
         };
         // The rows for the log, and for a transaction to note for its commit.
         let staged = (journals || transacting)
             .then(|| rows.iter().map(|row| row.to_vec()).collect::<Vec<_>>());
-        let result = kept(sql, 0, |_| {
-            if transacting {
-                self.refuse_row_keys_since(&catalog, &name, &rows)?;
-            }
-            let table = catalog.table_appending(&name)?;
-            // Several rows go in together, so a key the last one repeats leaves out the first.
-            match rows.as_slice() {
-                [row] => table.append_row(row)?,
-                many => {
-                    table.append_rows(&many.iter().map(|row| row.to_vec()).collect::<Vec<_>>())?
+        let result = filled.and_then(|()| {
+            kept(sql, 0, |_| {
+                if transacting {
+                    self.refuse_row_keys_since(&catalog, &name, &rows)?;
                 }
-            }
-            if journals && let Some(rows) = &staged {
-                self.stage_rows(&name, table.columns(), rows);
-            }
-            if transacting && let Some(rows) = staged {
-                let fields = table.columns();
-                self.wrote(table.oid(), |written, _| written.appended_values(fields, rows));
-            }
-            QueryResult::changed(rows.len())
+                let table = catalog.table_appending(&name)?;
+                // Several rows go in together, so a key the last one repeats leaves out the first.
+                match rows.as_slice() {
+                    [row] => table.append_row(row)?,
+                    many => table
+                        .append_rows(&many.iter().map(|row| row.to_vec()).collect::<Vec<_>>())?,
+                }
+                if journals && let Some(rows) = &staged {
+                    self.stage_rows(&name, table.columns(), rows);
+                }
+                if transacting && let Some(rows) = staged {
+                    let fields = table.columns();
+                    self.wrote(table.oid(), |written, _| written.appended_values(fields, rows));
+                }
+                QueryResult::changed(rows.len())
+            })
         });
         // A failure aborts an open transaction in `in_transaction`, which every prepared statement
         // runs under.
@@ -4364,6 +4370,57 @@ impl Shared {
         drop(catalog);
         let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
         Some(result.and_then(|result| settled.map(|()| result)))
+    }
+
+    /// Puts the defaults that `fills` gives into each of `rows`. As in the plan, each row moves a
+    /// sequence once, and the time is the start of the transaction.
+    fn fill_defaults(
+        &self,
+        rows: &mut [Vec<Value>],
+        fills: &[(usize, crate::prepared::Fill)],
+        table: &rudb_catalog::Table,
+    ) -> Result<()> {
+        use crate::prepared::Fill;
+        let fields = table.columns();
+        let mut utc = None;
+        let mut local = None;
+        for row in rows {
+            for (at, fill) in fills {
+                let ty = &fields[*at].ty;
+                row[*at] = match fill {
+                    Fill::Value(value) => value.clone(),
+                    Fill::Next(id) => {
+                        let next = Value::BigInt(rudb_common::sequence::lookup(*id)?.next()?);
+                        if *ty == LogicalType::BigInt {
+                            next
+                        } else {
+                            rudb_kernels::cast::cast_value(&next, ty, false)?
+                        }
+                    }
+                    Fill::Now => {
+                        let utc = *utc.get_or_insert_with(|| self.transaction_start());
+                        if *ty == LogicalType::Timestamp {
+                            Value::Timestamp(
+                                *local.get_or_insert_with(|| self.inner.settings.local_micros(utc)),
+                            )
+                        } else {
+                            Value::TimestampTz(utc)
+                        }
+                    }
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// What `now()` gives in this connection: the start of the open transaction, else the time
+    /// the statement arrived, else the clock.
+    fn transaction_start(&self) -> i64 {
+        [&self.conn.begun, &self.conn.received]
+            .into_iter()
+            .map(|held| held.load(Ordering::Acquire))
+            .find(|&micros| micros != 0)
+            .unwrap_or_else(rudb_bind::micros_now)
     }
 
     /// Runs a prepared point read without binding it, or says it cannot and leaves it to
@@ -7860,6 +7917,10 @@ fn upsert_target(
     upsert: &crate::prepared::Upsert,
 ) -> Option<(QualifiedName, Vec<usize>, Vec<usize>)> {
     let (name, targets) = direct_targets(catalog, &upsert.insert)?;
+    if !targets.fills.is_empty() {
+        return None;
+    }
+    let targets = targets.at;
     let table = catalog.table(&name).ok()?;
     let guards = table.guards();
     let [guard] = guards.as_slice() else { return None };
@@ -7973,10 +8034,13 @@ fn keys_fit(table: &rudb_catalog::Table, key: &[usize], values: &[Value]) -> boo
     key.iter().zip(values).all(|(&at, value)| fits_declared(value, table.declared_type(at)))
 }
 
+/// The table a [`crate::prepared::Direct`] insert writes and where its items land, or `None` when
+/// the table is not a plain one, a column is named twice or not at all, or a column the insert
+/// leaves out has a default that [`fill_of`] does not know.
 fn direct_targets(
     catalog: &Catalog,
     direct: &crate::prepared::Direct,
-) -> Option<(QualifiedName, Vec<usize>)> {
+) -> Option<(QualifiedName, crate::prepared::Targets)> {
     let parts: Vec<&str> = direct.name.iter().map(String::as_str).collect();
     let name = catalog.resolve(&parts).ok()?;
     if !name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
@@ -8002,12 +8066,110 @@ fn direct_targets(
         }
         targets
     };
-    if direct.rows.first().is_none_or(|row| targets.len() != row.len())
-        || (0..fields.len()).any(|at| !targets.contains(&at) && table.default(at).is_some())
-    {
+    if direct.rows.first().is_none_or(|row| targets.len() != row.len()) {
         return None;
     }
-    Some((name, targets))
+    let mut fills = Vec::new();
+    for at in (0..fields.len()).filter(|at| !targets.contains(at)) {
+        if let Some(text) = table.default(at) {
+            match fill_of(catalog, table, at, text)? {
+                crate::prepared::Fill::Value(Value::Null) => {}
+                fill => fills.push((at, fill)),
+            }
+        }
+    }
+    Some((name, crate::prepared::Targets { at: targets, fills }))
+}
+
+/// What the default `text` of column `at` puts in the column, when it is one of the defaults the
+/// ORMs write: a constant, `nextval` of a sequence for a `serial` column, or the time of the
+/// transaction. Anything else, or a value that would need more than a widening to fit the column,
+/// gives `None` and the plan reads the default.
+fn fill_of(
+    catalog: &Catalog,
+    table: &rudb_catalog::Table,
+    at: usize,
+    text: &str,
+) -> Option<crate::prepared::Fill> {
+    use crate::prepared::Fill;
+    const TIMESTAMP: u32 = 1114;
+    const TIMESTAMPTZ: u32 = 1184;
+    let field = &table.columns()[at];
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    if matches!(lower.as_str(), "now()" | "current_timestamp" | "transaction_timestamp()") {
+        if !matches!(field.ty, LogicalType::Timestamp | LogicalType::TimestampTz) {
+            return None;
+        }
+        // The plan does not round to a precision below microseconds yet, so neither does this.
+        let declared = table.declared_type(at);
+        if declared.is_some_and(|declared| {
+            !matches!(declared.oid, TIMESTAMP | TIMESTAMPTZ) || (0..6).contains(&declared.typmod)
+        }) {
+            return None;
+        }
+        return Some(Fill::Now);
+    }
+    if let Some(sequence) = lower
+        .strip_prefix("nextval('")
+        .and_then(|rest| rest.strip_suffix("')").or_else(|| rest.strip_suffix("'::regclass)")))
+    {
+        let integer =
+            matches!(field.ty, LogicalType::SmallInt | LogicalType::Integer | LogicalType::BigInt);
+        if sequence.contains(['\'', '"']) || !integer {
+            return None;
+        }
+        let parts: Vec<&str> = sequence.split('.').collect();
+        let resolved = catalog.resolve_sequence(&parts).ok()?;
+        return Some(Fill::Next(catalog.sequence(&resolved).ok()?.counter().id()));
+    }
+    let value = match lower.as_str() {
+        "null" => Value::Null,
+        "true" => Value::Boolean(true),
+        "false" => Value::Boolean(false),
+        _ if text.starts_with('\'') => Value::Varchar(quoted_text(text)?),
+        _ => {
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            match text.parse::<i32>() {
+                Ok(value) => Value::Integer(value),
+                Err(_) => Value::BigInt(text.parse().ok()?),
+            }
+        }
+    };
+    if !fits_declared(&value, table.declared_type(at)) {
+        return None;
+    }
+    let value = if value.is_null() {
+        if field.not_null {
+            return None;
+        }
+        value
+    } else if value.is_of(&field.ty) {
+        value
+    } else if widens(&value.logical_type(), &field.ty) {
+        rudb_kernels::cast::cast_value(&value, &field.ty, false).ok()?
+    } else {
+        return None;
+    };
+    Some(Fill::Value(value))
+}
+
+/// The text of a string written in single quotes, with a doubled quote standing for one, or `None`
+/// when `text` is not only that.
+fn quoted_text(text: &str) -> Option<String> {
+    let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' && chars.next() != Some('\'') {
+            return None;
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 /// The table a [`crate::prepared::Lookup`] reads, the key its `WHERE` names and the columns its
