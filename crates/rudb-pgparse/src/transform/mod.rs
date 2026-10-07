@@ -16,6 +16,7 @@
 mod expr;
 mod query;
 mod types;
+mod write;
 
 use std::cell::OnceCell;
 
@@ -58,8 +59,7 @@ pub fn transform(text: &str) -> Result<Ast, Refused> {
         let Node::RawStmt(raw) = node else {
             return Err(not_yet(node));
         };
-        let statement = transform.statement(raw)?;
-        transform.ast.statements.push(statement);
+        transform.statement(raw)?;
     }
     Ok(transform.ast)
 }
@@ -187,19 +187,30 @@ impl<'a> Transform<'a> {
         })
     }
 
-    /// One statement. Only a query is built yet.
-    fn statement(&mut self, raw: &RawStmt) -> Made<Statement> {
+    /// One statement, added to the statements of the tree. A `TRUNCATE` of several tables adds one
+    /// statement for each table.
+    fn statement(&mut self, raw: &RawStmt) -> Made<()> {
         let start = u32::try_from(raw.stmt_location).unwrap_or(0);
         let end = match u32::try_from(raw.stmt_len) {
             Ok(0) | Err(_) => self.text.len() as u32,
             Ok(len) => start + len,
         };
         self.span = Span::new(start, end);
-        match &raw.stmt {
-            Some(Node::SelectStmt(select)) => Ok(Statement::Query(self.query(select)?)),
-            Some(node) => Err(not_yet(node)),
-            None => clause("RawStmt"),
-        }
+        let statement = match &raw.stmt {
+            Some(Node::SelectStmt(select)) => Statement::Query(self.query(select)?),
+            Some(Node::InsertStmt(insert)) => self.insert(insert)?,
+            Some(Node::UpdateStmt(update)) => self.update(update)?,
+            Some(Node::DeleteStmt(delete)) => self.delete(delete)?,
+            Some(Node::TruncateStmt(truncate)) => {
+                let statements = self.truncate(truncate)?;
+                self.ast.statements.extend(statements);
+                return Ok(());
+            }
+            Some(node) => return Err(not_yet(node)),
+            None => return clause("RawStmt"),
+        };
+        self.ast.statements.push(statement);
+        Ok(())
     }
 
     /// The span of the token at a location, or the span of the statement when the location is not
@@ -312,5 +323,22 @@ mod tests {
             error("with recursive r as (select 1 union select 2 order by 1) select 1 from r"),
             "ok"
         );
+    }
+
+    #[test]
+    fn errors_of_the_writing_statements() {
+        assert_eq!(error("update t set (a, b) = (1, 2), c = 3"), "ok");
+        assert!(
+            error("update t set (a, b) = (1, 2, 3)")
+                .contains("number of columns does not match number of values")
+        );
+        assert!(
+            error("update t set (a) = (1)").contains("must be a sub-SELECT or ROW() expression")
+        );
+        assert!(
+            error("insert into t values (1) on conflict do update set b = 1")
+                .contains("requires inference specification or constraint name")
+        );
+        assert_eq!(error("truncate a, b"), "ok");
     }
 }

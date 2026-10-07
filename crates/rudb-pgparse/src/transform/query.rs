@@ -141,25 +141,7 @@ impl Transform<'_> {
             [None] => Distinct::Yes,
             list => Distinct::On(self.expr_list(list)?),
         };
-        let mut targets = Vec::with_capacity(select.targetList.len());
-        for node in select.targetList.iter().flatten() {
-            let Node::ResTarget(target) = node else {
-                return Err(not_yet(node));
-            };
-            if !target.indirection.is_empty() {
-                return clause("ResTarget");
-            }
-            let Some(value) = &target.val else {
-                return clause("ResTarget");
-            };
-            let expr = self.expr(value)?;
-            let alias = match &target.name {
-                Some(name) => self.intern(name),
-                None => NONE,
-            };
-            targets.push(Target { expr, alias });
-        }
-        let targets = self.ast.target_slice(targets);
+        let targets = self.targets(&select.targetList)?;
         let filter = self.optional(select.whereClause.as_ref())?;
         if select.groupDistinct {
             return clause("GroupDistinct");
@@ -204,10 +186,33 @@ impl Transform<'_> {
         Ok(OrderItem { expr: self.expr(node)?, order, nulls })
     }
 
+    /// A target list, of a select or of a `RETURNING`.
+    pub(super) fn targets(&mut self, list: &List) -> Made<Slice> {
+        let mut targets = Vec::with_capacity(list.len());
+        for node in list.iter().flatten() {
+            let Node::ResTarget(target) = node else {
+                return Err(not_yet(node));
+            };
+            if !target.indirection.is_empty() {
+                return clause("ResTarget");
+            }
+            let Some(value) = &target.val else {
+                return clause("ResTarget");
+            };
+            let expr = self.expr(value)?;
+            let alias = match &target.name {
+                Some(name) => self.intern(name),
+                None => NONE,
+            };
+            targets.push(Target { expr, alias });
+        }
+        Ok(self.ast.target_slice(targets))
+    }
+
     // `WITH`.
 
     /// The definitions of a `WITH`, put in scope for the rest of the query.
-    fn with_clause(&mut self, with: &WithClause) -> Made<()> {
+    pub(super) fn with_clause(&mut self, with: &WithClause) -> Made<()> {
         let mark = self.scope.len();
         for node in with.ctes.iter().flatten() {
             let Node::CommonTableExpr(cte) = node else {
@@ -360,7 +365,7 @@ impl Transform<'_> {
     /// when it reads itself, or when it is read more than once by the statement's own query and no
     /// definition after it takes its name. `NOT MATERIALIZED` puts a definition in place even when
     /// it is read more than once.
-    fn settle(&mut self, mark: usize) -> Vec<u32> {
+    pub(super) fn settle(&mut self, mark: usize) -> Vec<u32> {
         let definitions = self.scope.split_off(mark);
         let mut once = Vec::new();
         for definition in definitions {
@@ -398,7 +403,7 @@ impl Transform<'_> {
 
     // `FROM`.
 
-    fn source(&mut self, node: &Node) -> Made<SourceRef> {
+    pub(super) fn source(&mut self, node: &Node) -> Made<SourceRef> {
         match node {
             Node::RangeVar(table) => self.table(table),
             Node::JoinExpr(join) => self.join(join),

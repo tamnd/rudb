@@ -15,7 +15,7 @@ fn leftmostLoc(loc1: i32, loc2: i32) -> i32 {
 }
 
 /// `exprLocation` of a node that can be `NULL`.
-pub(super) fn exprLocation(expr: Option<&Node>) -> i32 {
+pub(crate) fn exprLocation(expr: Option<&Node>) -> i32 {
     expr.map_or(-1, nodeLocation)
 }
 
