@@ -165,9 +165,13 @@
 //! nothing to do, so the old filter is left in the arena with nothing pointing at it. That costs a
 //! few nodes on a plan and is the reason every pass walks from the root rather than over the arena.
 
+use std::cmp::Ordering;
+
+use rudb_common::bounds::Bound as Edge;
 use rudb_common::{LogicalType, Result};
 use rudb_plan::{
-    Bound, BuildSide, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice,
+    Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
+    NodeRef, Plan, Slice,
 };
 
 use crate::pass::{Context, Pass};
@@ -1059,12 +1063,42 @@ fn narrowed(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
         return;
     }
     for table in wanted {
-        let each: Vec<Vec<ExprRef>> = said
+        let mut each: Vec<Vec<ExprRef>> = said
             .iter()
             .map(|branch| {
                 branch.iter().filter(|&&(at, _)| at == table).map(|&(_, atom)| atom).collect()
             })
             .collect();
+        // What every branch says about this table is said once beside the rest, since `(A AND X)
+        // OR (A AND Y)` is `A AND (X OR Y)`. `shared` has usually stated it already. In q19 that is
+        // the ship mode and the ship instruction, and what is left is three ranges of quantity.
+        let common: Vec<ExprRef> = each[0]
+            .iter()
+            .copied()
+            .filter(|&atom| {
+                each.iter().all(|atoms| atoms.iter().any(|&a| walk::same(plan, a, atom)))
+            })
+            .collect();
+        for &atom in &common {
+            if !into.iter().any(|&other| walk::same(plan, atom, other)) {
+                into.push(atom);
+            }
+            for atoms in &mut each {
+                atoms.retain(|&other| !walk::same(plan, atom, other));
+            }
+        }
+        // A branch with nothing left lets every row through that the common part does.
+        if each.iter().any(Vec::is_empty) {
+            continue;
+        }
+        if let Some(ends) = stretch(plan, &each) {
+            for end in ends {
+                if !into.iter().any(|&other| walk::same(plan, end, other)) {
+                    into.push(end);
+                }
+            }
+            continue;
+        }
         let mut per: Vec<ExprRef> = Vec::with_capacity(each.len());
         for atoms in each {
             per.push(joined_with(plan, ConjunctionOp::And, &atoms));
@@ -1087,6 +1121,111 @@ fn narrowed(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
         }
         into.push(derived);
     }
+}
+
+/// The ends of the one stretch of a column the branches cover between them, when each branch is
+/// a stretch of the same column and the stretches overlap or meet.
+///
+/// q19 restricts `l_quantity` to 1 through 11, 10 through 20 or 20 through 30, which is 1 through 30.
+/// Read as written that was three ranges and an `OR` over each row of lineitem, and the bookkeeping
+/// of the `OR` cost more than the comparisons did. One range is one comparison a row, and a part
+/// whose quantities all fall outside it is skipped on its bounds.
+///
+/// Each end that comes back is a comparison one of the branches wrote, so nothing new is built and
+/// a second run of the pass finds the same ends already stated. No end comes back for a side some
+/// branch leaves open, and nothing at all when every side is open, since that implies nothing.
+/// Only the four orderings against a constant are read. An equality is a stretch too, but it would
+/// be an end with nothing written to stand for it.
+fn stretch(plan: &Plan, branches: &[Vec<ExprRef>]) -> Option<Vec<ExprRef>> {
+    let mut column: Option<ColumnBinding> = None;
+    let mut stretches: Vec<(Option<End>, Option<End>)> = Vec::with_capacity(branches.len());
+    for atoms in branches {
+        let (mut low, mut high): (Option<End>, Option<End>) = (None, None);
+        for &atom in atoms {
+            let Expr::Compare { op, left, right } = *plan.expr(atom) else { return None };
+            let (op, binding, value) = match (plan.expr(left), plan.expr(right)) {
+                (Expr::Column(binding), Expr::Constant(value)) => (op, *binding, *value),
+                (Expr::Constant(value), Expr::Column(binding)) => (op.flip(), *binding, *value),
+                _ => return None,
+            };
+            if *column.get_or_insert(binding) != binding {
+                return None;
+            }
+            let bound = Edge::of_value(plan.value(value))?;
+            let (end, lower) = match op {
+                CompareOp::Greater => ((bound, false, atom), true),
+                CompareOp::GreaterOrEqual => ((bound, true, atom), true),
+                CompareOp::Less => ((bound, false, atom), false),
+                CompareOp::LessOrEqual => ((bound, true, atom), false),
+                _ => return None,
+            };
+            // Two ends on one side of a branch are both true of its rows, so the tighter one is
+            // the side.
+            let held = if lower { &mut low } else { &mut high };
+            *held = Some(match held.take() {
+                None => end,
+                Some(other) => tighter(other, end, lower)?,
+            });
+        }
+        stretches.push((low, high));
+    }
+    // Lowest first, an open low end before every other, and then each stretch has to start no
+    // later than the ones before it reach.
+    let mut unordered = false;
+    stretches.sort_by(|one, other| match (&one.0, &other.0) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(one), Some(other)) => one.0.order(&other.0).unwrap_or_else(|| {
+            unordered = true;
+            Ordering::Equal
+        }),
+    });
+    if unordered {
+        return None;
+    }
+    let mut stretches = stretches.into_iter();
+    let (low, mut reach) = stretches.next()?;
+    for (start, end) in stretches {
+        if let (Some(start), Some(held)) = (&start, &reach) {
+            match start.0.order(&held.0)? {
+                Ordering::Greater => return None,
+                Ordering::Equal if !start.1 && !held.1 => return None,
+                _ => {}
+            }
+        }
+        // An open high end anywhere leaves the whole stretch open above.
+        reach = match (reach, end) {
+            (Some(held), Some(end)) => Some(looser(held, end)?),
+            _ => None,
+        };
+    }
+    let ends: Vec<ExprRef> = [low, reach].into_iter().flatten().map(|end| end.2).collect();
+    (!ends.is_empty()).then_some(ends)
+}
+
+/// One end of a stretch of a column: the bound, whether the bound itself is in, and the comparison
+/// that says so.
+type End = (Edge, bool, ExprRef);
+
+/// The tighter of two ends on one side, which is the larger of two low ends and the smaller of two
+/// high ones, or `None` when the two bounds cannot be ordered. At the same bound the end that
+/// leaves the bound out is the tighter.
+fn tighter(one: End, other: End, lower: bool) -> Option<End> {
+    Some(match (one.0.order(&other.0)?, lower) {
+        (Ordering::Less, true) | (Ordering::Greater, false) => other,
+        (Ordering::Equal, _) if one.1 && !other.1 => other,
+        _ => one,
+    })
+}
+
+/// The higher of two high ends, and at the same bound the one that takes the bound in.
+fn looser(one: End, other: End) -> Option<End> {
+    Some(match one.0.order(&other.0)? {
+        Ordering::Less => other,
+        Ordering::Equal if other.1 && !one.1 => other,
+        _ => one,
+    })
 }
 
 /// The one table an expression reads, or nothing when it reads none or more than one.
@@ -1982,6 +2121,56 @@ Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER = 1::INTEGE
         // holding, and the join has to recognise it rather than write it down twice. The real q19
         // failed the optimizer's own settle check with a condition list of the same equality twice.
         assert_eq!(pushed(after), after);
+    }
+
+    /// The filter `pushed` leaves right over the scan of `a`, from a plan of `a` joined to `b`.
+    fn over_a(plan: &str) -> String {
+        let lines: Vec<&str> = plan.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("Get memory.main.t AS a"))
+            .expect("a scan of a");
+        lines[at - 1].trim_start().to_owned()
+    }
+
+    #[test]
+    fn ranges_of_one_column_that_meet_are_implied_as_the_one_range_they_cover() {
+        // TPC-H q19 in miniature again, with its three ranges of quantity and the conjunct every
+        // branch has. What the disjunction says about `a` is 1 through 30, and the conjunct every
+        // branch has about `a` is said once beside it rather than in each branch.
+        let branch = |low: u32, high: u32, other: u32| {
+            format!(
+                "((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER >= {low}::INTEGER)::BOOLEAN AND (#0.1::INTEGER <= {high}::INTEGER)::BOOLEAN AND (#0.0::INTEGER > 0::INTEGER)::BOOLEAN AND (#1.1::INTEGER = {other}::INTEGER)::BOOLEAN)::BOOLEAN"
+            )
+        };
+        let before = format!(
+            "Filter ({} OR {} OR {})::BOOLEAN\n  CrossProduct\n    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]\n    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]\n",
+            branch(1, 11, 7),
+            branch(10, 20, 8),
+            branch(20, 30, 9)
+        );
+        let after = pushed(&before);
+        let filter = over_a(&after);
+        assert!(filter.contains("(#0.1::INTEGER >= 1::INTEGER)::BOOLEAN"), "{after}");
+        assert!(filter.contains("(#0.1::INTEGER <= 30::INTEGER)::BOOLEAN"), "{after}");
+        assert!(filter.contains("(#0.0::INTEGER > 0::INTEGER)::BOOLEAN"), "{after}");
+        assert!(!filter.contains(" OR "), "{after}");
+        assert!(!filter.contains("11::INTEGER") && !filter.contains("20::INTEGER"), "{after}");
+        assert_eq!(pushed(&after), after);
+    }
+
+    #[test]
+    fn ranges_of_one_column_with_a_gap_between_them_stay_a_disjunction() {
+        // 1 through 5 or 10 through 20 lets no 7 through, so the one range 1 through 20 would be a
+        // predicate the query does not imply. Two ranges that meet at an end neither of them takes
+        // in leave that one value out the same way.
+        for (first, second) in [("<= 5", ">= 10"), ("< 10", "> 10")] {
+            let before = format!(
+                "Filter (((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER >= 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER {first}::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN AND (#0.1::INTEGER {second}::INTEGER)::BOOLEAN AND (#0.1::INTEGER <= 20::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN\n  CrossProduct\n    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]\n    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]\n"
+            );
+            let after = pushed(&before);
+            assert!(over_a(&after).contains(" OR "), "{after}");
+        }
     }
 
     #[test]
