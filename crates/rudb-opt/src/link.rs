@@ -1116,14 +1116,15 @@ mod tests {
         };
         // Rows enough that a tenth of them do not fit either, whatever the filter is estimated at.
         let mut plan = filtered("INNER");
-        let context = context(30_000_000);
-        let text = rewritten(&mut plan, &context);
+        let large = context(30_000_000);
+        let text = rewritten(&mut plan, &large);
         assert!(text.contains("LinkJoin INNER"), "the join was not rewritten:\n{text}");
-        assert!(matches!(about(&plan, &context), Why::Narrow { .. }));
+        assert!(matches!(about(&plan, &large), Why::Narrow { .. }));
         let mut plan = filtered("SEMI");
-        let text = rewritten(&mut plan, &context(1_000));
+        let small = context(1_000);
+        let text = rewritten(&mut plan, &small);
         assert!(!text.contains("LinkJoin"), "a filtered parent that fits was linked:\n{text}");
-        assert!(matches!(about(&plan, &context(1_000)), Why::Fits { .. }));
+        assert!(matches!(about(&plan, &small), Why::Fits { .. }));
     }
 
     /// `lineitem` against `partsupp` over both halves of its key, with `on` as the conditions.
