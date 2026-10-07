@@ -1753,6 +1753,18 @@ impl Catalog {
         Ok(true)
     }
 
+    /// Whether a table, a view, a sequence or an index in the schema of `table` has the name. These
+    /// are the names that PostgreSQL keeps in one namespace.
+    pub fn relation_named(&self, table: &QualifiedName, name: &str) -> bool {
+        let Ok(schema) = self.schema(&table.catalog, &table.schema) else { return false };
+        schema.kind(name).is_some()
+            || schema.sequences.iter().any(|held| same_name(&held.name().table, name))
+            || schema
+                .tables
+                .iter()
+                .any(|held| held.indexes().iter().any(|index| same_name(&index.name, name)))
+    }
+
     /// The table holding the index this name means, read as schema and index name, and where the
     /// index is in its list.
     fn index_in(&self, name: &QualifiedName) -> Option<(QualifiedName, usize)> {

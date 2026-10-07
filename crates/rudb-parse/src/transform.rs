@@ -1321,9 +1321,7 @@ impl<'a> Transform<'a> {
     }
 
     fn index_statement(&mut self, index: Index) -> Statement {
-        let at = self.ast.indexes.len() as u32;
-        self.ast.indexes.push(index);
-        Statement::Index(at)
+        Statement::Index(self.ast.push_index(index))
     }
 
     /// `CreateSequenceStmt <- 'SEQUENCE' IfNotExists? QualifiedName SequenceOption*`.

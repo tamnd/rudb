@@ -14,6 +14,7 @@
 //! transform for that statement until it does.
 
 mod expr;
+mod index;
 mod query;
 mod types;
 mod write;
@@ -201,6 +202,7 @@ impl<'a> Transform<'a> {
             Some(Node::InsertStmt(insert)) => self.insert(insert)?,
             Some(Node::UpdateStmt(update)) => self.update(update)?,
             Some(Node::DeleteStmt(delete)) => self.delete(delete)?,
+            Some(Node::IndexStmt(index)) => self.create_index(index)?,
             Some(Node::TruncateStmt(truncate)) => {
                 let statements = self.truncate(truncate)?;
                 self.ast.statements.extend(statements);

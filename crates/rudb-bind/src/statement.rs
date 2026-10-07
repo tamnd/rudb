@@ -2359,10 +2359,11 @@ fn create_index(
     let mut columns = Vec::new();
     let mut plain = true;
     let mut texts = Vec::new();
+    let mut column_names = Vec::new();
     for &expr in ast.expr_list(written.elements) {
         if let ast::Expr::Column { name: column } = ast.exprs[expr as usize] {
-            let column: Vec<&str> = ast.name(column).collect();
-            if let [only] = column[..]
+            let path: Vec<&str> = ast.name(column).collect();
+            if let [only] = path[..]
                 && !fields.iter().any(|field| same_name(&field.name, only))
             {
                 let names: Vec<String> =
@@ -2373,8 +2374,14 @@ fn create_index(
                          : {}",
                     name.table,
                     names.join(", ")
-                )));
+                ))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!("column \"{only}\" does not exist"))
+                .placed_at(ast.part_span(column, 0)));
             }
+        }
+        if written.name.is_empty() {
+            column_names.push(binder.index_column_name(ast, expr, &scope));
         }
         if crate::expr::has_aggregate(ast, expr) {
             return Err(Error::binder("aggregate functions are not allowed in index expressions"));
@@ -2431,7 +2438,14 @@ fn create_index(
     } else {
         format!(" USING {} ", ast.string(written.using))
     };
-    let index_name = parts.last().cloned().unwrap_or_default();
+    // Only the PostgreSQL grammar takes an index with no name, and it is named as PostgreSQL
+    // names it.
+    let index_name = match parts.last() {
+        Some(written) => written.clone(),
+        None => crate::figure::index_name(&name.table, &column_names, |taken| {
+            catalog.relation_named(&name, taken)
+        }),
+    };
     let sql = format!(
         "CREATE {unique}INDEX {} ON {}{using}({});",
         rudb_parse::quoted(&index_name),
