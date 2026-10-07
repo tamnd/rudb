@@ -609,6 +609,7 @@ dependencies = [
  "rudb-functions",
  "rudb-native",
  "rudb-parse",
+ "rudb-pgtypes",
  "rudb-storage",
  "rudb-txn",
  "rudb-vector",
