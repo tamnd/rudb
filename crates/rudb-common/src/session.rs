@@ -187,7 +187,9 @@ pub struct Semantics {
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     disable_timestamptz_casts: bool,
+    error_texts: ErrorTexts,
     errors_as_json: bool,
+    function_rules: FunctionRules,
     integer_division: bool,
     ieee_floating_point_ops: bool,
     identifier_case: IdentifierCase,
@@ -199,8 +201,11 @@ pub struct Semantics {
     operator_rules: OperatorRules,
     order_by_non_integer_literal: bool,
     pivot_limit: u64,
+    plan_errors: PlanErrors,
     regex_match_full: bool,
     scalar_subquery_error_on_multiple_rows: bool,
+    sequence_owners: SequenceOwners,
+    set_functions: SetFunctions,
     show_behavior: ShowBehavior,
     single_arrow_lambdas: bool,
     type_names: TypeNames,
@@ -218,7 +223,9 @@ impl Default for Semantics {
             default_descending: false,
             default_null_order: DefaultNullOrder::default(),
             disable_timestamptz_casts: false,
+            error_texts: ErrorTexts::Pin,
             errors_as_json: false,
+            function_rules: FunctionRules::Pin,
             integer_division: false,
             ieee_floating_point_ops: true,
             identifier_case: IdentifierCase::Preserve,
@@ -230,8 +237,11 @@ impl Default for Semantics {
             operator_rules: OperatorRules::Pin,
             order_by_non_integer_literal: false,
             pivot_limit: 100_000,
+            plan_errors: PlanErrors::Pin,
             regex_match_full: false,
             scalar_subquery_error_on_multiple_rows: true,
+            sequence_owners: SequenceOwners::Table,
+            set_functions: SetFunctions::Pin,
             show_behavior: ShowBehavior::Auto,
             single_arrow_lambdas: false,
             type_names: TypeNames::Pin,
@@ -307,6 +317,31 @@ impl Semantics {
     #[must_use]
     pub fn unknown_types(self) -> UnknownTypes {
         self.unknown_types
+    }
+    /// The words and the SQLSTATE of an error that the dialects report differently.
+    #[must_use]
+    pub fn error_texts(self) -> ErrorTexts {
+        self.error_texts
+    }
+    /// The rules of the functions that are different between the dialects.
+    #[must_use]
+    pub fn function_rules(self) -> FunctionRules {
+        self.function_rules
+    }
+    /// When an error of a constant part of a query is raised.
+    #[must_use]
+    pub fn plan_errors(self) -> PlanErrors {
+        self.plan_errors
+    }
+    /// What the name after `OWNED BY` of a sequence names.
+    #[must_use]
+    pub fn sequence_owners(self) -> SequenceOwners {
+        self.sequence_owners
+    }
+    /// Which set returning functions a select list can call.
+    #[must_use]
+    pub fn set_functions(self) -> SetFunctions {
+        self.set_functions
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -534,6 +569,62 @@ pub enum UnknownTypes {
     /// elements of an array, of the column that an `INSERT` writes or the `bigint` of a `LIMIT`.
     /// It prefers `text` to a `bytea`, and it is a `text` as a result column or as the argument of
     /// `min` or `max`. A null parameter has the type that the client declared for it.
+    Postgres,
+}
+
+/// The words and the SQLSTATE of an error that the dialects report differently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ErrorTexts {
+    /// The text of DuckDB.
+    #[default]
+    Pin,
+    /// The text and the SQLSTATE of PostgreSQL, such as `there is no parameter $1` with `42P02`
+    /// and `LIMIT must not be negative` with `2201W`.
+    Postgres,
+}
+
+/// The rules of the functions that are different between the dialects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FunctionRules {
+    /// The functions of DuckDB.
+    #[default]
+    Pin,
+    /// The functions of PostgreSQL where they are different: `every`, `pg_typeof` and a
+    /// `current_setting` that reads the settings of the session are there, the result types are
+    /// the ones of PostgreSQL, such as an `int4` for `generate_series` over `int4` and a `float8`
+    /// for `date_part`, and an advisory lock function gives `void`.
+    Postgres,
+}
+
+/// When an error of a constant part of a query is raised.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlanErrors {
+    /// As in DuckDB: the error comes when the query reads the value, so a part that no row
+    /// reaches raises nothing.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the planner folds each call whose arguments are all constants, and an
+    /// error there fails the statement before it makes a row.
+    Postgres,
+}
+
+/// What the name after `OWNED BY` of a sequence names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SequenceOwners {
+    /// As in DuckDB: the name is a table, with its schema in front if it has one.
+    #[default]
+    Table,
+    /// As in PostgreSQL: the last part of the name is a column of the table.
+    Column,
+}
+
+/// Which set returning functions a select list can call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SetFunctions {
+    /// As in DuckDB: only `unnest`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: also `generate_series`, which gives one row for each value.
     Postgres,
 }
 
@@ -942,6 +1033,11 @@ impl Session {
             self.semantics.type_names = TypeNames::Postgres;
             self.semantics.operator_rules = OperatorRules::Postgres;
             self.semantics.unknown_types = UnknownTypes::Postgres;
+            self.semantics.error_texts = ErrorTexts::Postgres;
+            self.semantics.function_rules = FunctionRules::Postgres;
+            self.semantics.plan_errors = PlanErrors::Postgres;
+            self.semantics.sequence_owners = SequenceOwners::Column;
+            self.semantics.set_functions = SetFunctions::Postgres;
         }
         self.postgres = Postgreses(postgres);
     }

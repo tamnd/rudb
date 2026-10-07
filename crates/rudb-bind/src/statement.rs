@@ -18,7 +18,8 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
     Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
-    LogicalType, Result, Session, SqlState, Stat, TypeNames, UnknownTypes, Value, Width,
+    LogicalType, PlanErrors, Result, SequenceOwners, Session, SqlState, Stat, TypeNames,
+    UnknownTypes, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -581,7 +582,7 @@ pub(crate) fn bind_one(
             }
             let mut plan = finish(binder, root)?;
             plan.set_origins(scope.origins());
-            if session.postgres().is_some() {
+            if session.semantics().plan_errors() == PlanErrors::Postgres {
                 match parameters.placeholders() {
                     // A parameter is a null while a statement is described, and its value can
                     // change what folds.
@@ -638,8 +639,8 @@ pub(crate) fn bind_one(
             if alter && name.is_some() {
                 let mut parts: Vec<&str> = ast.name(written.owner).collect();
                 // PostgreSQL names a column of the owner, and the table owns the sequence here.
-                let column = match session.postgres() {
-                    Some(_) if parts.len() > 1 => parts.pop(),
+                let column = match session.semantics().sequence_owners() {
+                    SequenceOwners::Column if parts.len() > 1 => parts.pop(),
                     _ => None,
                 };
                 let held = catalog.resolve_owner(&parts)?;

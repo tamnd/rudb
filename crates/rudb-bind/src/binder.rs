@@ -17,9 +17,9 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    AggregateTypes, DeclaredType, Error, Field, JoinColumns, LogicalType, Origin, Result,
-    Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey, UnknownTypes, Value,
-    ValuesNames,
+    AggregateTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, JoinColumns,
+    LogicalType, Origin, Result, Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey,
+    UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -2200,7 +2200,7 @@ impl<'a> Binder<'a> {
                     Some(Origin::typed(NAME))
                 }
                 // An advisory lock function such as `pg_advisory_lock` gives `void`.
-                _ if self.session.postgres().is_some()
+                _ if self.semantics.function_rules() == FunctionRules::Postgres
                     && crate::advisory::gives_void(ast, target.expr) =>
                 {
                     Some(Origin::typed(VOID))
@@ -2710,7 +2710,8 @@ impl<'a> Binder<'a> {
         if value.is_null() {
             return Ok(Bound::All);
         }
-        row_count(&value, clause, self.session.postgres().is_some()).map(Bound::Rows)
+        let texts = self.semantics.error_texts() == ErrorTexts::Postgres;
+        row_count(&value, clause, texts).map(Bound::Rows)
     }
 
     // ------------------------------------------------------------------- from

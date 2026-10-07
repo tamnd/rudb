@@ -10,7 +10,7 @@
 //! that reads the type from the RowDescription gets the type it expects.
 
 use rudb_catalog::{Catalog, same_name};
-use rudb_common::{Error, LogicalType, Result, SqlState, Value};
+use rudb_common::{Error, FunctionRules, LogicalType, Result, SqlState, Value};
 use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
@@ -342,7 +342,7 @@ impl Binder<'_> {
     /// `int4` column where the series here gives a BIGINT. A parameter of no type is typed as an
     /// `int4` here, as PostgreSQL types it.
     pub(crate) fn postgres_series(&mut self, function: &str, arguments: &mut [ExprRef]) -> bool {
-        if self.session.postgres().is_none()
+        if self.semantics.function_rules() == FunctionRules::Pin
             || !same_name(function, "generate_series")
             || arguments.is_empty()
         {

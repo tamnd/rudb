@@ -11,9 +11,10 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CharacterTypes, DeclaredType, Error, Field, LogicalType, MAX_DECIMAL_WIDTH, NumberLiterals,
-    OperatorRules, Result, Semantics, Session, SqlState, StateKey, UnknownTypes, Value,
-    is_clustering_setting, looks_like_rule, rule_names,
+    CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, LogicalType,
+    MAX_DECIMAL_WIDTH, NumberLiterals, OperatorRules, Result, Semantics, Session, SetFunctions,
+    SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule,
+    rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -144,7 +145,7 @@ impl Binder<'_> {
                     && !self.in_aggregate
                     && !self.in_window
                     && !self.in_lambda()
-                    && self.session.postgres().is_some()
+                    && self.semantics.set_functions() == SetFunctions::Postgres
                     && rudb_catalog::same_name(
                         ast.name(name).last().unwrap_or_default(),
                         "generate_series",
@@ -258,12 +259,12 @@ impl Binder<'_> {
                 self.exporting = ast.exports_state(expr);
                 let bound = self.bind_call(ast, name, args, distinct, filter, sorted, scope);
                 self.exporting = false;
-                match self.session.postgres() {
-                    Some(_) => {
+                match self.semantics.function_rules() {
+                    FunctionRules::Postgres => {
                         let written = ast.name(name).last().unwrap_or_default();
                         Ok(self.postgres_result(written, bound?))
                     }
-                    None => bound,
+                    FunctionRules::Pin => bound,
                 }
             }
             ast::Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec } => {
@@ -287,7 +288,10 @@ impl Binder<'_> {
                 let session = self.session;
                 let written = ast.string(ty);
                 let target = crate::statement::session_type(self.catalog(), session, written)?;
-                let declared = session.postgres().and(rudb_pgtypes::declared_type(written));
+                let declared = match session.semantics().type_names() {
+                    TypeNames::Postgres => rudb_pgtypes::declared_type(written),
+                    TypeNames::Pin => None,
+                };
                 if !try_cast
                     && let Some(declared) = declared
                     && let Some(value) = self.read_literal(ast, operand, declared.oid)
@@ -582,7 +586,7 @@ impl Binder<'_> {
         let Some(value) = self.parameters.get(name) else {
             // A numbered parameter in a query that has no values for it is an undefined parameter
             // in PostgreSQL.
-            if self.session.postgres().is_some() {
+            if self.semantics.error_texts() == ErrorTexts::Postgres {
                 let number = name.trim_start_matches('$');
                 return Err(Error::binder(format!("there is no parameter ${number}"))
                     .state(SqlState::UNDEFINED_PARAMETER));
@@ -1275,7 +1279,8 @@ impl Binder<'_> {
         }
         let arguments = ast.expr_list(args).to_vec();
         // `every` is the SQL standard name of `bool_and`, which PostgreSQL has and the pin does not.
-        let postgres = self.session.postgres().is_some();
+        let postgres = self.semantics.function_rules() == FunctionRules::Postgres;
+        let unknowns = self.semantics.unknown_types() == UnknownTypes::Postgres;
         if postgres && rudb_catalog::same_name(&written, "every") {
             written = "bool_and".to_string();
         }
@@ -1319,7 +1324,7 @@ impl Binder<'_> {
         // `pg_typeof` names the PostgreSQL type, as `format_type` does with no typmod, so a
         // `numeric(2,1)` literal is `numeric`. A string literal or a null has no type yet.
         if !modified
-            && self.session.postgres().is_some()
+            && postgres
             && rudb_catalog::same_name(&written, "pg_typeof")
             && let [only] = arguments[..]
         {
@@ -1489,7 +1494,7 @@ impl Binder<'_> {
         // too, which an `EXPLAIN` of a query that calls it shows. A call this cannot fold falls
         // through to the table, which refuses it in upstream's words.
         if rudb_catalog::same_name(&written, "current_setting")
-            && self.session.postgres().is_some()
+            && postgres
             && let Some(folded) = self.postgres_setting(&bound)?
         {
             return Ok(folded);
@@ -1624,13 +1629,13 @@ impl Binder<'_> {
                 .collect();
             self.adopt_literals(function, &kinds, &mut bound)?;
             // Parameters of no type and nothing else are `text` in PostgreSQL.
-            if postgres && bound.iter().all(|&arg| self.is_placeholder(arg)) {
+            if unknowns && bound.iter().all(|&arg| self.is_placeholder(arg)) {
                 for arg in &mut bound {
                     *arg = self.cast_to(*arg, &LogicalType::Varchar);
                 }
             }
         }
-        if postgres
+        if unknowns
             && rudb_catalog::same_name(&written, "nullif")
             && bound.iter().all(|&arg| self.is_placeholder(arg))
         {
@@ -1734,7 +1739,8 @@ impl Binder<'_> {
                 return self.call(bytes, bound);
             }
         }
-        let call = self.call(&written, bound).map_err(|error| match postgres {
+        let texts = self.semantics.error_texts() == ErrorTexts::Postgres;
+        let call = self.call(&written, bound).map_err(|error| match texts {
             true => undefined_function(ast, error, &written, &arguments, &types),
             false => literals_spelled(ast, error, &arguments, &types),
         })?;
