@@ -14,13 +14,22 @@
 //! [`keyword`], which says whether a word is a keyword and of which [`Category`], and
 //! [`token`], the token numbers.
 //!
-//! [`recognize`], which runs the tables over a list of tokens and says where the first token is
-//! that the grammar does not accept. The lexer, the lookahead filter of `parser.c` and the actions
-//! that build the AST of `rudb-parse` come next, in that order.
+//! [`Lexer`], a port of `scan.l`, and [`Tokens`], the filter of `parser.c` after it, which looks one
+//! token further for the few places where the grammar needs two tokens.
+//!
+//! [`check`], which lexes and parses a text and gives the same first error as PostgreSQL, with the
+//! same message and position. [`recognize`] runs the tables over a list of tokens. The actions that
+//! build the AST of `rudb-parse` come next.
 
+mod error;
+mod filter;
 mod generated;
+mod lexer;
 mod parser;
 
+pub use error::{Error, Notice};
+pub use filter::Tokens;
 pub use generated::keywords::{Category, Keyword};
 pub use generated::tables::{RULES, STATES, TOKENS, token};
-pub use parser::{SyntaxError, character, keyword, recognize, rule_name, symbol_name};
+pub use lexer::{Lexer, Token, Value};
+pub use parser::{SyntaxError, character, check, keyword, recognize, rule_name, symbol_name};
