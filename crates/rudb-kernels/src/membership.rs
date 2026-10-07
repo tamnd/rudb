@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::{LogicalType, Result, Value};
-use rudb_vector::{Data, Form, Live, Selection, Validity, Vector};
+use rudb_vector::{Data, Form, Live, PREFETCH_AHEAD, Selection, Validity, Vector, prefetch};
 
 use crate::fallback::{self, Kernel};
 use crate::peel::{Found, Peel, search};
@@ -592,9 +592,15 @@ fn select_text(input: &Vector, members: &Members, live: Option<&Selection>) -> O
     let row = |slot: usize| named.map_or(slot as u32, |named| named[slot]);
     let negated = members.negated;
     // The sorted search reads no value at all, and the memo takes the dictionaries without an order.
+    // Over rows a filter before this one left, which on q12 is a few in a hundred of `lineitem`,
+    // each code is a cache line of its own, and asked for a few rows ahead the misses overlap
+    // rather than each being waited out in turn.
     if let Some(found) = members.sought(input) {
         let found = found.ok()?;
         return Some(picked(count, row, |slot| {
+            if let Some(&ahead) = named.and_then(|named| named.get(slot + PREFETCH_AHEAD)) {
+                prefetch(codes, ahead as usize);
+            }
             found.get(codes[row(slot) as usize] as usize).copied().unwrap_or(false) != negated
         }));
     }

@@ -644,9 +644,12 @@ unsafe fn group_codes(
 /// orders. A code is below 2^25 and the caller keeps `shift` below 2^30 either way, so both sides
 /// fit a signed lane and one signed compare answers eight rows. `fresh` is as [`within_words`]
 /// takes it, and each side is a `(bytes, width)` pair with the bytes it asks for there.
+///
+/// Two sides of sixteen bits, which is where the dates of TPC-H are held, take their codes with one
+/// load that widens eight of them to lanes rather than the shuffle, shift and mask of any other
+/// width, see [`against_blocks`].
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-#[allow(unsafe_code)]
 pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool>(
     left: (&[u8], usize),
     right: (&[u8], usize),
@@ -654,9 +657,34 @@ pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool
     words: &mut [u64],
     fresh: bool,
 ) {
+    if left.1 == 16 && right.1 == 16 {
+        against_blocks::<SWAP, EQUAL, NOT, true>(left, right, shift, words, fresh);
+    } else {
+        against_blocks::<SWAP, EQUAL, NOT, false>(left, right, shift, words, fresh);
+    }
+}
+
+/// [`against_words`] with `WIDE` when both widths are sixteen.
+///
+/// A code of sixteen bits starts on a byte, so a group of eight is the sixteen bytes at `16 * g`
+/// and one zero extending load puts them in lanes. Taken through the table as any other width, a
+/// group was two loads, an insert, a shuffle, a shift and a mask a side, and on q12 the compare of
+/// `l_commitdate` with `l_receiptdate` and of `l_shipdate` with `l_commitdate` was a sixth of the
+/// query.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+#[allow(unsafe_code)]
+fn against_blocks<const SWAP: bool, const EQUAL: bool, const NOT: bool, const WIDE: bool>(
+    left: (&[u8], usize),
+    right: (&[u8], usize),
+    shift: i32,
+    words: &mut [u64],
+    fresh: bool,
+) {
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32,
-        _mm256_loadu_si256, _mm256_movemask_ps, _mm256_set1_epi32,
+        _mm_loadu_si128, _mm256_add_epi32, _mm256_castsi256_ps, _mm256_cmpeq_epi32,
+        _mm256_cmpgt_epi32, _mm256_cvtepu16_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_set1_epi32,
     };
     let ((left, one), (right, other)) = (left, right);
     assert!((1..=LANE_WIDTH_MAX).contains(&one) && (1..=LANE_WIDTH_MAX).contains(&other));
@@ -668,7 +696,8 @@ pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool
     let (left_half, right_half) = (4 * one / 8, 4 * other / 8);
     // SAFETY: the build enables AVX2, which the `cfg` on this function checks. Each side's loads
     // are the ones [`within_words`] makes over its own bytes and width, which the asserts above
-    // keep inside them for the same reason they do there.
+    // keep inside them for the same reason they do there. With `WIDE` a group reads the sixteen
+    // bytes at `128 * b + 16 * g`, which ends at the end of the block.
     unsafe {
         let left_shuffle = _mm256_loadu_si256(left_shuffle.as_ptr().cast());
         let left_shifts = _mm256_loadu_si256(left_shifts.as_ptr().cast());
@@ -688,20 +717,29 @@ pub(crate) fn against_words<const SWAP: bool, const EQUAL: bool, const NOT: bool
                 (left.as_ptr().add(8 * block * one), right.as_ptr().add(8 * block * other));
             let mut found = 0_u64;
             for group in 0..8 {
-                let a = group_codes(
-                    at.add(group * one),
-                    left_half,
-                    left_shuffle,
-                    left_shifts,
-                    left_mask,
-                );
-                let b = group_codes(
-                    to.add(group * other),
-                    right_half,
-                    right_shuffle,
-                    right_shifts,
-                    right_mask,
-                );
+                let (a, b) = if WIDE {
+                    (
+                        _mm256_cvtepu16_epi32(_mm_loadu_si128(at.add(group * 16).cast())),
+                        _mm256_cvtepu16_epi32(_mm_loadu_si128(to.add(group * 16).cast())),
+                    )
+                } else {
+                    (
+                        group_codes(
+                            at.add(group * one),
+                            left_half,
+                            left_shuffle,
+                            left_shifts,
+                            left_mask,
+                        ),
+                        group_codes(
+                            to.add(group * other),
+                            right_half,
+                            right_shuffle,
+                            right_shifts,
+                            right_mask,
+                        ),
+                    )
+                };
                 let b = _mm256_add_epi32(b, shift);
                 let (x, y) = if SWAP { (b, a) } else { (a, b) };
                 let test = if EQUAL { _mm256_cmpeq_epi32(x, y) } else { _mm256_cmpgt_epi32(x, y) };
@@ -1144,7 +1182,9 @@ mod tests {
         type Against = fn((&[u8], usize), (&[u8], usize), i32, &mut [u64], bool);
         type Case = (Against, fn(i64, i64) -> bool);
         let blocks = 3;
-        for (one, other) in [(1, 1), (5, 7), (12, 12), (12, 13), (25, 3), (25, 25)] {
+        for (one, other) in
+            [(1, 1), (5, 7), (12, 12), (12, 13), (16, 16), (16, 12), (25, 3), (25, 25)]
+        {
             let (left, a) = packed_blocks(one, blocks, 1);
             let (right, b) = packed_blocks(other, blocks, 5);
             for shift in [-40_i32, -1, 0, 2, 30] {
