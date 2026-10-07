@@ -3121,16 +3121,22 @@ fn like_run<A: Fn(usize) -> usize>(
     // A prefix is decided on the length and the first four bytes, which every view holds whether
     // the string is in it or in the arena, and only a row they agree with is read from the arena.
     // TPC-H q20 asks `p_name LIKE 'forest%'` of the two hundred thousand parts twice, and a call to
-    // compare bytes for each of them was a fifth of the query.
+    // compare bytes for each of them was a fifth of the query. The four bytes are compared as one
+    // number under a mask, because a slice of a length known only at run time is compared by a call
+    // to `memcmp`, and that call was still made on every row.
     if let (false, Pattern::Prefix(prefix)) = (like.fold_case, &like.compiled) {
         let prefix = prefix.as_bytes();
         let views = column.views();
         let head = prefix.len().min(4);
+        let (mut wanted, mut keep) = ([0u8; 4], [0u8; 4]);
+        wanted[..head].copy_from_slice(&prefix[..head]);
+        keep[..head].fill(u8::MAX);
+        let (wanted, keep) = (u32::from_ne_bytes(wanted), u32::from_ne_bytes(keep));
         let validity = over_valid(rows, base, |index| {
             let at = at(index);
             let held = views.get(at).is_some_and(|view| {
                 view.len() >= prefix.len()
-                    && view.prefix()[..head] == prefix[..head]
+                    && u32::from_ne_bytes(view.prefix()) & keep == wanted
                     && (prefix.len() <= 4
                         || column.bytes(at).is_some_and(|text| text.starts_with(prefix)))
             }) || (prefix.is_empty() && views.get(at).is_none());
