@@ -1494,6 +1494,7 @@ impl Binder<'_> {
             return Ok(self.add_constant(Value::Varchar(text.trim_start().to_string())));
         }
         if bound.is_empty() && rudb_catalog::same_name(&written, "txid_current") {
+            self.read_per_transaction();
             return Ok(self.add_constant(Value::UBigInt(self.session.transaction())));
         }
         // `getvariable` is folded for the reason `current_setting` is: it is declared to return
@@ -1508,12 +1509,14 @@ impl Binder<'_> {
             && let [catalog, schema] = bound[..]
             && let Some(answered) = self.in_search_path(catalog, schema)?
         {
+            self.read_per_transaction();
             return Ok(answered);
         }
         if rudb_catalog::same_name(&written, "current_schemas")
             && bound.len() == 1
             && let Some(folded) = self.current_schemas(bound[0])?
         {
+            self.read_per_transaction();
             return Ok(folded);
         }
         // The session context functions are the third group the binder answers, and they fold for

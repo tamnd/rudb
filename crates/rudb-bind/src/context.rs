@@ -161,6 +161,14 @@ impl Binder<'_> {
 
     /// One session context answer, as a constant in the plan.
     fn context(&mut self, what: Context) -> ExprRef {
+        // The two local answers and the users are the pin's macros rather than its functions, so
+        // only the rest are settled per transaction there.
+        if !matches!(
+            what,
+            Context::LocalInstant | Context::LocalTime | Context::User | Context::SessionUser
+        ) {
+            self.read_per_transaction();
+        }
         let instant = self.instant();
         let local = self.session.local_micros(instant);
         let midnight = || local.rem_euclid(MICROS_PER_DAY);

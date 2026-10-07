@@ -54,6 +54,10 @@ pub struct Described {
     /// The error of [`crate::fold::planned`] for a query of a PostgreSQL session with no
     /// parameters, which PostgreSQL raises when it plans the query and not when it parses it.
     pub planning: Option<Error>,
+    /// Whether the statement calls a function whose answer is settled once per transaction, such
+    /// as `now()` or `current_schema()`. The pin marks these `CONSISTENT_WITHIN_QUERY` and plans a
+    /// statement that calls one again at every `EXECUTE`.
+    pub per_transaction: bool,
 }
 
 impl Placeholders {
@@ -95,6 +99,11 @@ impl Placeholders {
     /// Keeps the error that planning the statement would raise.
     pub fn plan_error(&self, error: Option<Error>) {
         self.lock().planning = error;
+    }
+
+    /// Notes that the statement calls a function whose answer is settled once per transaction.
+    pub fn read_per_transaction(&self) {
+        self.lock().per_transaction = true;
     }
 
     /// Whether the statement has no parameters.

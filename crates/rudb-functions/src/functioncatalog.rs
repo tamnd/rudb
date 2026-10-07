@@ -312,6 +312,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbTriggers,
     TableFunction::DuckdbSequences,
     TableFunction::DuckdbIndexes,
+    TableFunction::DuckdbDependencies,
     TableFunction::DuckdbConstraints,
     TableFunction::DuckdbColumns,
     TableFunction::DuckdbExtensions,
@@ -319,6 +320,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::DuckdbDialects,
     TableFunction::DuckdbGrammarExtensions,
     TableFunction::DuckdbVariables,
+    TableFunction::DuckdbPreparedStatements,
     TableFunction::PragmaTableInfo,
     TableFunction::PragmaShow,
     TableFunction::PragmaStorageInfo,
@@ -373,6 +375,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::DuckdbTriggers
         | TableFunction::DuckdbSequences
         | TableFunction::DuckdbIndexes
+        | TableFunction::DuckdbDependencies
         | TableFunction::DuckdbConstraints
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
@@ -380,6 +383,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::DuckdbDialects
         | TableFunction::DuckdbGrammarExtensions
         | TableFunction::DuckdbVariables
+        | TableFunction::DuckdbPreparedStatements
         | TableFunction::PragmaVersion
         | TableFunction::PragmaPlatform
         | TableFunction::PragmaUserAgent

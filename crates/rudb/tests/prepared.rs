@@ -354,3 +354,64 @@ fn a_name_with_no_from_clause_to_look_in_says_the_clause_is_missing() {
             .starts_with("Binder Error: Referenced column \"nosuch\" not found in FROM clause!"),
     );
 }
+
+#[test]
+fn duckdb_prepared_statements_lists_what_prepare_named_the_way_the_pin_does() {
+    let db = Database::new();
+    for sql in [
+        "PREPARE p1 AS SELECT 42;",
+        "CREATE TABLE tbl(a VARCHAR)",
+        "PREPARE p2 AS INSERT INTO tbl VALUES ('test')",
+        "PREPARE p3 AS SELECT 21, $1, $2",
+        "PREPARE scan AS SELECT a FROM tbl",
+        "PREPARE stamp AS SELECT now()",
+    ] {
+        db.execute(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    let listed = "SELECT string_agg(name || '|' || statement || '|' || \
+                  coalesce(parameter_types::VARCHAR, 'NULL') || '|' || \
+                  coalesce(result_types::VARCHAR, 'NULL'), ';' ORDER BY name) \
+                  FROM duckdb_prepared_statements()";
+    // A read of a table and a call settled per transaction both leave the types out, since the
+    // pin plans those statements again at every `EXECUTE`.
+    assert_eq!(
+        executed(&db, listed),
+        Value::Varchar(
+            "p1|SELECT 42|NULL|[INTEGER];p2|INSERT INTO tbl (VALUES ('test'))|NULL|[BIGINT];\
+             p3|SELECT 21, $1, $2|[UNKNOWN, UNKNOWN]|NULL;scan|SELECT a FROM tbl|NULL|NULL;\
+             stamp|SELECT now()|NULL|NULL"
+                .into()
+        )
+    );
+    db.execute("DEALLOCATE p1").expect("deallocates");
+    assert_eq!(executed(&db, "SELECT count(*) FROM pg_prepared_statements"), Value::BigInt(4));
+}
+
+#[test]
+fn duckdb_dependencies_lists_indexes_foreign_keys_and_sequences_in_defaults() {
+    let db = Database::new();
+    for sql in [
+        "CREATE TABLE p(k INTEGER PRIMARY KEY)",
+        "CREATE TABLE c(k INTEGER REFERENCES p(k))",
+        "CREATE INDEX ci ON c(k)",
+        "CREATE SEQUENCE s",
+        "CREATE TABLE d(x INTEGER DEFAULT nextval('s'))",
+        "CREATE VIEW v AS SELECT * FROM d",
+        "CREATE TABLE o(x INTEGER)",
+        "CREATE SEQUENCE sq2",
+        "ALTER SEQUENCE sq2 OWNED BY o",
+    ] {
+        db.execute(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    let named = "WITH names AS (SELECT table_oid AS oid, table_name AS n FROM duckdb_tables() \
+                 UNION ALL SELECT index_oid, index_name FROM duckdb_indexes() \
+                 UNION ALL SELECT sequence_oid, sequence_name FROM duckdb_sequences()) \
+                 SELECT string_agg(o.n || '>' || r.n || ':' || d.deptype, ',' ORDER BY o.n, r.n) \
+                 FROM duckdb_dependencies() d JOIN names o ON o.oid = d.objid \
+                 JOIN names r ON r.oid = d.refobjid";
+    // The view is not there, which is the pin's: it lists no row for a view.
+    assert_eq!(executed(&db, named), Value::Varchar("c>ci:a,p>c:n,s>d:n,sq2>o:a".into()));
+    let zeros =
+        "SELECT count(*) FROM pg_depend WHERE classid + objsubid + refclassid + refobjsubid = 0";
+    assert_eq!(executed(&db, zeros), Value::BigInt(4));
+}

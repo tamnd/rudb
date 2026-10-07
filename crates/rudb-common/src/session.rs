@@ -43,6 +43,7 @@ pub struct Session {
     postgres: Postgreses,
     begun: Begun,
     transaction: Transaction,
+    prepared: Prepareds,
 }
 
 /// When the open transaction began and when the statement arrived, in microseconds since the
@@ -122,6 +123,28 @@ impl PartialEq for Transaction {
 }
 
 impl Eq for Transaction {}
+
+/// One statement `PREPARE` named, the way `duckdb_prepared_statements()` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStatement {
+    /// The name as it was written.
+    pub name: String,
+    /// The statement written back out, which is how the pin prints it rather than how it was typed.
+    pub statement: String,
+    /// How many parameters it takes. The pin lists each one as `UNKNOWN`, whatever it is used as.
+    pub parameters: usize,
+    /// The types of the columns it answers, `BIGINT` alone for a write with no `RETURNING`. `None`
+    /// where the pin plans the statement again at every `EXECUTE` and so has no types to give.
+    pub results: Option<Vec<LogicalType>>,
+}
+
+/// The statements a connection holds by name, in the order of their names in lower case.
+///
+/// Shared, so reading the session once per statement copies a pointer and not the list. Two are
+/// equal when they hold the same statements, so the session a plan was kept against stops matching
+/// once a statement is prepared or deallocated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Prepareds(Arc<[PreparedStatement]>);
 
 /// One value `SET VARIABLE` left behind, with the type it was computed at.
 ///
@@ -478,6 +501,7 @@ impl Default for Session {
             postgres: Postgreses::default(),
             begun: Begun::default(),
             transaction: Transaction::default(),
+            prepared: Prepareds::default(),
         }
     }
 }
@@ -703,6 +727,17 @@ impl Session {
     /// Records the number of the transaction the statement runs in.
     pub fn set_transaction(&mut self, number: u64) {
         self.transaction = Transaction(number);
+    }
+
+    /// Records the statements the connection holds by name.
+    pub fn set_prepared(&mut self, statements: Arc<[PreparedStatement]>) {
+        self.prepared = Prepareds(statements);
+    }
+
+    /// The statements the connection holds by name, which `duckdb_prepared_statements()` lists.
+    #[must_use]
+    pub fn prepared(&self) -> &[PreparedStatement] {
+        &self.prepared.0
     }
 
     /// The number of the transaction the statement runs in, which is the same for every statement

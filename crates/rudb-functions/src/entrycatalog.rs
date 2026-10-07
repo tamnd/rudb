@@ -182,6 +182,23 @@ pub fn index_fields() -> Vec<Field> {
     ]
 }
 
+/// The columns of `duckdb_dependencies()`, in the pin's order, which are PostgreSQL's `pg_depend`.
+///
+/// The two class columns and the two sub object columns are always zero on the pin, since it has
+/// one class of entry and no dependency on a single column.
+#[must_use]
+pub fn dependency_fields() -> Vec<Field> {
+    vec![
+        Field::new("classid", LogicalType::BigInt),
+        Field::new("objid", LogicalType::BigInt),
+        Field::new("objsubid", LogicalType::Integer),
+        Field::new("refclassid", LogicalType::BigInt),
+        Field::new("refobjid", LogicalType::BigInt),
+        Field::new("refobjsubid", LogicalType::Integer),
+        Field::new("deptype", LogicalType::Varchar),
+    ]
+}
+
 /// The columns of `duckdb_constraints()`, in the pin's order.
 #[must_use]
 pub fn constraint_fields() -> Vec<Field> {
