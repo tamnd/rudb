@@ -1638,9 +1638,11 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
 fn listed_keys(
     exact: &Exact,
     count: u64,
-    keys: impl Iterator<Item = i64>,
+    (base, words): (i128, &[u64]),
     within: Option<u64>,
 ) -> Option<Planned> {
+    let base64 = i64::try_from(base).ok()?;
+    let keys = members(words).map(move |key| key.wrapping_add(base64));
     if exact.own {
         return owned_keys(exact, count, keys, within).map(Planned::Ready);
     }
@@ -1661,7 +1663,7 @@ fn listed_keys(
     let Some(adjacency) = exact.adjacency() else {
         return pushed_keys(exact, map, keys, worth, within.is_some()).map(Planned::Ready);
     };
-    let held = keyed_parents(map, adjacency.parents(), keys)?;
+    let held = parents_of_words(map, adjacency.parents(), base, words)?;
     let most = match within {
         Some(held) => held.saturating_sub(1),
         None => below(children, exact.gathered),
@@ -1671,6 +1673,45 @@ fn listed_keys(
         return None;
     }
     Some(Planned::Through { spans, placed: within.is_some() })
+}
+
+/// [`keyed_parents`] of the keys a bitmap holds, bit `n` being key `base + n`, read off the key
+/// map a word at a time when the map has a span. See [`KeyMap::rows_of_span`].
+///
+/// The kept keys of a consistent reduction are such a bitmap, and a lookup a key was most of what
+/// finding their lists cost, on the query's own thread while the scan's workers wait. In JOB 13a
+/// the lookups were seven percent of the query at one thread.
+fn parents_of_words(map: &KeyMap, parents: u64, base: i128, words: &[u64]) -> Option<Rids> {
+    if let Some((from, range)) = map.span() {
+        let over = window(words, from.checked_sub(base)?, range)?;
+        return Rids::from_words(parents, map.rows_of_span(&over, parents).ok()??).ok();
+    }
+    let base = i64::try_from(base).ok()?;
+    keyed_parents(map, parents, members(words).map(move |key| key.wrapping_add(base)))
+}
+
+/// The `len` bits of `words` from bit `from` on, which may be before the first, as words. `None`
+/// when a bit outside them is set, which is a key outside the span and so a key no parent holds.
+fn window(words: &[u64], from: i128, len: u64) -> Option<Vec<u64>> {
+    let word = |at: i128| usize::try_from(at).ok().and_then(|at| words.get(at)).copied();
+    let bits = |bit: i128| {
+        let (at, shift) = (bit.div_euclid(64), bit.rem_euclid(64));
+        let low = word(at).unwrap_or(0);
+        if shift == 0 {
+            return low;
+        }
+        low >> shift | word(at + 1).unwrap_or(0) << (64 - shift)
+    };
+    let mut out: Vec<u64> = (0..usize::try_from(len.div_ceil(64)).ok()?)
+        .map(|at| bits(from + 64 * at as i128))
+        .collect();
+    if let Some(last) = out.last_mut()
+        && len % 64 != 0
+    {
+        *last &= (1 << (len % 64)) - 1;
+    }
+    let ones = |words: &[u64]| words.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
+    (ones(&out) == ones(words)).then_some(out)
 }
 
 /// The parents that hold `keys`, as a set over the `parents` rows of the parent table, `None` when
@@ -2055,10 +2096,9 @@ impl Found {
         }
         // Bit zero is the smallest key the parent holds for a join's bitmap, and key zero for the
         // one a consistent reduction kept.
-        let base = i64::try_from(domain.base).ok()?;
-        let keys = members(&domain.words).map(move |key| key.wrapping_add(base));
+        let kept = (domain.base, domain.words.as_slice());
         // A refusal is not kept, since a scan that learns it holds fewer rows asks again with them.
-        let planned = listed_keys(exact?, listing.count, keys, within)?;
+        let planned = listed_keys(exact?, listing.count, kept, within)?;
         let reach = planned.reach();
         let _ = listing.planned.set(Some(planned));
         Some(reach)
@@ -2104,6 +2144,7 @@ mod tests {
 
     use super::{
         Across, Exact, Extremes, Found, Keyed, SMALL, Schema, Sideways, beneath, found_for, hash,
+        keyed_parents, members, parents_of_words, window,
     };
 
     fn found(
@@ -2953,5 +2994,44 @@ mod tests {
             None,
             "another table's column"
         );
+    }
+
+    /// The parents of a bitmap of keys read a word at a time are the parents a lookup of each key
+    /// finds, in every form a key map takes and from a bitmap that starts below, at, or above the
+    /// map's smallest key. A key the map does not hold, or one past either end, finds nothing.
+    #[test]
+    fn the_parents_of_a_bitmap_of_keys_are_the_parents_a_lookup_of_each_finds() {
+        let shuffled: Vec<Option<i128>> = (0..300).map(|rid| Some(5 + (rid * 37) % 300)).collect();
+        let gaps: Vec<Option<i128>> = (0..300).map(|rid| Some(5 + rid * 2)).collect();
+        let identity: Vec<Option<i128>> = (0..300).map(|rid| Some(5 + rid)).collect();
+        for parent_keys in [shuffled, gaps, identity] {
+            let map = KeyMap::build(&parent_keys).expect("unique keys");
+            for base in [0_i128, 3, 5, 9] {
+                let held: Vec<i64> = [5, 7, 70, 71, 200, 303]
+                    .into_iter()
+                    .filter(|&key| key >= base as i64)
+                    .collect();
+                let mut words = vec![0_u64; 12];
+                for key in &held {
+                    let bit = (*key as i128 - base) as usize;
+                    words[bit / 64] |= 1 << (bit % 64);
+                }
+                let by_lookup =
+                    keyed_parents(&map, 300, members(&words).map(|key| key + base as i64));
+                let by_words = parents_of_words(&map, 300, base, &words);
+                assert_eq!(
+                    by_words.map(|rids| rids.iter().collect::<Vec<_>>()),
+                    by_lookup.map(|rids| rids.iter().collect::<Vec<_>>()),
+                    "base {base}"
+                );
+            }
+            let mut past = vec![0_u64; 12];
+            past[11] = 1;
+            assert!(parents_of_words(&map, 300, 0, &past).is_none(), "a key past the last");
+        }
+        assert_eq!(window(&[0b1011_0000], -2, 10), Some(vec![0b10_1100_0000]));
+        assert_eq!(window(&[0b1011_0000], 4, 3), None, "a bit past the window");
+        assert_eq!(window(&[0b1011_0000], 5, 3), None, "a bit before the window");
+        assert_eq!(window(&[0, 1 << 3], 64 + 3, 1), Some(vec![1]));
     }
 }
