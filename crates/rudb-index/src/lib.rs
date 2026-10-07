@@ -11,12 +11,15 @@
 //! a merge drops it.
 //!
 //! This crate knows what a key and a rid are and nothing about a file, a table or a transaction.
-//! [`key`] writes keys, [`run`] holds runs and writes them as `RUDBKI1`.
+//! [`key`] writes keys, [`l0`] holds the newest entries in a B+tree under optimistic lock coupling,
+//! and [`run`] holds runs and writes them as `RUDBKI1`.
 
 pub mod key;
+pub mod l0;
 pub mod run;
 
 mod bloom;
 
 pub use key::normalize;
+pub use l0::L0;
 pub use run::{Hit, Run, RunWriter};
