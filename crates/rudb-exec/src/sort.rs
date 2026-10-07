@@ -332,9 +332,7 @@ impl Ranked {
             }
             written += wide;
         }
-        rows.sort_unstable_by(|left, right| {
-            normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
-        });
+        in_order(&mut rows);
         self.rows = rows;
         Ok(())
     }
@@ -523,9 +521,7 @@ impl Keyed {
     fn sort(&mut self, keys: &[SortKey]) -> Result<()> {
         match self {
             Self::Normal(rows) => {
-                rows.sort_unstable_by(|left, right| {
-                    normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
-                });
+                in_order(rows);
                 Ok(())
             }
             Self::Ranked(ranked) => ranked.sort(keys),
@@ -587,6 +583,98 @@ impl Keyed {
             Self::Ranked(ranked) => ranked.footprint(),
             Self::Valued(rows) => rows.iter().map(|row| rows::footprint(&row.0) + BESIDE).sum(),
         }
+    }
+}
+
+/// From how many rows [`in_order`] counts bytes rather than comparing rows.
+const RADIX_FROM: usize = 1024;
+
+/// Up to how many rows [`in_order`] counts bytes, because counting needs a second copy of the rows.
+const RADIX_TO: usize = 1 << 20;
+
+/// Puts normalized rows in order of their keys, and of where they arrived where the keys tie.
+///
+/// A comparison sort of eighteen thousand rows is fourteen rounds of comparing and moving 48 bytes
+/// a row, and on TPC-H q16 that was about 640 instructions a row. Most of the 24 key bytes are the
+/// same in every row, though: a count that fits in a byte, two ranks under 150 and a size under 50
+/// leave four bytes that tell the rows apart. So above a thousand rows this sorts a byte at a time
+/// from the last that varies to the first, each pass a count and a stable scatter, and skips every
+/// byte that is the same in all of them. The arrival is a tie breaker of 16 bytes on top, and when
+/// the rows are already in the order they arrived, which they are whenever one thread gathered them,
+/// the passes keep that order among equal keys and the arrival needs no pass of its own.
+///
+/// Comparing the keys and then the arrivals is comparing those bytes in that order, so this is the
+/// order the comparison sort gives, row for row.
+fn in_order(rows: &mut [Normalized]) {
+    if !(RADIX_FROM..=RADIX_TO).contains(&rows.len()) {
+        rows.sort_unstable_by(|left, right| {
+            normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        return;
+    }
+    let (key, arrival) = (rows[0].0, arrival_bytes(rows[0].1));
+    let mut differs = [0_u8; normal::WIDTH];
+    let mut late = [0_u8; 16];
+    let mut arrived = true;
+    let mut previous = rows[0].1;
+    for row in rows.iter() {
+        for (differ, (&byte, &first)) in differs.iter_mut().zip(row.0.iter().zip(&key)) {
+            *differ |= byte ^ first;
+        }
+        for (differ, (byte, &first)) in
+            late.iter_mut().zip(arrival_bytes(row.1).into_iter().zip(&arrival))
+        {
+            *differ |= byte ^ first;
+        }
+        arrived &= row.1 >= previous;
+        previous = row.1;
+    }
+    let mut spare = rows.to_vec();
+    let mut from_spare = false;
+    if !arrived {
+        for at in (0..late.len()).rev().filter(|&at| late[at] != 0) {
+            let (from, into) =
+                if from_spare { (&spare[..], &mut *rows) } else { (&*rows, &mut spare[..]) };
+            by_byte(from, into, |row| arrival_bytes(row.1)[at]);
+            from_spare = !from_spare;
+        }
+    }
+    for at in (0..differs.len()).rev().filter(|&at| differs[at] != 0) {
+        let (from, into) =
+            if from_spare { (&spare[..], &mut *rows) } else { (&*rows, &mut spare[..]) };
+        by_byte(from, into, |row| row.0[at]);
+        from_spare = !from_spare;
+    }
+    if from_spare {
+        rows.copy_from_slice(&spare);
+    }
+}
+
+/// An arrival as the bytes it compares by, the morsel and then the row, each big endian.
+fn arrival_bytes((morsel, at): Arrival) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&morsel.to_be_bytes());
+    bytes[8..].copy_from_slice(&at.to_be_bytes());
+    bytes
+}
+
+/// Writes the rows of `from` into `into` in order of one byte, keeping the order they had where it
+/// is the same.
+fn by_byte(from: &[Normalized], into: &mut [Normalized], byte: impl Fn(&Normalized) -> u8) {
+    let mut starts = [0_usize; 256];
+    for row in from {
+        starts[usize::from(byte(row))] += 1;
+    }
+    let mut next = 0;
+    for start in &mut starts {
+        let count = *start;
+        *start = next;
+        next += count;
+    }
+    for row in from {
+        let digit = usize::from(byte(row));
+        into[starts[digit]] = *row;
+        starts[digit] += 1;
     }
 }
 
@@ -872,9 +960,7 @@ impl Sink for Sort {
         // the last instance is done. `finalize` merges the runs. The valued arm is left for
         // `finalize`, which sorts it the way it always has.
         if let Keyed::Normal(rows) = &mut local.held.rows {
-            rows.sort_unstable_by(|left, right| {
-                normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
-            });
+            in_order(rows);
         }
         self.runs.lock().map_err(poisoned)?.extend(local.runs);
         let mut gathered = self.gathered.lock().map_err(poisoned)?;
@@ -1528,7 +1614,7 @@ mod tests {
     use rudb_common::{LogicalType, Value};
     use rudb_vector::{Validity, Vector};
 
-    use super::{Normalized, Ranked, merged};
+    use super::{Normalized, Ranked, in_order, merged};
     use crate::normal::{self, WIDTH};
 
     /// A key held as codes into one dictionary ranks its rows the way hashing their strings does,
@@ -1580,6 +1666,43 @@ mod tests {
                 (state % 97, arrival)
             })
             .collect()
+    }
+
+    /// Counting bytes puts rows in the order comparing them does, with keys that tie, keys that vary
+    /// in only a few bytes, and arrivals that are and are not already in order.
+    #[test]
+    fn counting_bytes_is_the_order_comparing_gives() {
+        for (count, spread, arrived) in [
+            (5000, 97, true),
+            (5000, 97, false),
+            (3000, 3, false),
+            (2000, u64::MAX, true),
+            (100, 7, false),
+        ] {
+            let keys = shuffled(count);
+            let mut rows: Vec<Normalized> = keys
+                .iter()
+                .enumerate()
+                .map(|(row, &(key, arrival))| {
+                    let mut normal = [0; WIDTH];
+                    normal[3..11]
+                        .copy_from_slice(&(key.wrapping_mul(0x9e37_79b9) % spread).to_be_bytes());
+                    normal[20] = (key % 5) as u8;
+                    let arrival = if arrived {
+                        (1, arrival)
+                    } else {
+                        (key % 4, (count as u64 - arrival) << 20)
+                    };
+                    (normal, arrival, (0, row as u32))
+                })
+                .collect();
+            let mut expected = rows.clone();
+            expected.sort_unstable_by(|left, right| {
+                normal::compare(&left.0, &right.0).then_with(|| left.1.cmp(&right.1))
+            });
+            in_order(&mut rows);
+            assert_eq!(rows, expected);
+        }
     }
 
     /// Runs sorted on their own and merged are the order one sort of all of them gives, for runs
