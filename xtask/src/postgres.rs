@@ -15,12 +15,15 @@
 //!
 //! `gram.y` gives the parse tables of `rudb-pgparse` through `postgres/gram.rs`, which removes the
 //! C, and `postgres/lalr.rs`, which makes the LALR(1) tables as bison 2.3 makes them. `kwlist.h`
-//! gives its keywords. `scan.l` and `parser.c` are the reference for its lexer. `cargo xtask
-//! pg-grammar` runs bison on the same grammar and compares the two sets of tables entry by entry.
+//! gives its keywords. `nodes.h`, `lockoptions.h`, `primnodes.h`, `parsenodes.h` and `value.h`
+//! give the node types of its raw parse tree through `postgres/nodes.rs`. `scan.l` and `parser.c`
+//! are the reference for its lexer. `cargo xtask pg-grammar` runs bison on the same grammar and
+//! compares the two sets of tables entry by entry.
 
 mod gram;
 mod guc;
 mod lalr;
+mod nodes;
 mod pgparse;
 
 use std::collections::BTreeMap;
@@ -69,6 +72,11 @@ const VENDORS: [Vendor; 5] = [
             ("src/backend/parser/scan.l", "scan.l"),
             ("src/backend/parser/parser.c", "parser.c"),
             ("src/include/parser/kwlist.h", "kwlist.h"),
+            ("src/include/nodes/nodes.h", "nodes.h"),
+            ("src/include/nodes/lockoptions.h", "lockoptions.h"),
+            ("src/include/nodes/primnodes.h", "primnodes.h"),
+            ("src/include/nodes/parsenodes.h", "parsenodes.h"),
+            ("src/include/nodes/value.h", "value.h"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
@@ -91,7 +99,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 8] = [
+const GENERATED: [Generated; 9] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -134,6 +142,18 @@ const GENERATED: [Generated; 8] = [
         output: "crates/rudb-pgparse/src/generated/keywords.rs",
         inputs: &["crates/rudb-pgparse/vendor/kwlist.h", "crates/rudb-pgparse/vendor/gram.y"],
         generate: pgparse::keywords,
+    },
+    Generated {
+        output: "crates/rudb-pgparse/src/generated/nodes.rs",
+        inputs: &[
+            "crates/rudb-pgparse/vendor/nodes.h",
+            "crates/rudb-pgparse/vendor/lockoptions.h",
+            "crates/rudb-pgparse/vendor/primnodes.h",
+            "crates/rudb-pgparse/vendor/parsenodes.h",
+            "crates/rudb-pgparse/vendor/value.h",
+            "crates/rudb-pgparse/vendor/gram.y",
+        ],
+        generate: nodes::nodes,
     },
 ];
 
