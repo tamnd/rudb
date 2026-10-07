@@ -160,6 +160,9 @@ pub(crate) fn within_words(
     assert!((1..=LANE_WIDTH_MAX).contains(&width));
     let Some(last) = words.len().checked_sub(1) else { return 0 };
     assert!(bytes.len() >= last * 8 * width + readable(width));
+    if width == 8 || width == 16 {
+        return within_aligned(bytes, width, low, span, words, fresh);
+    }
     if narrow(width) {
         return within_narrow(bytes, width, low, span, words, fresh);
     }
@@ -207,6 +210,87 @@ pub(crate) fn within_words(
         }
     }
     kept
+}
+
+/// [`within_words`] for codes of a byte or of two, which are compared where they lie.
+///
+/// Every other width has its codes shuffled, shifted and masked into lanes before the compare, and
+/// that was most of what a filter over them cost. A code of eight or sixteen bits already starts on
+/// a byte, so a block of 64 is two loads of 32 codes or four of sixteen, each a subtract, a min and
+/// an equal, and the answers come out with the `movemask` [`within_narrow`] ends with. A page whose
+/// codes are a few bits short of either is held at it for this, see `Vector::on_lanes`. The
+/// arguments are as [`within_words`] has checked them.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+#[allow(unsafe_code)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "both ends fit the width, and a movemask is 32 bits"
+)]
+fn within_aligned(
+    bytes: &[u8],
+    width: usize,
+    low: u32,
+    span: u32,
+    words: &mut [u64],
+    fresh: bool,
+) -> usize {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_cmpeq_epi16, _mm256_loadu_si256, _mm256_min_epu8,
+        _mm256_min_epu16, _mm256_movemask_epi8, _mm256_packs_epi16, _mm256_permute4x64_epi64,
+        _mm256_set1_epi8, _mm256_set1_epi16, _mm256_sub_epi8, _mm256_sub_epi16,
+    };
+    /// Each word of `words` set to or narrowed by what `found` says of its block.
+    fn blocks(words: &mut [u64], fresh: bool, found: impl Fn(usize) -> u64) -> usize {
+        let mut kept = 0;
+        for (block, word) in words.iter_mut().enumerate() {
+            if !fresh && *word == 0 {
+                continue;
+            }
+            *word = if fresh { found(block) } else { *word & found(block) };
+            kept += word.count_ones() as usize;
+        }
+        kept
+    }
+    // SAFETY: the build enables AVX2, which the `cfg` on this function checks. Block `b` is the
+    // `8 * width` bytes from `8 * b * width`, which are all the loads below read, and
+    // [`within_words`] checked that every block it was handed is inside `bytes`. `loadu` has no
+    // alignment requirement.
+    unsafe {
+        let at = |block: usize| bytes.as_ptr().add(8 * block * width);
+        if width == 8 {
+            let (low, span) =
+                (_mm256_set1_epi8(low as u8 as i8), _mm256_set1_epi8(span as u8 as i8));
+            let inside = |at: *const u8| {
+                let offset = _mm256_sub_epi8(_mm256_loadu_si256(at.cast()), low);
+                let equal = _mm256_cmpeq_epi8(_mm256_min_epu8(offset, span), offset);
+                u64::from(_mm256_movemask_epi8(equal) as u32)
+            };
+            blocks(words, fresh, |block| {
+                let first = at(block);
+                inside(first) | inside(first.add(32)) << 32
+            })
+        } else {
+            let (low, span) =
+                (_mm256_set1_epi16(low as u16 as i16), _mm256_set1_epi16(span as u16 as i16));
+            let inside = |at: *const u8| -> __m256i {
+                let offset = _mm256_sub_epi16(_mm256_loadu_si256(at.cast()), low);
+                _mm256_cmpeq_epi16(_mm256_min_epu16(offset, span), offset)
+            };
+            // The same packing and permute as in [`within_narrow`], for the same reason.
+            let half = |at: *const u8| {
+                let packed = _mm256_packs_epi16(inside(at), inside(at.add(32)));
+                let ordered = _mm256_permute4x64_epi64::<0b1101_1000>(packed);
+                u64::from(_mm256_movemask_epi8(ordered) as u32)
+            };
+            blocks(words, fresh, |block| {
+                let first = at(block);
+                half(first) | half(first.add(64)) << 32
+            })
+        }
+    }
 }
 
 /// [`within_words`] for a width [`narrow`] takes, sixteen codes to a register rather than eight.

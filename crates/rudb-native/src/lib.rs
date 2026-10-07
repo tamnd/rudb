@@ -16101,10 +16101,11 @@ fn decode(
         // held in is what every later scan reads. A stride is held packed over the range of its
         // values: `l_quantity` is a stride of 100 over six bit codes, and flat it was eight bytes a
         // row, 48 MB at SF1, which q06 read from memory on every run, where packed it is thirteen
-        // bits a row and the packed filter kernels take it. Anything else stays flat, because
+        // bits a row, held at sixteen so that a filter compares the codes where they lie, and the
+        // packed filter kernels take it. Anything else stays flat, because
         // `l_orderkey` is a delta and the grouping by runs over it was four times slower on q18
         // packed. See spec/perf/107-a-stride-held-packed.md.
-        let held = if integer::is_strided(tail) { flat.bit_packed()? } else { flat };
+        let held = if integer::is_strided(tail) { flat.bit_packed()?.on_lanes() } else { flat };
         return Ok(held.with_validity(validity));
     }
     if codec == 2 {
@@ -16120,7 +16121,9 @@ fn decode(
         if cur.at != bytes.len() {
             return Err(invalid("packed page has trailing bytes"));
         }
-        return Ok(Vector::packed(ty.clone(), words, width, base, rows)?.with_validity(validity));
+        return Ok(Vector::packed(ty.clone(), words, width, base, rows)?
+            .on_lanes()
+            .with_validity(validity));
     }
     if codec != 0 {
         return Err(invalid("page codec is unknown"));
@@ -22121,7 +22124,7 @@ mod tests {
         let column = read.column(0).expect("the column");
         let packed = column.packed_parts().expect("held packed rather than flat");
         assert_eq!(packed.base(), 100);
-        assert_eq!(packed.width(), 13, "4,900 between the ends");
+        assert_eq!(packed.width(), 16, "4,900 between the ends is thirteen bits, held at sixteen");
         for (row, &value) in values.iter().enumerate() {
             assert_eq!(packed.code(row), u64::try_from(value - 100).expect("above the base"));
         }
