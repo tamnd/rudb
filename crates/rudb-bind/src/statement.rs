@@ -17,9 +17,9 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
-    Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
-    LogicalType, PlanErrors, QueryColumns, Result, SequenceOwners, Session, Span, SqlState, Stat,
-    TypeNames, UnknownTypes, Value, Width,
+    Bound as ColumnBound, Clustering, ConflictArbiter, DeclaredType, Error, Field,
+    IdentifierCompare, InsertColumns, LogicalType, PlanErrors, QueryColumns, Result,
+    SequenceOwners, Session, Span, SqlState, Stat, TypeNames, UnknownTypes, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -3592,8 +3592,11 @@ fn bind_conflict(
     let fields = table.columns();
     // A unique index is a conflict target as a key is, which is how the pin counts them too.
     let keys = table.guards();
+    let arbiter = session.semantics().conflict_arbiter();
+    // A PostgreSQL session refuses a target that matches no key only after the action is read.
+    let mut unmatched = None;
     let key = if conflict.target.is_empty() {
-        if keys.is_empty() {
+        if keys.is_empty() && arbiter == ConflictArbiter::Pin {
             return Err(Error::binder(
                 "There are no UNIQUE/PRIMARY KEY constraints that refer to this table, specify ON \
                  CONFLICT columns manually",
@@ -3612,7 +3615,7 @@ fn bind_conflict(
     } else {
         let compare = session.semantics().identifier_compare();
         let mut wanted = Vec::new();
-        for column in ast.name(conflict.target) {
+        for (written_at, column) in ast.name(conflict.target).enumerate() {
             let Some(at) = fields.iter().position(|field| compare.same(&field.name, column)) else {
                 return Err(Error::binder(format!(
                     "Table \"{}\" does not have a column with name \"{column}\"",
@@ -3620,7 +3623,7 @@ fn bind_conflict(
                 ))
                 .state(SqlState::UNDEFINED_COLUMN)
                 .pg(format!("column \"{column}\" does not exist"))
-                .unplaced());
+                .placed_at(ast.part_span(conflict.target, written_at)));
             };
             wanted.push(at);
         }
@@ -3631,13 +3634,20 @@ fn bind_conflict(
             held.sort_unstable();
             held == wanted
         });
-        let Some(found) = found else {
-            return Err(Error::binder(
+        if found.is_none() {
+            let error = Error::binder(
                 "The specified columns as conflict target are not referenced by a UNIQUE/PRIMARY \
                  KEY CONSTRAINT or INDEX",
-            ));
-        };
-        Some(found)
+            )
+            .state(SqlState::INVALID_COLUMN_REFERENCE)
+            .pg("there is no unique or exclusion constraint matching the ON CONFLICT specification")
+            .unplaced();
+            match arbiter {
+                ConflictArbiter::Pin => return Err(error),
+                ConflictArbiter::Postgres => unmatched = Some(error),
+            }
+        }
+        found
     };
     let action = match conflict.action {
         ast::ConflictAction::Nothing => ConflictAction::Nothing,
@@ -3705,6 +3715,9 @@ fn bind_conflict(
             ConflictAction::Update { columns, plan, generate }
         }
     };
+    if let Some(error) = unmatched {
+        return Err(error);
+    }
     Ok(Conflict { key, action })
 }
 
