@@ -18,14 +18,14 @@ fn advisory_name(written: &str) -> Option<&'static str> {
         .find(|name| rudb_catalog::same_name(written, name))
 }
 
-/// Whether a target of the select list is a call of an advisory lock function that gives `void`.
+/// Whether a target of the select list is a call of an advisory lock function or of `pg_sleep`
+/// that gives `void`.
 pub(crate) fn gives_void(ast: &Ast, expr: ast::ExprRef) -> bool {
     match ast.expr(expr) {
-        ast::Expr::Function { name, .. } => ast
-            .name(name)
-            .last()
-            .and_then(|written| advisory_name(written))
-            .is_some_and(rudb_kernels::advisory::gives_void),
+        ast::Expr::Function { name, .. } => ast.name(name).last().is_some_and(|written| {
+            rudb_catalog::same_name(written, "pg_sleep")
+                || advisory_name(written).is_some_and(rudb_kernels::advisory::gives_void)
+        }),
         _ => false,
     }
 }
@@ -112,6 +112,52 @@ impl Binder<'_> {
         let args = self.plan_mut().add_expr_list(&args);
         let name = self.plan_mut().intern(name);
         Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+}
+
+impl Binder<'_> {
+    /// The call `pg_sleep(seconds)` in a PostgreSQL session, or `None` for another name or another
+    /// session. The kernel reads the backend number to find the cancel flag of the session.
+    pub(crate) fn sleep_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        if !rudb_catalog::same_name(written, "pg_sleep") {
+            return Ok(None);
+        }
+        let Some(postgres) = self.session.postgres() else {
+            return Ok(None);
+        };
+        let backend = i64::from(postgres.backend);
+        let [seconds] = arguments[..] else {
+            let unknown: Vec<bool> = arguments
+                .iter()
+                .map(|&argument| {
+                    matches!(
+                        ast.expr(argument),
+                        ast::Expr::Literal { kind: LiteralKind::String, .. }
+                    )
+                })
+                .collect();
+            let mut types = Vec::with_capacity(arguments.len());
+            for &argument in arguments {
+                let bound = self.bind_expr(ast, argument, scope)?;
+                types.push(self.plan().expr_type(bound).clone());
+            }
+            return Err(no_such_function("pg_sleep", &types, &unknown));
+        };
+        let bound = match self.read_literal(ast, seconds, rudb_pgtypes::oid::FLOAT8) {
+            Some(value) => value?,
+            None => self.bind_expr(ast, seconds, scope)?,
+        };
+        let seconds = self.checked_cast_to(bound, &LogicalType::Double, false)?;
+        let args = [self.add_constant(Value::BigInt(backend)), seconds];
+        let args = self.plan_mut().add_expr_list(&args);
+        let name = self.plan_mut().intern("pg_sleep");
+        Ok(Some(self.add_expr(Expr::Function { name, args }, LogicalType::Varchar)))
     }
 }
 

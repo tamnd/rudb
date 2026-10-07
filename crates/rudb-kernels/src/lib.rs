@@ -101,6 +101,7 @@ pub mod select;
 mod sequence;
 mod shape;
 mod similarity;
+mod sleep;
 mod split;
 mod statistics;
 pub mod strftime;

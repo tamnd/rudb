@@ -232,6 +232,13 @@ pub fn register(owner: i32, cancel: Cancel) {
     table().cancels.insert(owner, cancel);
 }
 
+/// The cancel flag of a session, which [`register`] gave, for another wait that has to stop with
+/// the statement, such as `pg_sleep`.
+#[must_use]
+pub fn cancel_of(owner: i32) -> Option<Cancel> {
+    table().cancels.get(&owner).cloned()
+}
+
 /// Takes a lock, and waits until no other session blocks it.
 ///
 /// # Errors

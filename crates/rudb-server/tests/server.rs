@@ -1900,6 +1900,30 @@ fn a_cancel_request_stops_the_statement() {
 }
 
 #[test]
+fn pg_sleep_waits_and_a_cancel_request_stops_it() {
+    let dirs = Dirs::new("pg_sleep");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    let (pid, key) = connect(&mut client, PROTOCOL_3_2);
+    let started = std::time::Instant::now();
+    let messages = client.query("select pg_sleep(0.2), pg_typeof(pg_sleep(-1))");
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(tags(&messages), "TDCZ");
+    assert_eq!(data_row(&messages[1]), [Some(Vec::new()), Some(b"void".to_vec())]);
+
+    client.send(&Frontend::Query(b"select pg_sleep(60)"));
+    std::thread::sleep(Duration::from_millis(300));
+    let mut canceler = Client::tcp(&server);
+    canceler.packet(&Packet::Cancel(Cancel { pid, key: &key }));
+    assert!(canceler.rest().is_empty());
+    let messages = client.until_ready();
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("57014"));
+    assert_eq!(tags(&client.query("select 1")), "TDCZ");
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_stop_ends_each_session_and_removes_the_files() {
     let dirs = Dirs::new("stop");
     let server = Server::start(dirs.config()).unwrap();
