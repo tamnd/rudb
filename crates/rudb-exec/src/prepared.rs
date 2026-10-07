@@ -227,6 +227,8 @@ enum Step {
         arms: Vec<PreparedArm>,
         /// The `ELSE`, if there is one. Absent means null.
         otherwise: Option<Prepared>,
+        /// The columns of the chunk the `ELSE` reads, see [`PreparedArm::then_reads`].
+        otherwise_reads: Vec<usize>,
         /// How to answer it as codes, for the shape that can be. Absent means read the values.
         blend: Option<Blend>,
     },
@@ -270,6 +272,15 @@ struct PreparedArm {
     when: Prepared,
     /// The result if the condition is true.
     then: Prepared,
+    /// The columns of the chunk the condition reads, in order, which are the only ones cut down to
+    /// the rows it runs over.
+    when_reads: Vec<usize>,
+    /// The columns of the chunk the result reads, in order.
+    ///
+    /// A branch runs over the rows it claimed, and cutting the chunk down to them used to cut every
+    /// column of it. On TPC-H q14 the chunk under the aggregate is six columns and the one arm
+    /// reads two, and the `ELSE 0` reads none.
+    then_reads: Vec<usize>,
 }
 
 /// A `CASE` over text whose every branch is a column or a literal, answered as codes.
@@ -1326,9 +1337,13 @@ impl Prepared {
             Step::InSet { input, members } => {
                 Some(in_set(self.operand(*input, chunk, slots)?, members, ty)?)
             }
-            Step::Case { arms, otherwise, blend } => {
-                Some(self.case(chunk, arms, otherwise.as_ref(), blend.as_ref(), ty)?)
-            }
+            Step::Case { arms, otherwise, otherwise_reads, blend } => Some(self.case(
+                chunk,
+                arms,
+                otherwise.as_ref().map(|otherwise| (otherwise, otherwise_reads.as_slice())),
+                blend.as_ref(),
+                ty,
+            )?),
             Step::Try { inner } => {
                 let mut scratch = inner.scratch();
                 Some(attempt(chunk, ty, |rows| inner.evaluate_one(rows, &mut scratch).cloned())?)
@@ -1435,7 +1450,7 @@ impl Prepared {
         &self,
         chunk: &Chunk,
         arms: &[PreparedArm],
-        otherwise: Option<&Prepared>,
+        otherwise: Option<(&Prepared, &[usize])>,
         blend: Option<&Blend>,
         ty: &LogicalType,
     ) -> Result<Vector> {
@@ -1446,9 +1461,21 @@ impl Prepared {
             return Ok(blended);
         }
         let mut built = Assembly::new(ty.clone(), chunk.len())?;
-        let branches = arms.iter().map(|arm| &arm.then).map(Some).chain([otherwise]);
+        let branches = arms
+            .iter()
+            .map(|arm| (&arm.then, arm.then_reads.as_slice()))
+            .map(Some)
+            .chain([otherwise]);
         for (branch, rows) in branches.zip(&claimed) {
-            let (Some(branch), false) = (branch, rows.is_empty()) else { continue };
+            let (Some((branch, reads)), false) = (branch, rows.is_empty()) else { continue };
+            // A literal is the same value for every row it claimed, so it is placed once for all of
+            // them, and there is nothing to cut and nothing to run. The `ELSE 0` of a conditional
+            // sum is this, and it used to be a cut of the chunk and a value written a row at a time.
+            if let [Step::Constant(value)] = branch.steps.as_slice() {
+                let piece = Vector::constant(branch.types[0].clone(), value.clone(), rows.len());
+                built.place(&placed(rows)?, &piece)?;
+                continue;
+            }
             // The same cut the conditions skip above, skipped here for the same reason: a branch
             // that claimed every row claimed them in order, so narrowing to them is a copy of every
             // column in the chunk to arrive back at the chunk.
@@ -1456,7 +1483,7 @@ impl Prepared {
             let matched = if rows.len() == chunk.len() {
                 chunk
             } else {
-                cut = narrow(chunk, rows)?;
+                cut = narrow_reading(chunk, rows, reads)?;
                 &cut
             };
             let mut scratch = branch.scratch();
@@ -1489,7 +1516,7 @@ impl Prepared {
             let narrowed = if pending.len() == chunk.len() {
                 chunk
             } else {
-                cut = narrow(chunk, &pending)?;
+                cut = narrow_reading(chunk, &pending, &arm.when_reads)?;
                 &cut
             };
             let mut scratch = arm.when.scratch();
@@ -1640,14 +1667,18 @@ impl Prepared {
                     prepared.push(PreparedArm {
                         when: Self::one(plan, arm.when, schema)?,
                         then: Self::one(plan, arm.then, schema)?,
+                        when_reads: reads(plan, arm.when, schema),
+                        then_reads: reads(plan, arm.then, schema),
                     });
                 }
+                let otherwise_reads =
+                    otherwise.map(|otherwise| reads(plan, otherwise, schema)).unwrap_or_default();
                 let otherwise = match otherwise {
                     Some(otherwise) => Some(Self::one(plan, otherwise, schema)?),
                     None => None,
                 };
                 let blend = blending(&ty, &prepared, otherwise.as_ref());
-                Step::Case { arms: prepared, otherwise, blend }
+                Step::Case { arms: prepared, otherwise, otherwise_reads, blend }
             }
         };
         Ok(self.place(plan, expr, step, ty))
@@ -2084,6 +2115,42 @@ pub(crate) fn narrow(chunk: &Chunk, rows: &[usize]) -> Result<Chunk> {
         selection.push(row);
     }
     chunk.clone().select(&selection)
+}
+
+/// [`narrow`] for an expression that reads only the columns `reads` names, in order.
+///
+/// Those are cut down to the rows and every other column is a null of its type, which costs nothing
+/// to make and is never read. The columns keep their places, so the expression prepared against the
+/// whole chunk finds what it reads where it expects it.
+fn narrow_reading(chunk: &Chunk, rows: &[usize], reads: &[usize]) -> Result<Chunk> {
+    if reads.len() == chunk.width() {
+        return narrow(chunk, rows);
+    }
+    let mut selection = Selection::with_capacity(rows.len());
+    for &row in rows {
+        selection.push(row);
+    }
+    let read = reads.iter().map(|&at| chunk.column(at).cloned()).collect::<Result<Vec<_>>>()?;
+    let mut cut =
+        Chunk::with_rows(read, chunk.len())?.select(&selection)?.into_columns().into_iter();
+    let mut columns = Vec::with_capacity(chunk.width());
+    for (at, column) in chunk.columns().iter().enumerate() {
+        columns.push(if reads.binary_search(&at).is_ok() {
+            cut.next().ok_or_else(|| Error::internal("a cut of a case branch lost a column"))?
+        } else {
+            Vector::constant(column.logical_type().clone(), Value::Null, rows.len())
+        });
+    }
+    Chunk::with_rows(columns, rows.len())
+}
+
+/// The columns of `schema` that `expr` reads, in order and each once.
+fn reads(plan: &Plan, expr: ExprRef, schema: &Schema) -> Vec<usize> {
+    let mut reads = Vec::new();
+    plan.read_columns(expr, &mut |_, binding| reads.extend(schema.position_of(binding)));
+    reads.sort_unstable();
+    reads.dedup();
+    reads
 }
 
 /// The kernels' comparison for the plan's.
