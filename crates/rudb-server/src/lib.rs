@@ -10,6 +10,11 @@
 //! the directory with the databases `postgres`, `template1` and `template0`, as `initdb` does.
 //!
 //! Document 05 of the PostgreSQL compatibility notes is the plan for this crate.
+//!
+//! The crate is empty on a system that is not Unix, because it waits with `poll(2)` and listens on
+//! Unix sockets.
+
+#![cfg(unix)]
 
 mod conf;
 mod config;

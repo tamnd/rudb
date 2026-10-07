@@ -1,6 +1,8 @@
 //! The server end to end, with a raw client over a Unix socket and over TCP. The messages and
 //! their order are those of the PostgreSQL 19 oracle for the same bytes.
 
+#![cfg(unix)]
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
