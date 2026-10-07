@@ -951,6 +951,7 @@ impl Binder<'_> {
         right: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        let symbol = op;
         let op = if op == BinaryOp::Divide && self.semantics.integer_division() {
             BinaryOp::IntegerDivide
         } else {
@@ -978,8 +979,25 @@ impl Binder<'_> {
             return self.call("->>", vec![picked, last]);
         }
         let written = [left, right];
-        let mut left = self.bind_expr(ast, left, scope)?;
-        let mut right = self.bind_expr(ast, right, scope)?;
+        let left = self.bind_expr(ast, left, scope)?;
+        let right = self.bind_expr(ast, right, scope)?;
+        let types = [left, right].map(|side| self.plan().expr_type(side).clone());
+        let texts = self.semantics.error_texts() == ErrorTexts::Postgres;
+        self.bind_operator(ast, op, written, [left, right], scope).map_err(|error| match texts {
+            true => undefined_operator(ast, error, symbol, &written, &types),
+            false => error,
+        })
+    }
+
+    /// The operator of `bind_binary` over its bound operands.
+    fn bind_operator(
+        &mut self,
+        ast: &Ast,
+        op: BinaryOp,
+        written: [ast::ExprRef; 2],
+        [mut left, mut right]: [ExprRef; 2],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
         if matches!(
             op,
             BinaryOp::Add
@@ -1014,6 +1032,24 @@ impl Binder<'_> {
                     right = self.cast_to(right, &LogicalType::Blob);
                 } else if literal(0) && blob(right) {
                     left = self.cast_to(left, &LogicalType::Blob);
+                }
+                // PostgreSQL joins a value to a string, and two values of the types that have
+                // `||` of their own. There is no `||` that makes a string of two other values.
+                let types = [left, right].map(|side| self.plan().expr_type(side).clone());
+                if !types.iter().any(|ty| {
+                    matches!(
+                        ty,
+                        LogicalType::Varchar
+                            | LogicalType::Null
+                            | LogicalType::Blob
+                            | LogicalType::Bit
+                            | LogicalType::Json
+                            | LogicalType::List(_)
+                            | LogicalType::Array(..)
+                    )
+                }) {
+                    let spelled = types.map(|ty| ty.to_string());
+                    return Err(rudb_functions::named_mismatch("||", &spelled, false));
                 }
             }
             if let Some(done) = self.pg_datetime_operator(op, left, right)? {
@@ -4744,11 +4780,7 @@ fn undefined_function(
     let spelled = types
         .iter()
         .zip(arguments)
-        .map(|(ty, &arg)| match ast.expr(arg) {
-            ast::Expr::Literal { kind: LiteralKind::String, .. } => "unknown".into(),
-            _ if *ty == LogicalType::Null => "unknown".into(),
-            _ => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(ty).oid),
-        })
+        .map(|(ty, &arg)| postgres_type_name(ast, arg, ty))
         .collect::<Vec<_>>()
         .join(", ");
     let message = format!("function {written}({spelled}) does not exist");
@@ -4764,6 +4796,50 @@ fn undefined_function(
     match error.span() {
         Some(span) => mapped.with_span(span),
         None => mapped,
+    }
+}
+
+/// The error of PostgreSQL for an operator that takes no operands of these types, which a
+/// PostgreSQL session sends in place of the error of the pin. It is placed at the operator, which
+/// is where the PostgreSQL transform places the expression. Another error stays as it is.
+fn undefined_operator(
+    ast: &Ast,
+    error: Error,
+    op: BinaryOp,
+    written: &[ast::ExprRef; 2],
+    types: &[LogicalType; 2],
+) -> Error {
+    let message = error.message();
+    if !message.starts_with("No function matches") && !message.starts_with("Cannot compare values")
+    {
+        return error;
+    }
+    let [left, right] = [0, 1].map(|at| postgres_type_name(ast, written[at], &types[at]));
+    let symbol = match op {
+        BinaryOp::Like => "~~".to_string(),
+        BinaryOp::NotLike => "!~~".to_string(),
+        BinaryOp::ILike => "~~*".to_string(),
+        BinaryOp::NotILike => "!~~*".to_string(),
+        _ => spelling(ast, op),
+    };
+    let mapped = Error::new(error.code(), message.to_string())
+        .state(SqlState::UNDEFINED_FUNCTION)
+        .pg(format!("operator does not exist: {left} {symbol} {right}"))
+        .detail("No operator of that name accepts the given argument types.")
+        .hint("You might need to add explicit type casts.");
+    match error.span() {
+        Some(span) => mapped.with_span(span),
+        None => mapped,
+    }
+}
+
+/// The type of an argument as `format_type` names it, with `unknown` for a string literal and a
+/// null, which have no type yet when PostgreSQL looks for a function or an operator.
+fn postgres_type_name(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
+    match ast.expr(arg) {
+        ast::Expr::Literal { kind: LiteralKind::String, .. } => "unknown".into(),
+        _ if *ty == LogicalType::Null => "unknown".into(),
+        _ => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(ty).oid).into_owned(),
     }
 }
 
