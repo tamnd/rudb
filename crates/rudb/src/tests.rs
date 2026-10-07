@@ -13549,6 +13549,94 @@ fn a_postgres_session_compares_identifiers_by_their_bytes() {
 }
 
 #[test]
+fn a_postgres_session_names_columns_in_ddl_and_joins_by_their_bytes() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let run = |sql: &str| connection.execute(sql).expect(sql);
+    let failure = |sql: &str| {
+        let error = connection.execute(sql).expect_err(sql);
+        let postgres = error.fields().and_then(|fields| fields.postgres.clone());
+        (error.reported_state().as_str().to_owned(), postgres)
+    };
+    let column = |text: &str| Some(text.to_owned());
+    run("CREATE TABLE l (\"A\" int, b int)");
+    run("CREATE TABLE r (a int PRIMARY KEY, b int)");
+    // The texts and the states are the ones of the PostgreSQL 19 oracle.
+    for (sql, state, text) in [
+        ("SELECT 1 AS \"X\" ORDER BY x", "42703", "column \"x\" does not exist"),
+        ("SELECT x.a", "42P01", "missing FROM-clause entry for table \"x\""),
+        (
+            "CREATE TABLE p (\"A\" int, UNIQUE (a))",
+            "42703",
+            "column \"a\" named in key does not exist",
+        ),
+        (
+            "CREATE TABLE p (\"A\" int, PRIMARY KEY (a))",
+            "42703",
+            "column \"a\" named in key does not exist",
+        ),
+        ("CREATE TABLE p (\"A\" int, CHECK (a > 0))", "42703", "column \"a\" does not exist"),
+        (
+            "CREATE TABLE p (\"A\" int, FOREIGN KEY (a) REFERENCES r (a))",
+            "42703",
+            "column \"a\" referenced in foreign key constraint does not exist",
+        ),
+        (
+            "CREATE TABLE p (\"A\" int, FOREIGN KEY (\"A\") REFERENCES r (\"A\"))",
+            "42703",
+            "column \"A\" referenced in foreign key constraint does not exist",
+        ),
+    ] {
+        assert_eq!(failure(sql), (state.into(), column(text)), "{sql}");
+    }
+    assert_eq!(
+        connection.execute("SELECT * FROM l JOIN r USING (a)").expect_err("no a").message(),
+        "column \"a\" specified in USING clause does not exist in left table"
+    );
+    assert_eq!(failure("SELECT * FROM l JOIN r USING (\"A\")").0, "42703");
+    assert_eq!(run("SELECT * FROM l NATURAL JOIN r").names(), ["A", "b", "a"]);
+    run("CREATE TABLE p (\"A\" int, a int, PRIMARY KEY (\"A\"))");
+    run("INSERT INTO p VALUES (1, 2)");
+    assert_eq!(
+        run("SELECT * FROM p").rows().next().expect("a row"),
+        [Value::Integer(1), Value::Integer(2)]
+    );
+    run("CREATE TABLE q (b int, \"B\" int)");
+    for (sql, state, text) in [
+        (
+            "ALTER TABLE q ADD COLUMN b int",
+            "42701",
+            "column \"b\" of relation \"q\" already exists",
+        ),
+        (
+            "ALTER TABLE q RENAME COLUMN \"B\" TO b",
+            "42701",
+            "column \"b\" of relation \"q\" already exists",
+        ),
+        ("ALTER TABLE q RENAME COLUMN bb TO c", "42703", "column \"bb\" does not exist"),
+        ("ALTER TABLE q DROP COLUMN bb", "42703", "column \"bb\" of relation \"q\" does not exist"),
+        (
+            "ALTER TABLE q ALTER COLUMN bb SET DEFAULT 1",
+            "42703",
+            "column \"bb\" of relation \"q\" does not exist",
+        ),
+    ] {
+        assert_eq!(failure(sql), (state.into(), column(text)), "{sql}");
+    }
+    run("ALTER TABLE q RENAME COLUMN \"B\" TO \"C\"");
+    assert_eq!(run("SELECT * FROM q").names(), ["b", "C"]);
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
@@ -13561,6 +13649,14 @@ fn a_duckdb_session_compares_identifiers_without_case() {
     );
     let error = connection.execute("CREATE TABLE u (a int, \"A\" int)").expect_err("one name");
     assert_eq!(error.message(), "Column with name A already exists!");
+    run("CREATE TABLE l (\"A\" int, b int)");
+    run("CREATE TABLE r (a int PRIMARY KEY, b int)");
+    run("CREATE TABLE p (\"A\" int, UNIQUE (a), CHECK (a > 0), FOREIGN KEY (a) REFERENCES r (A))");
+    assert_eq!(run("SELECT 1 AS \"X\" ORDER BY x").names(), ["X"]);
+    assert_eq!(run("SELECT * FROM l JOIN r USING (a)").names(), ["A", "b", "b"]);
+    assert_eq!(run("SELECT * FROM l NATURAL JOIN r").names(), ["A", "b"]);
+    let error = connection.execute("ALTER TABLE l ADD COLUMN B int").expect_err("one name");
+    assert_eq!(error.message(), "Column with name \"B\" already exists!");
 }
 
 #[test]

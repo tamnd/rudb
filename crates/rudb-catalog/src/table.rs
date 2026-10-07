@@ -3408,8 +3408,10 @@ impl Table {
         workers: usize,
     ) -> Result<()> {
         use crate::Alteration;
+        // The binder checks a new name under the rule of the session. This is the check that
+        // holds for every session: no two columns with the same bytes.
         let taken = |columns: &[Field], name: &str| {
-            if columns.iter().any(|held| same_name(&held.name, name)) {
+            if columns.iter().any(|held| held.name == name) {
                 return Err(Error::catalog(format!("Column with name \"{name}\" already exists!")));
             }
             Ok(())
