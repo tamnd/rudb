@@ -159,6 +159,13 @@ fn run<V: AsRef<Vector>>(
         return Vector::from_values(returns.clone(), &[]);
     }
 
+    if let ("__rudb_pg_output", [value, settings @ ..]) = (name, args) {
+        let settings: Vec<Value> = settings
+            .iter()
+            .map(|setting| setting.as_ref().try_value_at(0))
+            .collect::<Result<_>>()?;
+        return cast::postgres_output(value.as_ref(), &settings);
+    }
     if let Some(answer) = crate::json::build_vectors(name, args, None) {
         return answer;
     }
@@ -4277,6 +4284,9 @@ pub fn call_values(
     }
     if let ("__rudb_pg_number", [value]) = (name, args) {
         return cast::postgres_number(value, returns);
+    }
+    if let ("__rudb_pg_output", [value, settings @ ..]) = (name, args) {
+        return cast::postgres_output_value(value, settings);
     }
     if name.starts_with("__rudb_pg_")
         && let Some(value) = text::postgres(name, args)?

@@ -184,6 +184,7 @@ pub struct Semantics {
     aggregate_types: AggregateTypes,
     cast_input: CastInput,
     number_casts: NumberCasts,
+    cast_output: CastOutput,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -222,6 +223,7 @@ impl Default for Semantics {
             aggregate_types: AggregateTypes::Pin,
             cast_input: CastInput::Pin,
             number_casts: NumberCasts::Pin,
+            cast_output: CastOutput::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -346,6 +348,11 @@ impl Semantics {
     #[must_use]
     pub fn number_casts(self) -> NumberCasts {
         self.number_casts
+    }
+    /// How a cast to text writes a value.
+    #[must_use]
+    pub fn cast_output(self) -> CastOutput {
+        self.cast_output
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -642,6 +649,18 @@ pub enum NumberCasts {
     Pin,
     /// As in PostgreSQL: the cast function of the type pair checks it, so `70000::int2` is `22003
     /// smallint out of range`, and `1e300::float8::float4` is `22003 value out of range: overflow`.
+    Postgres,
+}
+
+/// How a cast to text writes a value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CastOutput {
+    /// As in DuckDB: the cast of the engine writes it, so `array[1, 2]::text` is `[1, 2]` and
+    /// `'NaN'::double::text` is `nan`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the output function of the type writes it, so `array[1, 2]::text` is
+    /// `{1,2}` and `'NaN'::float8::text` is `NaN`.
     Postgres,
 }
 
@@ -1075,6 +1094,7 @@ impl Session {
             self.semantics.plan_errors = PlanErrors::Postgres;
             self.semantics.cast_input = CastInput::Postgres;
             self.semantics.number_casts = NumberCasts::Postgres;
+            self.semantics.cast_output = CastOutput::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }

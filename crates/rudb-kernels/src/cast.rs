@@ -2079,6 +2079,54 @@ pub(crate) fn postgres_number(value: &Value, target: &LogicalType) -> Result<Val
     }
 }
 
+/// A cast to text in a PostgreSQL session, which the binder writes as `__rudb_pg_output` over the
+/// value, the OID of its type, `extra_float_digits`, and whether `bytea_output` is `escape`. The
+/// output function of the type writes the text, so `'NaN'::float8::text` is `NaN`,
+/// `'\x01ff'::bytea::text` is `\x01ff` and `array[1, 2]::text` is `{1,2}`. The binder writes it
+/// only for a type whose output reads no other setting.
+pub(crate) fn postgres_output(value: &Vector, settings: &[Value]) -> Result<Vector> {
+    use rudb_pgtypes::{ByteaOutput, DateFormat, FixedZone, IntervalStyle, OutputSettings};
+    let [oid, digits, escape] = settings else {
+        return Err(Error::internal("__rudb_pg_output takes the value and three settings"));
+    };
+    let oid = output_oid(oid)?;
+    let zone = FixedZone::utc();
+    let settings = OutputSettings {
+        date_format: DateFormat::ISO_MDY,
+        interval_style: IntervalStyle::Postgres,
+        extra_float_digits: digits
+            .as_i64()
+            .and_then(|digits| i32::try_from(digits).ok())
+            .unwrap_or(1),
+        bytea_output: match escape {
+            Value::Boolean(true) => ByteaOutput::Escape,
+            _ => ByteaOutput::Hex,
+        },
+        time_zone: &zone,
+    };
+    let texts = rudb_pgtypes::text_values(value, oid, &settings).map_err(Error::from)?;
+    let values: Vec<Value> =
+        texts.into_iter().map(|text| text.map_or(Value::Null, Value::Varchar)).collect();
+    Vector::from_values(LogicalType::Varchar, &values)
+}
+
+/// [`postgres_output`] on one value, which the folding of a constant and a call row by row reach.
+pub(crate) fn postgres_output_value(value: &Value, settings: &[Value]) -> Result<Value> {
+    let oid = settings.first().map_or(Ok(0), output_oid)?;
+    let Some(ty) = rudb_pgtypes::logical_type(oid) else {
+        return Err(Error::internal(format!("no type for the output of the type {oid}")));
+    };
+    let vector = Vector::from_values(ty, std::slice::from_ref(value))?;
+    Ok(postgres_output(&vector, settings)?.value_at(0))
+}
+
+/// The OID argument of `__rudb_pg_output`.
+fn output_oid(oid: &Value) -> Result<u32> {
+    oid.as_i64()
+        .and_then(|oid| u32::try_from(oid).ok())
+        .ok_or_else(|| Error::internal(format!("the OID of a type as a {}", oid.logical_type())))
+}
+
 /// The PostgreSQL name of an integer type, as its range error spells it.
 fn integer_name(target: &LogicalType) -> &'static str {
     match target {
