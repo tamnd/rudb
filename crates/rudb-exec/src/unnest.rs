@@ -20,7 +20,7 @@ use rudb_pipeline::{Progress, Stream};
 use rudb_plan::{ExprRef, Plan, Slice};
 use rudb_vector::selection::Selection;
 use rudb_vector::vector::NO_ROW;
-use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
+use rudb_vector::{Chunk, Data, VECTOR_SIZE, Vector};
 
 use crate::prepared::{Prepared, Scratch};
 use crate::schema::Schema;
@@ -34,6 +34,9 @@ pub(crate) struct LateralUnnest {
     elements: Vec<LogicalType>,
     /// The input's columns followed by one column per list.
     schema: Schema,
+    /// Whether a last column numbers the rows of each input row from 1, which is
+    /// `WITH ORDINALITY`.
+    ordinality: bool,
     cancel: Cancel,
 }
 
@@ -79,24 +82,26 @@ impl LateralUnnest {
         index: u32,
         args: Slice,
         columns: Slice,
+        ordinality: bool,
         cancel: &Cancel,
     ) -> Result<Self> {
         let fields = plan.field_list(columns).to_vec();
         let exprs: Vec<ExprRef> = plan.expr_list(args).to_vec();
-        if fields.len() != exprs.len() {
+        if fields.len() != exprs.len() + usize::from(ordinality) {
             return Err(Error::internal(format!(
                 "unnest() of {} lists with {} columns",
                 exprs.len(),
                 fields.len()
             )));
         }
-        let elements = fields.iter().map(|field| field.ty.clone()).collect();
+        let elements = fields[..exprs.len()].iter().map(|field| field.ty.clone()).collect();
         let produced = Schema::numbered(fields, index);
         let schema = Schema::concat(input, &produced);
         Ok(Self {
             args: Prepared::new(plan, &exprs, input)?,
             elements,
             schema,
+            ordinality,
             cancel: cancel.clone(),
         })
     }
@@ -182,10 +187,14 @@ impl Stream for LateralUnnest {
         };
         let mut rows = Vec::new();
         let mut rids: Vec<Vec<u32>> = vec![Vec::new(); local.lists.len()];
+        let mut numbers: Vec<i64> = Vec::new();
         while local.row < input.len() && rows.len() < VECTOR_SIZE {
             let count = local.counts[local.row] as usize;
             let end = (local.made + VECTOR_SIZE - rows.len()).min(count);
             let row = u32::try_from(local.row).map_err(|_| Error::internal("a chunk row"))?;
+            if self.ordinality {
+                numbers.extend((local.made..end).map(|at| at as i64 + 1));
+            }
             for at in local.made..end {
                 rows.push(row);
                 for (list, ids) in local.lists.iter().zip(&mut rids) {
@@ -219,6 +228,9 @@ impl Stream for LateralUnnest {
                 }
                 None => Vector::constant(element.clone(), Value::Null, len),
             });
+        }
+        if self.ordinality {
+            columns.push(Vector::flat(LogicalType::BigInt, Data::Int64(numbers.into()))?);
         }
         *chunk = Chunk::with_rows(columns, len)?;
         if local.row < input.len() {

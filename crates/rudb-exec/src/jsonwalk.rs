@@ -34,6 +34,9 @@ pub(crate) struct LateralJson {
     /// The input's columns followed by the ones picked.
     schema: Schema,
     types: Vec<LogicalType>,
+    /// Whether a last column numbers the values of each document from 1, which is
+    /// `WITH ORDINALITY`.
+    ordinality: bool,
     cancel: Cancel,
 }
 
@@ -64,6 +67,7 @@ impl LateralJson {
     ///
     /// If the name is not one of the two walks, or if an argument does not resolve against the
     /// input's schema. Both are failures of the plan.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         plan: &Plan,
         input: &Schema,
@@ -71,6 +75,7 @@ impl LateralJson {
         function: &str,
         args: Slice,
         columns: Slice,
+        ordinality: bool,
         cancel: &Cancel,
     ) -> Result<Self> {
         let tree = match TableFunction::lookup(function) {
@@ -80,7 +85,8 @@ impl LateralJson {
         };
         let fields = plan.field_list(columns).to_vec();
         let all = json_walk_fields();
-        let picks = fields
+        let walked = fields.len().saturating_sub(usize::from(ordinality));
+        let picks = fields[..walked]
             .iter()
             .map(|field| {
                 all.iter().position(|held| held.name == field.name).ok_or_else(|| {
@@ -97,6 +103,7 @@ impl LateralJson {
             args: Prepared::new(plan, &exprs, input)?,
             types: schema.types(),
             schema,
+            ordinality,
             cancel: cancel.clone(),
         })
     }
@@ -189,10 +196,14 @@ impl Stream for LateralJson {
                 let left: Vec<Value> = input.row(local.row).collect();
                 let room = VECTOR_SIZE - out.len();
                 let end = (local.made + room).min(local.walked.len());
-                for entry in &local.walked[local.made..end] {
+                for (at, entry) in local.walked[local.made..end].iter().enumerate() {
                     let mut made = left.clone();
                     let values = entry_values(entry);
                     made.extend(self.picks.iter().map(|&at| values[at].clone()));
+                    if self.ordinality {
+                        let number = local.made + at + 1;
+                        made.push(Value::BigInt(i64::try_from(number).unwrap_or(i64::MAX)));
+                    }
                     out.push(made);
                 }
                 if end < local.walked.len() {

@@ -634,7 +634,16 @@ impl Generator {
                 let count = self.random.count(1, 3);
                 let columns = self.fields(count);
                 let index = self.index();
-                Node::TableFunction { index, function, args, options, settings, columns }
+                let ordinality = self.random.below(2) == 1;
+                Node::TableFunction {
+                    index,
+                    function,
+                    args,
+                    options,
+                    settings,
+                    columns,
+                    ordinality,
+                }
             }
         }
     }

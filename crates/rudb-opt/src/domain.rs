@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use rudb_common::{Field, LogicalType, Value};
 use rudb_plan::{
     Arm, Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
-    NodeRef, Plan, Slice, SortKey, StrRef, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    NodeRef, Plan, Slice, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::tables::{TableSet, produced};
@@ -466,9 +466,7 @@ fn push(
         Node::MaterializedCte { .. } | Node::CteScan { .. } | Node::RecursiveCte { .. } => {
             held(plan, at, domain, index, keys, outer)
         }
-        Node::TableFunction { index: at_index, function, args, options, settings, columns } => {
-            lateral(plan, at_index, function, args, options, settings, columns, domain, index, keys)
-        }
+        Node::TableFunction { .. } => lateral(plan, at, domain, index, keys),
         Node::CrossProduct { left, right } => {
             let empty = plan.add_expr_list(&[]);
             sides(plan, left, right, JoinKind::Inner, empty, domain, index, keys, outer)
@@ -1019,19 +1017,25 @@ fn values(
 /// The domain columns come out of it unmoved. A `LateralFunction` appends the function's columns to
 /// the row it was given rather than replacing it, the way a window does, so the domain columns are
 /// still where the domain put them and `keys` goes back out reading the domain straight.
-#[allow(clippy::too_many_arguments)]
 fn lateral(
     plan: &mut Plan,
-    at_index: u32,
-    function: StrRef,
-    args: Slice,
-    options: Slice,
-    settings: Slice,
-    columns: Slice,
+    call: NodeRef,
     domain: NodeRef,
     index: u32,
     keys: &[Key],
 ) -> Option<Pushed> {
+    let Node::TableFunction {
+        index: at_index,
+        function,
+        args,
+        options,
+        settings,
+        columns,
+        ordinality,
+    } = *plan.node(call)
+    else {
+        return None;
+    };
     // The outer references read the domain straight rather than something a lower operator carried,
     // because there is no lower operator. Nothing else is moved for the same reason.
     let mut map = HashMap::new();
@@ -1050,6 +1054,7 @@ fn lateral(
         options,
         settings,
         columns,
+        ordinality,
     });
     let carried = (0..keys.len())
         .map(|position| ColumnBinding::new(index, u32::try_from(position).expect("key count")))

@@ -14557,3 +14557,45 @@ fn a_generated_column_is_refused_the_way_the_pin_refuses_one() {
         assert_eq!(failure(&db, sql), message, "{sql}");
     }
 }
+
+/// `WITH ORDINALITY` adds a BIGINT column named `ordinality` that numbers the rows of a call from
+/// 1, and a lateral call numbers the rows of each outer row from 1 again.
+#[test]
+fn with_ordinality_numbers_the_rows_of_a_call() {
+    let db = Database::new();
+    let big = Value::BigInt;
+    let result = db.query("SELECT * FROM range(3) WITH ORDINALITY").unwrap();
+    assert_eq!(result.names(), ["range", "ordinality"]);
+    assert_eq!(
+        result.rows().collect::<Vec<_>>(),
+        vec![vec![big(0), big(1)], vec![big(1), big(2)], vec![big(2), big(3)]]
+    );
+    let result = db.query("SELECT * FROM range(2) WITH ORDINALITY AS t(a, n)").unwrap();
+    assert_eq!(result.names(), ["a", "n"]);
+    assert_eq!(
+        rows(&db, "SELECT * FROM unnest([10, 20]) WITH ORDINALITY"),
+        vec![vec![integer(10), big(1)], vec![integer(20), big(2)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT typeof(ordinality) FROM generate_series(1, 2) WITH ORDINALITY"),
+        vec![vec![text("BIGINT")], vec![text("BIGINT")]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT v.n, r.range, r.ordinality FROM (VALUES (2), (3)) v(n), \
+             LATERAL range(v.n) WITH ORDINALITY r ORDER BY 1, 3",
+        ),
+        vec![
+            vec![integer(2), big(0), big(1)],
+            vec![integer(2), big(1), big(2)],
+            vec![integer(3), big(0), big(1)],
+            vec![integer(3), big(1), big(2)],
+            vec![integer(3), big(2), big(3)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM range(5000) WITH ORDINALITY t(a, n) WHERE n = a + 1"),
+        vec![vec![big(5000)]]
+    );
+}

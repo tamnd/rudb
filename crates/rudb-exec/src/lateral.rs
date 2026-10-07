@@ -42,6 +42,8 @@ pub(crate) struct LateralSeries {
     produced: LogicalType,
     /// The zone a series of `TIMESTAMPTZ` steps its days and months in.
     time_zone: SessionTimeZone,
+    /// Whether a last column numbers the values of each call from 1, which is `WITH ORDINALITY`.
+    ordinality: bool,
     cancel: Cancel,
 }
 
@@ -78,6 +80,7 @@ impl LateralSeries {
     /// If the name is not a table function, if it is one this operator does not answer, or if an
     /// argument does not resolve against the input's schema. All three are failures of the plan and
     /// are found when the operator is built rather than on the first chunk.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         plan: &Plan,
         input: &Schema,
@@ -85,6 +88,7 @@ impl LateralSeries {
         function: &str,
         args: Slice,
         columns: Slice,
+        ordinality: bool,
         cancel: &Cancel,
     ) -> Result<Self> {
         let Some(function) = TableFunction::lookup(function) else {
@@ -101,9 +105,10 @@ impl LateralSeries {
         // because what comes out of this is a BIGINT or a moment and a field that said otherwise
         // would be a chunk that does not match the schema above it.
         let fields = plan.field_list(columns).to_vec();
-        let [field] = fields.as_slice() else {
+        let wanted = 1 + usize::from(ordinality);
+        let (Some(field), true) = (fields.first(), fields.len() == wanted) else {
             return Err(Error::internal(format!(
-                "{}() with {} columns rather than one",
+                "{}() with {} columns rather than {wanted}",
                 function.name(),
                 fields.len()
             )));
@@ -127,6 +132,7 @@ impl LateralSeries {
             produced: made,
             schema,
             time_zone: SessionTimeZone::default(),
+            ordinality,
             cancel: cancel.clone(),
         })
     }
@@ -238,6 +244,9 @@ impl Stream for LateralSeries {
                         LogicalType::TimestampTz => Value::TimestampTz(value),
                         _ => Value::BigInt(value),
                     });
+                    if self.ordinality {
+                        made.push(Value::BigInt(i64::try_from(at + 1).unwrap_or(i64::MAX)));
+                    }
                     out.push(made);
                 }
                 if end < call.len() {

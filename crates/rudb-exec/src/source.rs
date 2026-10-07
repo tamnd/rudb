@@ -3344,6 +3344,8 @@ pub(crate) struct Series {
     /// The moments of a series whose step has months in it, which cannot be worked out from a
     /// position and so are walked once and kept.
     listed: Option<Arc<[i64]>>,
+    /// Whether a second column numbers the values from 1, which is `WITH ORDINALITY`.
+    ordinality: bool,
     morsels: AtomicU64,
 }
 
@@ -3361,6 +3363,25 @@ impl Series {
     ///
     /// Whatever evaluating an argument reports, and a step of zero.
     pub(crate) fn new(
+        plan: &Plan,
+        index: u32,
+        function: &str,
+        args: Slice,
+        time_zone: SessionTimeZone,
+        ordinality: bool,
+    ) -> Result<Self> {
+        let mut series = Self::counted(plan, index, function, args, time_zone)?;
+        if ordinality {
+            let mut fields = series.schema.fields().to_vec();
+            fields.push(Field::new("ordinality", LogicalType::BigInt));
+            series.schema = Schema::numbered(fields, index);
+            series.ordinality = true;
+        }
+        Ok(series)
+    }
+
+    /// The series of the call, with no column for `WITH ORDINALITY`.
+    fn counted(
         plan: &Plan,
         index: u32,
         function: &str,
@@ -3429,11 +3450,13 @@ impl Series {
             rows: 0,
             ty: LogicalType::BigInt,
             listed: None,
+            ordinality: false,
             morsels: AtomicU64::new(0),
         }
     }
 
-    /// What this produces, which is one column named after the function.
+    /// What this produces, which is one column named after the function, and the number of each
+    /// value for `WITH ORDINALITY`.
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
@@ -3464,9 +3487,10 @@ impl Source for Series {
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
         let count = usize::try_from(morsel.remaining()).unwrap_or(usize::MAX).min(VECTOR_SIZE);
         if count == 0 {
-            *out = Chunk::empty(std::slice::from_ref(&self.ty));
+            *out = Chunk::empty(&self.schema.types());
             return Ok(Progress::Done);
         }
+        let first = morsel.cursor();
         // The loop is over `i64` rather than over `Value`, and the vector is built out of the run
         // it fills rather than out of a list of tagged values that would have to be read back one
         // at a time to find the run again. `range()` is the source every microbenchmark in
@@ -3488,10 +3512,25 @@ impl Source for Series {
             counted
         };
         morsel.advance(u64::try_from(count).unwrap_or(u64::MAX));
-        let vector = Vector::flat(self.ty.clone(), Data::Int64(counted.into()))?;
-        *out = Chunk::with_rows(vec![vector], count)?;
+        let mut columns = vec![Vector::flat(self.ty.clone(), Data::Int64(counted.into()))?];
+        if self.ordinality {
+            columns.push(ordinals(first, count)?);
+        }
+        *out = Chunk::with_rows(columns, count)?;
         Ok(if morsel.is_drained() { Progress::Done } else { Progress::More })
     }
+}
+
+/// The numbers of `WITH ORDINALITY` for `count` rows after the first `first` rows of a call, which
+/// count from 1.
+///
+/// # Errors
+///
+/// None in practice. A number past `i64::MAX` is a call with more rows than any can make.
+pub(crate) fn ordinals(first: u64, count: usize) -> Result<Vector> {
+    let first = i64::try_from(first).map_err(|_| Error::internal("an ordinality past i64"))?;
+    let numbers: Vec<i64> = (1..=count as i64).map(|at| first.saturating_add(at)).collect();
+    Vector::flat(LogicalType::BigInt, Data::Int64(numbers.into()))
 }
 
 /// The moments a `range` or `generate_series` call over dates or timestamps gives, or `None` when an

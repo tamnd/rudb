@@ -412,6 +412,7 @@ mod tests {
             options: empty,
             settings: empty,
             columns,
+            ordinality: false,
         });
         plan.set_root(node);
         assert!(root(&plan).is_empty());
@@ -468,6 +469,7 @@ mod tests {
             options: empty,
             settings: empty,
             columns,
+            ordinality: false,
         });
         plan.set_root(node);
         assert!(root(&plan).is_empty(), "one input row becomes any number of output rows");

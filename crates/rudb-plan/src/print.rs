@@ -102,8 +102,17 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             }
             out.write_char(']')
         }
-        Node::TableFunction { index, function, args, options, settings, columns }
-        | Node::LateralFunction { index, function, args, options, settings, columns, .. } => {
+        Node::TableFunction { index, function, args, options, settings, columns, ordinality }
+        | Node::LateralFunction {
+            index,
+            function,
+            args,
+            options,
+            settings,
+            columns,
+            ordinality,
+            ..
+        } => {
             out.write_char(' ')?;
             write_identifier(out, plan.string(function))?;
             out.write_str(" args=")?;
@@ -125,7 +134,11 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
                 out.write_char(']')?;
             }
             write!(out, " #{index} ")?;
-            write_schema(plan, out, columns)
+            write_schema(plan, out, columns)?;
+            if ordinality {
+                out.write_str(" ordinality")?;
+            }
+            Ok(())
         }
         Node::Fetch { index, args, columns, row, .. } => {
             out.write_str(" args=")?;

@@ -57,7 +57,7 @@ pub(crate) struct UnnestCall {
     /// The list, bound against what the block computes, with an array cast to a list.
     arg: ExprRef,
     /// How many levels the call takes apart.
-    depth: usize,
+    pub(crate) depth: usize,
 }
 
 /// The type one level down, for a list or an array, and `None` for anything else.
@@ -406,6 +406,7 @@ impl Binder<'_> {
                 options,
                 settings,
                 columns,
+                ordinality: false,
             });
         }
         Ok(node)

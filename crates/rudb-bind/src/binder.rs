@@ -37,6 +37,7 @@ use rudb_plan::{
 
 use crate::expr::{describe, postgres_oid, written_oid};
 use crate::fold;
+use crate::ordinality::unnumbered;
 use crate::parameters::{Parameters, Written};
 use crate::scope::{Joined, Scope, Visible};
 
@@ -3008,10 +3009,11 @@ impl<'a> Binder<'a> {
                 .bind_table(ast, name, alias, columns)
                 .map_err(|error| error.with_fallback_span(ast.source_span(source))),
             ast::Source::Function { name, args, alias, columns, pragma } => {
-                match self.value_call(ast, source, name) {
-                    Some(call) => self.bind_value_source(ast, call, alias, columns),
-                    None => self.bind_table_function(ast, name, args, alias, columns, pragma),
+                let ordinality = ast.with_ordinality(source);
+                if let Some(call) = self.value_call(ast, source, name) {
+                    return self.bind_value_source(ast, call, alias, columns, ordinality);
                 }
+                self.bind_table_function(ast, name, args, alias, columns, pragma, ordinality)
             }
             ast::Source::Subquery { query, alias, columns } => {
                 let (node, mut scope) = self.bind_query(ast, query)?;
@@ -3402,6 +3404,7 @@ impl<'a> Binder<'a> {
     /// whatever happens to be to the left in the `FROM` list. Letting it would mean `FROM t,
     /// range(t.n)` quietly binding to something whose meaning depends on the order the sources were
     /// written in.
+    #[allow(clippy::too_many_arguments)]
     fn bind_table_function(
         &mut self,
         ast: &Ast,
@@ -3410,12 +3413,21 @@ impl<'a> Binder<'a> {
         alias: ast::StrRef,
         columns: ast::Slice,
         pragma: bool,
+        ordinality: bool,
     ) -> Result<(NodeRef, Scope)> {
+        // A call that is not made by one operator has no place for each row to number.
+        let numbered = |bound: (NodeRef, Scope)| {
+            if ordinality {
+                let name: Vec<&str> = ast.name(name).collect();
+                return Err(unnumbered(&name.join(".")));
+            }
+            Ok(bound)
+        };
         // The column names written after the alias, kept under a name of their own because the
         // match on what the function's columns are below binds `columns` to something else.
         let renamed = columns;
         if !pragma && let Some(bound) = self.table_macro(ast, name, args, alias, columns)? {
-            return Ok(bound);
+            return numbered(bound);
         }
         let parts: Vec<&str> = ast.name(name).collect();
         // A qualified call names a schema, and the two schemas that exist are the ones every
@@ -3434,15 +3446,15 @@ impl<'a> Binder<'a> {
         if !pragma
             && let Some(bound) = self.query_function(ast, function_name, args, alias, columns)?
         {
-            return Ok(bound);
+            return numbered(bound);
         }
         if !pragma && let Some(bound) = self.all_types(ast, function_name, args, alias, columns)? {
-            return Ok(bound);
+            return numbered(bound);
         }
         if !pragma
             && let Some(bound) = self.vector_types(ast, function_name, args, alias, columns)?
         {
-            return Ok(bound);
+            return numbered(bound);
         }
         // The name is looked up before the arguments are bound so that a call of something that is
         // not a table function says that, rather than reporting whatever is wrong with the
@@ -3636,18 +3648,25 @@ impl<'a> Binder<'a> {
         } else {
             ast.string(alias).to_string()
         };
+        // The column list names the number too, so it goes on once the number is there.
         let names: Vec<&str> = ast.name(columns).collect();
-        let (node, scope) = self.table_function_source(
+        let written = if ordinality { &[][..] } else { &names[..] };
+        let (node, mut scope) = self.table_function_source(
             resolved.function,
             &cast,
             &written_options,
             Read { fields, rows: measured, distincts: counted, zones: bounded },
             &label,
-            &names,
+            written,
         )?;
         let node = self.lateral_over_subqueries(node, waiting);
-        if integers {
-            return Ok(self.integer_series(node, scope));
+        if ordinality {
+            self.number_rows(node, &mut scope)?;
+        }
+        let (node, mut scope) =
+            if integers { self.integer_series(node, scope) } else { (node, scope) };
+        if ordinality && !names.is_empty() {
+            scope.rename(&names, &label)?;
         }
         Ok((node, scope))
     }
@@ -3662,7 +3681,7 @@ impl<'a> Binder<'a> {
         if self.scalar_subqueries.len() <= waiting {
             return node;
         }
-        let Node::TableFunction { index, function, args, options, settings, columns } =
+        let Node::TableFunction { index, function, args, options, settings, columns, ordinality } =
             self.plan.node(node).clone()
         else {
             return node;
@@ -3692,6 +3711,7 @@ impl<'a> Binder<'a> {
             options,
             settings,
             columns,
+            ordinality,
         })
     }
 
@@ -4262,6 +4282,7 @@ impl<'a> Binder<'a> {
             options,
             settings,
             columns,
+            ordinality: false,
         });
         Ok((node, scope))
     }
