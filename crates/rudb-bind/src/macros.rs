@@ -98,6 +98,13 @@ const MACROS: &[Macro] = &[
          ((upper(logical_type) = 'BOOLEAN')) THEN ('bool') ELSE lower(logical_type) END",
     ),
     define(
+        "format_type",
+        &["type_oid", "typemod"],
+        "((SELECT format_pg_type(logical_type, type_name) FROM duckdb_types() AS t WHERE \
+         (t.type_oid = type_oid)) || CASE  WHEN ((typemod > 0)) THEN (concat('(', (typemod // \
+         1000), ',', (typemod % 1000), ')')) ELSE '' END)",
+    ),
+    define(
         "generate_subscripts",
         &["arr", "dim"],
         "unnest(generate_series(1, array_length(arr, dim)))",
@@ -174,7 +181,24 @@ const MACROS: &[Macro] = &[
     define("pg_conf_load_time", &[], "current_timestamp"),
     define("pg_conversion_is_visible", &["conversion_oid"], "true"),
     define("pg_function_is_visible", &["function_oid"], "true"),
+    define(
+        "pg_get_constraintdef",
+        &["constraint_oid"],
+        "(SELECT constraint_text FROM duckdb_constraints() AS d_constraint WHERE \
+         ((d_constraint.table_oid = (constraint_oid // 1000000)) AND \
+         (d_constraint.constraint_index = (constraint_oid % 1000000))))",
+    ),
+    define(
+        "pg_get_constraintdef",
+        &["constraint_oid", "pretty_bool"],
+        "pg_get_constraintdef(constraint_oid)",
+    ),
     define("pg_get_expr", &["pg_node_tree", "relation_oid"], "pg_node_tree"),
+    define(
+        "pg_get_viewdef",
+        &["oid"],
+        "(SELECT \"sql\" FROM duckdb_views() AS v WHERE (v.view_oid = oid))",
+    ),
     define("pg_has_role", &["role", "privilege"], "true"),
     define("pg_has_role", &["user", "role", "privilege"], "true"),
     define("pg_is_other_temp_schema", &["schema_id"], "false"),
@@ -183,6 +207,7 @@ const MACROS: &[Macro] = &[
     define("pg_operator_is_visible", &["operator_oid"], "true"),
     define("pg_opfamily_is_visible", &["opclass_oid"], "true"),
     define("pg_postmaster_start_time", &[], "current_timestamp"),
+    define("pg_sleep", &["seconds"], "sleep_ms(CAST((seconds * 1000) AS BIGINT))"),
     define("pg_table_is_visible", &["table_oid"], "true"),
     define("pg_ts_config_is_visible", &["config_oid"], "true"),
     define("pg_ts_dict_is_visible", &["dict_oid"], "true"),
@@ -275,6 +300,7 @@ impl Binder<'_> {
         let Some(chosen) = chosen(written, arguments.len())? else {
             return Ok(None);
         };
+        self.keep_statement(ast);
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = substitute(chosen.body, chosen.parameters, &texts)?;
@@ -299,6 +325,7 @@ impl Binder<'_> {
         let Some(chosen) = chosen(call.name, call.args.len())? else {
             return Ok(None);
         };
+        self.keep_statement(ast);
         let texts: Vec<String> =
             call.args.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = windowed(ast, call, chosen.name, chosen.body, chosen.parameters, &texts)?;
@@ -516,6 +543,7 @@ impl Binder<'_> {
                  \"ORDER BY\" are only applicable to window and aggregate functions."
             )));
         }
+        self.keep_statement(ast);
         let (positional, named) = ast.written_args(call, args);
         let text = self.expanded(ast, &called, &overloads, positional, named, scope)?;
         let depth = deeper()?;
@@ -548,6 +576,7 @@ impl Binder<'_> {
             return Err(Error::binder(format!("Macro \"{written}\"() {said}")));
         }
         let overloads = found.overloads.clone();
+        self.keep_statement(ast);
         let (positional, named) = ast.written_args(expr, args);
         let (body, names, texts) =
             self.overload_for(ast, &called, &overloads, positional, named, scope)?;
@@ -604,6 +633,7 @@ impl Binder<'_> {
                 )));
             }
         }
+        self.keep_statement(ast);
         let empty = Scope::empty();
         let text = self.expanded(ast, &called, &overloads, &positional, &named, &empty)?;
         let parsed = parse_ast_with_case(&text, self.semantics.identifier_case())?;

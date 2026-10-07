@@ -85,7 +85,7 @@ fn transform_dialect(
         query,
         tokens,
         tree,
-        ast: Ast::default(),
+        ast: Ast { source: query.into(), ..Ast::default() },
         interned: HashMap::new(),
         anonymous: 0,
         identifier_case,

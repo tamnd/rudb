@@ -1739,6 +1739,20 @@ const TABLE: &[Entry] = &[
     session("current_user", Fixed::Varchar),
     session("session_user", Fixed::Varchar),
     session("user", Fixed::Varchar),
+    // Folded by the binder too, for the same reason: the text of the statement, the number of the
+    // transaction and the version are settled before the first row is read.
+    session("current_query", Fixed::Varchar),
+    session("txid_current", Fixed::UBigInt),
+    session("version", Fixed::Varchar),
+    // Volatile like `random`, so it is not folded and it sleeps once for every row it is called
+    // on, as it does on the pin.
+    Entry {
+        name: "sleep_ms",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::FixedTo(Fixed::BigInt, Fixed::Null),
+        numeric_only: false,
+    },
     // Aggregates.
     aggregate("count_star", Arity::exactly(0), Shape::AnyTo(Fixed::BigInt), false),
     aggregate("count", Arity::exactly(1), Shape::AnyTo(Fixed::BigInt), false),
@@ -4623,6 +4637,10 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("today", &["today() -> DATE"]),
     ("current_schema", &["current_schema() -> VARCHAR"]),
     ("current_database", &["current_database() -> VARCHAR"]),
+    ("current_query", &["current_query() -> VARCHAR"]),
+    ("txid_current", &["txid_current() -> UBIGINT"]),
+    ("version", &["\"version\"() -> VARCHAR"]),
+    ("sleep_ms", &["sleep_ms(col0 BIGINT) -> \"NULL\""]),
     ("lower", &["lower(col0 VARCHAR) -> VARCHAR"]),
     ("error", &["\"error\"(col0 VARCHAR) -> \"NULL\""]),
     ("upper", &["upper(col0 VARCHAR) -> VARCHAR"]),

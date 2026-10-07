@@ -17,6 +17,8 @@
 //! so the code reads a node out by value first. Nodes are small and `Copy`, so that is a register
 //! move.
 
+use std::sync::Arc;
+
 use rudb_common::Span;
 
 use crate::matcher::NONE;
@@ -1641,6 +1643,9 @@ pub struct Ast {
     /// The `EXCLUDE` and `RENAME` lists of the stars written with either, beside the star they
     /// belong to. Kept to one side because a star with neither is by far the usual one.
     pub star_lists: Vec<(ExprRef, StarLists)>,
+    /// The text the statements were parsed from, which `current_query()` answers with. Shared,
+    /// so the binder can keep it for the statement without copying it.
+    pub source: Arc<str>,
 }
 
 /// The `EXCLUDE` and `RENAME` lists of one star.

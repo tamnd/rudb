@@ -43,9 +43,9 @@
 //!
 //! No window functions, because rudb has none. No macros, no pragma functions and no table macros,
 //! for the same reason. `has_side_effects` is false and `stability` is `CONSISTENT` on every scalar
-//! and aggregate row except the sequence functions, `random` and `setseed`, which are `VOLATILE` with
-//! side effects as they are on the pin. There is no `now` yet, which would be the first
-//! `CONSISTENT_WITHIN_QUERY` row.
+//! and aggregate row except the sequence functions, `random`, `setseed`, `sleep_ms` and
+//! `current_query`, which are `VOLATILE` with side effects as they are on the pin. There is no
+//! `now` yet, which would be the first `CONSISTENT_WITHIN_QUERY` row.
 
 use rudb_common::{Field, LogicalType};
 use rudb_kernels::json::scan;
@@ -91,6 +91,7 @@ pub const VOLATILE: &str = "VOLATILE";
 
 /// The functions the pin reports as volatile with side effects, of the ones rudb has.
 const MOVING: &[&str] = &[
+    "current_query",
     "currval",
     "error",
     "gen_random_uuid",
@@ -98,6 +99,7 @@ const MOVING: &[&str] = &[
     "random",
     "setseed",
     "setval",
+    "sleep_ms",
     "uuid",
     "uuidv4",
     "uuidv7",
