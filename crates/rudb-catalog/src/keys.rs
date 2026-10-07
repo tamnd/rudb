@@ -477,10 +477,15 @@ fn repeated(
     let name = key.pg_name(&table.table, columns);
     let names = key.columns.iter().map(|&at| identifier(&columns[at].name));
     let names = names.collect::<Vec<_>>().join(", ");
+    let mut values = Vec::with_capacity(key.columns.len());
+    for &column in &key.columns {
+        values.push(crate::table::pg_text(&chunk.column(column)?.value_at(row)));
+    }
+    let values = values.join(", ");
     Ok(Error::constraint(message)
         .state(SqlState::UNIQUE_VIOLATION)
         .pg(format!("duplicate key value violates unique constraint \"{name}\""))
-        .detail(format!("Key ({names})=({}) already exists.", bare(chunk, key, row)?))
+        .detail(format!("Key ({names})=({values}) already exists."))
         .table(&table.schema, &table.table)
         .constraint_name(name))
 }

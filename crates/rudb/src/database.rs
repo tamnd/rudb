@@ -3644,7 +3644,7 @@ struct NativeSink {
     /// the file still reads as that generation until the last write lands in the header.
     temporary: Option<PathBuf>,
     target: PathBuf,
-    table: String,
+    name: QualifiedName,
     fields: Vec<Field>,
     profile: Arc<LoadProfile>,
     /// The table's primary key and unique constraints, which the rows are checked against once
@@ -3667,7 +3667,9 @@ impl NativeSink {
                 _ => vector.validity().has_nulls(vector.len()),
             };
             if null {
-                return Err(rudb_catalog::null_in(&self.table, &field.name));
+                let row = (0..vector.len()).find(|&row| vector.is_null_at(row)).unwrap_or(0);
+                let row = rudb_catalog::row_of(&chunk, row)?;
+                return Err(rudb_catalog::null_in(&self.name, &field.name, &row));
             }
         }
         if !self.keys.is_empty() {
@@ -3695,7 +3697,7 @@ impl NativeSink {
 
     fn create(
         target: &Path,
-        name: String,
+        name: QualifiedName,
         fields: Vec<Field>,
         clustering: Option<Clustering>,
         limit: Option<u64>,
@@ -3705,8 +3707,8 @@ impl NativeSink {
         if temporary.exists() {
             std::fs::remove_file(&temporary).map_err(|error| Error::io(error.to_string()))?;
         }
-        let profile = LoadProfile::begin(name.clone());
-        let writer = rudb_native::Writer::create(&temporary, name.clone(), fields.clone())?
+        let profile = LoadProfile::begin(name.table.clone());
+        let writer = rudb_native::Writer::create(&temporary, name.table.clone(), fields.clone())?
             .with_profile(Arc::clone(&profile))
             .with_dictionary_cap(dictionary_budget(limit));
         let mut writer = declared(writer, clustering, &keys)?;
@@ -3716,7 +3718,7 @@ impl NativeSink {
             writer: Mutex::new(Some(writer)),
             temporary: Some(temporary),
             target: target.to_path_buf(),
-            table: name,
+            name,
             fields,
             profile,
             keys,
@@ -3729,14 +3731,14 @@ impl NativeSink {
     /// holds.
     fn open(
         target: &Path,
-        name: String,
+        name: QualifiedName,
         fields: Vec<Field>,
         clustering: Option<Clustering>,
         limit: Option<u64>,
         keys: Vec<Key>,
     ) -> Result<Self> {
-        let profile = LoadProfile::begin(name.clone());
-        let writer = rudb_native::Writer::open(target, name.clone(), fields.clone())?
+        let profile = LoadProfile::begin(name.table.clone());
+        let writer = rudb_native::Writer::open(target, name.table.clone(), fields.clone())?
             .with_profile(Arc::clone(&profile))
             .with_dictionary_cap(dictionary_budget(limit));
         let mut writer = declared(writer, clustering, &keys)?;
@@ -3746,7 +3748,7 @@ impl NativeSink {
             writer: Mutex::new(Some(writer)),
             temporary: None,
             target: target.to_path_buf(),
-            table: name,
+            name,
             fields,
             profile,
             keys,
@@ -6889,14 +6891,21 @@ impl Shared {
                         let sink = Arc::new(if alone {
                             NativeSink::create(
                                 path,
-                                table.clone(),
+                                create.name.clone(),
                                 fields,
                                 None,
                                 limit,
                                 Vec::new(),
                             )?
                         } else {
-                            NativeSink::open(path, table.clone(), fields, None, limit, Vec::new())?
+                            NativeSink::open(
+                                path,
+                                create.name.clone(),
+                                fields,
+                                None,
+                                limit,
+                                Vec::new(),
+                            )?
                         });
                         // The rows go in under a read lock, so queries run while they do. Nothing
                         // else can change the catalog in the gap between the two locks, because
@@ -7188,14 +7197,21 @@ impl Shared {
                         let sink = Arc::new(if alone {
                             NativeSink::create(
                                 path,
-                                table.clone(),
+                                target.name().clone(),
                                 fields,
                                 clustering,
                                 limit,
                                 keys,
                             )?
                         } else {
-                            NativeSink::open(path, table.clone(), fields, clustering, limit, keys)?
+                            NativeSink::open(
+                                path,
+                                target.name().clone(),
+                                fields,
+                                clustering,
+                                limit,
+                                keys,
+                            )?
                         });
                         let query = rudb_exec::build_measured_into(
                             &insert.source,

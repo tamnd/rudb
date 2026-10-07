@@ -3185,7 +3185,7 @@ impl Table {
         }
         for (at, column) in self.columns.iter().enumerate() {
             if column.not_null && row.get(at).is_some_and(Value::is_null) {
-                return Err(self.null_in(&column.name));
+                return Err(self.null_in(&column.name, row));
             }
         }
         self.rows.to_append()?.append_row(row)
@@ -3213,7 +3213,7 @@ impl Table {
         for row in rows {
             for (at, column) in self.columns.iter().enumerate() {
                 if column.not_null && row.get(at).is_some_and(Value::is_null) {
-                    return Err(self.null_in(&column.name));
+                    return Err(self.null_in(&column.name, row));
                 }
             }
         }
@@ -3264,9 +3264,13 @@ impl Table {
             // Asked through the validity rather than through a value per row. Building a value for
             // every row of every `NOT NULL` column was most of what loading a file cost, and for a
             // string column it copied each row's bytes only to drop them.
-            let found = !vector.never_null() && (0..vector.len()).any(|row| vector.is_null_at(row));
-            if found {
-                return Err(self.null_in(&column.name));
+            let found = if vector.never_null() {
+                None
+            } else {
+                (0..vector.len()).find(|&row| vector.is_null_at(row))
+            };
+            if let Some(row) = found {
+                return Err(self.null_in(&column.name, &row_of(chunk, row)?));
             }
         }
         Ok(())
@@ -3493,10 +3497,10 @@ impl Table {
         }
     }
 
-    /// The error DuckDB raises when a null reaches a column that refuses them, with the text
-    /// PostgreSQL gives.
-    fn null_in(&self, column: &str) -> Error {
-        null_in(&self.name.table, column)
+    /// The error DuckDB raises when a null reaches a column that refuses them, in the row `row`,
+    /// with the text PostgreSQL gives.
+    fn null_in(&self, column: &str, row: &[Value]) -> Error {
+        null_in(&self.name, column, row)
     }
 }
 
@@ -3595,14 +3599,39 @@ fn lay(ty: &LogicalType, chunks: &[Chunk], column: usize, rows: usize) -> Result
     rudb_vector::assemble::interleave(ty, &pieces, &order)
 }
 
-/// The error for a null in the column `column` of `table`, which refuses them.
+/// The error for a null in the column `column` of `table`, which refuses them, in the row `row`.
 #[must_use]
-pub fn null_in(table: &str, column: &str) -> Error {
-    Error::constraint(format!("NOT NULL constraint failed: {table}.{column}"))
+pub fn null_in(table: &QualifiedName, column: &str, row: &[Value]) -> Error {
+    let values = row.iter().map(pg_text).collect::<Vec<_>>().join(", ");
+    Error::constraint(format!("NOT NULL constraint failed: {}.{column}", table.table))
         .state(rudb_common::SqlState::NOT_NULL_VIOLATION)
         .pg(format!(
-            "null value in column \"{column}\" of relation \"{table}\" violates not-null constraint"
+            "null value in column \"{column}\" of relation \"{}\" violates not-null constraint",
+            table.table
         ))
+        .detail(format!("Failing row contains ({values})."))
+        .table(&table.schema, &table.table)
+        .column(column)
+}
+
+/// A value as PostgreSQL writes it in the detail of a refused row or key: `null` for a null, `t`
+/// or `f` for a boolean, and a float in its shortest form with the default `extra_float_digits`.
+pub(crate) fn pg_text(value: &Value) -> String {
+    let mut out = Vec::new();
+    match value {
+        Value::Null => return "null".to_owned(),
+        Value::Boolean(true) => return "t".to_owned(),
+        Value::Boolean(false) => return "f".to_owned(),
+        Value::Float(float) => rudb_pgtypes::float4_out(*float, 1, &mut out),
+        Value::Double(double) => rudb_pgtypes::float8_out(*double, 1, &mut out),
+        value => return value.to_string(),
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The values of the row `row` of `chunk`, for the detail of an error that refuses it.
+pub fn row_of(chunk: &Chunk, row: usize) -> Result<Vec<Value>> {
+    chunk.columns().iter().map(|column| Ok(column.value_at(row))).collect()
 }
 
 #[cfg(test)]
@@ -3610,6 +3639,22 @@ mod tests {
     use rudb_vector::Vector;
 
     use super::*;
+
+    /// A null in a `NOT NULL` column carries the row and the fields a PostgreSQL session sends,
+    /// with each value as PostgreSQL writes it.
+    #[test]
+    fn a_refused_null_names_its_row() {
+        let table = QualifiedName::new("memory", "main", "n");
+        let row = [Value::Integer(3), Value::Boolean(true), Value::Null, Value::Double(3.0)];
+        let error = null_in(&table, "t", &row);
+        assert_eq!(error.reported_state().as_str(), "23502");
+        let fields = error.fields().expect("fields were set");
+        assert_eq!(fields.detail.as_deref(), Some("Failing row contains (3, t, null, 3)."));
+        assert_eq!(fields.schema.as_deref(), Some("main"));
+        assert_eq!(fields.table.as_deref(), Some("n"));
+        assert_eq!(fields.column.as_deref(), Some("t"));
+        assert_eq!(error.to_string(), "Constraint Error: NOT NULL constraint failed: n.t");
+    }
 
     /// A key column of the tests below, with the value each row number gives it.
     type KeyColumn = (LogicalType, fn(i64) -> Value);

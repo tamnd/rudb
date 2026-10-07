@@ -21,6 +21,7 @@ rudb-txn.workspace = true
 rudb-functions.workspace = true
 rudb-native.workspace = true
 rudb-parse.workspace = true
+rudb-pgtypes.workspace = true
 
 [lints]
 workspace = true

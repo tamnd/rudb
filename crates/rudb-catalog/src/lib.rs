@@ -47,6 +47,8 @@ pub use points::{Point, Reach, Spot, looks_up};
 pub use rudb_native::StoredPart;
 pub use search::SearchEntry;
 pub use system::{INFORMATION_SCHEMA, PG_CATALOG, SYSTEM_CATALOG, TEMP_CATALOG};
-pub use table::{CodedRows, Rows, Table, duplicate_check, next_revision, null_in, revision_now};
+pub use table::{
+    CodedRows, Rows, Table, duplicate_check, next_revision, null_in, revision_now, row_of,
+};
 pub use trigger::{Event, Trigger};
 pub use view::View;
