@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use rudb_common::Span;
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, ColumnDef, ConflictAction, Expr, ExprRef, Insert, JoinKind,
+    Ast, BinaryOp, CaseArm, ColumnDef, ConflictAction, Expr, ExprRef, Index, Insert, JoinKind,
     LiteralKind, OrderItem, Overriding, Query, QueryBody, QueryRef, Select, SelectRef, Slice,
     Source, SourceRef, Statement, StrRef, Target, Truncate, WindowRef, WindowSpec,
 };
@@ -214,6 +214,13 @@ impl Ast {
         let index = self.inserts.len() as u32;
         self.inserts.push(insert);
         index
+    }
+
+    /// Add a `CREATE INDEX` or a `DROP INDEX`, and give its index in `Ast::indexes`.
+    pub fn push_index(&mut self, index: Index) -> u32 {
+        let at = self.indexes.len() as u32;
+        self.indexes.push(index);
+        at
     }
 
     /// The `FROM` of the one table that a writing statement names.

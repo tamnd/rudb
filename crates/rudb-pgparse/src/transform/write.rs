@@ -161,7 +161,7 @@ impl Transform<'_> {
 
     /// The name and the alias of the table that a statement writes. `ONLY` is the same as no
     /// `ONLY`, because no table inherits from another.
-    fn written_table(&mut self, table: Option<&RangeVar>) -> Made<(Slice, StrRef)> {
+    pub(super) fn written_table(&mut self, table: Option<&RangeVar>) -> Made<(Slice, StrRef)> {
         let Some(table) = table else {
             return clause("RangeVar");
         };

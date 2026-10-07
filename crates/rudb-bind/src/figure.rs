@@ -15,6 +15,9 @@ use crate::scope::Scope;
 /// The name of a target that has no name of its own.
 const NO_NAME: &str = "?column?";
 
+/// The longest name that PostgreSQL keeps, in bytes, which is `NAMEDATALEN - 1`.
+const NAME_BYTES: usize = 63;
+
 impl Binder<'_> {
     /// The name of an unaliased target: the name of PostgreSQL in a PostgreSQL session, and the
     /// name of DuckDB in any other.
@@ -23,6 +26,18 @@ impl Binder<'_> {
             return self.output_name(ast, target, input);
         }
         self.figure(ast, target, input).map_or_else(|| NO_NAME.to_owned(), |(name, _)| name)
+    }
+
+    /// The name of an element of an index that has no name, as `ChooseIndexColumnNames` gives it
+    /// before it makes the names different: the name of the column or of the function, else
+    /// `expr`.
+    pub(crate) fn index_column_name(
+        &self,
+        ast: &Ast,
+        element: ast::ExprRef,
+        input: &Scope,
+    ) -> String {
+        self.figure(ast, element, input).map_or_else(|| "expr".to_owned(), |(name, _)| name)
     }
 
     /// The name of an expression and how strong it is, as `FigureColnameInternal` gives them. A
@@ -60,6 +75,71 @@ impl Binder<'_> {
             _ => None,
         }
     }
+}
+
+/// The name that PostgreSQL gives to an index with no name, by the rules of `ChooseIndexName` in
+/// `indexcmds.c`. It is the table, the columns and `idx`, joined by `_` and cut to 63 bytes. When
+/// `taken` says that a relation has the name, a number goes after `idx`.
+pub(crate) fn index_name(table: &str, columns: &[String], taken: impl Fn(&str) -> bool) -> String {
+    // A column whose name an earlier column has takes the first number that makes it new.
+    let mut names: Vec<String> = Vec::with_capacity(columns.len());
+    for column in columns {
+        let mut name = column.clone();
+        let mut number = 1;
+        while names.contains(&name) {
+            let suffix = number.to_string();
+            name = format!("{}{suffix}", clip(column, NAME_BYTES - suffix.len()));
+            number += 1;
+        }
+        names.push(name);
+    }
+    let mut addition = String::new();
+    for name in &names {
+        if !addition.is_empty() {
+            addition.push('_');
+        }
+        addition.push_str(clip(name, NAME_BYTES));
+        if addition.len() > NAME_BYTES {
+            break;
+        }
+    }
+    let mut label = "idx".to_owned();
+    let mut pass = 0;
+    loop {
+        let name = object_name(table, &addition, &label);
+        if !taken(&name) {
+            return name;
+        }
+        pass += 1;
+        label = format!("idx{pass}");
+    }
+}
+
+/// `name1_name2_label`, with the longer of the two names cut first until the whole fits in 63
+/// bytes, as `makeObjectName` does. The label is never cut.
+fn object_name(first: &str, second: &str, label: &str) -> String {
+    let room = NAME_BYTES - 2 - label.len();
+    let (mut first_len, mut second_len) = (first.len(), second.len());
+    while first_len + second_len > room {
+        if first_len > second_len {
+            first_len -= 1;
+        } else {
+            second_len -= 1;
+        }
+    }
+    format!("{}_{}_{label}", clip(first, first_len), clip(second, second_len))
+}
+
+/// The longest start of `text` that has at most `bytes` bytes and ends at a whole character.
+fn clip(text: &str, bytes: usize) -> &str {
+    if text.len() <= bytes {
+        return text;
+    }
+    let mut end = bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The name of the first column of a subquery, which PostgreSQL gives to the subquery as a whole.
@@ -155,7 +235,7 @@ fn type_name(written: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::type_name;
+    use super::{index_name, type_name};
 
     #[test]
     fn the_names_of_types_in_casts() {
@@ -181,5 +261,24 @@ mod tests {
         for (written, name) in names {
             assert_eq!(type_name(written), name, "{written}");
         }
+    }
+
+    fn named(table: &str, columns: &[&str], taken: &[&str]) -> String {
+        let columns: Vec<String> = columns.iter().map(|&column| column.to_owned()).collect();
+        index_name(table, &columns, |name| taken.contains(&name))
+    }
+
+    #[test]
+    fn an_index_name_is_the_name_that_postgres_gives() {
+        assert_eq!(named("t", &["a"], &[]), "t_a_idx");
+        assert_eq!(named("t", &["a", "a", "a"], &[]), "t_a_a1_a2_idx");
+        assert_eq!(named("t", &["a"], &["t_a_idx", "t_a_idx1"]), "t_a_idx2");
+        // The longer name is cut first, and a cut never splits a character.
+        let long = "c".repeat(70);
+        assert_eq!(named("t", &[&long], &[]), format!("t_{}_idx", "c".repeat(57)));
+        let wide = "é".repeat(40);
+        let name = named(&wide, &["a"], &[]);
+        assert!(name.len() <= 63, "{name}");
+        assert_eq!(name, format!("{}_a_idx", "é".repeat(28)));
     }
 }

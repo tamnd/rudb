@@ -3233,3 +3233,70 @@ fn on_conflict_reads_its_action_before_it_matches_a_key() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn an_index_with_no_name_is_named_as_postgres_names_it() {
+    let dirs = Dirs::new("index-names");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The cases of the PostgreSQL 19 oracle, and the names that it gives.
+    for sql in [
+        "create temp table t (a int, b text, \"Mixed\" int)",
+        "create index on t (a)",
+        "create index on t (a)",
+        "create index on t (a, b)",
+        "create index on t ((a + 1))",
+        "create index on t (lower(b))",
+        "create index on t (a, a)",
+        "create index on t (\"Mixed\")",
+        "create unique index on t (b)",
+        "create index on t using btree (a)",
+        "create temp table t_b_idx2 (x int)",
+        "create index on t (b)",
+        "create index on t (b)",
+        "create temp table averyveryveryveryveryveryverylongtablenamethatgoesonandonandon \
+         (averyveryveryveryveryveryverylongcolumnnamethatgoesonandonandon int)",
+        "create index on averyveryveryveryveryveryverylongtablenamethatgoesonandonandon \
+         (averyveryveryveryveryveryverylongcolumnnamethatgoesonandonandon)",
+    ] {
+        assert!(!tags(&client.query(sql)).contains('E'), "{sql}");
+    }
+    let names = client.query("select index_name from duckdb_indexes() order by index_name");
+    let names: Vec<String> = names
+        .iter()
+        .filter(|message| message.tag == b'D')
+        .map(|message| String::from_utf8(data_row(message)[0].clone().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "averyveryveryveryveryveryvery_averyveryveryveryveryveryvery_idx",
+            "t_Mixed_idx",
+            "t_a_a1_idx",
+            "t_a_b_idx",
+            "t_a_idx",
+            "t_a_idx1",
+            "t_a_idx2",
+            "t_b_idx",
+            "t_b_idx1",
+            "t_b_idx3",
+            "t_expr_idx",
+            "t_lower_idx",
+        ]
+    );
+    for (sql, position) in [("create index on t (z)", "20"), ("create index on t ((z + 1))", "21")]
+    {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42703"), "{sql}");
+        assert_eq!(
+            messages[0].field(b'M').as_deref(),
+            Some("column \"z\" does not exist"),
+            "{sql}"
+        );
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
