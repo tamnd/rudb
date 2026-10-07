@@ -154,6 +154,8 @@ impl Assembly {
         // of those rows reads it there. Flattening it first wrote the value out again for each row,
         // and the `ELSE 0` of TPC-H q14's conditional sum was a tenth of the query that way.
         if piece.form() == Form::Constant && !positions.is_empty() {
+            // flatten: a slice of one row of the constant, so the copy is one value, and it gives
+            // the run of data that `extend` reads.
             let one = piece.slice(0, 1)?.flatten()?;
             let Some(from) = one.data() else {
                 return Err(Error::internal("a flattened vector with no run of data in it"));
