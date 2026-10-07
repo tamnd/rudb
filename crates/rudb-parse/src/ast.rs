@@ -355,6 +355,15 @@ pub struct Identity {
     pub sequence: Slice,
 }
 
+/// The options of a `TRUNCATE`, which only a PostgreSQL session can write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Truncate {
+    /// `RESTART IDENTITY`: the sequences the truncated tables own start again.
+    pub restart: bool,
+    /// `CASCADE`: the tables whose foreign keys point into a truncated table are truncated too.
+    pub cascade: bool,
+}
+
 /// What `OVERRIDING` an `INSERT` wrote, which only a PostgreSQL session can write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Overriding {
@@ -696,6 +705,8 @@ pub struct Insert {
     pub copy: bool,
     /// What `OVERRIDING` the statement wrote.
     pub overriding: Overriding,
+    /// The options of the `TRUNCATE` of a PostgreSQL session that this `DELETE` stands for.
+    pub truncate: Option<Truncate>,
 }
 
 /// `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.

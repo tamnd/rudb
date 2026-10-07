@@ -16,7 +16,7 @@ use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
 use rudb_common::{
     Cancel, Clustering, DeclaredType, Error, Field, LogicalType, Memory, Origin, PreparedStatement,
-    Result, Rule, Session, Value,
+    Result, Rule, Session, SqlState, Value,
 };
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
@@ -684,6 +684,10 @@ struct Conn {
     /// The plans of the last queries this connection ran as text, oldest first. See
     /// [`Shared::cached_simple`].
     simple: Mutex<Vec<Arc<Simple>>>,
+    /// The tables the `TRUNCATE` that runs now empties, see [`Shared::truncate`]. Every table
+    /// whose foreign key points into one of them is in the list too, so a delete from one of them
+    /// leaves nobody's parent behind and does not look.
+    truncating: Mutex<Vec<QualifiedName>>,
 }
 
 /// How many plans a connection keeps by the text of their query.
@@ -730,6 +734,7 @@ impl Conn {
             prepared: Mutex::default(),
             listed: Mutex::default(),
             simple: Mutex::default(),
+            truncating: Mutex::default(),
             postgres: Mutex::default(),
             begun: AtomicI64::new(0),
             received: AtomicI64::new(0),
@@ -6366,20 +6371,10 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
-        if let [_, _, ..] = ast.statements.as_slice()
-            && ast.statements.iter().all(|s| matches!(s, ast::Statement::Delete(_)))
+        if let Some(&ast::Statement::Delete(at)) = ast.statements.first()
+            && let Some(options) = ast.inserts[at as usize].truncate
         {
-            // `TRUNCATE a, b` of a PostgreSQL session, which is one delete for each table. They
-            // run in one transaction, so a table that is not there truncates none of them.
-            return self.atomically(|| {
-                let mut last = None;
-                for &statement in &ast.statements {
-                    let mut step = ast.clone();
-                    step.statements = vec![statement];
-                    last = Some(self.execute_ast(&step, sql, parameters, cancel, parse_ns)?);
-                }
-                last.ok_or_else(|| Error::internal("a truncate of no table"))
-            });
+            return self.truncate(ast, options, sql, parameters, cancel);
         }
         let unwritten = unwritten_definitions(ast, parameters);
         if !unwritten.is_empty() {
@@ -6392,6 +6387,118 @@ impl Shared {
                 .atomically(|| self.run_triggered(ast, sql, parameters, cancel, parse_ns, fired));
         }
         self.execute_unfired(ast, sql, parameters, cancel, parse_ns)
+    }
+
+    /// `TRUNCATE` of a PostgreSQL session, which is one `DELETE` for each table it named.
+    ///
+    /// The deletes run in one transaction, so a table that is not there truncates none of them.
+    /// Every table whose foreign key points into a truncated table has to be truncated too, as
+    /// PostgreSQL says, even when it has no rows. `CASCADE` adds them to the list with a notice for
+    /// each and without it the statement is refused. The tables that point into others go first,
+    /// so that no delete leaves a row behind whose parent is gone. `RESTART IDENTITY` then puts
+    /// each sequence a truncated table owns back at its start. A sequence is not part of a
+    /// transaction, so a rollback leaves it where the truncate put it.
+    fn truncate(
+        &self,
+        ast: &Ast,
+        options: ast::Truncate,
+        sql: &str,
+        parameters: &Parameters,
+        cancel: &Cancel,
+    ) -> Result<QueryResult> {
+        let mut tables: Vec<QualifiedName> = Vec::new();
+        let mut notices = Vec::new();
+        {
+            let catalog = self.read();
+            for statement in &ast.statements {
+                let ast::Statement::Delete(at) = *statement else { continue };
+                let parts: Vec<&str> = ast.name(ast.inserts[at as usize].name).collect();
+                let name = catalog.resolve(&parts)?;
+                if !tables.contains(&name) {
+                    tables.push(name);
+                }
+            }
+            let mut at = 0;
+            while at < tables.len() {
+                let pointing: Vec<QualifiedName> = catalog
+                    .tables()
+                    .filter(|held| held.foreign().iter().any(|key| key.table == tables[at]))
+                    .map(|held| held.name().clone())
+                    .filter(|name| !tables.contains(name))
+                    .collect();
+                for name in pointing {
+                    if !options.cascade {
+                        return Err(Error::binder(
+                            "cannot truncate a table referenced in a foreign key constraint",
+                        )
+                        .state(SqlState::FEATURE_NOT_SUPPORTED)
+                        .detail(format!(
+                            "Table \"{}\" references \"{}\".",
+                            name.table, tables[at].table
+                        ))
+                        .hint(format!(
+                            "Truncate table \"{}\" at the same time, or use TRUNCATE ... CASCADE.",
+                            name.table
+                        ))
+                        .unplaced());
+                    }
+                    notices.push(Notice {
+                        sqlstate: "00000",
+                        message: format!("truncate cascades to table \"{}\"", name.table),
+                    });
+                    tables.push(name);
+                }
+                at += 1;
+            }
+            let mut ordered = Vec::with_capacity(tables.len());
+            while !tables.is_empty() {
+                let pointed = |name: &QualifiedName| {
+                    tables.iter().filter(|other| *other != name).any(|other| {
+                        catalog
+                            .table(other)
+                            .is_ok_and(|held| held.foreign().iter().any(|key| &key.table == name))
+                    })
+                };
+                let next = tables.iter().position(|name| !pointed(name)).unwrap_or(0);
+                ordered.push(tables.remove(next));
+            }
+            tables = ordered;
+        }
+        let session = self.session();
+        *self.conn.truncating.lock().unwrap_or_else(PoisonError::into_inner) = tables.clone();
+        let result = self.atomically(|| {
+            let mut last = None;
+            for name in &tables {
+                let delete = format!(
+                    "DELETE FROM {}.{}.{}",
+                    rudb_parse::quoted(&name.catalog),
+                    rudb_parse::quoted(&name.schema),
+                    rudb_parse::quoted(&name.table)
+                );
+                let step = parse(&session, &delete)?;
+                last = Some(self.execute_ast(&step, sql, parameters, cancel, 0)?);
+            }
+            if options.restart {
+                let catalog = self.read();
+                for held in catalog.sequences() {
+                    if held.owner().is_some_and(|owner| tables.contains(owner)) {
+                        let counter = held.counter();
+                        counter.set(counter.options().start, false)?;
+                    }
+                }
+            }
+            last.ok_or_else(|| Error::internal("a truncate of no table"))
+        });
+        self.conn.truncating.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        let result = result?;
+        // The result of a delete can be held elsewhere too, and a notice needs one of its own. A
+        // client reads no count from a truncate.
+        Ok(if notices.is_empty() { result } else { QueryResult::empty().noting(notices) })
+    }
+
+    /// Whether the `TRUNCATE` that runs now empties table `name`.
+    fn truncating(&self, name: &QualifiedName) -> bool {
+        self.conn.truncating.lock().unwrap_or_else(PoisonError::into_inner).contains(name)
     }
 
     /// [`Shared::execute_ast`] for a statement no trigger fires on, or the one a trigger fired on.
@@ -7455,8 +7562,11 @@ impl Shared {
                         // A delete from any other table nothing points into takes its rows out by
                         // number too, see `Table::remove_rows`, rather than build the table again
                         // from the rows it keeps.
-                        let removed =
-                            delete && !taken && whole && !catalog.referenced(&insert.name);
+                        let truncated = delete && whole && self.truncating(&insert.name);
+                        let removed = delete
+                            && !taken
+                            && whole
+                            && (truncated || !catalog.referenced(&insert.name));
                         // The binder reads only the condition when it expects the rows taken, and
                         // a source without the table's columns has no rows to keep.
                         if !taken && chunks.first().is_some_and(|chunk| chunk.width() <= width) {
@@ -7472,7 +7582,9 @@ impl Shared {
                         if !delete {
                             foreign::missing(&catalog, &insert.name, &changed)?;
                         }
-                        foreign::lost(&catalog, &insert.name, &kept)?;
+                        if !truncated {
+                            foreign::lost(&catalog, &insert.name, &kept)?;
+                        }
                         let name = &insert.name;
                         let table = catalog.table(name)?;
                         let claim = if watched {

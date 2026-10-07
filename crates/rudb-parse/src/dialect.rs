@@ -38,9 +38,11 @@ pub fn dialect_named(name: &str) -> Option<Dialect> {
 /// `CREATE UNLOGGED TABLE` and `CREATE UNLOGGED SEQUENCE`. rudb writes every table to its log, and
 /// a table that PostgreSQL does not log answers each query the same.
 ///
-/// The other is the list of tables after the first one in `TRUNCATE a, b, c`, because the grammar
-/// takes one table. The transform reads the names back from the text between the first table and
-/// the end of the statement, see `Transform::truncated_too`.
+/// The other is the list of tables after the first one in `TRUNCATE a, b, c` and the options after
+/// it, because the grammar takes one table and no options. The transform reads the names and the
+/// options back from the text between the first table and the end of the statement, see
+/// `Transform::truncated_too`. An `ONLY` before a table goes too, because no rudb table inherits
+/// from another.
 ///
 /// Two more clauses leave the tokens the same way and the transform reads them back from the text
 /// of the statement, see `Transform::dropped`. One is `GENERATED ALWAYS AS IDENTITY` and
@@ -65,9 +67,12 @@ pub fn postgres_tokens(query: &str, tokens: &mut Vec<Token>) {
     let mut at = 0;
     while at < tokens.len() {
         if word(&tokens[at], "truncate")
-            && let Some(list) = truncate_list(query, tokens, at + 1)
+            && let Some((list, only)) = truncate_list(query, tokens, at + 1)
         {
             tokens.drain(list);
+            if let Some(only) = only {
+                tokens.remove(only);
+            }
         }
         at += 1;
     }
@@ -139,11 +144,26 @@ fn overriding(query: &str, tokens: &[Token], at: usize) -> Option<usize> {
     .then_some(at + 3)
 }
 
-/// The tokens of `, b, c` in `TRUNCATE [TABLE] a, b, c`, where `from` is the token after
-/// `TRUNCATE`. `None` if the statement has one table or has any other word after its tables.
-fn truncate_list(query: &str, tokens: &[Token], from: usize) -> Option<std::ops::Range<usize>> {
+/// The tokens of `, b, c` and of the options in `TRUNCATE [TABLE] [ONLY] a, b, c [options]`, where
+/// `from` is the token after `TRUNCATE`, and the token of the first `ONLY`. The options are
+/// `RESTART IDENTITY`, `CONTINUE IDENTITY`, `CASCADE` and `RESTRICT`. `None` if the statement has
+/// none of these or has any other word after its tables.
+fn truncate_list(
+    query: &str,
+    tokens: &[Token],
+    from: usize,
+) -> Option<(std::ops::Range<usize>, Option<usize>)> {
     let is = |at: usize, text: &str| tokens.get(at).is_some_and(|t| t.text(query) == text);
+    let word = |at: usize, text: &str| {
+        tokens.get(at).is_some_and(|t| {
+            matches!(t.kind, Kind::Identifier | Kind::Keyword)
+                && t.text(query).eq_ignore_ascii_case(text)
+        })
+    };
     let name = |mut at: usize| -> Option<usize> {
+        if word(at, "only") {
+            at += 1;
+        }
         let part = |at: usize| {
             tokens.get(at).is_some_and(|t| t.kind.is_identifier() || t.kind == Kind::Keyword)
         };
@@ -157,16 +177,27 @@ fn truncate_list(query: &str, tokens: &[Token], from: usize) -> Option<std::ops:
         Some(at)
     };
     let mut at = from;
-    if tokens.get(at).is_some_and(|t| t.text(query).eq_ignore_ascii_case("table")) {
+    if word(at, "table") {
         at += 1;
     }
+    let only = word(at, "only").then_some(at);
     let start = name(at)?;
     at = start;
     while is(at, ",") {
         at = name(at + 1)?;
     }
+    loop {
+        if (word(at, "restart") || word(at, "continue")) && word(at + 1, "identity") {
+            at += 2;
+        } else if word(at, "cascade") || word(at, "restrict") {
+            at += 1;
+        } else {
+            break;
+        }
+    }
     let end = tokens.get(at)?;
-    (at > start && matches!(end.kind, Kind::Terminator | Kind::EndOfInput)).then_some(start..at)
+    (matches!(end.kind, Kind::Terminator | Kind::EndOfInput) && (at > start || only.is_some()))
+        .then_some((start..at, only))
 }
 
 #[cfg(test)]
@@ -203,7 +234,13 @@ mod tests {
             ["truncate", "table", "a", ";", "select", "1", ""]
         );
         assert_eq!(texts("truncate a"), ["truncate", "a", ""]);
-        assert_eq!(texts("truncate a, b cascade"), ["truncate", "a", ",", "b", "cascade", ""]);
+        assert_eq!(texts("truncate a, b cascade"), ["truncate", "a", ""]);
+        assert_eq!(texts("truncate only a restart identity"), ["truncate", "a", ""]);
+        assert_eq!(
+            texts("TRUNCATE TABLE a CONTINUE IDENTITY RESTRICT"),
+            ["TRUNCATE", "TABLE", "a", ""]
+        );
+        assert_eq!(texts("truncate a, b where"), ["truncate", "a", ",", "b", "where", ""]);
     }
 
     #[test]

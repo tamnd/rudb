@@ -27,7 +27,8 @@ use crate::ast::{
     JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Overriding,
     Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting, Slice,
     Source, SourceRef, StarLists, Statement, StrRef, Target, Transaction, Trigger, TriggerEvent,
-    TriggerTiming, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    TriggerTiming, Truncate, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowSpec,
+    WindowUnit,
 };
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
@@ -482,50 +483,75 @@ impl<'a> Transform<'a> {
             };
             let truncated = self.truncated_too(statement);
             let inner = self.first(statement);
+            let first = self.ast.statements.len();
             let statement = self.statement(statement)?;
             self.ast.statements.push(statement);
-            for name in truncated {
+            let Some((names, options)) = truncated else { continue };
+            for name in names {
                 let name = self.part_slice(name);
                 let statement = self.changed_rows(inner, name, NONE, Vec::new(), true)?;
                 self.ast.statements.push(statement);
+            }
+            for &statement in &self.ast.statements[first..] {
+                if let Statement::Delete(at) = statement {
+                    self.ast.inserts[at as usize].truncate = Some(options);
+                }
             }
         }
         Ok(())
     }
 
-    /// The tables after the first one in a `TRUNCATE a, b, c` that a PostgreSQL session sent.
+    /// The tables after the first one in a `TRUNCATE a, b, c` that a PostgreSQL session sent, and
+    /// the options of the statement.
     ///
-    /// [`crate::dialect::postgres_tokens`] takes `, b, c` out of the tokens, so the statement
-    /// parses as `TRUNCATE a`, and the names are read back here from the text between the end of
-    /// the statement and the next token. Each table is truncated by its own statement, in the
-    /// order they were written.
-    fn truncated_too(&mut self, statement: u32) -> Vec<Vec<StrRef>> {
+    /// [`crate::dialect::postgres_tokens`] takes `, b, c` and the options after them out of the
+    /// tokens, so the statement parses as `TRUNCATE a`, and the names and the options are read
+    /// back here from the text between the end of the statement and the next token. Each table is
+    /// truncated by its own statement, in the order they were written. `None` for any other
+    /// statement.
+    fn truncated_too(&mut self, statement: u32) -> Option<(Vec<Vec<StrRef>>, Truncate)> {
         let inner = self.first(statement);
         if !self.postgres || self.name(inner) != "TruncateStatement" {
-            return Vec::new();
+            return None;
         }
+        let mut names = Vec::new();
+        let mut options = Truncate::default();
         let end = self.tree.node(inner).end as usize;
         let (Some(last), Some(next)) = (self.tokens.get(end.wrapping_sub(1)), self.tokens.get(end))
         else {
-            return Vec::new();
+            return Some((names, options));
         };
         let gap = &self.query[last.end as usize..next.start as usize];
-        let Ok(tokens) = tokenize(gap) else { return Vec::new() };
-        let mut names = Vec::new();
+        let Ok(tokens) = tokenize(gap) else { return Some((names, options)) };
+        // Whether the next word is a part of a name, which it is after a comma or a dot.
+        let mut part = false;
         for token in &tokens {
             match token.text(gap) {
-                "," => names.push(Vec::new()),
-                "." | "" => {}
-                text => {
-                    let part = self.fold_identifier(text);
-                    let part = self.intern(&part);
-                    if let Some(name) = names.last_mut() {
-                        name.push(part);
-                    }
+                "," => {
+                    names.push(Vec::new());
+                    part = true;
                 }
+                "." => part = true,
+                "" => {}
+                text if part => {
+                    // `ONLY` before a name says to leave out the tables that inherit from it, and
+                    // no rudb table inherits.
+                    if text.eq_ignore_ascii_case("only") {
+                        continue;
+                    }
+                    let text = self.fold_identifier(text);
+                    let text = self.intern(&text);
+                    if let Some(name) = names.last_mut() {
+                        name.push(text);
+                    }
+                    part = false;
+                }
+                text if text.eq_ignore_ascii_case("restart") => options.restart = true,
+                text if text.eq_ignore_ascii_case("cascade") => options.cascade = true,
+                _ => {}
             }
         }
-        names
+        Some((names, options))
     }
 
     /// The words that [`crate::dialect::postgres_tokens`] took out of the tokens of `node`, from
@@ -2893,6 +2919,7 @@ impl<'a> Transform<'a> {
             conflict,
             copy: false,
             overriding,
+            truncate: None,
         });
         Ok(Statement::Insert(index))
     }
@@ -3032,6 +3059,7 @@ impl<'a> Transform<'a> {
             conflict: None,
             copy: true,
             overriding: Overriding::None,
+            truncate: None,
         });
         Ok(Statement::Insert(index))
     }
@@ -3584,6 +3612,7 @@ impl<'a> Transform<'a> {
             conflict: None,
             copy: false,
             overriding: Overriding::None,
+            truncate: None,
         });
         if delete { Statement::Delete(index) } else { Statement::Update(index) }
     }
