@@ -6,4 +6,5 @@
 //! and `productions.txt`, the name of each alternative.
 
 pub(crate) mod keywords;
+pub(crate) mod nodes;
 pub(crate) mod tables;

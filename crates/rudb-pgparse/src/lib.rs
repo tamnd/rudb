@@ -18,13 +18,19 @@
 //! token further for the few places where the grammar needs two tokens.
 //!
 //! [`check`], which lexes and parses a text and gives the same first error as PostgreSQL, with the
-//! same message and position. [`recognize`] runs the tables over a list of tokens. The actions that
-//! build the AST of `rudb-parse` come next.
+//! same message and position. [`recognize`] runs the tables over a list of tokens.
+//!
+//! [`nodes`], the node types of the raw parse tree of PostgreSQL, generated from the vendored
+//! headers with the names and the fields of C. Each node writes the text of `nodeToString`, which
+//! PostgreSQL logs for a statement when `debug_print_raw_parse` is on, so a test compares the two
+//! trees. The actions of `gram.y` that build this tree come next, and after them the transform
+//! from this tree to the AST of `rudb-parse`.
 
 mod error;
 mod filter;
 mod generated;
 mod lexer;
+pub mod nodes;
 mod parser;
 
 pub use error::{Error, Notice};
