@@ -709,7 +709,8 @@ impl Siblings {
     /// A part reached sparsely is read at the rows asked for, as before.
     fn sides_at(&self, own: &[Prepared], column: usize, local: &mut Walking) -> Result<()> {
         let starts = self.starts()?;
-        let Walking { runs, within, flat, scratch, values, pass, some_values, some_pass, .. } = local;
+        let Walking { runs, within, flat, scratch, values, pass, some_values, some_pass, .. } =
+            local;
         values.clear();
         pass.clear();
         self.by_part(runs, within, |part, within, wanted| {
