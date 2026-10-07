@@ -182,6 +182,8 @@ impl Eq for Variables {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Semantics {
     aggregate_types: AggregateTypes,
+    character_types: CharacterTypes,
+    column_names: ColumnNames,
     default_descending: bool,
     default_null_order: DefaultNullOrder,
     disable_timestamptz_casts: bool,
@@ -193,12 +195,14 @@ pub struct Semantics {
     insert_columns: InsertColumns,
     join_columns: JoinColumns,
     null_on_division_by_zero: bool,
+    number_literals: NumberLiterals,
     order_by_non_integer_literal: bool,
     pivot_limit: u64,
     regex_match_full: bool,
     scalar_subquery_error_on_multiple_rows: bool,
     show_behavior: ShowBehavior,
     single_arrow_lambdas: bool,
+    type_names: TypeNames,
     values_names: ValuesNames,
     warnings_as_errors: bool,
 }
@@ -207,6 +211,8 @@ impl Default for Semantics {
     fn default() -> Self {
         Self {
             aggregate_types: AggregateTypes::Pin,
+            character_types: CharacterTypes::Pin,
+            column_names: ColumnNames::Pin,
             default_descending: false,
             default_null_order: DefaultNullOrder::default(),
             disable_timestamptz_casts: false,
@@ -218,12 +224,14 @@ impl Default for Semantics {
             insert_columns: InsertColumns::Exact,
             join_columns: JoinColumns::InPlace,
             null_on_division_by_zero: false,
+            number_literals: NumberLiterals::Pin,
             order_by_non_integer_literal: false,
             pivot_limit: 100_000,
             regex_match_full: false,
             scalar_subquery_error_on_multiple_rows: true,
             show_behavior: ShowBehavior::Auto,
             single_arrow_lambdas: false,
+            type_names: TypeNames::Pin,
             values_names: ValuesNames::FromZero,
             warnings_as_errors: false,
         }
@@ -265,6 +273,26 @@ impl Semantics {
     #[must_use]
     pub fn values_names(self) -> ValuesNames {
         self.values_names
+    }
+    /// The rules of `char(n)` and `varchar(n)`.
+    #[must_use]
+    pub fn character_types(self) -> CharacterTypes {
+        self.character_types
+    }
+    /// The name of a result column that has no alias.
+    #[must_use]
+    pub fn column_names(self) -> ColumnNames {
+        self.column_names
+    }
+    /// The type of a number literal.
+    #[must_use]
+    pub fn number_literals(self) -> NumberLiterals {
+        self.number_literals
+    }
+    /// The type names that a column definition can use.
+    #[must_use]
+    pub fn type_names(self) -> TypeNames {
+        self.type_names
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -432,6 +460,52 @@ pub enum AggregateTypes {
     Pin,
     /// As in PostgreSQL: `sum` of an `int2` or an `int4` is an `int8`, `sum` of a `float4` is a
     /// `float4`, and `avg` of an integer or a `numeric` is a `numeric`.
+    Postgres,
+}
+
+/// The rules of `char(n)` and `varchar(n)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CharacterTypes {
+    /// As in DuckDB: the length is not checked, and a `char(n)` value has no padding.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a store refuses a value that is too long with `22001`, an explicit cast
+    /// cuts it, and a comparison with a `char(n)` value ignores the trailing spaces.
+    Postgres,
+}
+
+/// The name of a result column that has no alias.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColumnNames {
+    /// As in DuckDB: the text of the expression, so `SELECT 1` has a column `1`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the name that `FigureColname` gives, such as the name of a column or of
+    /// a function, the name of the type of a cast, or `?column?`.
+    Postgres,
+}
+
+/// The type of a number literal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NumberLiterals {
+    /// As in DuckDB: a number with an exponent is a `DOUBLE`, an integer past `BIGINT` is a
+    /// `HUGEINT` or a `BIGNUM`, and an integer literal takes the integer type that it meets in an
+    /// operator when its value fits.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a number with an exponent, an integer past `bigint` and a decimal past 38
+    /// digits are a `numeric`, and an integer literal keeps its own type.
+    Postgres,
+}
+
+/// The type names that a column definition can use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TypeNames {
+    /// The type names of DuckDB.
+    #[default]
+    Pin,
+    /// The type names of PostgreSQL too, such as `bpchar` and `serial`, with the declared type
+    /// that a client sees for each column.
     Postgres,
 }
 
@@ -823,6 +897,10 @@ impl Session {
             self.semantics.join_columns = JoinColumns::MergedFirst;
             self.semantics.aggregate_types = AggregateTypes::Postgres;
             self.semantics.values_names = ValuesNames::FromOne;
+            self.semantics.character_types = CharacterTypes::Postgres;
+            self.semantics.column_names = ColumnNames::Postgres;
+            self.semantics.number_literals = NumberLiterals::Postgres;
+            self.semantics.type_names = TypeNames::Postgres;
         }
         self.postgres = Postgreses(postgres);
     }

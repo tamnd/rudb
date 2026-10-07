@@ -18,7 +18,7 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
     Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
-    LogicalType, Result, Session, SqlState, Stat, Value, Width,
+    LogicalType, Result, Session, SqlState, Stat, TypeNames, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -1251,7 +1251,7 @@ fn column_type(
     text: &str,
     home: Option<&QualifiedName>,
 ) -> Result<LogicalType> {
-    if session.postgres().is_some()
+    if session.semantics().type_names() == TypeNames::Postgres
         && let Some(declared) = rudb_pgtypes::declared_type(text)
     {
         if let Some(ty) = rudb_pgtypes::session_type(declared) {
@@ -1316,7 +1316,10 @@ fn create_table(
                     ast.string(def.name)
                 )));
             }
-            let serial = if session.postgres().is_some() { serial_type(text) } else { None };
+            let serial = match session.semantics().type_names() {
+                TypeNames::Pin => None,
+                TypeNames::Postgres => serial_type(text),
+            };
             serials.push(serial.is_some() || def.identity.is_some());
             let ty = match serial.clone() {
                 Some(ty) => ty,

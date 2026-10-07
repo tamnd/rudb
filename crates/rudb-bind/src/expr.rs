@@ -11,8 +11,9 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    DeclaredType, Error, Field, LogicalType, MAX_DECIMAL_WIDTH, Result, Semantics, Session,
-    SqlState, StateKey, Value, is_clustering_setting, looks_like_rule, rule_names,
+    CharacterTypes, DeclaredType, Error, Field, LogicalType, MAX_DECIMAL_WIDTH, NumberLiterals,
+    Result, Semantics, Session, SqlState, StateKey, Value, is_clustering_setting, looks_like_rule,
+    rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -775,7 +776,7 @@ impl Binder<'_> {
     /// `HUGEINT` or a `BIGNUM`.
     fn number(&self, text: &str, negative: bool) -> Result<Value> {
         let value = number(text, negative)?;
-        if self.session.postgres().is_none()
+        if self.semantics.number_literals() == NumberLiterals::Pin
             || !matches!(
                 value,
                 Value::Double(_) | Value::HugeInt(_) | Value::UHugeInt(_) | Value::BigNum(_)
@@ -1003,7 +1004,7 @@ impl Binder<'_> {
             }
         }
         if let Some(comparison) = comparison_of(op) {
-            if self.session.postgres().is_some() {
+            if self.semantics.character_types() == CharacterTypes::Postgres {
                 self.bpchar_operands(ast, written, [&mut left, &mut right], scope)?;
             }
             return self.compare(comparison, left, right);
@@ -1982,11 +1983,11 @@ impl Binder<'_> {
             (CompareOp::Equal, ConjunctionOp::Or)
         };
         let mut tests = Vec::with_capacity(written.len());
-        let postgres = self.session.postgres().is_some();
+        let padded = self.semantics.character_types() == CharacterTypes::Postgres;
         for written in written {
             let mut item = self.bind_expr(ast, written, scope)?;
             let mut subject = subject;
-            if postgres {
+            if padded {
                 self.bpchar_operands(ast, [operand, written], [&mut subject, &mut item], scope)?;
             }
             tests.push(self.compare(op, subject, item)?);
@@ -2271,7 +2272,7 @@ impl Binder<'_> {
         declared: Option<DeclaredType>,
     ) -> Result<ExprRef> {
         match declared {
-            Some(declared) if self.session.postgres().is_some() => {
+            Some(declared) if self.semantics.character_types() == CharacterTypes::Postgres => {
                 self.pg_length(expr, declared, false)
             }
             _ => Ok(expr),
@@ -3297,7 +3298,9 @@ impl Binder<'_> {
         written: &[ast::ExprRef],
         bound: &mut [ExprRef],
     ) {
-        if self.session.postgres().is_some() || written.len() != bound.len() {
+        if self.semantics.number_literals() == NumberLiterals::Postgres
+            || written.len() != bound.len()
+        {
             return;
         }
         let literals: Vec<Option<i128>> = written

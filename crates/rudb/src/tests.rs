@@ -13762,6 +13762,52 @@ fn each_dialect_types_sum_and_avg_and_names_the_columns_of_values() {
 }
 
 #[test]
+fn each_dialect_names_columns_and_types_literals_and_character_types() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let first = |connection: &crate::Connection, sql: &str| {
+        let result = connection.execute(sql).expect(sql);
+        let row = result.rows().next().expect("a row").to_vec();
+        (result.names().to_vec(), row)
+    };
+    let text = |text: &str| Value::Varchar(text.into());
+    let literals = "SELECT 1, typeof(1e2), typeof(9223372036854775808)";
+    let padded = "SELECT 'ab'::char(4) = 'ab  '::char(4) AS same";
+    let db = Database::new();
+    let connection = db.connect();
+    assert_eq!(
+        first(&connection, literals),
+        (
+            vec!["1".into(), "typeof(100.0)".into(), "typeof(9223372036854775808)".into()],
+            vec![Value::Integer(1), text("DOUBLE"), text("HUGEINT")]
+        )
+    );
+    let error = connection.execute("CREATE TABLE s (a serial)").expect_err("no serial");
+    assert_eq!(error.message(), "Type with name serial does not exist!");
+    connection.execute("CREATE TABLE c (v varchar(2))").expect("creates");
+    connection.execute("INSERT INTO c VALUES ('abc')").expect("no length");
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    assert_eq!(
+        first(&connection, literals),
+        (
+            vec!["?column?".into(), "typeof".into(), "typeof".into()],
+            vec![Value::Integer(1), text("PG_NUMERIC"), text("PG_NUMERIC")]
+        )
+    );
+    connection.execute("CREATE TABLE s (a serial)").expect("a serial");
+    connection.execute("CREATE TABLE p (v varchar(2))").expect("creates");
+    let error = connection.execute("INSERT INTO p VALUES ('abc')").expect_err("too long");
+    assert_eq!(error.reported_state().as_str(), "22001");
+    assert_eq!(first(&connection, padded).1, [Value::Boolean(true)]);
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
