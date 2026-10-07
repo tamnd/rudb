@@ -1810,6 +1810,41 @@ impl Vector {
         Ok(packed.with_validity(self.validity.clone()))
     }
 
+    /// The same packed values with each code widened to a byte or to two, when it is a few bits
+    /// short of one, and the vector as it was otherwise.
+    ///
+    /// For a vector that is held and filtered many times rather than written. A filter compares
+    /// packed codes in vector registers, and a code of eight or sixteen bits is compared where it
+    /// lies where any other width is shuffled, shifted and masked into lanes first, see
+    /// `lanes::within_aligned`. That costs the bits it adds, so a code is widened only when it grows
+    /// by a third at most, six and seven bits to a byte and twelve to fifteen to two. The dates of
+    /// TPC-H are twelve bits and `l_quantity` thirteen, and a filter on either is a test of sixteen
+    /// codes a register this way. The base stays where it is, and a vector whose type cannot hold
+    /// the wider top is left alone.
+    #[must_use]
+    pub fn on_lanes(self) -> Self {
+        let Body::Packed { words, width, base, offset } = &self.body else {
+            return self;
+        };
+        let (width, base, offset) = (*width, *base, *offset);
+        let lanes = match width {
+            6..=7 => 8,
+            12..=15 => 16,
+            _ => return self,
+        };
+        if layout_range(&self.ty)
+            .is_none_or(|(_, high)| base + i128::from(u64::MAX >> (64 - lanes)) > high)
+        {
+            return self;
+        }
+        let mut held = vec![0_u64; words_for(self.len, lanes)];
+        for row in 0..self.len {
+            let code = code_at(words, (offset + row) * width as usize, width);
+            write_code(&mut held, row * lanes as usize, lanes, code);
+        }
+        Self { body: Body::Packed { words: Arc::new(held), width: lanes, base, offset: 0 }, ..self }
+    }
+
     /// A vector of string views over an arena somebody else is holding too.
     ///
     /// The way in for a scan that has a page of strings and wants several chunks over it. Each chunk
@@ -8563,6 +8598,32 @@ mod tests {
         }
     }
 
+    /// Codes a few bits short of a byte or of two are held at it with the same values, a cut of a
+    /// column is widened from where it starts, and the widths either side of those are left alone.
+    #[test]
+    fn codes_short_of_a_byte_or_two_are_held_at_it_with_the_same_values() {
+        for (width, held) in
+            [(5, 5), (6, 8), (7, 8), (8, 8), (11, 11), (12, 16), (15, 16), (17, 17)]
+        {
+            let span = (1_i64 << width) - 1;
+            let values: Vec<i64> = (0..1000).map(|row| -300 + (row * 7919) % (span + 1)).collect();
+            let flat =
+                Vector::flat(LogicalType::BigInt, Data::Int64(values.clone().into())).unwrap();
+            let packed = flat.bit_packed().unwrap();
+            assert_eq!(packed.packed_parts().expect("packed").width(), width);
+            let cut = packed.slice(70, 900).unwrap();
+            let lanes = cut.clone().on_lanes();
+            let parts = lanes.packed_parts().expect("still packed");
+            assert_eq!(parts.width(), held, "width {width}");
+            assert_eq!(parts.base(), cut.packed_parts().expect("packed").base());
+            assert_eq!(
+                lanes.iter().collect::<Vec<_>>(),
+                cut.iter().collect::<Vec<_>>(),
+                "width {width} read back differently"
+            );
+        }
+    }
+
     #[test]
     fn the_width_is_the_bits_the_range_needs_and_not_the_bits_the_type_has() {
         let values: Vec<i32> = (0..1024).map(|row| 40 + (row * 2560) / 1023).collect();
@@ -8789,7 +8850,7 @@ mod tests {
     fn a_packed_block_says_which_rows_are_in_a_range_as_each_row_does() {
         let words: Vec<u64> =
             (0..400_u64).map(|word| word.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
-        for width in [1, 4, 7, 13, 25, 26, 33] {
+        for width in [1, 4, 7, 8, 13, 16, 25, 26, 33] {
             let rows = 400 * 64 / width as usize;
             let whole = Vector::packed(LogicalType::BigInt, words.clone(), width, 0, rows)
                 .expect("the codes the words hold");
