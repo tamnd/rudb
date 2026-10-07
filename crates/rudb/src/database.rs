@@ -4394,7 +4394,10 @@ impl Shared {
                     let fields = table.columns();
                     self.wrote(table.oid(), |written, _| written.appended_values(fields, rows));
                 }
-                QueryResult::changed(rows.len())
+                match &targets.returning {
+                    Some(target) => self.returned(target, &rows),
+                    None => QueryResult::changed(rows.len()),
+                }
             })
         });
         // A failure aborts an open transaction in `in_transaction`, which every prepared statement
@@ -4405,6 +4408,30 @@ impl Shared {
         drop(catalog);
         let settled = writing.map_or(Ok(()), |writing| self.settle(writing));
         Some(result.and_then(|result| settled.map(|()| result)))
+    }
+
+    /// What a `RETURNING` list of columns gives for `rows` as they went in, each one already of its
+    /// column's type.
+    fn returned(&self, target: &crate::prepared::Target, rows: &[&[Value]]) -> Result<QueryResult> {
+        let columns = target
+            .columns
+            .iter()
+            .zip(target.types.iter())
+            .map(|(&at, ty)| {
+                let values = rows.iter().map(|row| row[at].clone()).collect::<Vec<_>>();
+                Vector::from_values(ty.clone(), &values)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let chunks = if rows.is_empty() { Vec::new() } else { vec![Chunk::new(columns)?] };
+        let reservation = Memory::unlimited().reservation();
+        let result = QueryResult::new(
+            Arc::clone(&target.names),
+            Arc::clone(&target.types),
+            chunks,
+            reservation,
+        )
+        .with_origins(&target.origins);
+        Ok(if target.zoned { result.in_session(self.session()) } else { result })
     }
 
     /// Puts the defaults that `fills` gives into each of `rows`. As in the plan, each row moves a
@@ -8115,7 +8142,18 @@ fn direct_targets(
             }
         }
     }
-    Some((name, crate::prepared::Targets { at: targets, fills }))
+    // The list reads the table the statement names, under the name or the alias it gave.
+    let returning = match &direct.returning {
+        Some(list) => {
+            let target = lookup_target(catalog, list)?;
+            if target.name != name {
+                return None;
+            }
+            Some(Arc::new(target))
+        }
+        None => None,
+    };
+    Some((name, crate::prepared::Targets { at: targets, fills, returning }))
 }
 
 /// What the default `text` of column `at` puts in the column, when it is one of the defaults the

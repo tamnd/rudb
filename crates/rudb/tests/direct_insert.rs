@@ -146,6 +146,75 @@ fn the_defaults_the_short_way_fills_land_as_the_plan_lands_them() {
 }
 
 #[test]
+fn a_returning_list_of_columns_answers_as_the_plan_answers() {
+    let db = Database::new();
+    for table in ["a", "b"] {
+        db.execute(&format!("CREATE SEQUENCE s{table}")).expect("creates");
+        db.execute(&format!(
+            "CREATE TABLE {table} (id INTEGER DEFAULT nextval('s{table}'), n INTEGER, \
+             word VARCHAR(8), stamp TIMESTAMPTZ DEFAULT now())"
+        ))
+        .expect("creates");
+    }
+    // The table of a column is its own on each side, and the rest has to be the same.
+    let described = |result: &rudb::QueryResult| {
+        (0..result.width())
+            .map(|column| {
+                let origin = result.origin(column);
+                let origin = origin.map(|origin| (origin.table != 0, origin.column, origin.ty));
+                (result.column_name(column).to_owned(), result.column_type(column), origin)
+            })
+            .collect::<Vec<_>>()
+    };
+    let lists = ["id", "*", "{t}.id, n AS m", "word, stamp, id", "x.*, x.n"];
+    db.execute("BEGIN").expect("begins");
+    for list in lists {
+        let target = |table: &str| {
+            if list.contains("x.") { format!("{table} AS x") } else { table.to_owned() }
+        };
+        let direct = format!("INSERT INTO {} (n, word) VALUES (?, ?)", target("a"));
+        let planned = format!("INSERT INTO {} (n, word) SELECT ?, ?", target("b"));
+        let direct = db.prepare(&format!("{direct} RETURNING {}", list.replace("{t}", "a")));
+        let direct = direct.expect("prepares");
+        assert_eq!(direct.explain(), "InsertOne a", "{list}");
+        let planned = db.prepare(&format!("{planned} RETURNING {}", list.replace("{t}", "b")));
+        let planned = planned.expect("prepares");
+        for n in 0..2 {
+            let values = [Value::Integer(n), Value::Varchar(format!("w{n}"))];
+            let left = direct.execute(&values).expect("inserts");
+            let right = planned.execute(&values).expect("inserts");
+            assert_eq!(described(&left), described(&right), "{list}");
+            assert_eq!(left.rows().collect::<Vec<_>>(), right.rows().collect::<Vec<_>>(), "{list}");
+        }
+    }
+    assert_eq!(rows(&db, "SELECT * FROM a ORDER BY id"), rows(&db, "SELECT * FROM b ORDER BY id"));
+    let many = db.prepare("INSERT INTO a (n) VALUES (?), (?) RETURNING id, n").expect("prepares");
+    assert_eq!(many.explain(), "InsertRows a");
+    let got = many.execute(&[Value::Integer(7), Value::Integer(8)]).expect("inserts");
+    let ids = rows(&db, "SELECT max(id) FROM a")[0][0].clone();
+    let Value::Integer(last) = ids else { panic!("{ids:?}") };
+    assert_eq!(
+        got.rows().collect::<Vec<_>>(),
+        vec![
+            vec![Value::Integer(last - 1), Value::Integer(7)],
+            vec![Value::Integer(last), Value::Integer(8)]
+        ]
+    );
+    db.execute("COMMIT").expect("commits");
+
+    // A list that is more than columns, or names a column the table does not have, is the plan's.
+    for list in ["id + 1", "count(*)", "nope", "b.id"] {
+        let one = db.prepare(&format!("INSERT INTO a (n) VALUES (?) RETURNING {list}"));
+        if let Ok(one) = one {
+            assert_eq!(one.explain(), "PIPELINE", "{list}");
+        }
+    }
+    let one = db.prepare("INSERT INTO a (n) VALUES (?) RETURNING id + 1").expect("prepares");
+    let got = one.execute(&[Value::Integer(9)]).expect("inserts");
+    assert_eq!(got.value_at(0, 0), Value::Integer(last + 2));
+}
+
+#[test]
 fn constraints_refuse_in_the_plans_words() {
     let db = Database::new();
     twins(&db, "id INTEGER PRIMARY KEY, qty INTEGER NOT NULL CHECK (qty > 0)");
