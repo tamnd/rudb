@@ -175,6 +175,20 @@ pub fn spares(fs: &dyn Filesystem, dir: &Path, lane: u8) -> Result<Vec<PathBuf>>
         .collect())
 }
 
+/// Removes a spare. A spare that is gone already is no error, because its removal is all that was
+/// wanted. A second lane on the same directory, such as the lane of a database that a test drops
+/// without closing, can recycle a spare or remove it between the listing and the removal.
+///
+/// # Errors
+///
+/// If the spare is still there after the removal failed.
+pub fn remove_spare(fs: &dyn Filesystem, path: &Path) -> Result<()> {
+    match fs.remove(path) {
+        Err(error) if fs.exists(path) => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// One transaction's records, which reach the lane together and end with its Commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
@@ -416,7 +430,7 @@ impl Lane {
                 }
                 kept.push(spare);
             } else {
-                fs.remove(&spare)?;
+                remove_spare(fs.as_ref(), &spare)?;
             }
         }
         let lane = Self {
@@ -893,7 +907,13 @@ fn make_spares(fs: &dyn Filesystem, dir: &Path, lane: u8, size: u64, state: &Mut
             state.made += 1;
             dir.join(spare_name(lane, state.made - 1))
         };
-        if fill(fs, &path, size).and_then(|()| fs.sync_dir(dir)).is_err() {
+        // A file that is there already under the name is not this thread's to remove. Only a
+        // second lane on the same directory makes one.
+        let Ok(file) = fs.open(&path, OpenMode::CreateNew) else {
+            lock().making = false;
+            return;
+        };
+        if fill(file.as_ref(), size).and_then(|()| fs.sync_dir(dir)).is_err() {
             let _ = fs.remove(&path);
             lock().making = false;
             return;
@@ -904,9 +924,8 @@ fn make_spares(fs: &dyn Filesystem, dir: &Path, lane: u8, size: u64, state: &Mut
     }
 }
 
-/// Creates `path` as `size` zero bytes and syncs it.
-fn fill(fs: &dyn Filesystem, path: &Path, size: u64) -> Result<()> {
-    let file = fs.open(path, OpenMode::CreateNew)?;
+/// Writes `size` zero bytes to a new `file` and syncs it.
+fn fill(file: &dyn File, size: u64) -> Result<()> {
     let zeros = vec![0_u8; ZERO_CHUNK.min(size as usize)];
     let mut at = 0;
     while at < size {

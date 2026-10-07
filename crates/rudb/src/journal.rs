@@ -37,7 +37,7 @@ use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{
     Block, Checkpointed, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER,
-    replay, segments, spares,
+    remove_spare, replay, segments, spares,
 };
 use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
@@ -675,7 +675,7 @@ impl Journal {
             self.fs.remove(&path)?;
         }
         for path in spares(self.fs.as_ref(), &self.dir, LANE)? {
-            self.fs.remove(&path)?;
+            remove_spare(self.fs.as_ref(), &path)?;
         }
         Ok(())
     }
