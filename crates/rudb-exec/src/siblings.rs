@@ -109,9 +109,9 @@ impl Walk {
         };
         same && self.key == other.key
             && Arc::ptr_eq(&self.keys, &other.keys)
-            && [self, other].iter().all(|walk| {
-                !walk.tests.is_empty() && compared(plan, walk).is_some()
-            })
+            && [self, other]
+                .iter()
+                .all(|walk| !walk.tests.is_empty() && compared(plan, walk).is_some())
     }
 }
 
@@ -736,9 +736,10 @@ impl Siblings {
         }
         let mut read = self.read(&local.runs, &mut local.part, &mut local.within)?;
         let length = local.runs.iter().map(|&(_, length)| length as usize).sum();
-        let picked = self.also.as_ref().map(|also| {
-            also.picks.iter().map(|&at| read[at].clone()).collect::<Vec<_>>()
-        });
+        let picked = self
+            .also
+            .as_ref()
+            .map(|also| also.picks.iter().map(|&at| read[at].clone()).collect::<Vec<_>>());
         read.truncate(self.width);
         values_of(
             Chunk::with_rows(read, length)?,
