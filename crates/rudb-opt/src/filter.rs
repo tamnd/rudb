@@ -939,6 +939,7 @@ fn split(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
         into.push(predicate);
         shared(plan, predicate, into);
         narrowed(plan, predicate, into);
+        hull(plan, predicate, into);
     }
 }
 
@@ -1225,6 +1226,194 @@ fn looser(one: End, other: End) -> Option<End> {
         Ordering::Less => other,
         Ordering::Equal if other.1 && !one.1 => other,
         _ => one,
+    })
+}
+
+/// Adds, for each column every branch of a disjunction tests against constants, the loosest test
+/// of that column every branch passes.
+///
+/// `narrowed` keeps what a branch says about one table together, and it has to, to say exactly
+/// what the branch says. Taken apart it still says something. A row passing `(a = 1 AND b <= 5) OR
+/// (a = 3 AND b <= 9)` has `a` at 1 or 3 and `b` at most 9 whichever branch it took, so `a = 1 OR a
+/// = 3` and `b <= 9` may each be stated beside the disjunction. Every branch has to test the
+/// column, since a branch that does not lets every value of it through. The values a column is
+/// equal to are gathered across the branches, and of the bounds on one side the loosest is kept,
+/// the tightest in each branch being what that branch promises.
+///
+/// What comes out is the cheapest test there is. An equality list is one membership test over the
+/// codes of a dictionary column and a bound is one comparison of packed integers, where the
+/// disjunction walks each branch over the rows the branches before it turned down. A bound at the
+/// top of a filter is also one a scan steps over a block with, which a bound inside an `OR` never
+/// is.
+///
+/// Only when the disjunction reads more than one table, for the reason `narrowed` gives, and a
+/// volatile test is left out for the reason `shared` gives.
+///
+/// TPC-H q19 is the query that needs it. Its branches each name a brand, four containers and a
+/// range of sizes, so `narrowed` sends part a disjunction of three conjunctions that is walked
+/// branch by branch over all two hundred thousand parts, of which 485 pass. Three brands, twelve
+/// containers and sizes up to 15 are each one test, and together they leave about one part in a
+/// hundred for the disjunction to look at.
+fn hull(plan: &mut Plan, predicate: ExprRef, into: &mut Vec<ExprRef>) {
+    let Expr::Conjunction { op: ConjunctionOp::Or, children } = *plan.expr(predicate) else {
+        return;
+    };
+    let branches = plan.expr_list(children).to_vec();
+    if branches.len() < 2 || reads_one(plan, predicate).is_some() {
+        return;
+    }
+    let mut said: Vec<Vec<Test>> = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let mut atoms = Vec::new();
+        split(plan, branch, &mut atoms);
+        let here: Vec<Test> = atoms
+            .into_iter()
+            .filter(|&atom| !walk::volatile(plan, atom))
+            .filter_map(|atom| test_of(plan, atom))
+            .collect();
+        if here.is_empty() {
+            return;
+        }
+        said.push(here);
+    }
+    let mut columns: Vec<ColumnBinding> = Vec::new();
+    for test in &said[0] {
+        if !columns.contains(&test.column) {
+            columns.push(test.column);
+        }
+    }
+    for column in columns {
+        let mut derived = Vec::new();
+        if let Some(members) = members(plan, &said, column) {
+            derived.push(joined_with(plan, ConjunctionOp::Or, &members));
+        }
+        for upper in [false, true] {
+            derived.extend(loosest(&said, column, upper));
+        }
+        for part in derived {
+            if !into.iter().any(|&other| walk::same(plan, part, other)) {
+                into.push(part);
+            }
+        }
+    }
+}
+
+/// One test of a column against a constant, as `hull` reads a branch.
+struct Test {
+    column: ColumnBinding,
+    said: Said,
+    /// The test as the plan has it, which is what `hull` states again when it is the loosest.
+    atom: ExprRef,
+}
+
+enum Said {
+    /// Equal to one of these, each an equality of the column and one constant.
+    Equal(Vec<ExprRef>),
+    /// A bound from above or from below, and whether the bound itself passes.
+    Bound { upper: bool, value: Edge, inclusive: bool },
+}
+
+/// `atom` read as a test of one column against constants, either way round, or nothing.
+///
+/// A disjunction of equalities of the one column is an `IN` list as the binder writes it, and reads
+/// as the values in it.
+fn test_of(plan: &Plan, atom: ExprRef) -> Option<Test> {
+    match *plan.expr(atom) {
+        Expr::Compare { op, left, right } => {
+            let (column, value, flipped) = match (plan.expr(left), plan.expr(right)) {
+                (Expr::Column(column), Expr::Constant(value)) => (*column, *value, false),
+                (Expr::Constant(value), Expr::Column(column)) => (*column, *value, true),
+                _ => return None,
+            };
+            let said = match op {
+                CompareOp::Equal => Said::Equal(vec![atom]),
+                CompareOp::Less
+                | CompareOp::LessOrEqual
+                | CompareOp::Greater
+                | CompareOp::GreaterOrEqual => {
+                    let below = matches!(op, CompareOp::Greater | CompareOp::GreaterOrEqual);
+                    Said::Bound {
+                        upper: below == flipped,
+                        value: Edge::of_value(plan.value(value))?,
+                        inclusive: matches!(op, CompareOp::LessOrEqual | CompareOp::GreaterOrEqual),
+                    }
+                }
+                CompareOp::NotEqual | CompareOp::DistinctFrom | CompareOp::NotDistinctFrom => {
+                    return None;
+                }
+            };
+            Some(Test { column, said, atom })
+        }
+        Expr::Conjunction { op: ConjunctionOp::Or, children } => {
+            let list = plan.expr_list(children).to_vec();
+            let mut column = None;
+            for &child in &list {
+                let Test { column: at, said: Said::Equal(_), .. } = test_of(plan, child)? else {
+                    return None;
+                };
+                if column.is_some_and(|column| column != at) {
+                    return None;
+                }
+                column = Some(at);
+            }
+            Some(Test { column: column?, said: Said::Equal(list), atom })
+        }
+        _ => None,
+    }
+}
+
+/// Every value some branch says `column` is equal to, or nothing when a branch says no such thing.
+fn members(plan: &Plan, said: &[Vec<Test>], column: ColumnBinding) -> Option<Vec<ExprRef>> {
+    let mut members: Vec<ExprRef> = Vec::new();
+    for branch in said {
+        let found = branch.iter().find_map(|test| match &test.said {
+            Said::Equal(list) if test.column == column => Some(list),
+            _ => None,
+        })?;
+        for &member in found {
+            if !members.iter().any(|&other| walk::same(plan, member, other)) {
+                members.push(member);
+            }
+        }
+    }
+    Some(members)
+}
+
+/// The loosest of the tightest bound each branch puts on `column` from one side, or nothing when a
+/// branch puts none there or two bounds cannot be compared.
+fn loosest(said: &[Vec<Test>], column: ColumnBinding, upper: bool) -> Option<ExprRef> {
+    let mut loosest: Option<(&Edge, bool, ExprRef)> = None;
+    for branch in said {
+        let mut tightest: Option<(&Edge, bool, ExprRef)> = None;
+        for test in branch {
+            let Said::Bound { upper: side, value, inclusive } = &test.said else {
+                continue;
+            };
+            if test.column != column || *side != upper {
+                continue;
+            }
+            let bound = (value, *inclusive, test.atom);
+            tightest = Some(match tightest {
+                Some(held) if wider(bound, held, upper)? => held,
+                _ => bound,
+            });
+        }
+        let tightest = tightest?;
+        loosest = Some(match loosest {
+            Some(held) if !wider(tightest, held, upper)? => held,
+            _ => tightest,
+        });
+    }
+    loosest.map(|(_, _, atom)| atom)
+}
+
+/// Whether `one` passes every value `other` does, two bounds from the same side, or nothing when
+/// they cannot be compared.
+fn wider(one: (&Edge, bool, ExprRef), other: (&Edge, bool, ExprRef), upper: bool) -> Option<bool> {
+    Some(match one.0.order(other.0)? {
+        Ordering::Equal => one.1 || !other.1,
+        Ordering::Less => !upper,
+        Ordering::Greater => upper,
     })
 }
 
@@ -2292,7 +2481,8 @@ Filter (((#0.0::DOUBLE < random()::DOUBLE)::BOOLEAN AND (#1.0::INTEGER = 2::INTE
     #[test]
     fn a_branch_saying_two_things_about_a_table_says_both_of_them() {
         // What one branch says about a table is a conjunction of its atoms, not the first of them.
-        // q19 writes three predicates over part into each of its branches.
+        // q19 writes three predicates over part into each of its branches. Each column `a` tests
+        // in both branches also gets a test of its own, which is `hull`.
         let before = "\
 Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR (((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 8::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
   CrossProduct
@@ -2302,12 +2492,37 @@ Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)
         let after = "\
 Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN OR (((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN AND (#1.0::INTEGER = 8::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
   CrossProduct
-    Filter (((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN
+    Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN OR ((#0.0::INTEGER = 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER > 7::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN AND ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 2::INTEGER)::BOOLEAN)::BOOLEAN AND (#0.1::INTEGER > 5::INTEGER)::BOOLEAN)::BOOLEAN
       Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
     Filter ((#1.0::INTEGER = 9::INTEGER)::BOOLEAN OR (#1.0::INTEGER = 8::INTEGER)::BOOLEAN)::BOOLEAN
       Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
 ";
         assert_eq!(pushed(before), after);
+    }
+
+    #[test]
+    fn a_column_every_branch_tests_gets_the_loosest_test_on_it() {
+        // `a.a` is one of 1, 3 and 4 whichever branch a row took, and the second branch writes its
+        // values as an `IN` list. Of the two bounds from below on `a.b` the one that lets 2
+        // through is the looser, and of the two from above it is 9. The constant on the left is
+        // read the same as on the right. `b` is tested on a different column in each branch, so
+        // there is no column of it every branch tests.
+        let before = "\
+Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER >= 2::INTEGER)::BOOLEAN)::BOOLEAN AND ((#0.1::INTEGER <= 5::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN OR ((((#0.0::INTEGER = 3::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN AND (2::INTEGER < #0.1::INTEGER)::BOOLEAN)::BOOLEAN AND ((#0.1::INTEGER < 9::INTEGER)::BOOLEAN AND (#1.1::INTEGER > 0::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        let after = "\
+Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER >= 2::INTEGER)::BOOLEAN)::BOOLEAN AND ((#0.1::INTEGER <= 5::INTEGER)::BOOLEAN AND (#1.0::INTEGER = 9::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN OR ((((#0.0::INTEGER = 3::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN AND (2::INTEGER < #0.1::INTEGER)::BOOLEAN)::BOOLEAN AND ((#0.1::INTEGER < 9::INTEGER)::BOOLEAN AND (#1.1::INTEGER > 0::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN)::BOOLEAN
+  CrossProduct
+    Filter ((((#0.0::INTEGER = 1::INTEGER)::BOOLEAN AND (#0.1::INTEGER >= 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER <= 5::INTEGER)::BOOLEAN)::BOOLEAN OR (((#0.0::INTEGER = 3::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN AND (2::INTEGER < #0.1::INTEGER)::BOOLEAN AND (#0.1::INTEGER < 9::INTEGER)::BOOLEAN)::BOOLEAN)::BOOLEAN AND ((#0.0::INTEGER = 1::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 3::INTEGER)::BOOLEAN OR (#0.0::INTEGER = 4::INTEGER)::BOOLEAN)::BOOLEAN AND (#0.1::INTEGER >= 2::INTEGER)::BOOLEAN AND (#0.1::INTEGER < 9::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS a #0 [a::INTEGER, b::INTEGER]
+    Filter ((#1.0::INTEGER = 9::INTEGER)::BOOLEAN OR (#1.1::INTEGER > 0::INTEGER)::BOOLEAN)::BOOLEAN
+      Get memory.main.t AS b #1 [a::INTEGER, b::INTEGER]
+";
+        assert_eq!(pushed(before), after);
+        assert_eq!(pushed(after), after);
     }
 
     #[test]
