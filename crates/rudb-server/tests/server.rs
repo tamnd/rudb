@@ -2718,3 +2718,89 @@ fn a_condition_must_be_a_boolean_as_in_postgresql() {
     assert_eq!(messages[0].field(b'P').as_deref(), Some("30"));
     server.stop().unwrap();
 }
+
+#[test]
+fn the_values_of_a_case_a_coalesce_and_an_array_take_the_common_type_of_postgresql() {
+    let dirs = Dirs::new("common-type");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table w (a int, b bigint, d numeric(10,2))");
+    client.query("insert into w values (1, 2, 1.25), (3, null, null)");
+    // The values and the errors of the PostgreSQL 19 oracle. A string literal and a NULL take the
+    // type of the other values, and a string literal is read with the input function of it.
+    for (sql, value) in [
+        ("select coalesce(1, '2') + 1", "2"),
+        ("select array[1, '2']", "{1,2}"),
+        ("select greatest(1, '5')", "5"),
+        ("select case when true then 1 else '7' end", "1"),
+        ("select 1 in (2, '1')", "t"),
+        ("select pg_typeof(coalesce(1, 1.5))", "numeric"),
+        ("select pg_typeof(array[1, 2.5])", "numeric[]"),
+        ("select pg_typeof(case when true then 1 else 2.5::float8 end)", "double precision"),
+        ("select pg_typeof(coalesce(1::int2, 2::int8))", "bigint"),
+        ("select pg_typeof(coalesce(current_date, now()))", "timestamp with time zone"),
+        ("select pg_typeof(array[1::int2, 2::int8])", "bigint[]"),
+        ("select pg_typeof(greatest(1::float4, 2.5))", "real"),
+        ("select pg_typeof(coalesce('a', 'b'))", "text"),
+        ("select pg_typeof(coalesce(null, null))", "text"),
+        ("select least(2, 1.25::float8, 3::int8)", "1.25"),
+        ("select coalesce(sum(b), 0) from w", "2"),
+        ("select coalesce(sum(b), 0.5) from w", "2"),
+        ("select string_agg(coalesce(d, 0)::text, ',' order by a) from w", "1.25,0"),
+        ("select string_agg((a in (1, 2.5))::text, ',' order by a) from w", "true,false"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    for (sql, code, message, position) in [
+        ("select coalesce(1, 'a')", "22P02", "invalid input syntax for type integer: \"a\"", "20"),
+        ("select array[1, 'a']", "22P02", "invalid input syntax for type integer: \"a\"", "17"),
+        ("select array['a', 1]", "22P02", "invalid input syntax for type integer: \"a\"", "14"),
+        ("select greatest(1, 'x')", "22P02", "invalid input syntax for type integer: \"x\"", "20"),
+        ("select nullif(1, 'x')", "22P02", "invalid input syntax for type integer: \"x\"", "18"),
+        (
+            "select case when true then 1 else 'x' end",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+            "35",
+        ),
+        ("select 1 in (2, 'x')", "22P02", "invalid input syntax for type integer: \"x\"", "17"),
+        (
+            "select coalesce(now(), 'x')",
+            "22007",
+            "invalid input syntax for type timestamp with time zone: \"x\"",
+            "24",
+        ),
+        (
+            "select coalesce(1, 'a'::text)",
+            "42804",
+            "COALESCE types integer and text cannot be matched",
+            "20",
+        ),
+        (
+            "select array[1, 'a'::text]",
+            "42804",
+            "ARRAY types integer and text cannot be matched",
+            "17",
+        ),
+        (
+            "select coalesce(true, 1)",
+            "42804",
+            "COALESCE types boolean and integer cannot be matched",
+            "23",
+        ),
+        (
+            "select coalesce(1, 'a'::varchar(3))",
+            "42804",
+            "COALESCE types integer and character varying cannot be matched",
+            "20",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}

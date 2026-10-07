@@ -11,10 +11,10 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CastInput, CastOutput, CharacterTypes, ConditionTypes, DeclaredType, Error, ErrorTexts, Field,
-    FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules,
-    Result, Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value,
-    is_clustering_setting, looks_like_rule, rule_names,
+    CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, DeclaredType, Error,
+    ErrorTexts, Field, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals,
+    OperatorRules, Result, Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames,
+    UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -879,6 +879,7 @@ impl Binder<'_> {
         for &item in &written {
             args.push(self.bind_expr(ast, item, scope)?);
         }
+        self.common_type(ast, &written, &mut args, Some("ARRAY"))?;
         self.adopt_integer_literals(ast, &written, &mut args);
         self.call("list_value", args)
     }
@@ -1728,6 +1729,13 @@ impl Binder<'_> {
                 *bound = self.cast_to(*bound, &ty);
             }
         }
+        let common = [("coalesce", "COALESCE"), ("greatest", "GREATEST"), ("least", "LEAST")]
+            .into_iter()
+            .find(|(name, _)| rudb_catalog::same_name(&written, name))
+            .map(|(_, context)| context);
+        if common.is_some() || rudb_catalog::same_name(&written, "nullif") {
+            self.common_type(ast, &arguments, &mut bound, common)?;
+        }
         if [
             "add",
             "subtract",
@@ -2051,6 +2059,7 @@ impl Binder<'_> {
             spelled.push(otherwise);
             results.push(fallback);
         }
+        self.common_type(ast, &spelled, &mut results, Some("CASE"))?;
         self.adopt_integer_literals(ast, &spelled, &mut results);
         for (arm, &then) in bound.iter_mut().zip(&results) {
             arm.then = then;
@@ -2126,10 +2135,18 @@ impl Binder<'_> {
         } else {
             (CompareOp::Equal, ConjunctionOp::Or)
         };
+        let mut values = Vec::with_capacity(written.len() + 1);
+        values.push(subject);
+        for &written in &written {
+            values.push(self.bind_expr(ast, written, scope)?);
+        }
+        let spelled: Vec<ast::ExprRef> =
+            std::iter::once(operand).chain(written.iter().copied()).collect();
+        self.common_type(ast, &spelled, &mut values, None)?;
+        let subject = values[0];
         let mut tests = Vec::with_capacity(written.len());
         let padded = self.semantics.character_types() == CharacterTypes::Postgres;
-        for written in written {
-            let mut item = self.bind_expr(ast, written, scope)?;
+        for (written, mut item) in written.into_iter().zip(values.into_iter().skip(1)) {
             let mut subject = subject;
             if padded {
                 self.bpchar_operands(ast, [operand, written], [&mut subject, &mut item], scope)?;
@@ -3763,6 +3780,89 @@ impl Binder<'_> {
         self.boolean_cast(expr, what)
     }
 
+    /// Brings the values that must have one type to the type that PostgreSQL gives them, in a
+    /// session with [`CommonTypes::Postgres`]. `written` are the values as written and `bound` the
+    /// same values bound. The pin then meets the values at one type as it does in every session.
+    ///
+    /// A string literal, a NULL and a parameter of no type are `unknown` and take the type of the
+    /// others. A string literal is read with the input function of that type, so
+    /// `COALESCE(1, 'a')` is the error of PostgreSQL at the literal. A value of a type with no
+    /// PostgreSQL type of its own leaves the values to the pin. `context` names the clause in the
+    /// error for two types in different categories. An `IN` list and `NULLIF` give no context,
+    /// because PostgreSQL compares their values one by one when they have no common type.
+    pub(crate) fn common_type(
+        &mut self,
+        ast: &Ast,
+        written: &[ast::ExprRef],
+        bound: &mut [ExprRef],
+        context: Option<&str>,
+    ) -> Result<()> {
+        if self.semantics.common_types() != CommonTypes::Postgres {
+            return Ok(());
+        }
+        let mut types = Vec::with_capacity(bound.len());
+        for (&written, &expr) in written.iter().zip(bound.iter()) {
+            let ty = self.plan().expr_type(expr);
+            let literal =
+                matches!(ast.expr(written), ast::Expr::Literal { kind: LiteralKind::String, .. });
+            if literal || *ty == LogicalType::Null || self.is_placeholder(expr) {
+                types.push(None);
+                continue;
+            }
+            let Some(mut oid) = postgres_oid(ty) else {
+                return Ok(());
+            };
+            // A cast names the PostgreSQL type, which can be one that rudb holds in the same way,
+            // as `varchar` and `text`.
+            if let ast::Expr::Cast { ty: name, .. } = ast.expr(written)
+                && let Some(declared) = rudb_pgtypes::declared_type(ast.string(name))
+                && rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(ty)
+            {
+                oid = declared.oid;
+            }
+            types.push(Some(oid));
+        }
+        let common = match rudb_pgtypes::common_type(&types) {
+            Ok(common) => common,
+            Err(mismatch) => {
+                let Some(context) = context else {
+                    return Ok(());
+                };
+                let first = rudb_pgtypes::format_type(mismatch.first);
+                let other = rudb_pgtypes::format_type(mismatch.other);
+                return Err(Error::binder(format!(
+                    "{context} types {first} and {other} cannot be matched"
+                ))
+                .state(SqlState::DATATYPE_MISMATCH)
+                .with_span(ast.leftmost_span(written[mismatch.at])));
+            }
+        };
+        let Some(target) = rudb_pgtypes::logical_type(common) else {
+            return Ok(());
+        };
+        // Values of one rudb type keep it, as a `numeric(10,2)` keeps its scale. Values of more
+        // than one type are cast to the common type, so the pin does not meet them at another.
+        let mut typed = bound.iter().zip(&types).filter(|(_, ty)| ty.is_some());
+        let first = typed.next().map(|(&expr, _)| self.plan().expr_type(expr).clone());
+        let one = typed.all(|(&expr, _)| Some(self.plan().expr_type(expr)) == first.as_ref());
+        for (at, expr) in bound.iter_mut().enumerate() {
+            match types[at] {
+                None => {
+                    if let Some(value) = self.read_literal(ast, written[at], common) {
+                        *expr = self.cast_to(value?, &target);
+                    } else if *self.plan().expr_type(*expr) == LogicalType::Null {
+                        *expr = self.cast_to(*expr, &target);
+                    }
+                }
+                Some(_) if !one && *self.plan().expr_type(*expr) != target => {
+                    *expr = self.cast_to(*expr, &target);
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Brings a predicate to `BOOLEAN` as the pin does: a number, a string and NULL are cast.
     fn boolean_cast(&mut self, expr: ExprRef, what: &str) -> Result<ExprRef> {
         let ty = self.plan().expr_type(expr).clone();
@@ -5144,6 +5244,19 @@ fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) ->
     }
     message.push('\n');
     Error::binder(message)
+}
+
+/// The PostgreSQL type of a rudb type that has one of its own, or `None` for a type such as a
+/// struct or a map, which PostgreSQL sends as text.
+fn postgres_oid(ty: &LogicalType) -> Option<u32> {
+    match ty {
+        LogicalType::Varchar => Some(rudb_pgtypes::oid::TEXT),
+        LogicalType::List(element) => {
+            let element = postgres_oid(element)?;
+            rudb_pgtypes::TypeInfo::get(element).map(|info| info.array).filter(|&array| array != 0)
+        }
+        ty => Some(rudb_pgtypes::pg_type(ty).oid).filter(|&oid| oid != rudb_pgtypes::oid::TEXT),
+    }
 }
 
 #[cfg(test)]
