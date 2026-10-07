@@ -92,6 +92,12 @@ pub const TEXT_GRAMS: &[u8; 8] = b"RUDBTG1\0";
 /// [`crate::postings`]. Paid for out of its own share, so it is on neither budget list below.
 pub const VALUE_ROWS: &[u8; 8] = b"RUDBVR1\0";
 
+/// How many children a relationship has and how many of them found a parent, under the link's own
+/// binding. Written for every relationship the link build measured, kept or not, so that a planner
+/// can still drop a parent nothing reads when the link and its adjacency were over their budgets.
+/// It is a few dozen bytes, so it is on neither budget list below.
+pub const LINK_COUNTS: &[u8; 8] = b"RUDBLC1\0";
+
 /// The kinds the graph document owns, which share its ten percent of the column bytes.
 pub const GRAPH_KINDS: &[&[u8; 8]] = &[KEY_MAP, FORWARD_LINK, ADJACENCY];
 
@@ -234,6 +240,7 @@ impl Section {
                 | RUN_PROJECTION
                 | TEXT_GRAMS
                 | VALUE_ROWS
+                | LINK_COUNTS
         )
     }
 

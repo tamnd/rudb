@@ -780,11 +780,12 @@ fn links_of_one_table(
     let mut report = Vec::with_capacity(edges.len());
     let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
     let mut adjacencies: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
+    let mut counts: Vec<Option<Vec<u8>>> = Vec::with_capacity(edges.len());
     let room = allowance.saturating_sub(spent);
     for edge in edges {
         let start = Instant::now();
         match one_link(&catalog, &child, edge, room) {
-            Ok((built, bytes, adjacency)) => {
+            Ok((built, bytes, adjacency, counted)) => {
                 report.push(BuiltLink {
                     build: start.elapsed(),
                     table_bytes: column_bytes,
@@ -792,6 +793,7 @@ fn links_of_one_table(
                 });
                 payloads.push(Some(bytes));
                 adjacencies.push(adjacency);
+                counts.push(Some(counted));
             }
             Err(note) => {
                 report.push(BuiltLink {
@@ -812,6 +814,7 @@ fn links_of_one_table(
                 });
                 payloads.push(None);
                 adjacencies.push(None);
+                counts.push(None);
             }
         }
     }
@@ -933,6 +936,22 @@ fn links_of_one_table(
             bytes: if kept { bytes } else { &[] },
         });
     }
+    // The counts go in for every relationship that was measured, kept or not, because whether
+    // every key that is not null found a parent is true of the data and not of what the budget
+    // kept. `cast_info.person_role_id` in JOB has neither its link nor its adjacency under the
+    // budget, and without this no plan could drop `char_name` from a join that reads nothing of it.
+    for (built, counted) in report.iter().zip(&counts) {
+        let Some(bytes) = counted else { continue };
+        attachments.push(Attachment {
+            kind: *section::LINK_COUNTS,
+            id: u64::try_from(built.edge.child_column)
+                .map_err(|_| invalid("column index overflow"))?,
+            flags: 0,
+            header_bytes: u32::try_from(binding_bytes(&built.edge.parent))
+                .map_err(|_| invalid("a parent name longer than a section header"))?,
+            bytes,
+        });
+    }
     for (column, bytes) in &measured {
         attachments.push(Attachment {
             kind: *section::DEGREES,
@@ -1020,8 +1039,8 @@ fn spans_of(child: &Reader, parent: &Reader, parents_of: &[Rid]) -> Result<Vec<S
     Ok(spans)
 }
 
-/// A built link, its payload, and the payload of its adjacency when it has one.
-type OneLink = (BuiltLink, Vec<u8>, Option<Vec<u8>>);
+/// A built link, its payload, the payload of its adjacency when it has one, and its counts.
+type OneLink = (BuiltLink, Vec<u8>, Option<Vec<u8>>, Vec<u8>);
 
 /// Builds one link, or says in one sentence why there is not one.
 ///
@@ -1115,6 +1134,8 @@ fn one_link(
         )
     });
     let (form, linked, bytes, size) = built?.map_err(|error| error.to_string())?;
+    let counts = encode_counts(&parent, edge, [parents_of.len() as u64, map.len(), linked])
+        .map_err(|error| error.to_string())?;
     let spans = spans?.map_err(|error| error.to_string())?;
     let adjacency = adjacency.map_err(|error| error.to_string())?;
     let (adjacency, degrees) = match (adjacency, degrees?) {
@@ -1145,6 +1166,7 @@ fn one_link(
         },
         bytes,
         adjacency,
+        counts,
     ))
 }
 
@@ -1215,6 +1237,34 @@ fn encode_link(link: &link::Link, parent: &Reader, edge: &Edge) -> Result<Vec<u8
     bytes.extend_from_slice(name);
     bytes.resize(binding_bytes(&edge.parent), 0);
     link.write(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The payload of a relationship's counts: the binding a link has, then the first
+/// [`link::HEADER_BYTES`] a link's header would, children, parents and the children that found
+/// one, with the rest zero.
+///
+/// The same layout as the front of a link, so that [`linked_parent`] reads either the same way.
+fn encode_counts(parent: &Reader, edge: &Edge, counts: [u64; 3]) -> Result<Vec<u8>> {
+    let name = edge.parent.as_bytes();
+    let mut bytes = Vec::with_capacity(binding_bytes(&edge.parent) + link::HEADER_BYTES);
+    bytes.extend_from_slice(&parent.table().generation().to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(edge.parent_column)
+            .map_err(|_| invalid("column index overflow"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(name.len())
+            .map_err(|_| invalid("a parent name longer than a u32"))?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(name);
+    bytes.resize(binding_bytes(&edge.parent), 0);
+    for count in counts {
+        bytes.extend_from_slice(&count.to_le_bytes());
+    }
+    bytes.resize(binding_bytes(&edge.parent) + link::HEADER_BYTES, 0);
     Ok(bytes)
 }
 
@@ -1358,11 +1408,13 @@ pub fn found_parent(child: &Reader, child_column: usize) -> Option<(String, usiz
 fn linked_parent(child: &Reader, child_column: usize, missed: u64) -> Option<(String, usize, u64)> {
     let table = child.table();
     let id = u64::try_from(child_column).ok()?;
-    // The link when it was kept, and the adjacency when the link was over its budget and the
-    // adjacency was not. Both start with the same binding and both count the children and the ones
-    // that found a parent, in the link's third word and the adjacency's `edges`. A budget record
-    // has no bytes, so it reads as nothing here and the next kind is asked.
-    [*section::FORWARD_LINK, *section::ADJACENCY].into_iter().find_map(|kind| {
+    // The counts the build keeps for every relationship it measured, then for a file written
+    // before it kept them, the link when it was kept and the adjacency when the link was over its
+    // budget and the adjacency was not. All start with the same binding and all count the children
+    // and the ones that found a parent, in the link's third word and the adjacency's `edges`. A
+    // budget record has no bytes, so it reads as nothing here and the next kind is asked.
+    let kinds = [*section::LINK_COUNTS, *section::FORWARD_LINK, *section::ADJACENCY];
+    kinds.into_iter().find_map(|kind| {
         let held =
             table.sections().iter().find(|section| section.kind == kind && section.id == id)?;
         if !held.usable(table.generation()) {
@@ -2229,6 +2281,32 @@ mod tests {
     }
 
     #[test]
+    fn the_counts_say_every_key_found_a_parent_when_the_link_was_over_its_budget() {
+        // `cast_info.person_role_id` again, with its link turned away the way the IMDb file turns
+        // it away, so that the counts are the only place the certificate can come from.
+        let foreign = (0..60_000_i64)
+            .map(|child| (child % 3 != 0).then_some((child * 7) % 1000 + 1))
+            .collect::<Vec<_>>();
+        let path = related("counted", 1000, &foreign);
+        let report = build_links_within(&path, &[edge()], 0).expect("build");
+        assert!(!report[0].built, "the link has to be refused for this to test anything");
+        assert_eq!((report[0].children, report[0].linked), (60_000, 40_000));
+
+        let catalog = Catalog::open(&path).expect("reopen");
+        let child = catalog.table("child").expect("the child");
+        let parent = catalog.table("parent").expect("the parent");
+        assert!(held_kind_bytes(&child, *section::LINK_COUNTS, &[]).expect("held") > 0);
+        assert_eq!(total_parent(&child, 0), None, "the nulls found no parent");
+        assert_eq!(
+            found_parent(&child, 0),
+            Some(("parent".to_owned(), 0, parent.table().generation())),
+            "but every key did"
+        );
+
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    #[test]
     fn a_parent_with_no_key_map_stored_gets_its_link_from_a_map_built_for_it() {
         // A key map the budget turned away, or one nobody asked for, is not a reason to go without
         // the link: the build makes the map it needs and keeps only the link.
@@ -2376,10 +2454,9 @@ mod tests {
         // What does survive is the size and the form, which is exit criterion 3 of G3: somebody
         // deciding whether to raise `graph_budget` reads this rather than rebuilding to find out.
         assert_eq!(refused_link(&child, 0), Some((link::Form::Packed, report[0].bytes as u64)));
-        // Every child found a parent, and whether a planner is told so rests on the adjacency now,
-        // which carries the same binding and the same counts when it was kept.
-        let total =
-            report[0].adjacency.then(|| ("parent".to_owned(), 0, parent.table().generation()));
+        // Every child found a parent, and a planner is told so whatever the budget kept, because
+        // the counts are kept in a section of their own.
+        let total = Some(("parent".to_owned(), 0, parent.table().generation()));
         assert_eq!(total_parent(&child, 0), total);
 
         fs::remove_file(&path).expect("clean up");
