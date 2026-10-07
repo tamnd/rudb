@@ -761,6 +761,9 @@ impl Binder<'_> {
             {
                 return self.bind_alias(ast, parts[0], alias, scope);
             }
+            if let Some(scan) = scope.rowid_scan(found.binding) {
+                self.number_rows(scan);
+            }
             return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
         }
         if let Some((ast, alias)) = alias {
@@ -769,10 +772,19 @@ impl Binder<'_> {
         let mut found = None;
         for (at, outer) in self.outer_scopes.iter().enumerate().rev() {
             if let Some(visible) = outer.resolve_optional(compare, parts)? {
-                found = Some((at, visible.binding, visible.ty.clone()));
+                found = Some((
+                    at,
+                    visible.binding,
+                    visible.ty.clone(),
+                    outer.rowid_scan(visible.binding),
+                ));
                 break;
             }
         }
+        if let Some((_, _, _, Some(scan))) = found {
+            self.number_rows(scan);
+        }
+        let found = found.map(|(at, binding, ty, _)| (at, binding, ty));
         let Some((at, binding, ty)) = found else {
             if self.columns_scope.is_some() {
                 return Err(Error::binder(format!(

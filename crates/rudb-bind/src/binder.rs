@@ -44,6 +44,8 @@ use crate::scope::{Joined, Scope, Visible};
 /// The PostgreSQL type `name`, which `current_user` and the other session names have.
 const NAME: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::NAME, typmod: -1 };
 const VOID: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::VOID, typmod: -1 };
+/// The name a table's row number answers to.
+const ROWID: &str = "rowid";
 
 /// Binds a parsed statement against a catalog.
 ///
@@ -3361,7 +3363,43 @@ impl<'a> Binder<'a> {
             index,
             columns,
         });
+        // The row number a scan counts, which is what the pin's `rowid` is until a row is deleted.
+        // The pin keeps the number of a row that is gone unused and the store here moves the rows
+        // after it down, so after a `DELETE` the two count differently.
+        let compare = self.semantics.identifier_compare();
+        if !excluded && !fields.iter().any(|field| compare.same(&field.name, ROWID)) {
+            let column = Visible {
+                table: label.clone(),
+                name: ROWID.to_string(),
+                binding: ColumnBinding::new(index, fields.len() as u32),
+                ty: LogicalType::BigInt,
+                not_null: false,
+                key: None,
+                default: None,
+                origin: None,
+                qualified: false,
+                also: None,
+                hidden: false,
+                using: None,
+            };
+            scope.add_rowid(column, node, 0);
+        }
         Ok((node, scope))
+    }
+
+    /// Has the scan `node` produce its row number, as the column after its last, once a `rowid`
+    /// reads it.
+    pub(crate) fn number_rows(&mut self, node: NodeRef) {
+        let Node::Get { columns, .. } = *self.plan.node(node) else { return };
+        let mut fields = self.plan.field_list(columns).to_vec();
+        if fields.last().is_some_and(|field| field.name == FILE_ROW_NUMBER) {
+            return;
+        }
+        fields.push(Field::required(FILE_ROW_NUMBER.to_string(), LogicalType::BigInt));
+        let widened = self.plan.add_fields(&fields);
+        if let Node::Get { columns, .. } = self.plan.node_mut(node) {
+            *columns = widened;
+        }
     }
 
     /// A view where a table goes, which is the body bound again right here.

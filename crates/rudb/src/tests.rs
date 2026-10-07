@@ -14346,6 +14346,65 @@ fn a_whole_number_literal_takes_the_integer_type_it_meets_when_it_fits() {
 }
 
 #[test]
+fn rowid_reads_a_tables_row_number_and_a_star_leaves_it_out() {
+    let db = scripted(&[
+        "CREATE TABLE a (i INTEGER)",
+        "INSERT INTO a VALUES (10), (11), (12), (13)",
+        "CREATE TABLE b (rowid INTEGER, j INTEGER)",
+        "INSERT INTO b VALUES (7, 8)",
+    ]);
+    let big = Value::BigInt;
+    assert_eq!(
+        rows(&db, "SELECT rowid, i, typeof(rowid) FROM a ORDER BY rowid"),
+        vec![
+            vec![big(0), integer(10), Value::Varchar("BIGINT".into())],
+            vec![big(1), integer(11), Value::Varchar("BIGINT".into())],
+            vec![big(2), integer(12), Value::Varchar("BIGINT".into())],
+            vec![big(3), integer(13), Value::Varchar("BIGINT".into())],
+        ]
+    );
+    assert_eq!(rows(&db, "SELECT * FROM a WHERE rowid = 2"), vec![vec![integer(12)]]);
+    assert_eq!(rows(&db, "SELECT rowid, * FROM b"), vec![vec![integer(7), integer(7), integer(8)]]);
+    assert_eq!(
+        rows(&db, "SELECT a2.rowid FROM a, a a2 WHERE a.rowid = a2.rowid AND a.i = 11"),
+        vec![vec![big(1)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT (SELECT a2.rowid FROM a a2 WHERE a.rowid = a2.rowid) FROM a ORDER BY 1"),
+        vec![vec![big(0)], vec![big(1)], vec![big(2)], vec![big(3)]]
+    );
+    for (statement, message) in [
+        (
+            "SELECT rowid FROM a, a a2",
+            "Ambiguous reference to column name \"rowid\" (use: 'a.rowid' or 'a2.rowid')",
+        ),
+        (
+            "SELECT rowid FROM a JOIN b ON true",
+            "Ambiguous reference to column name \"rowid\" (use: 'a.rowid' or 'b.rowid')",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    for statement in [
+        "SELECT rowid FROM (SELECT * FROM a)",
+        "WITH c AS (SELECT * FROM a) SELECT rowid FROM c",
+        "SELECT rowid FROM range(3)",
+    ] {
+        assert!(
+            refusal(&db, statement).starts_with("Referenced column \"rowid\" not found"),
+            "{statement}"
+        );
+    }
+    db.execute("INSERT INTO a SELECT rowid FROM a WHERE i = 13").unwrap();
+    db.execute("UPDATE a SET i = rowid + 100 WHERE i < 12").unwrap();
+    db.execute("DELETE FROM a WHERE rowid = (SELECT max(rowid) FROM a)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT i FROM a ORDER BY rowid"),
+        vec![vec![integer(100)], vec![integer(101)], vec![integer(12)], vec![integer(13)]]
+    );
+}
+
+#[test]
 fn an_error_working_out_a_generated_column_names_the_column() {
     let db = Database::new();
     db.execute("CREATE TABLE t (a INTEGER, b AS (a + 1), c VARCHAR, d BOOLEAN AS (c))").unwrap();

@@ -10,7 +10,7 @@
 //! no `hits` to refer to, which is SQL's rule and not ours.
 
 use rudb_common::{Error, Field, IdentifierCompare, LogicalType, Origin, Result, SqlState};
-use rudb_plan::ColumnBinding;
+use rudb_plan::{ColumnBinding, NodeRef};
 
 /// One visible column.
 #[derive(Debug, Clone)]
@@ -87,22 +87,53 @@ impl Joined {
     }
 }
 
+/// The `rowid` of a table in scope, which a name reaches and a star does not.
+///
+/// Kept beside the columns rather than among them, because everything that reads the columns of a
+/// scope as the columns of a row, such as a star, a subquery's output or a view's fields, would
+/// otherwise have to step over it. Only a table the catalog holds has one, and not one that has a
+/// column of that name, which then wins. On the pin it still counts in an ambiguity: `SELECT rowid
+/// FROM a JOIN b ON true` is refused when only `b` has a column called `rowid`.
+#[derive(Debug, Clone)]
+pub(crate) struct Rowid {
+    /// The column a name resolves to, bound one past the table's last column.
+    pub(crate) column: Visible,
+    /// The scan, which only produces the row number once something reads it.
+    pub(crate) scan: NodeRef,
+    /// Where the table's columns start in the scope, which orders it among them in an error.
+    pub(crate) at: usize,
+}
+
 /// The columns a name can resolve against.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
     pub(crate) columns: Vec<Visible>,
+    pub(crate) rowids: Vec<Rowid>,
 }
 
 impl Scope {
     /// A scope with nothing in it, which is what `SELECT 1` binds against.
     pub(crate) fn empty() -> Self {
-        Self { columns: Vec::new() }
+        Self::default()
     }
 
     /// Everything on the left followed by everything on the right, which is what a join sees.
     pub(crate) fn concat(mut self, other: Self) -> Self {
+        let start = self.columns.len();
         self.columns.extend(other.columns);
+        self.rowids
+            .extend(other.rowids.into_iter().map(|rowid| Rowid { at: rowid.at + start, ..rowid }));
         self
+    }
+
+    /// Makes `rowid` reachable for the table whose columns start at `at`.
+    pub(crate) fn add_rowid(&mut self, column: Visible, scan: NodeRef, at: usize) {
+        self.rowids.push(Rowid { column, scan, at });
+    }
+
+    /// The scan whose row number `binding` is, when it is a `rowid`.
+    pub(crate) fn rowid_scan(&self, binding: ColumnBinding) -> Option<NodeRef> {
+        self.rowids.iter().find(|rowid| rowid.column.binding == binding).map(|rowid| rowid.scan)
     }
 
     pub(crate) fn push(&mut self, column: Visible) {
@@ -173,15 +204,27 @@ impl Scope {
                 )));
             }
         };
-        let matched: Vec<&Visible> = self
+        let mut matched: Vec<(usize, &Visible)> = self
             .columns
             .iter()
-            .filter(|held| {
+            .enumerate()
+            .filter(|(_, held)| {
                 compare.same(&held.name, column)
                     && (table.is_some() || !(held.qualified || held.hidden))
                     && table.is_none_or(|table| compare.same(&held.table, table))
             })
             .collect();
+        matched.extend(
+            self.rowids
+                .iter()
+                .filter(|rowid| {
+                    compare.same(&rowid.column.name, column)
+                        && table.is_none_or(|table| compare.same(&rowid.column.table, table))
+                })
+                .map(|rowid| (rowid.at, &rowid.column)),
+        );
+        matched.sort_by_key(|(at, _)| *at);
+        let matched: Vec<&Visible> = matched.into_iter().map(|(_, held)| held).collect();
         let matched = if matched.is_empty() {
             self.columns
                 .iter()
@@ -254,6 +297,9 @@ impl Scope {
         for column in &mut self.columns {
             column.table = table.to_string();
         }
+        for rowid in &mut self.rowids {
+            rowid.column.table = table.to_string();
+        }
     }
 
     /// Replaces the column names, which is what `AS t(a, b)` does.
@@ -310,6 +356,7 @@ impl Scope {
     /// side once its condition has been bound.
     pub(crate) fn truncate(&mut self, position: usize) {
         self.columns.truncate(position);
+        self.rowids.retain(|rowid| rowid.at < position);
     }
 
     /// Where a column of that name sits, if exactly one does.
