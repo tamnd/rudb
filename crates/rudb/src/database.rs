@@ -7899,7 +7899,9 @@ impl Shared {
                     updated.push(at);
                 }
             }
-            rudb_bind::ConflictAction::Update { columns, mut plan } if !clashes.is_empty() => {
+            rudb_bind::ConflictAction::Update { columns, mut plan, generate }
+                if !clashes.is_empty() =>
+            {
                 let matched: Vec<Vec<Value>> =
                     clashes.iter().map(|(at, _)| held[*at].clone()).collect();
                 let incoming: Vec<Vec<Value>> =
@@ -7938,6 +7940,29 @@ impl Shared {
                         held[*at][column] = value.clone();
                     }
                     updated.push(*at);
+                }
+                if let Some(mut generate) = generate.filter(|_| !updated.is_empty()) {
+                    let changed: Vec<Vec<Value>> =
+                        updated.iter().map(|&at| held[at].clone()).collect();
+                    let rows = upsert::chunks_of(&types, &changed)?;
+                    let before = catalog.table_mut(name)?.stand_in(rows, workers)?;
+                    let answer = (|| {
+                        let context = self.optimizer(catalog)?;
+                        rudb_opt::optimize_with(&mut generate, &context)?;
+                        let under = Under::new(
+                            self.budget(),
+                            context.facts(),
+                            seams,
+                            session,
+                            Rows::ForACaller,
+                        );
+                        run(sql, &generate, catalog, cancel, under)
+                    })();
+                    catalog.table_mut(name)?.put_back(before);
+                    let rows = upsert::rows_of(&answer?.into_chunks());
+                    for (&at, row) in updated.iter().zip(rows) {
+                        held[at] = row;
+                    }
                 }
             }
             rudb_bind::ConflictAction::Update { .. } => {}
@@ -8346,7 +8371,11 @@ fn direct_targets(
         return None;
     }
     let table = catalog.table(&name).ok()?;
-    if !table.checks().is_empty() || !table.foreign().is_empty() || table.clustering().is_some() {
+    if !table.checks().is_empty()
+        || !table.foreign().is_empty()
+        || table.clustering().is_some()
+        || table.has_generated()
+    {
         return None;
     }
     let fields = table.columns();
@@ -8597,6 +8626,7 @@ fn writes_in_place(catalog: &Catalog, target: &crate::prepared::Target) -> bool 
         || !table.checks().is_empty()
         || !table.foreign().is_empty()
         || table.clustering().is_some()
+        || table.has_generated()
         || catalog.tables().any(|held| held.foreign().iter().any(|key| &key.table == name)))
 }
 
@@ -9458,6 +9488,9 @@ fn create_table(
     }
     if !create.checks.is_empty() {
         catalog.table_mut(&create.name)?.set_checks(create.checks);
+    }
+    if !create.generated.is_empty() {
+        catalog.table_mut(&create.name)?.set_generated(create.generated);
     }
     if !create.order.is_empty() {
         catalog.table_mut(&create.name)?.set_order(create.order);

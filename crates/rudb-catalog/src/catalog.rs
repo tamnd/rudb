@@ -1603,7 +1603,10 @@ impl Catalog {
         // index refusals that name the column's index rather than the table's dependents.
         let changed = match &alteration {
             crate::Alteration::Type { column, .. } => Some((*column, true)),
-            crate::Alteration::DropColumn { column, .. } => Some((*column, false)),
+            // A drop that takes generated columns with it is about the first of them all.
+            crate::Alteration::DropColumn { column, also, .. } => {
+                Some((also.iter().copied().fold(*column, usize::min), false))
+            }
             _ => None,
         };
         let original = self.table(name)?;

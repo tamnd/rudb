@@ -1654,6 +1654,9 @@ pub struct Table {
     defaults: Vec<Option<String>>,
     /// The PostgreSQL type each column was declared with, or empty when no column has one.
     types: Vec<Option<DeclaredType>>,
+    /// The expression of each generated column as SQL, or empty when no column is one. The value
+    /// is worked out when a row is written and kept like any other, so a read is a read.
+    generated: Vec<Option<String>>,
     /// Which columns are identity columns, or empty when no column is one.
     identities: Vec<Option<Identity>>,
     /// The SQL of each `CHECK` constraint, in the order written.
@@ -1710,6 +1713,7 @@ impl Table {
             indexes: Vec::new(),
             defaults: Vec::new(),
             types: Vec::new(),
+            generated: Vec::new(),
             identities: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
@@ -1734,7 +1738,7 @@ impl Table {
         let clustering = reader.table().clustering().cloned();
         let stored = reader.table().constraints();
         let (keys, foreign) = restored(&name, stored);
-        let defaults = stored.defaults.clone();
+        let (defaults, generated) = restored_generated(stored);
         let types = stored.types.clone();
         let identities = restored_identities(stored, columns.len());
         let checks = stored.checks.clone();
@@ -1758,6 +1762,7 @@ impl Table {
             indexes,
             defaults,
             types,
+            generated,
             identities,
             checks,
             foreign,
@@ -1811,9 +1816,16 @@ impl Table {
                 referenced: places(&foreign.referenced)?,
             });
         }
-        if self.defaults.iter().any(Option::is_some) {
+        // A generated column keeps its expression where a default would go, marked 7 in the
+        // order below, which a build that predates it reads as a default.
+        if self.defaults.iter().chain(&self.generated).any(Option::is_some) {
             stored.defaults.clone_from(&self.defaults);
             stored.defaults.resize(self.columns.len(), None);
+            for (at, expression) in self.generated.iter().enumerate() {
+                if expression.is_some() {
+                    stored.defaults[at].clone_from(expression);
+                }
+            }
         }
         if self.types.iter().any(Option::is_some) {
             stored.types.clone_from(&self.types);
@@ -1842,6 +1854,11 @@ impl Table {
                 Some(Identity::Always) => stored.order.push((5, place(at)?)),
                 Some(Identity::ByDefault) => stored.order.push((6, place(at)?)),
                 None => {}
+            }
+        }
+        for (at, expression) in self.generated.iter().enumerate() {
+            if expression.is_some() {
+                stored.order.push((7, place(at)?));
             }
         }
         for index in &self.indexes {
@@ -3000,6 +3017,32 @@ impl Table {
         self.types = types;
     }
 
+    /// The expression of a generated column as SQL, or `None` for a column that holds what is
+    /// written to it.
+    #[must_use]
+    pub fn generated(&self, column: usize) -> Option<&str> {
+        self.generated.get(column).and_then(Option::as_deref)
+    }
+
+    /// Whether any column is a generated one.
+    #[must_use]
+    pub fn has_generated(&self) -> bool {
+        self.generated.iter().any(Option::is_some)
+    }
+
+    /// What the pin reports as the expression of a generated column, which is the expression cast
+    /// to the column type, `CAST((a * 5) AS INTEGER)`.
+    #[must_use]
+    pub fn generation(&self, column: usize) -> Option<String> {
+        let expression = self.generated(column)?;
+        Some(format!("CAST({expression} AS {})", self.columns[column].ty))
+    }
+
+    /// Declares the columns' generated expressions, one per column.
+    pub fn set_generated(&mut self, generated: Vec<Option<String>>) {
+        self.generated = generated;
+    }
+
     /// Whether a column is an identity column, and of which kind.
     #[must_use]
     pub fn identity(&self, column: usize) -> Option<Identity> {
@@ -3360,13 +3403,19 @@ impl Table {
         self.defaults.resize(self.columns.len(), None);
         self.types.resize(self.columns.len(), None);
         self.identities.resize(self.columns.len(), None);
+        if self.has_generated() {
+            self.generated.resize(self.columns.len(), None);
+        }
         let mut moved = true;
         match alteration {
             Alteration::Rename(to) => self.name.table = to,
-            Alteration::RenameColumn { column, to, checks } => {
+            Alteration::RenameColumn { column, to, checks, generated } => {
                 taken(&self.columns, &to)?;
                 self.columns[column].name = to;
                 self.checks = checks;
+                if self.has_generated() {
+                    self.generated = generated;
+                }
             }
             Alteration::AddColumn { field, default, sequences, declared } => {
                 taken(&self.columns, &field.name)?;
@@ -3374,64 +3423,77 @@ impl Table {
                 self.defaults.push(default);
                 self.types.push(declared);
                 self.identities.push(None);
+                if self.has_generated() {
+                    self.generated.push(None);
+                }
                 self.depend_on(sequences);
             }
-            Alteration::DropColumn { column, checks } => {
-                if self.columns.len() == 1 {
+            Alteration::DropColumn { column, checks, also } => {
+                let mut dropped = also;
+                dropped.push(column);
+                dropped.sort_unstable();
+                dropped.dedup();
+                if self.columns.len() <= dropped.len() {
                     return Err(Error::catalog(
                         "Cannot drop column: table only has one column remaining!",
                     ));
-                }
-                let name = self.columns[column].name.clone();
-                for key in &self.keys {
-                    if !key.columns.contains(&column) {
-                        continue;
-                    }
-                    if key.columns.len() == 1 {
-                        return Err(Error::catalog(format!(
-                            "Cannot drop column \"{name}\" because there is a UNIQUE constraint that \
-                             depends on it"
-                        )));
-                    }
-                    let names: Vec<&str> =
-                        key.columns.iter().map(|&at| self.columns[at].name.as_str()).collect();
-                    return Err(Error::catalog(format!(
-                        "Cannot drop column \"{name}\" because it is referenced in unique \
-                         constraint UNIQUE({})",
-                        names.join(", ")
-                    )));
-                }
-                if self.foreign.iter().any(|foreign| foreign.columns.contains(&column)) {
-                    return Err(Error::catalog(format!(
-                        "Cannot drop column \"{name}\" because there is a FOREIGN KEY constraint \
-                         that depends on it"
-                    )));
-                }
-                let shift = |at: &mut usize| {
-                    if *at > column {
-                        *at -= 1;
-                    }
-                };
-                for key in &mut self.keys {
-                    key.columns.iter_mut().for_each(shift);
-                }
-                for foreign in &mut self.foreign {
-                    foreign.columns.iter_mut().for_each(shift);
                 }
                 // The kept order points at columns and checks by place, and both can move.
                 if checks.len() != self.checks.len() {
                     self.order.retain(|held| !matches!(held, crate::Constraint::Check(_)));
                 }
-                self.order.retain(|&held| held != crate::Constraint::NotNull(column));
-                for held in &mut self.order {
-                    if let crate::Constraint::NotNull(at) = held {
-                        shift(at);
+                // From the last, so the places of the ones still to go do not move.
+                for &column in dropped.iter().rev() {
+                    let name = self.columns[column].name.clone();
+                    for key in &self.keys {
+                        if !key.columns.contains(&column) {
+                            continue;
+                        }
+                        if key.columns.len() == 1 {
+                            return Err(Error::catalog(format!(
+                                "Cannot drop column \"{name}\" because there is a UNIQUE \
+                                 constraint that depends on it"
+                            )));
+                        }
+                        let names: Vec<&str> =
+                            key.columns.iter().map(|&at| self.columns[at].name.as_str()).collect();
+                        return Err(Error::catalog(format!(
+                            "Cannot drop column \"{name}\" because it is referenced in unique \
+                             constraint UNIQUE({})",
+                            names.join(", ")
+                        )));
+                    }
+                    if self.foreign.iter().any(|foreign| foreign.columns.contains(&column)) {
+                        return Err(Error::catalog(format!(
+                            "Cannot drop column \"{name}\" because there is a FOREIGN KEY \
+                             constraint that depends on it"
+                        )));
+                    }
+                    let shift = |at: &mut usize| {
+                        if *at > column {
+                            *at -= 1;
+                        }
+                    };
+                    for key in &mut self.keys {
+                        key.columns.iter_mut().for_each(shift);
+                    }
+                    for foreign in &mut self.foreign {
+                        foreign.columns.iter_mut().for_each(shift);
+                    }
+                    self.order.retain(|&held| held != crate::Constraint::NotNull(column));
+                    for held in &mut self.order {
+                        if let crate::Constraint::NotNull(at) = held {
+                            shift(at);
+                        }
+                    }
+                    self.columns.remove(column);
+                    self.defaults.remove(column);
+                    self.types.remove(column);
+                    self.identities.remove(column);
+                    if column < self.generated.len() {
+                        self.generated.remove(column);
                     }
                 }
-                self.columns.remove(column);
-                self.defaults.remove(column);
-                self.types.remove(column);
-                self.identities.remove(column);
                 self.checks = checks;
                 self.clustering = None;
             }
@@ -3607,6 +3669,25 @@ fn restored_order(stored: &rudb_native::Constraints) -> Vec<crate::Constraint> {
             }
         })
         .collect()
+}
+
+/// The defaults and the generated expressions [`Table::stored_constraints`] wrote down, each one
+/// per column or empty when no column has one. A generated column's expression is where its default
+/// would be, and the order marks the column 7.
+fn restored_generated(
+    stored: &rudb_native::Constraints,
+) -> (Vec<Option<String>>, Vec<Option<String>>) {
+    let mut defaults = stored.defaults.clone();
+    let mut generated = Vec::new();
+    for &(kind, at) in &stored.order {
+        let at = usize::from(at);
+        if kind != 7 || at >= defaults.len() {
+            continue;
+        }
+        generated.resize(defaults.len(), None);
+        generated[at] = defaults[at].take();
+    }
+    (defaults, generated)
 }
 
 /// The identity columns [`Table::stored_constraints`] wrote down, one per column, or empty when

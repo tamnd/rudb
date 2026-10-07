@@ -3506,12 +3506,22 @@ impl<'a> Binder<'a> {
         let spelled: Vec<&str> = parts.iter().map(String::as_str).collect();
         let name = self.catalog.resolve(&spelled)?;
         let described = self.described(ast, &name)?;
+        // A view has neither defaults nor keys, and a generated column shows its expression.
+        let table = (self.catalog.entry(&name)? == Entry::Table)
+            .then(|| self.catalog.table(&name))
+            .transpose()?;
         let mut rows = Vec::with_capacity(described.len());
         for (at, field) in described.iter().enumerate() {
             let items = if matches!(function, TableFunction::PragmaShow) {
                 self.describing(field)
             } else {
-                self.table_info(at, field)
+                let default = table.and_then(|table| {
+                    table.generation(at).or_else(|| table.default(at).map(str::to_owned))
+                });
+                let key = table.is_some_and(|table| {
+                    table.keys().iter().any(|key| key.primary && key.columns.contains(&at))
+                });
+                self.table_info(at, field, default, key)
             };
             rows.push(self.plan.add_expr_list(&items));
         }
@@ -3607,16 +3617,22 @@ impl<'a> Binder<'a> {
     /// One row of `pragma_table_info()`, which is SQLite's six columns about the same column.
     ///
     /// `cid` counts from zero, which is SQLite's numbering and not the one based `ordinal_position`
-    /// the standard views report. `dflt_value` and `pk` are the two nothings rudb has to report
-    /// until `CREATE TABLE` takes a `DEFAULT` or a key.
-    fn table_info(&mut self, at: usize, field: &Field) -> Vec<ExprRef> {
+    /// the standard views report. `dflt_value` is the default as SQL, or a generated column's
+    /// expression cast to its type, and `pk` is whether the column is in the primary key.
+    fn table_info(
+        &mut self,
+        at: usize,
+        field: &Field,
+        default: Option<String>,
+        key: bool,
+    ) -> Vec<ExprRef> {
         let cid = self.plan.add_constant(Value::Integer(i32::try_from(at).unwrap_or(i32::MAX)));
         let name = self.plan.add_constant(Value::Varchar(field.name.clone()));
         let ty = self.plan.add_constant(Value::Varchar(field.ty.to_string()));
         let not_null = self.plan.add_constant(Value::Boolean(field.not_null));
-        let default = self.plan.add_constant(Value::Null);
+        let default = self.plan.add_constant(default.map_or(Value::Null, Value::Varchar));
         let default = self.cast_to(default, &LogicalType::Varchar);
-        let key = self.plan.add_constant(Value::Boolean(false));
+        let key = self.plan.add_constant(Value::Boolean(key));
         vec![cid, name, ty, not_null, default, key]
     }
 

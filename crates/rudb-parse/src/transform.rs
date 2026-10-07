@@ -1610,10 +1610,15 @@ impl<'a> Transform<'a> {
             }
             "AddColumn" => self.add_column(option)?,
             "AddConstraint" => self.add_constraint(option)?,
-            "DropColumn" if !nested(self, option) => AlterAction::DropColumn {
-                column: column(self, option),
-                quiet: self.find(option, "IfExists") != NONE,
-            },
+            "DropColumn" if !nested(self, option) => {
+                let behavior = self.find(option, "DropBehavior");
+                AlterAction::DropColumn {
+                    column: column(self, option),
+                    quiet: self.find(option, "IfExists") != NONE,
+                    cascade: behavior != NONE
+                        && self.name(self.first(behavior)) == "CascadeDropBehavior",
+                }
+            }
             "AlterColumn" if !nested(self, option) => {
                 let at = column(self, option);
                 let entry = self.first(self.find(option, "AlterColumnEntry"));
@@ -1784,7 +1789,7 @@ impl<'a> Transform<'a> {
                 "Adding a NOT NULL column with IF NOT EXISTS is not supported",
             ));
         }
-        let column = ColumnDef { name, ty, not_null, default, identity: None };
+        let column = ColumnDef { name, ty, not_null, default, identity: None, generated: NONE };
         Ok(AlterAction::AddColumn { column, quiet })
     }
 
@@ -2211,9 +2216,7 @@ impl<'a> Transform<'a> {
             let text = self.text(type_node).to_string();
             self.intern(&text)
         };
-        if self.find(node, "GeneratedColumn") != NONE {
-            return self.unsupported(self.find(node, "GeneratedColumn"));
-        }
+        let generated = self.generated_column(node)?;
         let mut not_null = false;
         let mut default = NONE;
         let mut keys = Vec::new();
@@ -2222,6 +2225,9 @@ impl<'a> Transform<'a> {
                 continue;
             }
             let constraint = self.first(kid);
+            if generated != NONE {
+                self.generated_constraint(constraint, name)?;
+            }
             match self.name(constraint) {
                 "NotNullConstraint" => {
                     not_null = self.name(self.first(constraint)) == "NotNullColumnConstraint";
@@ -2251,7 +2257,39 @@ impl<'a> Transform<'a> {
             }
         }
         let identity = self.identity(node)?;
-        Ok((ColumnDef { name, ty, not_null, default, identity }, keys))
+        Ok((ColumnDef { name, ty, not_null, default, identity, generated }, keys))
+    }
+
+    /// The expression of `GeneratedColumn <- Generated? 'AS' Parens(Expression)
+    /// GeneratedColumnType?` on a column, or `NONE` when the column has none. Only a `VIRTUAL`
+    /// column is made, as in the pin, which refuses `STORED`.
+    fn generated_column(&mut self, node: u32) -> Result<ExprRef> {
+        let generated = self.find(node, "GeneratedColumn");
+        if generated == NONE {
+            return Ok(NONE);
+        }
+        let kind = self.find(generated, "GeneratedColumnType");
+        if kind != NONE && self.name(self.first(kind)) == "StoredGeneratedColumn" {
+            return Err(Error::invalid_input("Can not create a STORED generated column!"));
+        }
+        self.expr(self.descendant(generated, "Expression"))
+    }
+
+    /// Refuses a constraint written on a generated column the way the pin does.
+    fn generated_constraint(&self, constraint: u32, column: StrRef) -> Result<()> {
+        Err(match self.name(constraint) {
+            "DefaultValue" => Error::parser("Not allowed to set default on a generated column"),
+            "ColumnCollation" => Error::parser("Collations are not supported on generated columns"),
+            // A `CHECK` is the table's, and the binder refuses one that reads a generated column.
+            "NotNullConstraint" | "PrimaryKeyConstraint" | "UniqueConstraint" => {
+                Error::binder("Constraints on generated columns are not supported yet")
+            }
+            "ForeignKeyConstraint" => Error::binder(format!(
+                "Failed to create foreign key: referenced column \"{}\" is a generated column",
+                self.ast.string(column)
+            )),
+            _ => return Ok(()),
+        })
     }
 
     /// `WithList <- 'WITH' RelOptionOrOids` of a table, in a PostgreSQL session.
@@ -2334,6 +2372,7 @@ impl<'a> Transform<'a> {
                     not_null: false,
                     default: NONE,
                     identity: None,
+                    generated: NONE,
                 });
             }
             self.column_def_slice(defs)
@@ -7792,9 +7831,10 @@ mod tests {
                         }
                         out
                     }
-                    AlterAction::DropColumn { column, quiet } => {
+                    AlterAction::DropColumn { column, quiet, cascade } => {
                         let quiet = if quiet { "IF EXISTS " } else { "" };
-                        format!("DROP COLUMN {quiet}{}", ast.string(column))
+                        let cascade = if cascade { " CASCADE" } else { "" };
+                        format!("DROP COLUMN {quiet}{}{cascade}", ast.string(column))
                     }
                     AlterAction::Default { column, default } if default == NONE => {
                         format!("ALTER COLUMN {} DROP DEFAULT", ast.string(column))

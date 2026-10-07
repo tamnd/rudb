@@ -229,6 +229,9 @@ pub struct CreateTable {
     pub identities: Vec<Option<rudb_catalog::Identity>>,
     /// The SQL of each `CHECK`, in the order written.
     pub checks: Vec<String>,
+    /// The expression of each generated column as SQL, one per column, or empty when no column is
+    /// one.
+    pub generated: Vec<Option<String>>,
     /// The foreign keys, in the order written.
     pub foreign: Vec<rudb_catalog::ForeignKey>,
     /// Every constraint, in the order written.
@@ -464,6 +467,9 @@ pub enum ConflictAction {
         columns: Vec<usize>,
         /// The query that works the values out.
         plan: Box<Plan>,
+        /// For a table with generated columns, the query that works them out again for the rows
+        /// that were updated, which it reads as the table and answers whole and in order.
+        generate: Option<Box<Plan>>,
     },
 }
 
@@ -1288,6 +1294,13 @@ fn create_table(
         let mut columns = Vec::with_capacity(defs.len());
         for def in defs {
             let text = ast.string(def.ty);
+            if text.is_empty() && def.generated != NONE {
+                // The type of the expression, which is settled once every column has a name.
+                serials.push(false);
+                types.push(None);
+                columns.push(Field::new(ast.string(def.name), LogicalType::Null));
+                continue;
+            }
             if text.is_empty() {
                 return Err(Error::binder(format!(
                     "Column \"{}\" was declared without a type",
@@ -1342,6 +1355,12 @@ fn create_table(
         (columns, Some(finish(binder, root)?))
     };
     duplicate_check(&columns)?;
+    let generated = if defs.iter().any(|def| def.generated != NONE) {
+        generated_columns(ast, defs, &mut columns, (catalog, parameters, session))?
+    } else {
+        Vec::new()
+    };
+    let is_generated = |at: usize| generated.get(at).is_some_and(Option::is_some);
     let mut defaults = Vec::with_capacity(defs.len());
     let mut sequences = Vec::new();
     let mut made = Vec::new();
@@ -1409,7 +1428,18 @@ fn create_table(
     }
     let mut checks = Vec::new();
     for &expr in ast.expr_list(written.checks) {
-        checks.push(check_text(ast, expr, &columns, catalog, parameters, session)?);
+        let text = check_text(ast, expr, &columns, catalog, parameters, session)?;
+        if !generated.is_empty() {
+            for used in columns_in(&text)? {
+                let place = columns.iter().position(|field| same_name(&field.name, &used));
+                if place.is_some_and(is_generated) {
+                    return Err(Error::binder(
+                        "Constraints on generated columns are not supported yet",
+                    ));
+                }
+            }
+        }
+        checks.push(text);
     }
     let mut keys = Vec::new();
     for (at, &names) in ast.name_list(written.keys).iter().enumerate() {
@@ -1422,6 +1452,11 @@ fn create_table(
                     name.table
                 )));
             };
+            if is_generated(place) {
+                return Err(Error::binder(
+                    "Constraints on generated columns are not supported yet",
+                ));
+            }
             places.push(place);
         }
         let primary = at as u32 == written.primary;
@@ -1440,6 +1475,15 @@ fn create_table(
         let names: Vec<&str> = ast.name(names).collect();
         let parts: Vec<&str> = ast.name(table).collect();
         let wanted: Vec<&str> = ast.name(wanted).collect();
+        for column in &names {
+            let place = columns.iter().position(|field| same_name(&field.name, column));
+            if place.is_some_and(is_generated) {
+                return Err(Error::binder(format!(
+                    "Failed to create foreign key: referenced column \"{column}\" is a generated \
+                     column"
+                )));
+            }
+        }
         let key = (names.as_slice(), parts.as_slice(), wanted.as_slice());
         foreign.push(foreign_key(catalog, &name, (&columns, &keys), key)?);
     }
@@ -1453,6 +1497,7 @@ fn create_table(
         defaults,
         types,
         checks,
+        generated,
         foreign,
         sequences,
         serials: made,
@@ -1730,6 +1775,137 @@ fn check_text(
     }
 }
 
+/// The expression of each generated column as the SQL it is kept as, refused the way the pin
+/// refuses one when the table is made. Each is bound over the columns in the order they depend on
+/// each other, and a column written without a type takes the type of its expression.
+fn generated_columns(
+    ast: &Ast,
+    defs: &[ast::ColumnDef],
+    columns: &mut [Field],
+    (catalog, parameters, session): (&Catalog, &Parameters, &Session),
+) -> Result<Vec<Option<String>>> {
+    let mut texts = vec![None; defs.len()];
+    let mut uses = vec![Vec::new(); defs.len()];
+    for (at, def) in defs.iter().enumerate() {
+        if def.generated == NONE {
+            continue;
+        }
+        let text = deparse::expression(ast, def.generated);
+        let (parsed, _) = check_ast(&text)?;
+        for expr in &parsed.exprs {
+            match *expr {
+                ast::Expr::Subquery { .. }
+                | ast::Expr::Exists { .. }
+                | ast::Expr::InSubquery { .. }
+                | ast::Expr::QuantifiedSubquery { .. } => {
+                    return Err(Error::parser(format!(
+                        "Expression of generated column \"{}\" contains a subquery, which isn't \
+                         allowed",
+                        columns[at].name
+                    )));
+                }
+                ast::Expr::Lambda { .. } => {
+                    return Err(Error::not_implemented(
+                        "Lambda functions are currently not supported in generated columns.",
+                    ));
+                }
+                ast::Expr::Column { name } if name.len > 1 => {
+                    return Err(Error::parser(
+                        "Qualified (tbl.name) column references are not allowed inside of \
+                         generated column expressions",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for used in columns_in(&text)? {
+            let Some(place) = columns.iter().position(|field| same_name(&field.name, &used)) else {
+                return Err(Error::binder(format!(
+                    "Column \"{used}\" referenced by generated column does not exist"
+                )));
+            };
+            uses[at].push(place);
+        }
+        texts[at] = Some(text);
+    }
+    // After the columns are looked up, since the pin names a missing one first.
+    if defs.iter().all(|def| def.generated != NONE) {
+        return Err(Error::binder(
+            "Creating a table without physical (non-generated) columns is not supported",
+        ));
+    }
+    // Depth first over what each column reads, so a column is bound after every generated column
+    // it reads, and a column that comes back to itself is the pin's circular dependency.
+    let mut order = Vec::new();
+    let mut state = vec![0u8; defs.len()];
+    for start in 0..defs.len() {
+        if texts[start].is_none() || state[start] == 2 {
+            continue;
+        }
+        let mut stack = vec![(start, 0usize)];
+        state[start] = 1;
+        while let Some(&mut (at, ref mut next)) = stack.last_mut() {
+            if let Some(&used) = uses[at].get(*next) {
+                *next += 1;
+                if texts[used].is_none() || state[used] == 2 {
+                    continue;
+                }
+                if state[used] == 1 {
+                    return Err(Error::invalid_input(
+                        "Circular dependency encountered when resolving generated column \
+                         expressions",
+                    ));
+                }
+                state[used] = 1;
+                stack.push((used, 0));
+            } else {
+                state[at] = 2;
+                order.push(at);
+                stack.pop();
+            }
+        }
+    }
+    for at in order {
+        let text = texts[at].as_deref().unwrap_or_default();
+        let (parsed, expr) = check_ast(text)?;
+        if crate::expr::has_aggregate(&parsed, expr) {
+            return Err(Error::binder("Aggregate functions are not supported here"));
+        }
+        let mut binder = Binder::with(catalog, parameters, session);
+        let index = binder.fresh_index();
+        let mut scope = crate::scope::Scope::empty();
+        for (place, field) in columns.iter().enumerate() {
+            scope.push(crate::scope::Visible {
+                table: String::new(),
+                name: field.name.clone(),
+                binding: rudb_plan::ColumnBinding::new(index, place as u32),
+                ty: field.ty.clone(),
+                not_null: false,
+                key: None,
+                default: None,
+                origin: None,
+                qualified: false,
+                also: None,
+                hidden: false,
+                using: None,
+            });
+        }
+        let before = binder.plan_mut().node_count();
+        let bound = binder.bind_expr(&parsed, expr, &scope)?;
+        if !binder.windows.is_empty() {
+            return Err(Error::binder("Window functions are not supported here"));
+        }
+        // A macro can hide a subquery the text did not show, and that binds to a new node.
+        if binder.plan_mut().node_count() > before {
+            return Err(Error::binder("Failed to bind generated column"));
+        }
+        if ast.string(defs[at].ty).is_empty() {
+            columns[at].ty = binder.plan().expr_type(bound).clone();
+        }
+    }
+    Ok(texts)
+}
+
 /// The `CHECK` constraints of a table as the query a write runs over the rows it wrote, or `None`
 /// for a table with none.
 ///
@@ -1883,7 +2059,13 @@ fn alter(
             }
             let checks =
                 checks.iter().map(|text| rename_in(text, old, to)).collect::<Result<Vec<_>>>()?;
-            rudb_catalog::Alteration::RenameColumn { column: at, to: to.to_string(), checks }
+            // The pin writes a generated column over the renamed one with the new name, too.
+            let generated = (0..fields.len())
+                .filter(|_| table.has_generated())
+                .map(|at| table.generated(at).map(|text| rename_in(text, old, to)).transpose())
+                .collect::<Result<Vec<_>>>()?;
+            let to = to.to_string();
+            rudb_catalog::Alteration::RenameColumn { column: at, to, checks, generated }
         }
         ast::AlterAction::AddColumn { column, quiet } => {
             if quiet && place(column.name).is_some() {
@@ -1920,11 +2102,32 @@ fn alter(
             )?);
             rudb_catalog::Alteration::AddColumn { field, default, sequences, declared }
         }
-        ast::AlterAction::DropColumn { column, quiet } => {
+        ast::AlterAction::DropColumn { column, quiet, cascade } => {
             let Some(at) = place(column) else {
                 return if quiet { nothing(Some(name)) } else { Err(missing(column)) };
             };
             let dropped = fields[at].name.as_str();
+            // The generated columns that read the dropped one, and the ones that read those.
+            let mut also: Vec<usize> = Vec::new();
+            let mut reached = vec![at];
+            while let Some(read) = reached.pop() {
+                for other in 0..fields.len() {
+                    if other == at || also.contains(&other) {
+                        continue;
+                    }
+                    if let Some(text) = table.generated(other)
+                        && columns_in(text)?.iter().any(|used| same_name(used, &fields[read].name))
+                    {
+                        also.push(other);
+                        reached.push(other);
+                    }
+                }
+            }
+            if !also.is_empty() && !cascade {
+                return Err(Error::catalog(
+                    "Cannot drop column: column is a dependency of 1 or more generated column(s)",
+                ));
+            }
             let mut kept = Vec::with_capacity(checks.len());
             for text in checks {
                 let used = columns_in(text)?;
@@ -1937,15 +2140,26 @@ fn alter(
                     )));
                 }
             }
+            let mut gone = also.clone();
+            gone.push(at);
+            gone.sort_unstable();
             rewrite =
                 Some(table_rewrite(ast, (catalog, parameters, session), &name, |_, _, out| {
-                    out.remove(at);
+                    for &at in gone.iter().rev() {
+                        out.remove(at);
+                    }
                     Ok(())
                 })?);
-            rudb_catalog::Alteration::DropColumn { column: at, checks: kept }
+            rudb_catalog::Alteration::DropColumn { column: at, checks: kept, also }
         }
         ast::AlterAction::Default { column, default } => {
             let at = found(column)?;
+            if table.generated(at).is_some() {
+                return Err(Error::binder(format!(
+                    "Cannot SET DEFAULT for generated column \"{}\"",
+                    fields[at].name
+                )));
+            }
             let (default, sequences) = if default == NONE {
                 (None, Vec::new())
             } else {
@@ -1955,24 +2169,51 @@ fn alter(
             rudb_catalog::Alteration::Default { column: at, default, sequences }
         }
         ast::AlterAction::NotNull { column, set } => {
-            rudb_catalog::Alteration::NotNull { column: found(column)?, set }
+            let at = found(column)?;
+            if set && table.generated(at).is_some() {
+                return Err(Error::binder("Unsupported constraint for generated column!"));
+            }
+            rudb_catalog::Alteration::NotNull { column: at, set }
         }
         ast::AlterAction::AddKey { columns, primary } => {
             let mut places = Vec::new();
             for column in ast.name(columns) {
                 let at = fields.iter().position(|field| same_name(&field.name, column));
-                places.push(at.ok_or_else(|| {
+                let at = at.ok_or_else(|| {
                     Error::catalog(format!(
                         "table \"{}\" does not have a column named \"{column}\"",
                         name.table
                     ))
-                })?);
+                })?;
+                // The pin says PRIMARY KEY for a UNIQUE as well.
+                if table.generated(at).is_some() {
+                    return Err(Error::binder(format!(
+                        "cannot create a PRIMARY KEY on a generated column: {column}"
+                    )));
+                }
+                places.push(at);
             }
             rudb_catalog::Alteration::AddKey { columns: places, primary }
         }
         ast::AlterAction::Type { column, ty, using } => {
             let at = found(column)?;
             let changed = fields[at].name.as_str();
+            if table.generated(at).is_some() {
+                return Err(Error::binder(
+                    "Using generated columns in alter statement not supported",
+                ));
+            }
+            for (other, field) in fields.iter().enumerate() {
+                if let Some(text) = table.generated(other)
+                    && columns_in(text)?.iter().any(|used| same_name(used, changed))
+                {
+                    return Err(Error::binder(format!(
+                        "This column is referenced by the generated column \"{}\", so its type \
+                         can not be changed",
+                        field.name
+                    )));
+                }
+            }
             if table.keys().iter().any(|key| key.columns.contains(&at)) {
                 return Err(Error::binder(
                     "Cannot change the type of a column that has a UNIQUE or PRIMARY KEY \
@@ -2888,7 +3129,7 @@ fn insert(
     // columns in order, and with one it is whatever the list says, which is also the check that
     // the list names columns the table has and names none of them twice.
     let targets: Vec<usize> = if written.columns.is_empty() {
-        (0..fields.len()).collect()
+        (0..fields.len()).filter(|&at| target.generated(at).is_none()).collect()
     } else {
         let mut targets = Vec::new();
         for column in ast.name(written.columns) {
@@ -2902,6 +3143,9 @@ fn insert(
             )?;
             if targets.contains(&at) {
                 return Err(Error::binder(format!("Duplicate column name \"{column}\" in INSERT")));
+            }
+            if target.generated(at).is_some() {
+                return Err(Error::binder("Cannot insert into a generated column"));
             }
             targets.push(at);
         }
@@ -3028,6 +3272,7 @@ fn insert(
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    let root = generate(&mut binder, (root, index), &fields, target, 0)?;
     let source = finish(binder, root)?;
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
     let conflict = match written.conflict {
@@ -3046,6 +3291,137 @@ fn insert(
         checks,
         patched: None,
     }))
+}
+
+/// Works out the generated columns of rows that have every other column, which is how a generated
+/// column is kept: a write stores its value like any other column's.
+///
+/// The input is `(root, index)`, a projection of the table's `fields` and then `extra` columns the
+/// write carries along. Each generated column gets a projection of its own, in the order they
+/// depend on each other, so a column that reads another generated column sees its new value.
+fn generate(
+    binder: &mut Binder<'_>,
+    (mut root, mut index): (rudb_plan::NodeRef, u32),
+    fields: &[Field],
+    table: &rudb_catalog::Table,
+    extra: usize,
+) -> Result<rudb_plan::NodeRef> {
+    if !table.has_generated() {
+        return Ok(root);
+    }
+    let width = fields.len() + extra;
+    let types: Vec<LogicalType> = {
+        let Node::Project { exprs, .. } = *binder.plan().node(root) else {
+            return Err(Error::internal("a write of generated columns that is not a projection"));
+        };
+        let list = binder.plan().expr_list(exprs);
+        list.iter().map(|&expr| binder.plan().expr_type(expr).clone()).collect()
+    };
+    if types.len() != width {
+        return Err(Error::internal("a write of generated columns of the wrong width"));
+    }
+    for at in generated_order(table)? {
+        let text = table.generated(at).unwrap_or_default();
+        let (parsed, expr) = check_ast(text)?;
+        let mut scope = crate::scope::Scope::empty();
+        for (place, field) in fields.iter().enumerate() {
+            scope.push(crate::scope::Visible {
+                table: String::new(),
+                name: field.name.clone(),
+                binding: rudb_plan::ColumnBinding::new(index, place as u32),
+                ty: types[place].clone(),
+                not_null: false,
+                key: None,
+                default: None,
+                origin: None,
+                qualified: false,
+                also: None,
+                hidden: false,
+                using: None,
+            });
+        }
+        let value = binder.bind_expr(&parsed, expr, &scope)?;
+        let value = binder.checked_cast_to(value, &fields[at].ty, false)?;
+        let mut exprs = Vec::with_capacity(width);
+        let mut names = Vec::with_capacity(width);
+        for (place, ty) in types.iter().enumerate() {
+            exprs.push(if place == at {
+                value
+            } else {
+                let binding = rudb_plan::ColumnBinding::new(index, place as u32);
+                binder.plan_mut().add_expr(Expr::Column(binding), ty.clone())
+            });
+            let name = fields.get(place).map_or("changed", |field| field.name.as_str());
+            names.push(binder.plan_mut().intern(name));
+        }
+        let exprs = binder.plan_mut().add_expr_list(&exprs);
+        let names = binder.plan_mut().add_name_list(&names);
+        index = binder.fresh_index();
+        root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    }
+    Ok(root)
+}
+
+/// The generated columns of a table in an order where each comes after every generated column it
+/// reads. The table refused a circle when it was made, so one is an internal error here.
+fn generated_order(table: &rudb_catalog::Table) -> Result<Vec<usize>> {
+    let fields = table.columns();
+    let mut waiting = Vec::new();
+    for at in 0..fields.len() {
+        if let Some(text) = table.generated(at) {
+            let mut reads = Vec::new();
+            for used in columns_in(text)? {
+                if let Some(place) = fields.iter().position(|field| same_name(&field.name, &used))
+                    && place != at
+                    && table.generated(place).is_some()
+                {
+                    reads.push(place);
+                }
+            }
+            waiting.push((at, reads));
+        }
+    }
+    let mut order = Vec::with_capacity(waiting.len());
+    while !waiting.is_empty() {
+        let Some(ready) =
+            waiting.iter().position(|(_, reads)| reads.iter().all(|read| order.contains(read)))
+        else {
+            return Err(Error::internal("generated columns that read each other in a circle"));
+        };
+        order.push(waiting.remove(ready).0);
+    }
+    Ok(order)
+}
+
+/// The rows of a table with its generated columns worked out again, for an `ON CONFLICT DO UPDATE`
+/// that changed the columns they read.
+fn regenerate(
+    ast: &Ast,
+    (catalog, parameters, session): (&Catalog, &Parameters, &Session),
+    name: &QualifiedName,
+) -> Result<Plan> {
+    let table = catalog.table(name)?;
+    let fields = table.columns();
+    let mut binder = Binder::with(catalog, parameters, session);
+    let (root, scope) =
+        binder.bind_catalog_table(ast, name, name.table.clone(), ast::Slice::default())?;
+    let mut exprs = Vec::with_capacity(fields.len());
+    let mut names = Vec::with_capacity(fields.len());
+    for field in fields {
+        let column = scope
+            .columns
+            .iter()
+            .find(|column| !column.hidden && same_name(&column.name, &field.name))
+            .ok_or_else(|| Error::internal("a table column its own scan does not have"))?;
+        exprs.push(binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone()));
+        names.push(binder.plan_mut().intern(&field.name));
+    }
+    let exprs = binder.plan_mut().add_expr_list(&exprs);
+    let names = binder.plan_mut().add_name_list(&names);
+    let index = binder.fresh_index();
+    let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    let root = generate(&mut binder, (root, index), fields, table, 0)?;
+    finish(binder, root)
 }
 
 /// Whether every row of an `INSERT ... VALUES` writes `DEFAULT` for the value at `from`.
@@ -3120,7 +3496,14 @@ fn bind_conflict(
     };
     let action = match conflict.action {
         ast::ConflictAction::Nothing => ConflictAction::Nothing,
-        ast::ConflictAction::Replace => ConflictAction::Replace(targets.to_vec()),
+        // The row that replaces a held one brings its generated columns, worked out from it.
+        ast::ConflictAction::Replace => ConflictAction::Replace(
+            targets
+                .iter()
+                .copied()
+                .chain((0..fields.len()).filter(|&at| table.generated(at).is_some()))
+                .collect(),
+        ),
         ast::ConflictAction::Update { columns: written, query } => {
             let mut columns = Vec::new();
             for column in ast.name(written) {
@@ -3133,6 +3516,11 @@ fn bind_conflict(
                 if columns.contains(&at) {
                     return Err(Error::binder(format!(
                         "Multiple assignments to same column \"\"{column}\"\""
+                    )));
+                }
+                if table.generated(at).is_some() {
+                    return Err(Error::binder(format!(
+                        "Cant update column \"{column}\" because it is a generated column!"
                     )));
                 }
                 columns.push(at);
@@ -3156,7 +3544,13 @@ fn bind_conflict(
             let index = binder.fresh_index();
             let root =
                 binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
-            ConflictAction::Update { columns, plan: Box::new(finish(binder, root)?) }
+            let plan = Box::new(finish(binder, root)?);
+            let generate = if table.has_generated() {
+                Some(Box::new(regenerate(ast, (catalog, parameters, session), name)?))
+            } else {
+                None
+            };
+            ConflictAction::Update { columns, plan, generate }
         }
     };
     Ok(Conflict { key, action })
@@ -3195,6 +3589,11 @@ fn change(
             fields.iter().position(|field| same_name(&field.name, column)).ok_or_else(|| {
                 Error::binder(format!("Referenced update column {column} not found in table!"))
             })?;
+        if catalog.table(&name)?.generated(at).is_some() {
+            return Err(Error::binder(format!(
+                "Cant update column \"{column}\" because it is a generated column!"
+            )));
+        }
         if targets.contains(&at) {
             return Err(Error::binder(format!(
                 "Multiple assignments to same column \"\"{column}\"\""
@@ -3249,7 +3648,12 @@ fn change(
     // A delete that marks its rows gone needs only which rows those are, so the source reads the
     // columns of the condition and not the rest. See [`Catalog::takes_rows`].
     // A trigger reads every column of the rows it changed, so a statement that fires one keeps them.
-    let narrow = returning.is_none() && parameters.capture().is_none() && catalog.takes_rows(&name);
+    // A generated column is worked out again from the whole new row, so an update of a table with
+    // one reads every column.
+    let narrow = returning.is_none()
+        && parameters.capture().is_none()
+        && catalog.takes_rows(&name)
+        && (delete || !table.has_generated());
     // An update that writes its rows beside the file reads the new values and not the old ones,
     // so a column it does not set is not read at all.
     let patched = (narrow && !delete).then(|| targets.clone());
@@ -3305,6 +3709,7 @@ fn change(
     let names = binder.plan_mut().add_name_list(&names);
     let index = binder.fresh_index();
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
+    let root = if delete { root } else { generate(&mut binder, (root, index), &fields, table, 1)? };
     let source = finish(binder, root)?;
     let write = if delete { Write::Delete } else { Write::Update };
     let checks = if delete { None } else { bind_checks(catalog, parameters, session, &name)? };
