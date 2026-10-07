@@ -2093,7 +2093,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ConsistentExtremes, DECODE, GATHER, PICK, Reach, Standing, Weight, gyo, take, trail, widens,
+        ConsistentExtremes, DECODE, GATHER, PICK, Reach, Standing, Weight, gyo, priced, take,
+        trail, widens,
     };
     use crate::pass::{Context, Pass};
     use rudb_common::LogicalType;
