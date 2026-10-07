@@ -569,6 +569,12 @@ impl Catalog {
                 entry.schema = main.name.clone();
                 continue;
             }
+            // A schema only `system` has, which is `pg_catalog` or `information_schema`, is taken
+            // as written, case and all, and points nowhere new: a bare name is still found in
+            // `system` after the path, and one created there is refused, as on the pin.
+            if entry.catalog.is_empty() && self.schema(SYSTEM_CATALOG, &entry.schema).is_ok() {
+                continue;
+            }
             return Err(Error::catalog(format!(
                 "{set}: No catalog + schema named \"{}\" found.",
                 entry.text()
