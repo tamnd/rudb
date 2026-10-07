@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rudb_common::{LogicalType, Result};
-use rudb_graph::Rids;
+use rudb_graph::{Rids, SPARSE_RATIO};
 
 use crate::graph::{BUDGET_FLOOR, by_part};
 use crate::section::{self, Attachment};
@@ -364,7 +364,10 @@ impl ValueRows {
     pub fn rows_of(&self, codes: &[u32]) -> Result<Rids> {
         let total =
             self.held(codes).ok_or_else(|| invalid("a code past the end of its dictionary"))?;
-        let dense = total.saturating_mul(64) >= self.rows;
+        // Laid out in the form the set settles in, so a set of more than one row in a thousand,
+        // which is `cast_info.note` naming the English voices in 8a, is set straight into its
+        // bitmap rather than gathered, sorted and then set into one.
+        let dense = total.saturating_mul(SPARSE_RATIO) >= self.rows;
         let mut words =
             if dense { vec![0_u64; self.rows.div_ceil(64) as usize] } else { Vec::new() };
         let mut members = if dense { Vec::new() } else { Vec::with_capacity(total as usize) };
@@ -414,8 +417,11 @@ impl ValueRows {
         if dense {
             Rids::from_words(self.rows, words)
         } else {
-            members.sort_unstable();
-            members.dedup();
+            // One value's rows rise already, and only rows from more than one need sorting.
+            if codes.len() + self.whole.len() > 1 {
+                members.sort_unstable();
+                members.dedup();
+            }
             Rids::from_sorted(self.rows, members)
         }
     }
