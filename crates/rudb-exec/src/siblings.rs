@@ -749,9 +749,7 @@ fn values_of(
         .column(column)
         .map_err(|_| Error::internal("a sibling walk compares a column it did not read"))?;
     pass.clear();
-    if !vector.validity().has_nulls(length)
-        && vector.signed_block(values)
-        && values.len() >= length
+    if !vector.validity().has_nulls(length) && vector.signed_block(values) && values.len() >= length
     {
         values.truncate(length);
         pass.resize(length, true);
