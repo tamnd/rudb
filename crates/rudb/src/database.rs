@@ -68,6 +68,19 @@ fn writes_in_with(sql: &str) -> bool {
             .any(|keyword| sql.to_ascii_lowercase().contains(keyword))
 }
 
+/// Whether a statement is one of the types the parser writes in front of a pivot that takes its
+/// values from the data, which hold those values as their labels.
+fn pivot_type(ast: &Ast, statement: ast::Statement) -> bool {
+    matches!(statement, ast::Statement::Type(at)
+        if ast.name_text(ast.types[at as usize].name).starts_with("__pivot_enum_"))
+}
+
+/// Whether a statement may pivot, which needs the path that may write, since a pivot that takes its
+/// values from the data makes the type it reads them from before it runs.
+fn mentions_pivot(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains("pivot")
+}
+
 /// The data changing `WITH` definitions of the statement in `ast` that have not run yet, in the
 /// order they were written, which is the order they run in.
 ///
@@ -4159,7 +4172,7 @@ impl Shared {
         }
         // These answer through the connection rather than the catalog, and `EXECUTE` answers with
         // whatever the statement it runs does, so they take the path that may write.
-        if names_prepared(sql) || writes_in_with(sql) {
+        if names_prepared(sql) || writes_in_with(sql) || mentions_pivot(sql) {
             return self.execute(sql, cancel);
         }
         self.in_transaction(sql, || {
@@ -6375,6 +6388,19 @@ impl Shared {
             && let Some(options) = ast.inserts[at as usize].truncate
         {
             return self.truncate(ast, options, sql, parameters, cancel);
+        }
+        if let [prelude @ .., _] = ast.statements.as_slice()
+            && !prelude.is_empty()
+            && prelude.iter().all(|&statement| pivot_type(ast, statement))
+        {
+            // A pivot that takes its values from the data, after the types it reads them from.
+            let mut last = None;
+            for &statement in &ast.statements {
+                let mut step = ast.clone();
+                step.statements = vec![statement];
+                last = Some(self.execute_ast(&step, sql, parameters, cancel, parse_ns)?);
+            }
+            return last.ok_or_else(|| Error::internal("a pivot with no statement"));
         }
         let unwritten = unwritten_definitions(ast, parameters);
         if !unwritten.is_empty() {
@@ -8837,7 +8863,7 @@ fn simple_cacheable(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
             let parts: Vec<&str> = ast.name(name).collect();
             catalog.resolve(&parts).is_ok_and(|name| catalog.table(&name).is_ok())
         }
-        ast::Source::Function { .. } => false,
+        ast::Source::Function { .. } | ast::Source::Pivot { .. } => false,
         _ => true,
     });
     fixed

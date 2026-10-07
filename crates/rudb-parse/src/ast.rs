@@ -1155,6 +1155,52 @@ pub enum Source {
         /// The `USING` column list, as a run of [`StrRef`].
         using: Slice,
     },
+    /// A `PIVOT` or an `UNPIVOT`, written after a table or as a statement of its own.
+    Pivot {
+        /// Which one, as an index into `Ast::pivots`.
+        pivot: u32,
+    },
+}
+
+/// A `PIVOT` or an `UNPIVOT`.
+///
+/// The statement forms, `PIVOT t ON a USING sum(b)` and `UNPIVOT t ON a, b`, are this under a
+/// `SELECT *`, the way the pin's transformer writes them. The binder turns it into an aggregate or
+/// an unnest over the source, which it can only do once it knows the source's columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pivot {
+    /// What is pivoted.
+    pub source: SourceRef,
+    /// Whether this is an `UNPIVOT`.
+    pub unpivot: bool,
+    /// The aggregates of a pivot, as a run of [`Target`], empty for an unpivot.
+    pub aggregates: Slice,
+    /// The `FOR` or `ON` columns, as a run of [`PivotColumn`].
+    pub columns: Slice,
+    /// The `GROUP BY` names of a pivot, as a run of [`StrRef`].
+    pub groups: Slice,
+    /// The value columns of an unpivot, as a run of [`StrRef`].
+    pub values: Slice,
+    /// Whether an unpivot keeps the rows whose value is null.
+    pub include_nulls: bool,
+    /// The alias, or `NONE`.
+    pub alias: StrRef,
+    /// Column aliases, as a run of [`StrRef`].
+    pub columns_alias: Slice,
+}
+
+/// One column a pivot spreads out or an unpivot gathers in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PivotColumn {
+    /// What a pivot spreads out on, as a run of expressions, one for each value of an entry.
+    pub exprs: Slice,
+    /// The `IN` list, as a run of [`Target`] whose expression is a value, a parenthesised list of
+    /// them or for an unpivot the column read.
+    pub entries: Slice,
+    /// The enum type whose labels are the values, written `IN e` or made from the data, or `NONE`.
+    pub enum_name: StrRef,
+    /// The name column of an unpivot, as a run of [`StrRef`].
+    pub names: Slice,
 }
 
 /// Which join.
@@ -1654,6 +1700,10 @@ pub struct Ast {
     pub windows: Vec<WindowSpec>,
     /// The materialised `WITH` arena.
     pub ctes: Vec<Cte>,
+    /// The `PIVOT` and `UNPIVOT` arena.
+    pub pivots: Vec<Pivot>,
+    /// Backing store for every [`Slice`] of pivot columns.
+    pub pivot_columns: Vec<PivotColumn>,
     /// Backing store for every [`Slice`] of materialised `WITH` indexes.
     pub cte_lists: Vec<u32>,
     /// The named arguments a call keeps as names, each call with a run of targets whose alias is
@@ -1769,6 +1819,73 @@ impl Ast {
     /// One materialised `WITH` definition.
     pub fn cte(&self, index: u32) -> Cte {
         self.ctes[index as usize]
+    }
+
+    /// The expressions directly under `expr`, leaving out the body of a subquery.
+    pub fn children(&self, expr: ExprRef) -> Vec<ExprRef> {
+        let ast = self;
+        let list = |slice: Slice| ast.expr_list(slice).to_vec();
+        let mut out = match ast.expr(expr) {
+            Expr::Star { .. }
+            | Expr::Column { .. }
+            | Expr::Positional { .. }
+            | Expr::Literal { .. }
+            | Expr::Parameter { .. }
+            | Expr::Default
+            | Expr::Subquery { .. }
+            | Expr::Exists { .. } => Vec::new(),
+            Expr::Columns { inner, .. } => vec![inner],
+            Expr::Unary { operand, .. }
+            | Expr::Cast { operand, .. }
+            | Expr::InSubquery { operand, .. }
+            | Expr::QuantifiedSubquery { operand, .. } => vec![operand],
+            Expr::Lambda { body, .. } => vec![body],
+            Expr::Binary { left, right, .. }
+            | Expr::QuantifiedArray { operand: left, array: right, .. } => vec![left, right],
+            Expr::Function { args, filter, .. } => {
+                let mut out = list(args);
+                out.push(filter);
+                out.extend(ast.named_args(expr).iter().map(|target| target.expr));
+                out.extend(ast.aggregate_order(expr).iter().map(|item| item.expr));
+                out
+            }
+            Expr::Window { args, filter, order, spec, .. } => {
+                let held = ast.window(spec);
+                let mut out = list(args);
+                out.push(filter);
+                out.extend(ast.order_list(order).iter().map(|item| item.expr));
+                out.extend(list(held.partition));
+                out.extend(ast.order_list(held.order).iter().map(|item| item.expr));
+                out
+            }
+            Expr::Case { operand, arms, otherwise } => {
+                let mut out = vec![operand, otherwise];
+                for arm in ast.arm_list(arms) {
+                    out.extend([arm.when, arm.then]);
+                }
+                out
+            }
+            Expr::Between { operand, low, high, .. } => vec![operand, low, high],
+            Expr::In { operand, list: items, .. } => {
+                let mut out = vec![operand];
+                out.extend(list(items));
+                out
+            }
+            Expr::List { items } | Expr::Row { items } => list(items),
+            Expr::Struct { values, .. } => list(values),
+        };
+        out.retain(|&child| child != NONE);
+        out
+    }
+
+    /// One `PIVOT` or `UNPIVOT`.
+    pub fn pivot(&self, index: u32) -> Pivot {
+        self.pivots[index as usize]
+    }
+
+    /// The columns of a pivot.
+    pub fn pivot_column_list(&self, slice: Slice) -> &[PivotColumn] {
+        &self.pivot_columns[slice.range()]
     }
 
     /// The materialised `WITH` definitions a query introduces, outermost first.

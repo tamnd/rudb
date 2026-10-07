@@ -13332,3 +13332,55 @@ fn a_result_knows_the_table_column_of_each_plain_column() {
         connection.execute("INSERT INTO t VALUES (2, 'y', 3) RETURNING c, a * 2").expect("runs");
     assert_eq!([returned.origin(0), returned.origin(1)], [of(2), None]);
 }
+
+#[test]
+fn a_pivot_spreads_the_values_it_is_given_or_the_ones_the_data_has() {
+    let db = Database::new();
+    db.execute(
+        "CREATE TABLE t AS SELECT * FROM (VALUES (1, 2, 10), (1, 3, 20), (2, 2, 5)) v(a, b, c)",
+    )
+    .expect("creates");
+    let names = |sql: &str| db.query(sql).expect("runs").names().to_vec();
+    assert_eq!(
+        names("PIVOT t ON a USING sum(c), count(*)"),
+        ["b", "1_sum(c)", "1_count_star()", "2_sum(c)", "2_count_star()"]
+    );
+    assert_eq!(
+        names("SELECT * FROM t PIVOT (sum(c) AS s FOR a IN (1 AS one, 2))"),
+        ["b", "one_s", "2_s"]
+    );
+    let counted = rows(&db, "SELECT * FROM (PIVOT t ON a GROUP BY b) ORDER BY b");
+    assert_eq!(
+        counted,
+        vec![
+            vec![Value::Integer(2), Value::BigInt(1), Value::BigInt(1)],
+            vec![Value::Integer(3), Value::BigInt(1), Value::BigInt(0)],
+        ]
+    );
+    let error = db.query("PIVOT t ON a USING c").expect_err("refused");
+    assert!(error.to_string().contains("Columns can only be referenced within the aggregate"));
+    db.execute("SET pivot_limit = 2").expect("sets");
+    let error = db.query("PIVOT t ON a IN (1, 2)").expect_err("refused");
+    assert!(error.to_string().contains("Pivot column limit of 2 exceeded"), "{error}");
+}
+
+#[test]
+fn an_unpivot_takes_columns_apart_into_rows() {
+    let db = Database::new();
+    db.execute("CREATE TABLE t AS SELECT * FROM (VALUES (1, 2, NULL), (2, 3, 4)) v(a, b, c)")
+        .expect("creates");
+    assert_eq!(
+        rows(&db, "UNPIVOT t ON b, c"),
+        vec![
+            vec![Value::Integer(1), Value::Varchar("b".into()), Value::Integer(2)],
+            vec![Value::Integer(2), Value::Varchar("b".into()), Value::Integer(3)],
+            vec![Value::Integer(2), Value::Varchar("c".into()), Value::Integer(4)],
+        ]
+    );
+    let names =
+        db.query("SELECT * FROM t UNPIVOT INCLUDE NULLS (v FOR n IN (b, c)) AS u").expect("runs");
+    assert_eq!(names.names(), ["a", "n", "v"]);
+    assert_eq!(names.rows().count(), 4);
+    let error = db.query("UNPIVOT t ON b + c").expect_err("refused");
+    assert!(error.to_string().contains("contains multiple (b, c)"));
+}

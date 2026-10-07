@@ -277,9 +277,9 @@ fn distinct_sits_above_the_projection() {
 }
 
 #[test]
-fn distinct_cannot_order_by_something_it_does_not_select() {
-    let message = failure("SELECT DISTINCT url FROM hits ORDER BY counter");
-    assert!(message.contains("must appear in the select list"), "{message}");
+fn distinct_ordered_by_something_it_does_not_select_is_distinct_on_what_it_selects() {
+    let text = plan("SELECT DISTINCT url FROM hits ORDER BY counter");
+    assert!(text.contains("Distinct on=[#"), "{text}");
 }
 
 #[test]

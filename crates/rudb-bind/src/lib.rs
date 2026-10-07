@@ -32,6 +32,7 @@ mod macros;
 mod maps;
 mod parameters;
 mod pgcalls;
+mod pivot;
 mod query_text;
 mod scope;
 mod state;
