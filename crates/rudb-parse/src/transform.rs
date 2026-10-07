@@ -3367,6 +3367,7 @@ impl<'a> Transform<'a> {
         let filter = self.find(action, "WhereClause");
         let condition =
             if filter == NONE { NONE } else { self.expr(self.find(filter, "Expression"))? };
+        let sets = sets.into_iter().map(Into::into).collect();
         let action = self.ast.conflict_update(
             &mut self.interned,
             name,
@@ -3513,6 +3514,7 @@ impl<'a> Transform<'a> {
         let using = if written == NONE { None } else { Some(self.sources(written)?) };
         let filter = self.find(node, "WhereClause");
         let filter = if filter == NONE { NONE } else { self.expr(self.first(filter))? };
+        let sets = sets.into_iter().map(Into::into).collect();
         let change = Change { name, alias, sets, filter, using, returning, delete, truncate: None };
         Ok(self.ast.changed_rows(&mut self.interned, change, self.current_span))
     }

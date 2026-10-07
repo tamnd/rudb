@@ -351,6 +351,15 @@ impl Error {
         self.field(|fields| fields.unplaced = true)
     }
 
+    /// The same error at `span`, or with no position when there is no span.
+    #[must_use]
+    pub fn placed_at(self, span: Option<Span>) -> Self {
+        match span {
+            Some(span) => self.with_span(span),
+            None => self.unplaced(),
+        }
+    }
+
     fn field(mut self, set: impl FnOnce(&mut Fields)) -> Self {
         set(self.0.fields.get_or_insert_with(Box::default));
         self

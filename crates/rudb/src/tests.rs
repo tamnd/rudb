@@ -13554,7 +13554,7 @@ fn a_postgres_session_inserts_fewer_values_than_columns() {
         (
             "INSERT INTO t (a, b) VALUES (1)",
             "INSERT has more target columns than expressions",
-            None,
+            Some(Span::new(18, 19)),
         ),
     ] {
         let error = connection.execute(sql).expect_err(sql);

@@ -10,7 +10,7 @@ use rudb_parse::ast::{
     Conflict, ConflictAction, ExprRef, Insert, Overriding, QueryRef, Slice, Statement, StrRef,
     Truncate,
 };
-use rudb_parse::build::Change;
+use rudb_parse::build::{Assignment, Change};
 
 use super::{Made, Transform, clause, not_yet};
 use crate::nodes::{
@@ -126,9 +126,10 @@ impl Transform<'_> {
             if !target.indirection.is_empty() {
                 return clause("InsertIndirection");
             }
-            parts.push(self.intern(target.name.as_deref().unwrap_or_default()));
+            let column = self.intern(target.name.as_deref().unwrap_or_default());
+            parts.push((column, Some(self.at(target.location))));
         }
-        let columns = self.ast.part_slice(parts);
+        let columns = self.ast.placed_part_slice(parts);
         // `DEFAULT VALUES` has no query, and the grammar takes no column list with it.
         let source = match &insert.selectStmt {
             None => NONE,
@@ -269,7 +270,7 @@ impl Transform<'_> {
     ///
     /// The grammar gives `(a, b) = source` as one target for each column, each with the same
     /// source and the place of its column in the list.
-    fn sets(&mut self, list: &List) -> Made<Vec<(StrRef, ExprRef)>> {
+    fn sets(&mut self, list: &List) -> Made<Vec<Assignment>> {
         let mut sets = Vec::with_capacity(list.len());
         let mut row = Vec::new();
         for node in list.iter().flatten() {
@@ -294,7 +295,7 @@ impl Transform<'_> {
                 Some(node) => self.expr(node)?,
                 None => return clause("ResTarget"),
             };
-            sets.push((column, value));
+            sets.push(Assignment { column, span: Some(self.at(target.location)), value });
         }
         Ok(sets)
     }
