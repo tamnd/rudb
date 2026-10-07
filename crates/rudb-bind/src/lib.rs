@@ -30,6 +30,7 @@ mod lambda;
 mod listaggr;
 mod macros;
 mod maps;
+mod ordinality;
 mod parameters;
 mod pgcalls;
 mod pivot;

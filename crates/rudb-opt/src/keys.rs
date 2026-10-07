@@ -451,10 +451,17 @@ pub(crate) fn copied(
             renames.push((index, fresh));
             Some(node)
         }
-        Node::TableFunction { index, function, args, options, settings, columns } => {
+        Node::TableFunction { index, function, args, options, settings, columns, ordinality } => {
             let fresh = walk::fresh_index(plan);
-            let copy =
-                Node::TableFunction { index: fresh, function, args, options, settings, columns };
+            let copy = Node::TableFunction {
+                index: fresh,
+                function,
+                args,
+                options,
+                settings,
+                columns,
+                ordinality,
+            };
             let node = plan.add_node_at(copy, span);
             carry(plan, index, fresh);
             renames.push((index, fresh));

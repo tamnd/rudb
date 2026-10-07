@@ -4513,12 +4513,12 @@ impl<'a> Transform<'a> {
             }
             // `TableFunction <- TableFunctionLateralOpt / TableFunctionAliasColon`, and
             // `TableFunctionLateralOpt <- Lateral? QualifiedTableFunction TableFunctionArguments
-            // WithOrdinality? TableAlias?`. The colon form is its own work and `WITH ORDINALITY`
-            // adds a column, so both are turned away rather than dropped. `LATERAL` is read and
-            // dropped, for the reason given above `TableSubquery`.
+            // WithOrdinality? TableAlias?`. The colon form is its own work, so it is turned away
+            // rather than dropped. `WITH ORDINALITY` is kept beside the source. `LATERAL` is read
+            // and dropped, for the reason given above `TableSubquery`.
             "TableFunction" => {
                 let form = self.first(inner);
-                for name in ["TableAliasColon", "WithOrdinality", "SampleClause"] {
+                for name in ["TableAliasColon", "SampleClause"] {
                     let clause = self.find(form, name);
                     if clause != NONE {
                         return self.unsupported(clause);
@@ -4534,7 +4534,18 @@ impl<'a> Transform<'a> {
                 }
                 let args = self.target_slice(args);
                 let (alias, columns) = self.table_alias(self.find(form, "TableAlias"));
-                Ok(self.push_source(Source::Function { name, args, alias, columns, pragma: false }))
+                let ordinality = self.find(form, "WithOrdinality") != NONE;
+                let source = self.push_source(Source::Function {
+                    name,
+                    args,
+                    alias,
+                    columns,
+                    pragma: false,
+                });
+                if ordinality {
+                    self.ast.ordinal_sources.push(source);
+                }
+                Ok(source)
             }
             "ValuesRef" => {
                 if self.find(inner, "TableAliasColon") != NONE {
@@ -9210,10 +9221,17 @@ mod tests {
 
     #[test]
     fn the_forms_of_a_table_function_this_does_not_cover_are_turned_away_by_name() {
-        for query in ["SELECT * FROM range(3) WITH ORDINALITY", "SELECT * FROM t: range(3)"] {
-            let error = parse_ast(query).unwrap_err().to_string();
-            assert!(error.contains("grammar rule"), "{query} failed with {error}");
-        }
+        let query = "SELECT * FROM t: range(3)";
+        let error = parse_ast(query).unwrap_err().to_string();
+        assert!(error.contains("grammar rule"), "{query} failed with {error}");
+    }
+
+    #[test]
+    fn with_ordinality_marks_the_source_it_is_written_on() {
+        let ast = parse_ast("SELECT * FROM range(3) WITH ORDINALITY, range(2)").unwrap();
+        assert_eq!(ast.ordinal_sources.len(), 1);
+        let ast = parse_ast("SELECT * FROM range(3)").unwrap();
+        assert!(ast.ordinal_sources.is_empty());
     }
 
     #[test]

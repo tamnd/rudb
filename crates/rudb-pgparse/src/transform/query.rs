@@ -493,12 +493,18 @@ impl Transform<'_> {
         Ok(self.ast.push_source(join, self.span))
     }
 
-    /// A function in `FROM`. `WITH ORDINALITY`, `ROWS FROM` and a column definition list are not
-    /// built yet.
+    /// A function in `FROM`, with `WITH ORDINALITY` kept beside it. `ROWS FROM` and a column
+    /// definition list are not built yet.
     fn function_source(&mut self, function: &RangeFunction) -> Made<SourceRef> {
+        let source = self.function_call_source(function)?;
         if function.ordinality {
-            return clause("WithOrdinality");
+            self.ast.ordinal_sources.push(source);
         }
+        Ok(source)
+    }
+
+    /// The source of the call of a function in `FROM`.
+    fn function_call_source(&mut self, function: &RangeFunction) -> Made<SourceRef> {
         if function.is_rowsfrom || function.functions.len() != 1 || !function.coldeflist.is_empty()
         {
             return clause("RowsFrom");

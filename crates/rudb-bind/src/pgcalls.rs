@@ -474,22 +474,23 @@ impl Binder<'_> {
         integers
     }
 
-    /// A projection over the series `node` that casts its BIGINT column to an `int4`.
+    /// A projection over the series `node` that casts its BIGINT column to an `int4`. The value is
+    /// the first column, and the number of `WITH ORDINALITY` after it stays a BIGINT.
     pub(crate) fn integer_series(&mut self, node: NodeRef, mut scope: Scope) -> (NodeRef, Scope) {
         let index = self.fresh_index();
         let mut exprs = Vec::with_capacity(scope.columns.len());
         let mut names = Vec::with_capacity(scope.columns.len());
-        for column in &scope.columns {
+        for (at, column) in scope.columns.iter().enumerate() {
             let read = self.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
             exprs.push(match column.ty {
-                LogicalType::BigInt => self.cast_to(read, &LogicalType::Integer),
+                LogicalType::BigInt if at == 0 => self.cast_to(read, &LogicalType::Integer),
                 _ => read,
             });
             names.push(self.plan_mut().intern(&column.name));
         }
         for (at, column) in scope.columns.iter_mut().enumerate() {
             column.binding = ColumnBinding::new(index, at as u32);
-            if column.ty == LogicalType::BigInt {
+            if at == 0 && column.ty == LogicalType::BigInt {
                 column.ty = LogicalType::Integer;
             }
         }

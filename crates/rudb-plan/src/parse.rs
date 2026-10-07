@@ -181,6 +181,7 @@ impl Reader<'_> {
                 let (options, settings) = read_options(plan, c)?;
                 let index = read_table_index(c)?;
                 let columns = read_schema(plan, c)?;
+                let ordinality = c.eat_word("ordinality");
                 Ok(Built::leaf(Node::TableFunction {
                     index,
                     function,
@@ -188,6 +189,7 @@ impl Reader<'_> {
                     options,
                     settings,
                     columns,
+                    ordinality,
                 }))
             }
             "LateralFunction" => {
@@ -198,6 +200,7 @@ impl Reader<'_> {
                 let (options, settings) = read_options(plan, c)?;
                 let index = read_table_index(c)?;
                 let columns = read_schema(plan, c)?;
+                let ordinality = c.eat_word("ordinality");
                 Ok(Built::unary(move |input| Node::LateralFunction {
                     input,
                     index,
@@ -206,6 +209,7 @@ impl Reader<'_> {
                     options,
                     settings,
                     columns,
+                    ordinality,
                 }))
             }
             "Fetch" => {

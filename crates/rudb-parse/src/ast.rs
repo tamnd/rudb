@@ -1765,6 +1765,9 @@ pub struct Ast {
     /// with the field it selects, or [`NONE`] for a subscript. `(x).a` names its column `a`, and
     /// a call of `struct_extract` written by hand names it for the function.
     pub indirections: Vec<(ExprRef, StrRef)>,
+    /// The function sources written `WITH ORDINALITY`, which have one more column that numbers
+    /// their rows from 1. Kept to one side because few sources have it.
+    pub ordinal_sources: Vec<SourceRef>,
     /// The text the statements were parsed from, which `current_query()` answers with. Shared,
     /// so the binder can keep it for the statement without copying it.
     pub source: Arc<str>,
@@ -2005,6 +2008,11 @@ impl Ast {
     /// The call of a function source as an expression, when the grammar kept one.
     pub fn source_call(&self, source: SourceRef) -> Option<ExprRef> {
         self.source_calls.iter().find(|(held, _)| *held == source).map(|&(_, call)| call)
+    }
+
+    /// Whether a function source was written `WITH ORDINALITY`.
+    pub fn with_ordinality(&self, source: SourceRef) -> bool {
+        self.ordinal_sources.contains(&source)
     }
 
     /// The field that a call made of a field selection selects, [`NONE`] for a call made of a

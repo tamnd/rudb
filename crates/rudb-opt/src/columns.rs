@@ -110,6 +110,9 @@ fn narrow(
 ) {
     let empty = BTreeSet::new();
     match *plan.node(node) {
+        // The number of `WITH ORDINALITY` is the last column the call makes, so the columns of
+        // such a call stay as they are.
+        Node::TableFunction { ordinality: true, .. } => {}
         // A `VALUES` list keeps its columns on purpose rather than by omission. The rows are already
         // in the plan, so narrowing one saves reading nothing and would cost a rewrite of every row.
         Node::Get { index, columns, .. }

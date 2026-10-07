@@ -2487,7 +2487,7 @@ impl<'a> Building<'a, '_> {
         let plan = self.plan;
         let id = self.shape.operator(reference);
         let pipeline = self.shape.pipeline(reference);
-        let Node::TableFunction { index, function, args, options, settings, columns } =
+        let Node::TableFunction { index, function, args, options, settings, columns, ordinality } =
             *plan.node(reference)
         else {
             return Err(Error::internal("a table function was built from a node that is not one"));
@@ -2522,8 +2522,16 @@ impl<'a> Building<'a, '_> {
             Some(TableFunction::Unnest) => {
                 let dummy = Dummy::new();
                 let below = dummy.schema().clone();
-                let unnest = LateralUnnest::new(plan, &below, index, args, columns, self.cancel)?
-                    .in_session(self.session);
+                let unnest = LateralUnnest::new(
+                    plan,
+                    &below,
+                    index,
+                    args,
+                    columns,
+                    ordinality,
+                    self.cancel,
+                )?
+                .in_session(self.session);
                 let schema = unnest.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Unnest", None);
                 Segment::new(Arc::new(dummy), below)
@@ -2539,6 +2547,7 @@ impl<'a> Building<'a, '_> {
                     function.name(),
                     args,
                     columns,
+                    ordinality,
                     self.cancel,
                 )?
                 .in_session(self.session);
@@ -2689,8 +2698,8 @@ impl<'a> Building<'a, '_> {
                 Segment::new(Arc::new(Watched::new(table, counters)), schema)
             }
             _ => {
-                let series =
-                    Series::new(plan, index, name, args, self.session.session_time_zone())?;
+                let time_zone = self.session.session_time_zone();
+                let series = Series::new(plan, index, name, args, time_zone, ordinality)?;
                 let schema = series.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Series", Some(name));
                 Segment::new(Arc::new(Watched::new(series, counters)), schema)
@@ -3463,13 +3472,20 @@ impl<'a> Building<'a, '_> {
                 Segment::new(Arc::new(Watched::new(values, counters)), schema)
             }
             Node::TableFunction { .. } => self.table_function(reference)?.reads(),
-            Node::LateralFunction { input, index, function, args, columns, .. } => {
+            Node::LateralFunction { input, index, function, args, columns, ordinality, .. } => {
                 let below = self.node(input)?;
                 let name = plan.string(function);
                 if TableFunction::lookup(name) == Some(TableFunction::Unnest) {
-                    let unnest =
-                        LateralUnnest::new(plan, &below.schema, index, args, columns, self.cancel)?
-                            .in_session(self.session);
+                    let unnest = LateralUnnest::new(
+                        plan,
+                        &below.schema,
+                        index,
+                        args,
+                        columns,
+                        ordinality,
+                        self.cancel,
+                    )?
+                    .in_session(self.session);
                     let schema = unnest.schema().clone();
                     let counters = self.watch(reference, id, pipeline, "Unnest", None);
                     return Ok(below.then(Arc::new(Watched::new(unnest, counters)), schema));
@@ -3485,6 +3501,7 @@ impl<'a> Building<'a, '_> {
                         name,
                         args,
                         columns,
+                        ordinality,
                         self.cancel,
                     )?
                     .in_session(self.session);
@@ -3499,6 +3516,7 @@ impl<'a> Building<'a, '_> {
                     name,
                     args,
                     columns,
+                    ordinality,
                     self.cancel,
                 )?
                 .in_session(self.session);

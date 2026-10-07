@@ -437,8 +437,16 @@ fn number(plan: &mut Plan, scan: NodeRef) -> Option<ColumnBinding> {
         }
         return Some(ColumnBinding::new(index, at));
     }
-    let Node::TableFunction { index, function, args, options, settings, columns } =
-        *plan.node(scan)
+    // A column after the ordinality would take its place as the last.
+    let Node::TableFunction {
+        index,
+        function,
+        args,
+        options,
+        settings,
+        columns,
+        ordinality: false,
+    } = *plan.node(scan)
     else {
         return None;
     };

@@ -214,6 +214,10 @@ pub enum Node {
         settings: Slice,
         /// The produced columns with their types, into the field pool.
         columns: Slice,
+        /// Whether the last of `columns` is the `BIGINT` of `WITH ORDINALITY`, which numbers the
+        /// rows of the call from 1. Only a call that knows the place of each of its rows has one,
+        /// and the columns of such a call are not narrowed.
+        ordinality: bool,
     },
     /// A table function evaluated once per row of its input, which is what `LATERAL` means.
     ///
@@ -246,6 +250,9 @@ pub enum Node {
         settings: Slice,
         /// The produced columns with their types, into the field pool, not counting the input's.
         columns: Slice,
+        /// Whether the last of `columns` is the `BIGINT` of `WITH ORDINALITY`, which numbers the
+        /// rows that each input row makes from 1.
+        ordinality: bool,
     },
     /// A predicate over the input, keeping the rows where it is true.
     ///
@@ -905,6 +912,7 @@ mod tests {
                 options: Slice::EMPTY,
                 settings: Slice::EMPTY,
                 columns: Slice::EMPTY,
+                ordinality: false,
             },
             Node::LateralFunction {
                 input: 0,
@@ -914,6 +922,7 @@ mod tests {
                 options: Slice::EMPTY,
                 settings: Slice::EMPTY,
                 columns: Slice::EMPTY,
+                ordinality: false,
             },
             Node::Filter { input: 0, predicate: 0 },
             Node::Project { input: 0, index: 0, exprs: Slice::EMPTY, names: Slice::EMPTY },

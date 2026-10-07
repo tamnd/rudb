@@ -3068,6 +3068,78 @@ fn a_function_in_from_is_a_relation_and_a_row_has_the_fields_f1_to_fn() {
     server.stop().unwrap();
 }
 
+/// `WITH ORDINALITY` numbers the rows of a function in `FROM` from 1, in a BIGINT column named
+/// `ordinality` that a column list can rename. A lateral call numbers the rows of each outer row.
+#[test]
+fn with_ordinality_numbers_the_rows_of_a_function_in_from() {
+    let dirs = Dirs::new("ordinal");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        let shape = messages.iter().find(|m| m.tag == b'T').unwrap();
+        let names: Vec<String> = row_shape(shape).into_iter().map(|(name, ..)| name).collect();
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(String::new, |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        (names.join(","), rows.join(";"))
+    };
+    // The values and the names of the columns of the PostgreSQL 19 oracle.
+    for (sql, names, rows) in [
+        (
+            "select * from generate_series(1, 2) with ordinality",
+            "generate_series,ordinality",
+            "1|1;2|2",
+        ),
+        ("select * from generate_series(1, 2) with ordinality g", "g,ordinality", "1|1;2|2"),
+        ("select * from generate_series(1, 2) with ordinality as t(a)", "a,ordinality", "1|1;2|2"),
+        (
+            "select * from unnest(array['a', 'b']) with ordinality as u(x, i) where i > 1",
+            "x,i",
+            "b|2",
+        ),
+        ("select * from repeat('ab', 2) with ordinality", "repeat,ordinality", "abab|1"),
+        (
+            "select * from regexp_split_to_table('a,b', ',') with ordinality r",
+            "r,ordinality",
+            "a|1;b|2",
+        ),
+        (
+            "select * from pg_input_error_info('x', 'int4') with ordinality",
+            "message,detail,hint,sql_error_code,ordinality",
+            "invalid input syntax for type integer: \"x\"|||22P02|1",
+        ),
+        (
+            "select * from (values (2), (3)) v(n), lateral generate_series(1, v.n) with ordinality g(x, i) order by 1, 3",
+            "n,x,i",
+            "2|1|1;2|2|2;3|1|1;3|2|2;3|3|3",
+        ),
+        (
+            "select pg_typeof(g), pg_typeof(ordinality) from generate_series(1, 1) with ordinality g",
+            "pg_typeof,pg_typeof",
+            "integer|bigint",
+        ),
+    ] {
+        assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
+    }
+    let messages = client.query("select * from upper('x') with ordinality as u(a, b, c)");
+    let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').as_deref(), Some("42P10"));
+    assert_eq!(
+        error.field(b'M').as_deref(),
+        Some("table \"u\" has 2 columns available but 3 columns specified")
+    );
+    server.stop().unwrap();
+}
+
 #[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");

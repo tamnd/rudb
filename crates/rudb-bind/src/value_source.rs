@@ -11,6 +11,7 @@ use rudb_parse::{Ast, NONE, ast};
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef};
 
 use crate::binder::Binder;
+use crate::ordinality::ORDINALITY;
 use crate::scope::{Scope, Visible};
 use crate::structs::STRUCT_EXTRACT;
 
@@ -48,6 +49,7 @@ impl Binder<'_> {
         call: ast::ExprRef,
         alias: ast::StrRef,
         columns: ast::Slice,
+        ordinality: bool,
     ) -> Result<(NodeRef, Scope)> {
         let written = match ast.expr(call) {
             ast::Expr::Function { name, .. } => {
@@ -76,6 +78,22 @@ impl Binder<'_> {
         if let Some(index) = index {
             input = self.plan_unnests(input, index, &unnests)?;
         }
+        // `WITH ORDINALITY` numbers the elements of an unnest, and the one row of any other call
+        // is 1. An unnest of more than one level would number only the last level.
+        let number = match (ordinality, index) {
+            (false, _) => None,
+            (true, None) => Some(self.add_constant(Value::BigInt(1))),
+            (true, Some(_)) if unnests.iter().all(|call| call.depth == 1) => {
+                let binding = self.ordinality_column(input)?;
+                Some(self.add_expr(Expr::Column(binding), LogicalType::BigInt))
+            }
+            (true, Some(_)) => {
+                return Err(Error::not_implemented(
+                    "WITH ORDINALITY for an unnest of more than one level",
+                ));
+            }
+        };
+        let number = number.map(|expr| (expr, ORDINALITY.to_owned()));
         let label = if alias == NONE { written.clone() } else { ast.string(alias).to_owned() };
         let ty = self.plan().expr_type(value).clone();
         // A row is computed once and its fields are read from the column that holds it.
@@ -87,7 +105,14 @@ impl Binder<'_> {
                 .state(SqlState::SYNTAX_ERROR));
             }
             LogicalType::Struct(fields) => {
-                let (row, held) = self.project(input, &[(value, written)]);
+                // The number passes through the projection of the row, as the fields read only it.
+                let mut inner = vec![(value, written)];
+                inner.extend(number.clone());
+                let (row, held) = self.project(input, &inner);
+                let number = number.map(|(_, name)| {
+                    let expr = self.plan_mut().add_expr(Expr::Column(held[1]), LogicalType::BigInt);
+                    (expr, name)
+                });
                 let column = self.plan_mut().add_expr(Expr::Column(held[0]), ty.clone());
                 let mut exprs = Vec::with_capacity(fields.len());
                 for (at, field) in fields.iter().enumerate() {
@@ -97,11 +122,14 @@ impl Binder<'_> {
                     let expr = self.add_expr(Expr::Function { name, args }, field.ty.clone());
                     exprs.push((expr, field.name.clone()));
                 }
+                exprs.extend(number);
                 self.scoped(row, &exprs, &label)
             }
             _ => {
                 let name = if alias == NONE { written } else { label.clone() };
-                self.scoped(input, &[(value, name)], &label)
+                let mut exprs = vec![(value, name)];
+                exprs.extend(number);
+                self.scoped(input, &exprs, &label)
             }
         };
         scope.relabel(&label);
