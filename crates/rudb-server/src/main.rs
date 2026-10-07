@@ -3,13 +3,27 @@
 //! PostgreSQL, `SIGTERM` starts a smart shutdown, `SIGINT` a fast one and `SIGQUIT` an immediate
 //! one. `SIGHUP` reloads the configuration files.
 
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::ExitCode;
+#[cfg(unix)]
 use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
 use rudb_server::{Config, Init, Server, Shutdown, init};
 
+/// The server waits with `poll(2)` and listens on Unix sockets, so it is built for Unix only. On
+/// any other system the binary says so and stops.
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("rudb-server: runs only on Unix");
+    std::process::ExitCode::FAILURE
+}
+
+#[cfg(unix)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -52,6 +66,7 @@ fn main() -> ExitCode {
 /// the last argument for the data directory, `-U` or `--username` for the name of the superuser,
 /// `--pwfile` for a file with the password of the superuser on its first line, and `-A` or
 /// `--auth`, `--auth-local` and `--auth-host` for the methods in `pg_hba.conf`.
+#[cfg(unix)]
 fn init_args(args: &[String]) -> Result<(PathBuf, Init), String> {
     let mut data = None;
     let mut superuser = None;
@@ -105,6 +120,7 @@ fn init_args(args: &[String]) -> Result<(PathBuf, Init), String> {
     Ok((data, options))
 }
 
+#[cfg(unix)]
 fn run(args: &[String]) -> ExitCode {
     let config = match Config::from_args(args) {
         Ok(config) => config,
@@ -178,6 +194,7 @@ fn run(args: &[String]) -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 fn signal_set() -> libc::sigset_t {
     // SAFETY: `sigemptyset` sets up the whole set before `sigaddset` reads it.
     unsafe {
