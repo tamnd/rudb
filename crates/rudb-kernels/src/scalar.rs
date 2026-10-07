@@ -4487,6 +4487,9 @@ pub fn call_values(
             }
         }
         ("/", [left, right]) => divide(left, right, returns),
+        ("||", [Value::Blob(left), Value::Blob(right)]) => {
+            Ok(Value::Blob([&left[..], right].concat()))
+        }
         ("||", [left, right]) => Ok(Value::Varchar(format!("{left}{right}"))),
         ("lower", [only]) => Ok(Value::Varchar(only.to_string().to_lowercase())),
         ("error", [message]) => Err(Error::invalid_input(message.to_string())),

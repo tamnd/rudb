@@ -2570,6 +2570,11 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
                     };
                     (vec![wanted.clone(), wanted.clone()], wanted)
                 }
+                // Two blobs are joined as bytes and give a blob, and a null takes the other side.
+                (LogicalType::Blob, LogicalType::Blob | LogicalType::Null)
+                | (LogicalType::Null, LogicalType::Blob) => {
+                    (vec![LogicalType::Blob; 2], LogicalType::Blob)
+                }
                 _ => (vec![LogicalType::Varchar; 2], LogicalType::Varchar),
             }
         }

@@ -1094,6 +1094,35 @@ fn a_parameter_alone_in_the_select_list_has_its_declared_type() {
 }
 
 #[test]
+fn a_value_of_no_type_takes_the_type_of_a_bytea_or_of_the_elements_of_an_array() {
+    let dirs = Dirs::new("bytea_array");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table t (b bytea, a int4[])");
+    let cases: [(&str, &[u32], u32); 4] = [
+        ("select b || $1 from t", &[17], 17),
+        ("select $1 || b from t", &[17], 17),
+        ("select array_append(a, $1) from t", &[23], 1007),
+        ("select array_prepend($1, a) from t", &[23], 1007),
+    ];
+    for (sql, types, column) in cases {
+        client.parse("", sql, &[]);
+        client.describe(Target::Statement, "");
+        let messages = client.sync();
+        assert_eq!(tags(&messages), "1tTZ", "{sql}");
+        assert_eq!(parameter_types(&messages[1]), types, "{sql}");
+        assert_eq!(row_shape(&messages[2])[0].1, column, "{sql}");
+    }
+    // Two `bytea` values are joined as bytes, and a string literal next to one is a `bytea`.
+    let sql = "select '\\xff'::bytea || '\\x00', array_append(array[1, 2], '3')";
+    let messages = client.query(sql);
+    assert_eq!(row_shape(&messages[0]).iter().map(|c| c.1).collect::<Vec<_>>(), [17, 1007]);
+    assert_eq!(data_row(&messages[1]), [Some(b"\\xff00".to_vec()), Some(b"{1,2,3}".to_vec())]);
+    server.stop().unwrap();
+}
+
+#[test]
 fn fetch_first_is_a_limit_and_a_negative_count_is_the_error_of_postgres() {
     let dirs = Dirs::new("fetch_first");
     let server = Server::start(dirs.config()).unwrap();
