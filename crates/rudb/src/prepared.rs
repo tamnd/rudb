@@ -85,9 +85,10 @@ struct Described {
 /// This is the trickle insert, one row or a few per statement, and binding it builds a plan of a
 /// projection over a `VALUES` only for the executor to walk it back down to the rows. So the shape is
 /// read once here, and an execution that finds a plain table under the name puts the row straight
-/// in. Anything the shape does not settle by itself, a constraint, a default or a value that needs
-/// more than a widening to fit its column, goes the long way, so the errors and the answers are
-/// the ones the plan gives.
+/// in. A column the statement leaves out gets its default here when the default is a constant, a
+/// `nextval` or the time of the transaction. Anything else the shape does not settle by itself, a
+/// constraint, another default or a value that needs more than a widening to fit its column, goes
+/// the long way, so the errors and the answers are the ones the plan gives.
 #[derive(Debug, Clone)]
 pub(crate) struct Direct {
     /// The table's name, as it was written.
@@ -107,11 +108,11 @@ pub(crate) struct Direct {
 /// changes until the catalog does. The insert itself moves the generation on, so it is the
 /// generation after the insert that is kept.
 #[derive(Debug, Default)]
-pub(crate) struct Found(Mutex<Option<(u64, QualifiedName, Vec<usize>)>>);
+pub(crate) struct Found(Mutex<Option<(u64, QualifiedName, Targets)>>);
 
 impl Found {
     /// The name and targets found at `generation`, taken out so the caller can hand them back.
-    pub(crate) fn take(&self, generation: u64) -> Option<(QualifiedName, Vec<usize>)> {
+    pub(crate) fn take(&self, generation: u64) -> Option<(QualifiedName, Targets)> {
         let mut found = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match found.take() {
             Some((at, name, targets)) if at == generation => Some((name, targets)),
@@ -120,9 +121,29 @@ impl Found {
     }
 
     /// Keeps `name` and `targets` as what the catalog holds at `generation`.
-    pub(crate) fn keep(&self, generation: u64, name: QualifiedName, targets: Vec<usize>) {
+    pub(crate) fn keep(&self, generation: u64, name: QualifiedName, targets: Targets) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, name, targets));
     }
+}
+
+/// Where the items of a [`Direct`] row land, and what goes into the columns the row leaves out.
+#[derive(Debug, Clone)]
+pub(crate) struct Targets {
+    /// The column of each item, in the order of the items.
+    pub(crate) at: Vec<usize>,
+    /// Each column the row leaves out that has a default, with the default.
+    pub(crate) fills: Vec<(usize, Fill)>,
+}
+
+/// A column default that a [`Direct`] insert can supply with no plan.
+#[derive(Debug, Clone)]
+pub(crate) enum Fill {
+    /// A constant, already of the column's type.
+    Value(Value),
+    /// `nextval('name')`, by the number of the sequence's counter.
+    Next(u64),
+    /// `now()` or `current_timestamp`, the start of the transaction.
+    Now,
 }
 
 impl Clone for Found {

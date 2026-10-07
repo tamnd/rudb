@@ -1356,6 +1356,21 @@ impl Settings {
         session
     }
 
+    /// A UTC instant shifted to the wall clock of the session's time zone. It reads the session
+    /// that [`Settings::session`] keeps and does not copy it.
+    pub(crate) fn local_micros(&self, micros: i64) -> i64 {
+        let changes = self.changes.load(AtomicOrdering::Acquire);
+        {
+            let built = self.built.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some((at, session)) = built.as_ref()
+                && *at == changes
+            {
+                return session.local_micros(micros);
+            }
+        }
+        self.session().local_micros(micros)
+    }
+
     /// The session the settings come to now, built from nothing.
     ///
     /// The locks are taken once each here rather than once per name through [`Settings::value`].

@@ -98,6 +98,54 @@ fn a_column_list_leaves_nulls_and_defaults_behind() {
 }
 
 #[test]
+fn the_defaults_the_short_way_fills_land_as_the_plan_lands_them() {
+    let db = Database::new();
+    db.execute("CREATE SEQUENCE s").expect("creates");
+    twins(
+        &db,
+        "id INTEGER DEFAULT nextval('s'), n INTEGER, k BIGINT DEFAULT 7, \
+         word VARCHAR DEFAULT 'it''s', flag BOOLEAN DEFAULT true, gone INTEGER DEFAULT NULL, \
+         stamp TIMESTAMPTZ DEFAULT now(), wall TIMESTAMP DEFAULT current_timestamp",
+    );
+    let one = db.prepare("INSERT INTO a (n) VALUES (?)").expect("prepares");
+    assert_eq!(one.explain(), "InsertOne a");
+    // In one transaction `now()` is one value, so the two tables can be compared as they are.
+    db.execute("BEGIN").expect("begins");
+    for n in 0..3 {
+        both(&db, "(n)", &[Value::Integer(n)], true);
+    }
+    let many = db.prepare("INSERT INTO a (n) VALUES (3), (4)").expect("prepares");
+    many.execute(&[]).expect("inserts");
+    db.execute("INSERT INTO b (n) SELECT * FROM (VALUES (3), (4))").expect("inserts");
+    db.execute("COMMIT").expect("commits");
+    let columns = "n, k, word, flag, gone, stamp, wall";
+    let sql = |table: &str| format!("SELECT {columns} FROM {table} ORDER BY n");
+    assert_eq!(rows(&db, &sql("a")), rows(&db, &sql("b")));
+    // Each row of each table moved the sequence once, in the order the rows went in.
+    let ids = |table: &str| rows(&db, &format!("SELECT id FROM {table} ORDER BY n"));
+    let int =
+        |values: &[i32]| values.iter().map(|&id| vec![Value::Integer(id)]).collect::<Vec<_>>();
+    assert_eq!(ids("a"), int(&[1, 3, 5, 7, 8]));
+    assert_eq!(ids("b"), int(&[2, 4, 6, 9, 10]));
+
+    // A default that is not one of those, or a precision the plan does not round to, is the
+    // plan's.
+    for column in ["k BIGINT DEFAULT 1 + 1", "k DOUBLE DEFAULT 2.5", "k TIMESTAMP(3) DEFAULT now()"]
+    {
+        db.execute("DROP TABLE IF EXISTS c").expect("drops");
+        db.execute(&format!("CREATE TABLE c (n INTEGER, {column})")).expect("creates");
+        let one = db.prepare("INSERT INTO c (n) VALUES (?)").expect("prepares");
+        assert_eq!(one.explain(), "PIPELINE", "{column}");
+        one.execute(&[Value::Integer(1)]).expect("inserts");
+        assert_eq!(rows(&db, "SELECT count(k) FROM c")[0][0], Value::BigInt(1), "{column}");
+    }
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM a WHERE stamp IS NULL OR wall IS NULL")[0][0],
+        Value::BigInt(0)
+    );
+}
+
+#[test]
 fn constraints_refuse_in_the_plans_words() {
     let db = Database::new();
     twins(&db, "id INTEGER PRIMARY KEY, qty INTEGER NOT NULL CHECK (qty > 0)");
