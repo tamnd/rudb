@@ -203,14 +203,16 @@ fn an_update_commits_beside_rows_appended_since() {
 }
 
 #[test]
-fn an_update_of_a_row_the_transaction_added_does_not_commit_beside_rows_appended_since() {
+fn an_update_of_a_row_the_transaction_added_commits_beside_rows_appended_since() {
     let (_database, one, two) = two();
     one.execute("BEGIN").expect("begins");
     one.execute("INSERT INTO t VALUES (5, 50)").expect("inserts");
     one.execute("UPDATE t SET v = 51 WHERE id = 5").expect("updates");
     two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
-    fails(&one, "COMMIT", "Failed to commit");
-    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+    one.execute("COMMIT").expect("commits");
+    let all = ints(&[(1, 10), (2, 20), (3, 30), (5, 51)]);
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), all);
+    fails(&two, "INSERT INTO t VALUES (5, 0)", "Duplicate key \"id: 5\"");
 }
 
 #[test]
@@ -250,24 +252,53 @@ fn a_delete_commits_beside_rows_appended_since() {
 }
 
 #[test]
-fn a_delete_of_a_row_the_transaction_added_does_not_commit_beside_rows_appended_since() {
+fn a_delete_of_a_row_the_transaction_added_commits_beside_rows_appended_since() {
     let (_database, one, two) = two();
     one.execute("BEGIN").expect("begins");
     one.execute("INSERT INTO t VALUES (5, 50), (6, 60)").expect("inserts");
     one.execute("DELETE FROM t WHERE id = 5").expect("deletes");
     two.execute("INSERT INTO t VALUES (3, 30)").expect("inserts");
-    fails(&one, "COMMIT", "Failed to commit");
-    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(1, 10), (2, 20), (3, 30)]));
+    one.execute("COMMIT").expect("commits");
+    let all = ints(&[(1, 10), (2, 20), (3, 30), (6, 60)]);
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), all);
+    two.execute("INSERT INTO t VALUES (5, 55)").expect("inserts");
 }
 
 #[test]
-fn a_delete_does_not_commit_beside_another_delete() {
+fn a_delete_commits_beside_another_delete() {
     let (_database, one, two) = two();
+    one.execute("INSERT INTO t VALUES (3, 30), (4, 40)").expect("inserts");
     one.execute("BEGIN").expect("begins");
     one.execute("DELETE FROM t WHERE id = 2").expect("deletes");
+    one.execute("UPDATE t SET v = 41 WHERE id = 4").expect("updates");
     two.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    one.execute("COMMIT").expect("commits");
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), ints(&[(3, 30), (4, 41)]));
+    let lookup = two.prepare("SELECT v FROM t WHERE id = ?").expect("prepares");
+    let found = lookup.execute(&[Value::Integer(4)]).expect("reads");
+    assert_eq!(found.rows().collect::<Vec<_>>(), vec![vec![Value::Integer(41)]]);
+}
+
+#[test]
+fn an_update_commits_beside_a_delete() {
+    let (_database, one, two) = two();
+    one.execute("BEGIN").expect("begins");
+    one.execute("UPDATE t SET v = 21 WHERE id = 2").expect("updates");
+    two.execute("DELETE FROM t WHERE id = 1").expect("deletes");
+    one.execute("COMMIT").expect("commits");
+    assert_eq!(rows(&two, "SELECT id, v FROM t ORDER BY id"), ints(&[(2, 21)]));
+}
+
+#[test]
+fn a_delete_without_a_key_does_not_commit_beside_another_delete() {
+    let (_database, one, two) = two();
+    one.execute("CREATE TABLE u (id INTEGER, v INTEGER)").expect("creates");
+    one.execute("INSERT INTO u VALUES (1, 10), (2, 20)").expect("inserts");
+    one.execute("BEGIN").expect("begins");
+    one.execute("DELETE FROM u WHERE id = 2").expect("deletes");
+    two.execute("DELETE FROM u WHERE id = 1").expect("deletes");
     fails(&one, "COMMIT", "Failed to commit");
-    assert_eq!(rows(&one, "SELECT id, v FROM t ORDER BY id"), ints(&[(2, 20)]));
+    assert_eq!(rows(&one, "SELECT id, v FROM u ORDER BY id"), ints(&[(2, 20)]));
 }
 
 #[test]
@@ -280,8 +311,7 @@ fn transactions_on_threads_that_delete_update_and_append_all_land() {
         for me in 1..=8 {
             let connection = database.connect();
             scope.spawn(move || {
-                // A delete moves rows, so a transaction that began before another one's delete
-                // committed fails its commit and goes again.
+                // A commit can still fail when it meets another one, so it goes again.
                 for round in 0..rounds {
                     loop {
                         connection.execute("BEGIN").expect("begins");
@@ -525,6 +555,39 @@ fn a_delete_committed_beside_rows_appended_since_survives_a_crash() {
         drop(database);
         remove(&path);
     }
+}
+
+#[test]
+fn a_commit_beside_another_delete_survives_a_crash() {
+    let path = file("found");
+    let database = Database::open(path.to_str().expect("UTF-8")).expect("opens");
+    let one = database.connect();
+    let two = database.connect();
+    one.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").expect("creates");
+    one.execute("INSERT INTO t SELECT i, i * 10 FROM range(1, 6) r(i)").expect("inserts");
+    one.execute("BEGIN").expect("begins");
+    one.execute("DELETE FROM t WHERE id = 4").expect("deletes");
+    one.execute("UPDATE t SET v = 55 WHERE id = 5").expect("updates");
+    one.execute("INSERT INTO t VALUES (9, 90)").expect("inserts");
+    two.execute("DELETE FROM t WHERE id = 1 OR id = 2").expect("deletes");
+    one.execute("COMMIT").expect("commits");
+    // The records after the commit have to land on the rows the commit put down.
+    two.execute("UPDATE t SET v = 99 WHERE id = 9").expect("updates");
+    two.execute("DELETE FROM t WHERE id = 3").expect("deletes");
+    two.execute("INSERT INTO t VALUES (7, 70)").expect("inserts");
+    drop((one, two));
+    std::mem::forget(database);
+
+    let database = Database::open(path.to_str().expect("UTF-8")).expect("reopens");
+    let connection = database.connect();
+    assert_eq!(
+        rows(&connection, "SELECT id, v FROM t ORDER BY id"),
+        ints(&[(5, 55), (7, 70), (9, 99)])
+    );
+    fails(&connection, "INSERT INTO t VALUES (9, 0)", "Duplicate key \"id: 9\"");
+    drop(connection);
+    drop(database);
+    remove(&path);
 }
 
 #[test]

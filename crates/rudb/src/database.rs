@@ -4011,8 +4011,13 @@ impl Shared {
         let id = self.registry().begin(at);
         *self.conn.catalog.write() = base.clone();
         *self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner) = shadow;
-        open.snapshot =
-            Some(txn::Snapshot { id, base, at, written: std::collections::HashMap::new() });
+        open.snapshot = Some(txn::Snapshot {
+            id,
+            base,
+            at,
+            written: std::collections::HashMap::new(),
+            renumbered: false,
+        });
         self.conn.private.store(true, Ordering::Release);
     }
 
@@ -5199,7 +5204,9 @@ impl Shared {
             && let Some(staged) = staged
             && let Some(journal) = self.committed_journal().as_mut()
         {
-            journal.absorb(staged);
+            // Records that number rows the commit found elsewhere would replay onto other rows,
+            // so the commit checkpoints instead.
+            if snapshot.renumbered { journal.dirty() } else { journal.absorb(staged) }
         }
         self.inner.registry.end(snapshot.id, commit && merged.is_ok());
         if commit && merged.is_ok() {

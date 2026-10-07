@@ -73,6 +73,9 @@ pub(crate) struct Snapshot {
     pub(crate) at: u64,
     /// What it did to each table it wrote rows of, by oid.
     pub(crate) written: HashMap<i64, Written>,
+    /// Whether the commit found the rows it changed under new numbers, so the row numbers in the
+    /// records it staged for the log name other rows, see [`rebase`].
+    pub(crate) renumbered: bool,
 }
 
 impl Snapshot {
@@ -578,7 +581,7 @@ pub(crate) fn merge(
             if written.appends() {
                 let written = snapshot.written.remove(&table.oid()).expect("asked just above");
                 let changes = written.into_changes().ok_or_else(commit_conflict)?;
-                return rebase(committed, &name, before, table, changes, workers);
+                return rebase(committed, &name, before, table, changes, workers).map(|_| ());
             }
         }
         // Only rows changed here, so the committed catalog keeps its shape and takes this
@@ -600,7 +603,7 @@ pub(crate) fn merge(
                 continue;
             }
             let changes = written.into_changes().ok_or_else(commit_conflict)?;
-            rebase(&mut next, &name, before, table, changes, workers)?;
+            snapshot.renumbered |= rebase(&mut next, &name, before, table, changes, workers)?;
         }
         *committed = next;
         return Ok(());
@@ -640,6 +643,12 @@ pub(crate) fn merge(
 /// it did not write or take out a row it added itself, since the log numbers that row as the copy
 /// did.
 ///
+/// When others took rows out since, the rows have new numbers, and a table with a key finds each
+/// row the transaction updated or took out again by its key, see [`found_again`]. So does a
+/// transaction that wrote a row it added while others added rows. Then it says so, because the
+/// numbers in the records the transaction staged for the log are not the numbers of those rows
+/// any more.
+///
 /// Anything else is done again on every row of the table read into memory, as long as the table
 /// still has the snapshot's rows and no more.
 fn rebase(
@@ -649,7 +658,7 @@ fn rebase(
     mine: &Table,
     changes: Vec<Change>,
     workers: usize,
-) -> Result<()> {
+) -> Result<bool> {
     let appends = changes.iter().all(|change| matches!(change, Change::Insert(_)));
     if appends {
         let chunks = changes
@@ -661,7 +670,7 @@ fn rebase(
             .flatten()
             .collect::<Vec<_>>();
         let table = committed.table_appending(name)?;
-        return table.append_committing(chunks, workers).map_err(failed_commit);
+        return table.append_committing(chunks, workers).map_err(failed_commit).map(|()| false);
     }
     let base = before.rows().len() as u64;
     let now = committed.table(name)?;
@@ -687,7 +696,27 @@ fn rebase(
         if !own.is_empty() {
             table.append_committing(own, workers).map_err(failed_commit)?;
         }
-        return Ok(());
+        return Ok(false);
+    }
+    // The rows the transaction added go on the end as its copy has them now, so what it did to
+    // them needs no doing again here, only the log numbers them as the copy did.
+    if let Some(done) = Redone::of(&changes, base)
+        && mine.rows().len() as u64 >= base - done.deleted.len() as u64
+        && let Some((updated, deleted)) = found_again(before, now, &done)?
+    {
+        let kept = base - done.deleted.len() as u64;
+        let numbers = done.updated.iter().copied().collect::<Vec<_>>();
+        let rows = picked(mine, &copied(&numbers, &done.deleted))?;
+        let own = picked(mine, &(kept..mine.rows().len() as u64).collect::<Vec<_>>())?;
+        let table = committed.table_appending(name)?;
+        if !table.put_rows(&updated, &rows)? {
+            return Err(commit_conflict());
+        }
+        table.remove_rows(&deleted, workers)?;
+        if !own.is_empty() {
+            table.append_committing(own, workers).map_err(failed_commit)?;
+        }
+        return Ok(true);
     }
     // Row numbers only mean the same rows while nothing committed since moved a row or added one,
     // since the transaction's own appends were numbered from the snapshot's end.
@@ -706,6 +735,49 @@ fn rebase(
     }
     let table = committed.table_mut(name)?;
     if moves { table.replace_all(chunks, workers) } else { table.update_all(chunks, workers) }
+        .map(|()| false)
+}
+
+/// The numbers in `now` of the snapshot's rows that `done` updated and took out, found by a key of
+/// the table, or `None` when the table has no key it finds rows by, a row is not there any more,
+/// a row there is not the snapshot's row, or the rows are not in the snapshot's order.
+///
+/// The transaction holds the rows it wrote, so nobody can change them after it wrote them. A
+/// commit before that can, and then the row is not the snapshot's and the commit fails, as it
+/// would have for a write of that row at its own number.
+fn found_again(before: &Table, now: &Table, done: &Redone) -> Result<Option<(Vec<u64>, Vec<u64>)>> {
+    if now.columns() != before.columns() {
+        return Ok(None);
+    }
+    let Some(key) = now.guards().into_iter().map(|key| key.columns).find(|key| now.finds_by(key))
+    else {
+        return Ok(None);
+    };
+    let all = (0..now.columns().len()).collect::<Vec<_>>();
+    let find = |numbers: &[u64]| -> Result<Option<Vec<u64>>> {
+        let mut found: Vec<u64> = Vec::with_capacity(numbers.len());
+        for chunk in picked(before, numbers)? {
+            for row in 0..chunk.len() {
+                let values =
+                    key.iter().map(|&column| chunk.value_at(row, column)).collect::<Vec<_>>();
+                let Some(Some((spot, held))) = now.spot(&key, &values, &all)? else {
+                    return Ok(None);
+                };
+                let same = (0..all.len())
+                    .all(|column| held.value_at(0, column) == chunk.value_at(row, column));
+                if !same || found.last().is_some_and(|&last| spot.number <= last) {
+                    return Ok(None);
+                }
+                found.push(spot.number);
+            }
+        }
+        Ok(Some(found))
+    };
+    let updated = done.updated.iter().copied().collect::<Vec<_>>();
+    let (Some(updated), Some(deleted)) = (find(&updated)?, find(&done.deleted)?) else {
+        return Ok(None);
+    };
+    Ok(Some((updated, deleted)))
 }
 
 /// What a transaction's changes to one table did to the snapshot's rows, by the snapshot's numbers
