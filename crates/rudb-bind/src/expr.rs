@@ -12,8 +12,8 @@
 
 use rudb_common::{
     CharacterTypes, DeclaredType, Error, Field, LogicalType, MAX_DECIMAL_WIDTH, NumberLiterals,
-    Result, Semantics, Session, SqlState, StateKey, Value, is_clustering_setting, looks_like_rule,
-    rule_names,
+    OperatorRules, Result, Semantics, Session, SqlState, StateKey, UnknownTypes, Value,
+    is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -595,7 +595,7 @@ impl Binder<'_> {
         let constant = self.add_constant(value.clone());
         // A null has no type, and in PostgreSQL it is a null of the type of its parameter.
         if value.is_null()
-            && self.session.postgres().is_some()
+            && self.semantics.unknown_types() == UnknownTypes::Postgres
             && let Some(ty) = self.parameters.declared_type(name)
             && let Some(ty) = rudb_pgtypes::logical_type(ty.oid)
         {
@@ -976,8 +976,10 @@ impl Binder<'_> {
             [left, right] = sides;
         }
         let mut op = op;
-        if self.session.postgres().is_some() {
+        if self.semantics.unknown_types() == UnknownTypes::Postgres {
             self.unknown_operand(op, &mut left, &mut right);
+        }
+        if self.semantics.operator_rules() == OperatorRules::Postgres {
             // A string literal joined to a `bytea` is a `bytea` too.
             if op == BinaryOp::Concat {
                 let literal = |at: usize| {
@@ -1063,7 +1065,7 @@ impl Binder<'_> {
         }
         // A division in PostgreSQL over an exact number that is not an integer is a `numeric`
         // division, which picks its own scale, so `1.0 / 3` is `0.33333333333333333333`.
-        if self.session.postgres().is_some()
+        if self.semantics.operator_rules() == OperatorRules::Postgres
             && matches!(op, BinaryOp::Divide | BinaryOp::IntegerDivide)
         {
             let types = [left, right].map(|arg| self.plan().expr_type(arg).clone());
@@ -1862,7 +1864,7 @@ impl Binder<'_> {
         let mut value = bound[element];
         let list = self.plan().expr_type(bound[1 - element]).clone();
         if let LogicalType::List(inner) = list
-            && self.session.postgres().is_some()
+            && self.semantics.unknown_types() == UnknownTypes::Postgres
             && (self.is_placeholder(value) || untyped[element])
         {
             value = self.cast_to(value, &inner);
@@ -2386,7 +2388,7 @@ impl Binder<'_> {
         let mut resolved = resolve(resolved_name, &types)?;
         // A parameter of no type in a PostgreSQL session prefers a string to a blob, as an
         // `unknown` argument prefers the string category there, so `repeat($1, 2)` repeats text.
-        if self.session.postgres().is_some() {
+        if self.semantics.unknown_types() == UnknownTypes::Postgres {
             let mut texts = types.clone();
             for (at, arg) in args.iter().enumerate() {
                 if resolved.arguments.get(at) == Some(&LogicalType::Blob)

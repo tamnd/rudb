@@ -196,6 +196,7 @@ pub struct Semantics {
     join_columns: JoinColumns,
     null_on_division_by_zero: bool,
     number_literals: NumberLiterals,
+    operator_rules: OperatorRules,
     order_by_non_integer_literal: bool,
     pivot_limit: u64,
     regex_match_full: bool,
@@ -203,6 +204,7 @@ pub struct Semantics {
     show_behavior: ShowBehavior,
     single_arrow_lambdas: bool,
     type_names: TypeNames,
+    unknown_types: UnknownTypes,
     values_names: ValuesNames,
     warnings_as_errors: bool,
 }
@@ -225,6 +227,7 @@ impl Default for Semantics {
             join_columns: JoinColumns::InPlace,
             null_on_division_by_zero: false,
             number_literals: NumberLiterals::Pin,
+            operator_rules: OperatorRules::Pin,
             order_by_non_integer_literal: false,
             pivot_limit: 100_000,
             regex_match_full: false,
@@ -232,6 +235,7 @@ impl Default for Semantics {
             show_behavior: ShowBehavior::Auto,
             single_arrow_lambdas: false,
             type_names: TypeNames::Pin,
+            unknown_types: UnknownTypes::Pin,
             values_names: ValuesNames::FromZero,
             warnings_as_errors: false,
         }
@@ -293,6 +297,16 @@ impl Semantics {
     #[must_use]
     pub fn type_names(self) -> TypeNames {
         self.type_names
+    }
+    /// The rules of the operators that are different between the dialects.
+    #[must_use]
+    pub fn operator_rules(self) -> OperatorRules {
+        self.operator_rules
+    }
+    /// How a parameter or a literal of no type gets its type.
+    #[must_use]
+    pub fn unknown_types(self) -> UnknownTypes {
+        self.unknown_types
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -495,6 +509,31 @@ pub enum NumberLiterals {
     Pin,
     /// As in PostgreSQL: a number with an exponent, an integer past `bigint` and a decimal past 38
     /// digits are a `numeric`, and an integer literal keeps its own type.
+    Postgres,
+}
+
+/// The rules of the operators that are different between the dialects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OperatorRules {
+    /// The operators of DuckDB.
+    #[default]
+    Pin,
+    /// The operators of PostgreSQL where they are different: `date - date` is an `int4`, `/`
+    /// divides an `interval`, a division of two exact numbers where one is not an integer is a
+    /// `numeric` division, and a string literal joined to a `bytea` is a `bytea`.
+    Postgres,
+}
+
+/// How a parameter or a literal of no type gets its type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnknownTypes {
+    /// As in DuckDB: a parameter takes the type that the function resolution of rudb gives it.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a parameter of no type takes the type of the other operand, of the
+    /// elements of an array, of the column that an `INSERT` writes or the `bigint` of a `LIMIT`.
+    /// It prefers `text` to a `bytea`, and it is a `text` as a result column or as the argument of
+    /// `min` or `max`. A null parameter has the type that the client declared for it.
     Postgres,
 }
 
@@ -901,6 +940,8 @@ impl Session {
             self.semantics.column_names = ColumnNames::Postgres;
             self.semantics.number_literals = NumberLiterals::Postgres;
             self.semantics.type_names = TypeNames::Postgres;
+            self.semantics.operator_rules = OperatorRules::Postgres;
+            self.semantics.unknown_types = UnknownTypes::Postgres;
         }
         self.postgres = Postgreses(postgres);
     }
