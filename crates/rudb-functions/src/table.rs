@@ -69,9 +69,9 @@ use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_kernels::json::scan;
 
 use crate::entrycatalog::{
-    column_fields, constraint_fields, database_fields, index_fields, schema_fields,
-    sequence_fields, show_database_fields, show_expanded_fields, show_table_fields, table_fields,
-    trigger_fields, view_fields,
+    column_fields, constraint_fields, database_fields, dependency_fields, index_fields,
+    schema_fields, sequence_fields, show_database_fields, show_expanded_fields, show_table_fields,
+    table_fields, trigger_fields, view_fields,
 };
 use crate::functioncatalog::function_fields;
 use crate::settingcatalog::setting_fields;
@@ -147,6 +147,8 @@ pub enum TableFunction {
     DuckdbSequences,
     /// `duckdb_indexes()`, every index somebody created with `CREATE INDEX`.
     DuckdbIndexes,
+    /// `duckdb_dependencies()`, which entry of the default database needs which other one.
+    DuckdbDependencies,
     /// `duckdb_constraints()`, every constraint of every table.
     DuckdbConstraints,
     /// `duckdb_columns()`, every column of every one of those.
@@ -161,6 +163,8 @@ pub enum TableFunction {
     DuckdbGrammarExtensions,
     /// `duckdb_variables()`, every variable `SET VARIABLE` has left in this session.
     DuckdbVariables,
+    /// `duckdb_prepared_statements()`, every statement `PREPARE` has named in this session.
+    DuckdbPreparedStatements,
     /// `pragma_table_info(name)`, the columns of one table or view, in SQLite's six columns.
     PragmaTableInfo,
     /// `pragma_show(name)`, the same columns again in the six `DESCRIBE` answers with.
@@ -227,6 +231,7 @@ impl TableFunction {
             Self::DuckdbTriggers => "duckdb_triggers",
             Self::DuckdbSequences => "duckdb_sequences",
             Self::DuckdbIndexes => "duckdb_indexes",
+            Self::DuckdbDependencies => "duckdb_dependencies",
             Self::DuckdbConstraints => "duckdb_constraints",
             Self::DuckdbColumns => "duckdb_columns",
             Self::DuckdbExtensions => "duckdb_extensions",
@@ -234,6 +239,7 @@ impl TableFunction {
             Self::DuckdbDialects => "duckdb_dialects",
             Self::DuckdbGrammarExtensions => "duckdb_grammar_extensions",
             Self::DuckdbVariables => "duckdb_variables",
+            Self::DuckdbPreparedStatements => "duckdb_prepared_statements",
             Self::PragmaTableInfo => "pragma_table_info",
             Self::PragmaShow => "pragma_show",
             Self::PragmaStorageInfo => "pragma_storage_info",
@@ -470,6 +476,9 @@ impl TableFunction {
         if name.eq_ignore_ascii_case("duckdb_indexes") {
             return Some(Self::DuckdbIndexes);
         }
+        if name.eq_ignore_ascii_case("duckdb_dependencies") {
+            return Some(Self::DuckdbDependencies);
+        }
         if name.eq_ignore_ascii_case("duckdb_constraints") {
             return Some(Self::DuckdbConstraints);
         }
@@ -490,6 +499,9 @@ impl TableFunction {
         }
         if name.eq_ignore_ascii_case("duckdb_variables") {
             return Some(Self::DuckdbVariables);
+        }
+        if name.eq_ignore_ascii_case("duckdb_prepared_statements") {
+            return Some(Self::DuckdbPreparedStatements);
         }
         if name.eq_ignore_ascii_case("pragma_table_info") {
             return Some(Self::PragmaTableInfo);
@@ -876,6 +888,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbTriggers
         | TableFunction::DuckdbSequences
         | TableFunction::DuckdbIndexes
+        | TableFunction::DuckdbDependencies
         | TableFunction::DuckdbConstraints
         | TableFunction::DuckdbColumns
         | TableFunction::DuckdbExtensions
@@ -883,6 +896,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::DuckdbDialects
         | TableFunction::DuckdbGrammarExtensions
         | TableFunction::DuckdbVariables
+        | TableFunction::DuckdbPreparedStatements
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo
@@ -916,6 +930,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbTriggers => Some(trigger_fields()),
         TableFunction::DuckdbSequences => Some(sequence_fields()),
         TableFunction::DuckdbIndexes => Some(index_fields()),
+        TableFunction::DuckdbDependencies => Some(dependency_fields()),
         TableFunction::DuckdbConstraints => Some(constraint_fields()),
         TableFunction::DuckdbColumns => Some(column_fields()),
         TableFunction::DuckdbExtensions => Some(extension_fields()),
@@ -923,6 +938,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         TableFunction::DuckdbDialects => Some(dialect_fields()),
         TableFunction::DuckdbGrammarExtensions => Some(grammar_extension_fields()),
         TableFunction::DuckdbVariables => Some(variable_fields()),
+        TableFunction::DuckdbPreparedStatements => Some(prepared_statement_fields()),
         TableFunction::PragmaVersion => Some(version_fields()),
         TableFunction::PragmaPlatform => Some(platform_fields()),
         TableFunction::PragmaUserAgent => Some(user_agent_fields()),
@@ -1428,6 +1444,20 @@ pub fn variable_fields() -> Vec<Field> {
         Field::new("name", LogicalType::Varchar),
         Field::new("value", LogicalType::Varchar),
         Field::new("type", LogicalType::Varchar),
+    ]
+}
+
+/// The columns `duckdb_prepared_statements()` produces, which are the pin's four. Each type is
+/// written out as text, and a list is null where the pin has nothing to say, see
+/// `rudb_common::PreparedStatement`.
+#[must_use]
+pub fn prepared_statement_fields() -> Vec<Field> {
+    let names = LogicalType::list(LogicalType::Varchar);
+    vec![
+        Field::new("name", LogicalType::Varchar),
+        Field::new("statement", LogicalType::Varchar),
+        Field::new("parameter_types", names.clone()),
+        Field::new("result_types", names),
     ]
 }
 

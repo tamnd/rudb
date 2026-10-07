@@ -72,8 +72,9 @@ use crate::enginenames::{
     version,
 };
 use crate::entrynames::{
-    columnnames, constraintnames, databasenames, indexnames, schemanames, sequencenames,
-    showdatabases, showtables, showtablesexpanded, tablenames, triggernames, viewnames,
+    columnnames, constraintnames, databasenames, dependencies, indexnames, schemanames,
+    sequencenames, showdatabases, showtables, showtablesexpanded, tablenames, triggernames,
+    viewnames,
 };
 use crate::fetch::{Fetch, TableFetch};
 use crate::functionnames::functionnames;
@@ -93,7 +94,7 @@ use crate::recursive::{Fixpoint, Fold};
 use crate::register::registries;
 use crate::schema::Schema;
 use crate::setop::SetOp;
-use crate::settingnames::{settingnames, variablenames};
+use crate::settingnames::{preparednames, settingnames, variablenames};
 use crate::siblings::{Children, Siblings, Walk};
 use crate::sideways::{self, Exact, Keyed, Sideways, Stored};
 use crate::sort::Sort;
@@ -2568,6 +2569,7 @@ impl<'a> Building<'a, '_> {
                 | TableFunction::DuckdbTriggers
                 | TableFunction::DuckdbSequences
                 | TableFunction::DuckdbIndexes
+                | TableFunction::DuckdbDependencies
                 | TableFunction::DuckdbConstraints
                 | TableFunction::DuckdbColumns
                 | TableFunction::DuckdbExtensions
@@ -2575,6 +2577,7 @@ impl<'a> Building<'a, '_> {
                 | TableFunction::DuckdbDialects
                 | TableFunction::DuckdbGrammarExtensions
                 | TableFunction::DuckdbVariables
+                | TableFunction::DuckdbPreparedStatements
                 | TableFunction::PragmaVersion
                 | TableFunction::PragmaPlatform
                 | TableFunction::PragmaUserAgent
@@ -2613,6 +2616,9 @@ impl<'a> Building<'a, '_> {
                         sequencenames(self.catalog, plan, index, columns)?
                     }
                     TableFunction::DuckdbIndexes => indexnames(self.catalog, plan, index, columns)?,
+                    TableFunction::DuckdbDependencies => {
+                        dependencies(self.catalog, plan, index, columns)?
+                    }
                     TableFunction::DuckdbConstraints => {
                         constraintnames(self.catalog, plan, index, columns)?
                     }
@@ -2627,6 +2633,9 @@ impl<'a> Building<'a, '_> {
                     }
                     TableFunction::DuckdbVariables => {
                         variablenames(self.session, plan, index, columns)?
+                    }
+                    TableFunction::DuckdbPreparedStatements => {
+                        preparednames(self.session, plan, index, columns)?
                     }
                     TableFunction::PragmaVersion => version(plan, index, columns)?,
                     TableFunction::PragmaPlatform => platform(plan, index, columns)?,

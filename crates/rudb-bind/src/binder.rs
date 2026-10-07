@@ -588,6 +588,14 @@ impl<'a> Binder<'a> {
         *self.started.get_or_insert_with(|| begun.unwrap_or_else(crate::context::micros_now))
     }
 
+    /// Notes, for a statement that is being described, that it calls a function whose answer is
+    /// settled once per transaction. See [`crate::Described::per_transaction`].
+    pub(crate) fn read_per_transaction(&self) {
+        if let Some(placeholders) = self.parameters.placeholders() {
+            placeholders.read_per_transaction();
+        }
+    }
+
     /// The text of the statement being bound, which is what `current_query()` folds to.
     pub(crate) fn statement_text(&mut self, ast: &Ast) -> Arc<str> {
         Arc::clone(self.source.get_or_insert_with(|| Arc::clone(&ast.source)))

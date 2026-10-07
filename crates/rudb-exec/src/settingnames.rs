@@ -16,7 +16,7 @@
 //! is where that is written down.
 
 use rudb_common::{LogicalType, Result, Session, Value};
-use rudb_functions::{SETTINGS, UNSET, setting_fields, variable_fields};
+use rudb_functions::{SETTINGS, UNSET, prepared_statement_fields, setting_fields, variable_fields};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -75,6 +75,41 @@ pub(crate) fn variablenames(
         })
         .collect();
     Metadata::new("duckdb_variables", &variable_fields(), &rows, plan, index, columns)
+}
+
+/// `duckdb_prepared_statements()`, every statement this session holds by name, in the order of the
+/// names.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn preparednames(
+    session: &Session,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let list = |names: Vec<String>| Value::List {
+        element: LogicalType::Varchar,
+        values: names.into_iter().map(Value::Varchar).collect(),
+    };
+    let rows: Vec<Vec<Value>> = session
+        .prepared()
+        .iter()
+        .map(|held| {
+            let parameters = match held.parameters {
+                0 => Value::Null,
+                count => list(vec!["UNKNOWN".to_string(); count]),
+            };
+            let results = held
+                .results
+                .as_ref()
+                .map_or(Value::Null, |types| list(types.iter().map(ToString::to_string).collect()));
+            vec![text(&held.name), text(&held.statement), parameters, results]
+        })
+        .collect();
+    let fields = prepared_statement_fields();
+    Metadata::new("duckdb_prepared_statements", &fields, &rows, plan, index, columns)
 }
 
 /// The `VARCHAR[]` of other spellings, empty for a setting that has none.

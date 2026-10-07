@@ -64,9 +64,10 @@
 //! lambdas it is made of.
 
 use crate::ast::{
-    Ast, BinaryOp, CaseArm, CreateViewRef, Distinct, Expr, ExprRef, JoinKind, LiteralKind, Nulls,
-    Order, OrderItem, Quantifier, QueryBody, QueryRef, SelectRef, SetOp, Slice, Source, SourceRef,
-    StrRef, Target, UnaryOp, WindowBound, WindowExclude, WindowRef, WindowUnit,
+    Ast, BinaryOp, CaseArm, ConflictAction, CreateViewRef, Distinct, Expr, ExprRef, InsertRef,
+    JoinKind, LiteralKind, Nulls, Order, OrderItem, Quantifier, QueryBody, QueryRef, SelectRef,
+    SetOp, Slice, Source, SourceRef, Statement, StrRef, Target, UnaryOp, WindowBound,
+    WindowExclude, WindowRef, WindowUnit,
 };
 use crate::matcher::NONE;
 use crate::tokenize::quoted;
@@ -95,6 +96,76 @@ pub fn create_view(ast: &Ast, index: CreateViewRef, schema: &str) -> String {
         out += &format!(" ({})", names(ast, written.columns));
     }
     out + &format!(" AS {};", query(ast, written.query))
+}
+
+/// The statement `PREPARE` held as `written`, as `duckdb_prepared_statements()` reports it.
+///
+/// A query and an `INSERT` are written back out the way the pin writes them, which was measured:
+/// `insert into t values (1)` comes back as `INSERT INTO t (VALUES (1))`, a conflict clause with
+/// no key as `ON CONFLICT  DO NOTHING` with two spaces, and a key as `ON CONFLICT (b ) DO
+/// NOTHING`. Anything else, which is an `UPDATE`, a `DELETE`, a `COPY` or an `ON CONFLICT DO
+/// UPDATE`, is the text as it was written without the space around it and the semicolon.
+#[must_use]
+pub fn prepared(ast: &Ast, written: &str) -> String {
+    match ast.statements.as_slice() {
+        [Statement::Query(index)] => return query(ast, *index),
+        [Statement::Insert(index)] => {
+            if let Some(out) = insert(ast, *index) {
+                return out;
+            }
+        }
+        _ => {}
+    }
+    written.trim().trim_end_matches(';').trim_end().to_string()
+}
+
+/// One `INSERT` written back out, or `None` for one this does not write the pin's way yet.
+fn insert(ast: &Ast, index: InsertRef) -> Option<String> {
+    let held = ast.insert(index);
+    if held.copy {
+        return None;
+    }
+    let mut out = "INSERT ".to_string();
+    let conflict = match held.conflict.map(|conflict| conflict.action) {
+        None => "",
+        Some(ConflictAction::Replace) => {
+            out += "OR REPLACE ";
+            ""
+        }
+        Some(ConflictAction::Nothing) => " ON CONFLICT ",
+        Some(ConflictAction::Update { .. }) => return None,
+    };
+    out += &format!("INTO {}", parts(ast, held.name));
+    if !held.columns.is_empty() {
+        out += &format!(" ({})", names(ast, held.columns));
+    }
+    if held.source == NONE {
+        out += " DEFAULT VALUES";
+    } else if let QueryBody::Values(rows) = ast.query(held.source).body {
+        out += &format!(" ({})", values(ast, rows));
+    } else {
+        out += &format!(" {}", query(ast, held.source));
+    }
+    if !conflict.is_empty() {
+        out += conflict;
+        let target = held.conflict.map(|conflict| conflict.target).unwrap_or_default();
+        // The key is followed by a space inside its parentheses, which is the pin's.
+        if target.is_empty() {
+            out += " DO NOTHING";
+        } else {
+            out += &format!("({} ) DO NOTHING", names(ast, target));
+        }
+    }
+    if let Some(returning) = held.returning {
+        let QueryBody::Select(select) = ast.query(returning).body else { return None };
+        let targets: Vec<String> = ast
+            .target_list(ast.select(select).targets)
+            .iter()
+            .map(|target| aliased(ast, target))
+            .collect();
+        out += &format!(" RETURNING {}", targets.join(", "));
+    }
+    Some(out)
 }
 
 /// One query written back out.
@@ -1101,7 +1172,7 @@ fn parts(ast: &Ast, list: Slice) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::create_view;
+    use super::{create_view, prepared};
     use crate::ast::Statement;
     use crate::transform::parse_ast;
 
@@ -1124,6 +1195,53 @@ mod tests {
             .and_then(|rest| rest.strip_suffix(';'))
             .expect("the statement wrapper is there")
             .to_string()
+    }
+
+    /// A statement as `duckdb_prepared_statements()` reports it.
+    fn held(sql: &str) -> String {
+        let ast = parse_ast(sql).unwrap_or_else(|error| panic!("{sql} should parse: {error}"));
+        prepared(&ast, sql)
+    }
+
+    /// Every one of these is what the pin answered for the same statement.
+    #[test]
+    fn a_prepared_insert_is_written_the_way_the_pin_writes_it() {
+        assert_eq!(held("insert into tbl values ('test')"), "INSERT INTO tbl (VALUES ('test'))");
+        assert_eq!(
+            held("insert into tbl (b, a) values (1, 'x'), (2, 'y')"),
+            "INSERT INTO tbl (b, a) (VALUES (1, 'x'), (2, 'y'))"
+        );
+        assert_eq!(held("insert into tbl default values"), "INSERT INTO tbl DEFAULT VALUES");
+        assert_eq!(
+            held("insert or replace into tbl values ('a', 1)"),
+            "INSERT OR REPLACE INTO tbl (VALUES ('a', 1))"
+        );
+        assert_eq!(
+            held("insert or ignore into tbl values ('a', 1)"),
+            "INSERT INTO tbl (VALUES ('a', 1)) ON CONFLICT  DO NOTHING"
+        );
+        assert_eq!(
+            held("insert into tbl values ('a', 1) on conflict (b) do nothing"),
+            "INSERT INTO tbl (VALUES ('a', 1)) ON CONFLICT (b ) DO NOTHING"
+        );
+        assert_eq!(held("insert into main.tbl select 1"), "INSERT INTO main.tbl SELECT 1");
+        assert_eq!(
+            held(r#"insert into tbl values ('a', 1) returning b + 1, a as "X y""#),
+            r#"INSERT INTO tbl (VALUES ('a', 1)) RETURNING (b + 1), a AS "X y""#
+        );
+        assert_eq!(
+            held("insert into tbl values ('a', 1) returning *"),
+            "INSERT INTO tbl (VALUES ('a', 1)) RETURNING *"
+        );
+    }
+
+    #[test]
+    fn a_prepared_query_is_written_back_out_and_the_rest_is_kept_as_written() {
+        assert_eq!(held("select 42;"), "SELECT 42");
+        assert_eq!(held("select 21, $1, $2"), "SELECT 21, $1, $2");
+        assert_eq!(held("select $name, $other_name"), "SELECT $name, $other_name");
+        assert_eq!(held("select ?"), "SELECT $1");
+        assert_eq!(held("delete from tbl where b = 1;  "), "delete from tbl where b = 1");
     }
 
     #[test]

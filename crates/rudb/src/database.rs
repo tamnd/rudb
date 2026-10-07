@@ -15,8 +15,8 @@ use rudb_catalog::{
 use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
 use rudb_common::{
-    Cancel, Clustering, DeclaredType, Error, Field, LogicalType, Memory, Origin, Result, Rule,
-    Session, Value,
+    Cancel, Clustering, DeclaredType, Error, Field, LogicalType, Memory, Origin, PreparedStatement,
+    Result, Rule, Session, Value,
 };
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_metrics::{Document, LoadProfile, Report, Span, Stage};
@@ -669,6 +669,9 @@ struct Conn {
     /// The statements `PREPARE` named, by the name in lower case, since the pin finds `"S"` under
     /// `s`.
     prepared: Mutex<BTreeMap<String, Arc<Named>>>,
+    /// What `duckdb_prepared_statements()` lists for [`Conn::prepared`], in the same order, made
+    /// again whenever a statement is prepared or deallocated.
+    listed: Mutex<Arc<[PreparedStatement]>>,
     /// The PostgreSQL session that speaks through this connection, from
     /// [`crate::Connection::set_postgres`].
     postgres: Mutex<Option<Arc<Postgres>>>,
@@ -710,6 +713,7 @@ struct Named {
     sql: String,
     ast: Ast,
     names: Vec<String>,
+    listed: PreparedStatement,
 }
 
 impl Conn {
@@ -724,6 +728,7 @@ impl Conn {
             blocked: AtomicU64::new(0),
             transaction: AtomicU64::new(0),
             prepared: Mutex::default(),
+            listed: Mutex::default(),
             simple: Mutex::default(),
             postgres: Mutex::default(),
             begun: AtomicI64::new(0),
@@ -4109,6 +4114,8 @@ impl Shared {
         }
         session.set_transaction(self.conn.transaction.load(Ordering::Relaxed));
         session
+            .set_prepared(self.conn.listed.lock().unwrap_or_else(PoisonError::into_inner).clone());
+        session
     }
 
     /// Records the PostgreSQL session that speaks through this connection.
@@ -6111,7 +6118,10 @@ impl Shared {
             }
             // The pin says nothing about a name it does not hold.
             ast::Statement::Deallocate(name) => {
-                self.prepared().remove(&ast.string(name).to_lowercase());
+                let mut prepared = self.prepared();
+                if prepared.remove(&ast.string(name).to_lowercase()).is_some() {
+                    self.relist(&prepared);
+                }
                 Ok(QueryResult::empty())
             }
             _ => return None,
@@ -6140,9 +6150,74 @@ impl Shared {
         {
             return Err(error);
         }
-        let named = Arc::new(Named { sql: text.to_string(), ast, names });
-        self.prepared().insert(name.to_lowercase(), named);
+        let listed = PreparedStatement {
+            name: name.to_string(),
+            statement: rudb_parse::deparse::prepared(&ast, text),
+            parameters: names.len(),
+            results: self.result_types(&ast, &names, &session),
+        };
+        let named = Arc::new(Named { sql: text.to_string(), ast, names, listed });
+        let mut prepared = self.prepared();
+        prepared.insert(name.to_lowercase(), named);
+        self.relist(&prepared);
         Ok(QueryResult::empty())
+    }
+
+    /// Makes the list `duckdb_prepared_statements()` reads again from the statements held now.
+    fn relist(&self, prepared: &BTreeMap<String, Arc<Named>>) {
+        let listed = prepared.values().map(|named| named.listed.clone()).collect();
+        *self.conn.listed.lock().unwrap_or_else(PoisonError::into_inner) = listed;
+    }
+
+    /// The types `duckdb_prepared_statements()` gives a prepared statement's answer, or `None`
+    /// where the pin gives none.
+    ///
+    /// The pin keeps the types only of a plan it can run again as it is, which was measured
+    /// statement by statement. A write with no `RETURNING` answers a count whatever it reads. A
+    /// statement that answers rows has no types when a parameter is left without one, when it
+    /// reads a table, which a view over one or a subquery counts as and an `UPDATE` or a `DELETE`
+    /// always does, or when it calls a function the pin settles once per transaction, such as
+    /// `now()` or `current_schema()`.
+    fn result_types(
+        &self,
+        ast: &Ast,
+        names: &[String],
+        session: &Session,
+    ) -> Option<Vec<LogicalType>> {
+        if !matches!(
+            ast.statements.as_slice(),
+            [ast::Statement::Query(_)
+                | ast::Statement::Insert(_)
+                | ast::Statement::Update(_)
+                | ast::Statement::Delete(_)]
+        ) {
+            return None;
+        }
+        let placeholders =
+            Placeholders::new(names.iter().map(|name| (name.clone(), None)).collect());
+        let parameters = Parameters::describing(placeholders.clone());
+        let bound = rudb_bind::bind_statement_with(ast, &self.read(), &parameters, session).ok()?;
+        let reads = |plan: &Plan| {
+            (0..plan.node_count())
+                .filter_map(|at| NodeRef::try_from(at).ok())
+                .any(|at| matches!(plan.node(at), Node::Get { .. }))
+        };
+        match &bound {
+            Bound::Query(plan) if !reads(plan) => {}
+            Bound::Insert(insert) if insert.returning.is_none() => {
+                return Some(vec![LogicalType::BigInt]);
+            }
+            Bound::Insert(insert)
+                if matches!(insert.write, Write::Append) && !reads(&insert.source) => {}
+            _ => return None,
+        }
+        let described = placeholders.described();
+        let resolved =
+            names.iter().all(|name| described.resolved.iter().any(|(held, _)| held == name));
+        if described.per_transaction || !resolved {
+            return None;
+        }
+        Some(described.fields?.into_iter().map(|field| field.ty).collect())
     }
 
     /// What `ast` takes and gives, found by binding it with each parameter in `names` as a

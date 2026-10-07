@@ -39,12 +39,14 @@
 //! too on everything it returns from a fresh session, because a schema created by `CREATE SCHEMA`
 //! has no stored text and nothing nests schemas.
 
+use std::collections::BTreeSet;
+
 use rudb_catalog::{Catalog, Constraint, Database, Schema, TEMP_CATALOG, Table};
 use rudb_common::{LogicalType, Result, Value};
 use rudb_functions::{
-    DUCKDB, canonical, column_fields, constraint_fields, database_fields, index_fields,
-    numeric_facts, schema_fields, sequence_fields, show_database_fields, show_expanded_fields,
-    show_table_fields, table_fields, trigger_fields, type_oid, view_fields,
+    DUCKDB, canonical, column_fields, constraint_fields, database_fields, dependency_fields,
+    index_fields, numeric_facts, schema_fields, sequence_fields, show_database_fields,
+    show_expanded_fields, show_table_fields, table_fields, trigger_fields, type_oid, view_fields,
 };
 use rudb_parse::{Kind, quoted, tokenize};
 use rudb_plan::{Plan, Slice};
@@ -288,6 +290,72 @@ pub(crate) fn indexnames(
         }
     }
     Metadata::new("duckdb_indexes", &index_fields(), &rows, plan, index, columns)
+}
+
+/// Which entry of the default database another one hangs on, in the columns the plan asked for.
+///
+/// Four kinds of row, which are the four the pin was found to report, each pair once. An index
+/// gives its table and itself, `a`, and so does a sequence `OWNED BY` a table or a view, with the
+/// sequence first. A sequence a column default calls `nextval` on gives the sequence and the
+/// table, `n`, and a foreign key gives the table it points at and the table it is on, `n`. Only
+/// the default database is read, as on the pin, so neither `temp` nor an attached database is
+/// here. The pin's rows come in the order of its own map, and these come by the two oids.
+///
+/// # Errors
+///
+/// If the plan asks for a column this table does not have.
+pub(crate) fn dependencies(
+    catalog: &Catalog,
+    plan: &Plan,
+    index: u32,
+    columns: Slice,
+) -> Result<Metadata> {
+    let mut pairs = BTreeSet::new();
+    let default = catalog.databases().iter().find(|held| held.name() == catalog.default_catalog());
+    if let Some(database) = default {
+        let schemas = database.schemas();
+        let tables = || schemas.iter().flat_map(Schema::tables);
+        let sequences = || schemas.iter().flat_map(Schema::sequences);
+        for table in tables() {
+            for held in table.indexes() {
+                pairs.insert((table.oid(), held.oid, "a"));
+            }
+            for name in table.sequences() {
+                if let Some(sequence) = sequences().find(|held| held.name() == name) {
+                    pairs.insert((sequence.oid(), table.oid(), "n"));
+                }
+            }
+            for foreign in table.foreign() {
+                if let Some(target) = tables().find(|held| *held.name() == foreign.table) {
+                    pairs.insert((target.oid(), table.oid(), "n"));
+                }
+            }
+        }
+        for sequence in sequences() {
+            let Some(owner) = sequence.owner() else { continue };
+            let table = tables().find(|held| held.name() == owner).map(Table::oid);
+            let views = || schemas.iter().flat_map(Schema::views);
+            let view = || views().find(|held| held.name() == owner).map(|held| held.oid());
+            if let Some(oid) = table.or_else(view) {
+                pairs.insert((sequence.oid(), oid, "a"));
+            }
+        }
+    }
+    let rows: Vec<Vec<Value>> = pairs
+        .into_iter()
+        .map(|(object, referenced, kind)| {
+            vec![
+                Value::BigInt(0),
+                Value::BigInt(object),
+                Value::Integer(0),
+                Value::BigInt(0),
+                Value::BigInt(referenced),
+                Value::Integer(0),
+                text(kind),
+            ]
+        })
+        .collect();
+    Metadata::new("duckdb_dependencies", &dependency_fields(), &rows, plan, index, columns)
 }
 
 /// Every constraint of every table, in the columns the plan asked for.

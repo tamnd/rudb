@@ -24,9 +24,9 @@ pub mod table;
 pub mod typecatalog;
 
 pub use entrycatalog::{
-    DUCKDB, canonical, column_fields, constraint_fields, database_fields, index_fields,
-    numeric_facts, schema_fields, sequence_fields, show_database_fields, show_expanded_fields,
-    show_table_fields, table_fields, trigger_fields, view_fields,
+    DUCKDB, canonical, column_fields, constraint_fields, database_fields, dependency_fields,
+    index_fields, numeric_facts, schema_fields, sequence_fields, show_database_fields,
+    show_expanded_fields, show_table_fields, table_fields, trigger_fields, view_fields,
 };
 pub use file::{
     Footers, TYPES_SET, content_files, csv_fields, csv_given, files, is_file, is_pattern,
@@ -49,9 +49,9 @@ pub use table::{
     Columns, FILE_ROW_NUMBER, ResolvedTable, TableFunction, codec_metric_fields, content_fields,
     database_size_fields, device_card_fields, dialect_fields, extension_fields,
     grammar_extension_fields, json_walk_fields, keyword_categories, keyword_fields, link_fields,
-    optimizer_fields, platform_fields, resolve_pragma, resolve_table, series, series_length,
-    statement_metric_fields, strategy_fields, user_agent_fields, variable_fields, version_fields,
-    write_metric_fields,
+    optimizer_fields, platform_fields, prepared_statement_fields, resolve_pragma, resolve_table,
+    series, series_length, statement_metric_fields, strategy_fields, user_agent_fields,
+    variable_fields, version_fields, write_metric_fields,
 };
 pub use typecatalog::{
     Signature, TYPE_NAMES, TypeEntry, representative, sort_key, type_category, type_fields,
