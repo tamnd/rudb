@@ -170,6 +170,28 @@ impl Selection {
         Self { indices }
     }
 
+    /// The positions either selection holds, each once and in order.
+    ///
+    /// What a threaded `OR` adds up while its operands all run over the same rows, so the two sides
+    /// can hold the same position. Both are in ascending order, as for [`Self::without`].
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        let (mut left, mut right) = (self.indices.as_slice(), other.indices.as_slice());
+        let mut indices = Vec::with_capacity(left.len() + right.len());
+        while let (Some(&a), Some(&b)) = (left.first(), right.first()) {
+            indices.push(a.min(b));
+            if a <= b {
+                left = &left[1..];
+            }
+            if b <= a {
+                right = &right[1..];
+            }
+        }
+        indices.extend_from_slice(left);
+        indices.extend_from_slice(right);
+        Self { indices }
+    }
+
     /// The positions below `len` that this selection does not hold.
     ///
     /// The other half of a threaded `OR`. What the branches leave behind is the rows none of them
@@ -249,6 +271,17 @@ mod tests {
     fn taking_rows_that_are_not_there_changes_nothing() {
         let live = Selection::from_indices(vec![2, 6]);
         assert_eq!(live.without(&Selection::from_indices(vec![0, 3, 7])), live);
+    }
+
+    #[test]
+    fn a_union_holds_each_position_of_either_side_once_and_in_order() {
+        let left = Selection::from_indices(vec![1, 4, 5, 9]);
+        let right = Selection::from_indices(vec![0, 4, 9, 12]);
+        assert_eq!(left.union(&right).indices(), &[0, 1, 4, 5, 9, 12]);
+        assert_eq!(right.union(&left), left.union(&right));
+        assert_eq!(left.union(&Selection::empty()), left);
+        assert_eq!(Selection::empty().union(&left), left);
+        assert_eq!(left.union(&left), left);
     }
 
     #[test]

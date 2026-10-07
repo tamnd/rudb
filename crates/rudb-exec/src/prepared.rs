@@ -819,9 +819,16 @@ impl Prepared {
     /// out of `live` the connective is true for.
     ///
     /// The walk is the same for both connectives and only the bookkeeping differs. `AND` carries the
-    /// rows every operand so far has kept, so each answer replaces it. `OR` carries the rows no
-    /// operand so far has accepted, so each answer comes out of it and the rows the connective keeps
-    /// are the ones that went missing along the way.
+    /// rows every operand so far has kept, so each answer replaces it. `OR` starts out running every
+    /// operand over all of `live` and adding up what they accept. Once more than half of `live` is
+    /// accepted it carries the rows no operand so far has accepted instead, so each answer comes out
+    /// of it and the rows the connective keeps are the ones that went missing along the way.
+    ///
+    /// The `OR` used to carry the missing rows from the first operand on, and on q19 at SF1 writing
+    /// out that complement and cutting it down again after each operand cost twice what the
+    /// comparisons did. An operand that runs over rows an earlier one accepted costs extra only in
+    /// proportion to those rows, where the rows not yet accepted are a pass over nearly all of them
+    /// for every operand while few are accepted.
     ///
     /// The operand is not `steps[begin..=operand]` evaluated and then narrowed. Its subtree is run
     /// over the whole chunk and it is the operand itself that reads only the rows in play, except
@@ -850,6 +857,9 @@ impl Prepared {
             .take()
             .unwrap_or_else(|| Ordering::new(op, self.weights(operands, begin)));
         let mut carried: Option<Selection> = live.cloned();
+        // What an `OR` has accepted while its operands still run over all of `live`, and `None` once
+        // it carries the rows not yet accepted instead.
+        let mut accepted = matches!(op, Connective::Or).then(Selection::empty);
         // The operands already answered as the other end of a range, see [`Self::range`], or as a
         // mask, see [`Self::masked`].
         let mut ranged: u128 = 0;
@@ -891,11 +901,24 @@ impl Prepared {
                 None => self.thread(operand, from, chunk, scratch, carried.as_ref())?,
             };
             order.observed(which, given, answered.len());
-            carried = Some(match (op, carried) {
-                (Connective::And, _) => answered,
-                (Connective::Or, None) => answered.complement(rows),
-                (Connective::Or, Some(carried)) => carried.without(&answered),
-            });
+            carried = match (op, accepted.take()) {
+                (Connective::And, _) => Some(answered),
+                (Connective::Or, Some(held)) => {
+                    let held = held.union(&answered);
+                    if held.len() * 2 > given {
+                        Some(
+                            carried
+                                .map_or_else(|| held.complement(rows), |live| live.without(&held)),
+                        )
+                    } else {
+                        accepted = Some(held);
+                        carried
+                    }
+                }
+                (Connective::Or, None) => Some(
+                    carried.map_or_else(|| answered.complement(rows), |c| c.without(&answered)),
+                ),
+            };
             // Keep a shared step alive when a later operand still reads it.
             for step in from..=operand {
                 if self.last_use[step] <= operand {
@@ -905,6 +928,9 @@ impl Prepared {
         }
         order.relearn();
         scratch.orders[index] = Some(order);
+        if let Some(held) = accepted {
+            return Ok(held);
+        }
         Ok(match (op, carried) {
             // A connective with no operands, which the binder does not build and which is answered
             // here rather than left to index arithmetic: an empty `AND` is every row and an empty
