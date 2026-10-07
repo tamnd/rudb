@@ -36,6 +36,27 @@ fn segments(path: &Path) -> usize {
     })
 }
 
+/// How many Insert records the log's segments hold. Not [`segments`], because a checkpoint keeps
+/// the segment it is writing, with its own Checkpoint record in it, so a log that took no rows
+/// since still has a segment.
+fn inserts(path: &Path) -> usize {
+    use rudb_io::RealFilesystem;
+    use rudb_txn::log::{Kind, SegmentHeader, replay, segments};
+
+    let fs = RealFilesystem::new();
+    let dir = wal(path);
+    let Some(first) = segments(&fs, &dir, 0).expect("lists").into_iter().next() else {
+        return 0;
+    };
+    let header = SegmentHeader::decode(&std::fs::read(&first.1).expect("reads")).expect("a header");
+    let read = replay(&fs, &dir, 0, header.database).expect("replays");
+    read.blocks
+        .iter()
+        .flat_map(|block| &block.records)
+        .filter(|record| record.header.kind == Kind::Insert)
+        .count()
+}
+
 fn open(path: &Path) -> Database {
     Database::open(path.to_str().expect("a UTF-8 path")).expect("the database opens")
 }
@@ -142,8 +163,9 @@ fn a_load_of_half_a_stripe_goes_to_the_file_and_not_the_log() {
     let db = open(&path);
     db.execute("CREATE TABLE t (id BIGINT)").expect("creates");
     db.execute("INSERT INTO t VALUES (0)").expect("inserts");
+    let logged = inserts(&path);
     db.execute("INSERT INTO t SELECT range + 1 FROM range(262144)").expect("loads");
-    assert_eq!(segments(&path), 0, "the load went to the file");
+    assert_eq!(inserts(&path), logged, "the load went to the file");
     db.execute("BEGIN").expect("begins");
     for start in (0..262_144).step_by(65_536) {
         let from = 262_145 + start;
@@ -151,9 +173,9 @@ fn a_load_of_half_a_stripe_goes_to_the_file_and_not_the_log() {
         db.execute(&sql).expect("inserts");
     }
     db.execute("COMMIT").expect("commits");
-    assert_eq!(segments(&path), 0, "four inserts that add up to a load went to the file too");
+    assert_eq!(inserts(&path), logged, "four inserts that add up to a load went to the file too");
     db.execute("INSERT INTO t SELECT range + 524289 FROM range(1000)").expect("inserts");
-    assert!(segments(&path) > 0, "a smaller insert is logged");
+    assert!(inserts(&path) > logged, "a smaller insert is logged");
     crash(db);
 
     let db = open(&path);
