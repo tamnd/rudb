@@ -62,7 +62,7 @@ pub use session::{
     AggregateTypes, CastInput, CastOutput, CharacterTypes, ColumnNames, CommonTypes,
     ConditionTypes, CountTypes, DefaultNullOrder, DistinctOrder, ErrorTexts, FunctionRules,
     IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns, NumberCasts, NumberLiterals,
-    OperatorRules, PlanErrors, PreparedStatement, Semantics, SequenceOwners, Session,
+    OperatorRules, PlanErrors, PreparedStatement, QueryColumns, Semantics, SequenceOwners, Session,
     SessionTimeZone, SetFunctions, ShowBehavior, TableNames, TypeNames, UnknownTypes, ValuesNames,
     Variable,
 };

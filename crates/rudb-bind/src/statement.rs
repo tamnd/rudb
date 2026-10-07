@@ -18,8 +18,8 @@ use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
     Bound as ColumnBound, Clustering, DeclaredType, Error, Field, IdentifierCompare, InsertColumns,
-    LogicalType, PlanErrors, Result, SequenceOwners, Session, SqlState, Stat, TypeNames,
-    UnknownTypes, Value, Width,
+    LogicalType, PlanErrors, QueryColumns, Result, SequenceOwners, Session, SqlState, Stat,
+    TypeNames, UnknownTypes, Value, Width,
 };
 use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
@@ -1363,7 +1363,7 @@ fn create_table(
             // A column that a table column or a cast gives keeps its type, as in PostgreSQL.
             types.push(column.origin.and_then(|origin| origin.ty));
         }
-        if defs.is_empty() {
+        if defs.is_empty() && session.semantics().query_columns() == QueryColumns::Pin {
             deduplicate(&mut columns);
         }
         (columns, Some(finish(binder, root)?))
@@ -2617,6 +2617,10 @@ fn create_view(
     if !aliases.is_empty() {
         let written: Vec<&str> = aliases.iter().map(String::as_str).collect();
         scope.rename(&written, "unnamed_subquery")?;
+    }
+    let semantics = session.semantics();
+    if semantics.query_columns() == QueryColumns::Postgres {
+        duplicate_check(&scope.fields(), semantics.identifier_compare())?;
     }
 
     let statement = deparse::create_view(ast, index, &name.schema);
