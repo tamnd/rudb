@@ -397,6 +397,9 @@ fn duckdb_dependencies_lists_indexes_foreign_keys_and_sequences_in_defaults() {
         "CREATE SEQUENCE s",
         "CREATE TABLE d(x INTEGER DEFAULT nextval('s'))",
         "CREATE VIEW v AS SELECT * FROM d",
+        "CREATE TABLE o(x INTEGER)",
+        "CREATE SEQUENCE sq2",
+        "ALTER SEQUENCE sq2 OWNED BY o",
     ] {
         db.execute(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
     }
@@ -407,8 +410,8 @@ fn duckdb_dependencies_lists_indexes_foreign_keys_and_sequences_in_defaults() {
                  FROM duckdb_dependencies() d JOIN names o ON o.oid = d.objid \
                  JOIN names r ON r.oid = d.refobjid";
     // The view is not there, which is the pin's: it lists no row for a view.
-    assert_eq!(executed(&db, named), Value::Varchar("c>ci:a,p>c:n,s>d:n".into()));
+    assert_eq!(executed(&db, named), Value::Varchar("c>ci:a,p>c:n,s>d:n,sq2>o:a".into()));
     let zeros =
         "SELECT count(*) FROM pg_depend WHERE classid + objsubid + refclassid + refobjsubid = 0";
-    assert_eq!(executed(&db, zeros), Value::BigInt(3));
+    assert_eq!(executed(&db, zeros), Value::BigInt(4));
 }

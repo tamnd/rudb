@@ -39,7 +39,7 @@
 //! too on everything it returns from a fresh session, because a schema created by `CREATE SCHEMA`
 //! has no stored text and nothing nests schemas.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use rudb_catalog::{Catalog, Constraint, Database, Schema, TEMP_CATALOG, Table};
 use rudb_common::{LogicalType, Result, Value};
@@ -301,6 +301,10 @@ pub(crate) fn indexnames(
 /// the default database is read, as on the pin, so neither `temp` nor an attached database is
 /// here. The pin's rows come in the order of its own map, and these come by the two oids.
 ///
+/// The catalog keeps a sequence a table owns among the ones its defaults use, so a pair that is
+/// both is listed once, as owned. The pin lists that pair as `n` when the default came first,
+/// and the catalog does not keep which came first.
+///
 /// # Errors
 ///
 /// If the plan asks for a column this table does not have.
@@ -310,7 +314,7 @@ pub(crate) fn dependencies(
     index: u32,
     columns: Slice,
 ) -> Result<Metadata> {
-    let mut pairs = BTreeSet::new();
+    let mut pairs = BTreeMap::new();
     let default = catalog.databases().iter().find(|held| held.name() == catalog.default_catalog());
     if let Some(database) = default {
         let schemas = database.schemas();
@@ -318,16 +322,16 @@ pub(crate) fn dependencies(
         let sequences = || schemas.iter().flat_map(Schema::sequences);
         for table in tables() {
             for held in table.indexes() {
-                pairs.insert((table.oid(), held.oid, "a"));
+                pairs.insert((table.oid(), held.oid), "a");
             }
             for name in table.sequences() {
                 if let Some(sequence) = sequences().find(|held| held.name() == name) {
-                    pairs.insert((sequence.oid(), table.oid(), "n"));
+                    pairs.insert((sequence.oid(), table.oid()), "n");
                 }
             }
             for foreign in table.foreign() {
                 if let Some(target) = tables().find(|held| *held.name() == foreign.table) {
-                    pairs.insert((target.oid(), table.oid(), "n"));
+                    pairs.insert((target.oid(), table.oid()), "n");
                 }
             }
         }
@@ -337,13 +341,13 @@ pub(crate) fn dependencies(
             let views = || schemas.iter().flat_map(Schema::views);
             let view = || views().find(|held| held.name() == owner).map(|held| held.oid());
             if let Some(oid) = table.or_else(view) {
-                pairs.insert((sequence.oid(), oid, "a"));
+                pairs.insert((sequence.oid(), oid), "a");
             }
         }
     }
     let rows: Vec<Vec<Value>> = pairs
         .into_iter()
-        .map(|(object, referenced, kind)| {
+        .map(|((object, referenced), kind)| {
             vec![
                 Value::BigInt(0),
                 Value::BigInt(object),
