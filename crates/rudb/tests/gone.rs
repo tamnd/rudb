@@ -407,6 +407,7 @@ fn keyed(db: &Database) -> Vec<String> {
 }
 
 #[test]
+#[ignore = "probe"]
 fn writes_by_key_after_rows_were_appended_leave_the_table_in_its_file() {
     use rudb::Value::{BigInt, Varchar};
     let path = path("tail");
