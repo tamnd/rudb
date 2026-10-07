@@ -3863,7 +3863,7 @@ impl Vector {
             && !self.validity.has_nulls(self.len)
             && below(indices, codes.len())
         {
-            let at: Vec<u32> = indices.iter().map(|&index| codes[index as usize]).collect();
+            let at = picked(codes.as_slice(), indices, |index| index as usize);
             return values.gather(&at);
         }
         // A constant gathered is the same constant at the new length, as long as every position is
@@ -4006,7 +4006,7 @@ impl Vector {
                     $(Data::$variant(values) => {
                         let values = values.as_slice();
                         let out: Vec<$native> =
-                            indices.iter().map(|&index| values[index as usize]).collect();
+                            picked(values, indices, |index| index as usize);
                         Data::$variant(Buffer::from_vec(out))
                     })+
                     Data::Empty | Data::Varlen(_) => return None,
@@ -4048,7 +4048,7 @@ impl Vector {
                 len: rows,
                 validity: Validity::AllValid,
                 body: Body::Dictionary {
-                    codes: at.iter().map(|&at| codes[index(at)]).collect(),
+                    codes: Buffer::from_vec(picked(codes.as_slice(), at, &index)),
                     values: Arc::clone(values),
                     stable: true,
                 },
@@ -5544,6 +5544,34 @@ fn unpack(
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
 pub const PREFETCH_AHEAD: usize = 16;
 
+/// `values` at each of `at`, every one of which is inside it.
+///
+/// Positions far apart each miss the cache, and read in turn the core waits out every miss, so
+/// each value is asked for some positions ahead and the misses overlap. A scan that keeps the parts
+/// of a column decoded reads them back at the rows its joins left, and on JOB 13a that is a few
+/// rows in each run of ten in `movie_info` and the wait on the load was most of the gather. Rows
+/// close together are left to the hardware, which follows them already.
+fn picked<T: Copy, P: Copy>(values: &[T], at: &[P], index: impl Fn(P) -> usize) -> Vec<T> {
+    let spread = match (at.first(), at.last()) {
+        (Some(&first), Some(&last)) => {
+            index(last).abs_diff(index(first)) >= at.len().saturating_mul(4)
+        }
+        _ => false,
+    };
+    if !spread {
+        return at.iter().map(|&position| values[index(position)]).collect();
+    }
+    at.iter()
+        .enumerate()
+        .map(|(place, &position)| {
+            if let Some(&ahead) = at.get(place + PREFETCH_AHEAD) {
+                prefetch(values, index(ahead));
+            }
+            values[index(position)]
+        })
+        .collect()
+}
+
 /// Asks for the cache line that holds `words[word]`, without waiting for it, and nothing for a word
 /// past the end.
 ///
@@ -6535,12 +6563,26 @@ mod tests {
 
     use super::{
         Body, Data, FSST_PAYS_AT, Form, MAP_KEY, MAP_VALUE, NO_ROW, VECTOR_SIZE, Vector, below,
-        packing_base,
+        packing_base, picked,
     };
     use crate::buffer::Buffer;
     use crate::fsst::SymbolTable;
     use crate::string::{StringColumn, StringView};
     use crate::validity::Validity;
+
+    #[test]
+    fn a_pick_of_positions_far_apart_is_the_values_at_them() {
+        let values: Vec<i32> = (0..10_000).map(|value| value * 7 - 3).collect();
+        let far: Vec<u32> = (0..500).map(|at| at * 19 + at % 5).collect();
+        let near: Vec<u32> = (100..160).collect();
+        let shuffled: Vec<u32> = (0..300).map(|at| (at * 7919) % 10_000).collect();
+        for at in [&far, &near, &shuffled, &Vec::new()] {
+            let plain: Vec<i32> = at.iter().map(|&at| values[at as usize]).collect();
+            assert_eq!(picked(&values, at, |at| at as usize), plain);
+        }
+        let wide: Vec<usize> = far.iter().map(|&at| at as usize).collect();
+        assert_eq!(picked(&values, &wide, |at| at), picked(&values, &far, |at| at as usize));
+    }
 
     #[test]
     fn a_column_built_a_value_at_a_time_is_the_one_built_from_all_of_them() {
