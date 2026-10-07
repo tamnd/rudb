@@ -306,6 +306,9 @@ pub struct SequenceChange {
     /// The table or view an `ALTER SEQUENCE ... OWNED BY` gives the sequence to, which makes this
     /// an alter rather than a create.
     pub owner: Option<QualifiedName>,
+    /// The name as written of a sequence that a `DROP SEQUENCE IF EXISTS` did not find, for the
+    /// notice that says so.
+    pub missing: Option<String>,
 }
 
 /// A bound `CREATE MACRO` or `DROP MACRO`.
@@ -609,10 +612,14 @@ pub(crate) fn bind_one(
             let parts: Vec<&str> = ast.name(written.name).collect();
             let alter = !written.owner.is_empty();
             let mut owner = None;
+            let mut missing = None;
             let name = if written.drop || alter {
                 match catalog.resolve_sequence(&parts) {
                     Ok(name) => Some(name),
-                    Err(_) if written.quiet => None,
+                    Err(_) if written.quiet => {
+                        missing = written.drop.then(|| parts.join("."));
+                        None
+                    }
                     Err(error) => return Err(error),
                 }
             } else if written.temporary {
@@ -621,8 +628,25 @@ pub(crate) fn bind_one(
                 Some(catalog.resolve_for_create(&parts)?)
             };
             if alter && name.is_some() {
-                let parts: Vec<&str> = ast.name(written.owner).collect();
-                owner = Some(catalog.resolve_owner(&parts)?);
+                let mut parts: Vec<&str> = ast.name(written.owner).collect();
+                // PostgreSQL names a column of the owner, and the table owns the sequence here.
+                let column = match session.postgres() {
+                    Some(_) if parts.len() > 1 => parts.pop(),
+                    _ => None,
+                };
+                let held = catalog.resolve_owner(&parts)?;
+                if let Some(column) = column
+                    && !catalog.table(&held).is_ok_and(|table| {
+                        table.columns().iter().any(|field| same_name(&field.name, column))
+                    })
+                {
+                    return Err(Error::binder(format!(
+                        "column \"{column}\" of relation \"{}\" does not exist",
+                        held.table
+                    ))
+                    .state(SqlState::UNDEFINED_COLUMN));
+                }
+                owner = Some(held);
             }
             Ok(Bound::Sequence(SequenceChange {
                 name,
@@ -632,6 +656,7 @@ pub(crate) fn bind_one(
                 cascade: written.cascade,
                 options: written.options,
                 owner,
+                missing,
             }))
         }
         ast::Statement::Type(index) => {

@@ -13090,6 +13090,56 @@ fn a_postgres_session_answers_current_setting_version_and_the_user() {
 }
 
 #[test]
+fn a_postgres_session_finds_the_sequence_of_a_serial_column() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    let run = |sql: &str| connection.execute(sql).expect(sql);
+    let text = |sql: &str| run(sql).rows().next().expect("a row")[0].clone();
+    run("CREATE TABLE s (id serial, n int DEFAULT 5)");
+    run("CREATE TABLE \"Mixed\" (\"Id\" bigserial)");
+    let held = |name: &str| Value::Varchar(name.to_owned());
+    assert_eq!(text("SELECT pg_get_serial_sequence('s', 'id')"), held("main.s_id_seq"));
+    assert_eq!(text("SELECT pg_get_serial_sequence('S', 'id')"), held("main.s_id_seq"));
+    assert_eq!(
+        text("SELECT pg_get_serial_sequence('\"Mixed\"', 'Id')"),
+        held("main.\"Mixed_Id_seq\"")
+    );
+    assert_eq!(text("SELECT pg_get_serial_sequence('s', 'n')"), Value::Null);
+    run("SELECT setval(pg_get_serial_sequence('s', 'id'), 41)");
+    assert_eq!(text("INSERT INTO s DEFAULT VALUES RETURNING id"), Value::Integer(42));
+    // A sequence that the table does not own gives a null, until `OWNED BY` gives it to the table.
+    run("CREATE SEQUENCE loose");
+    run("CREATE TABLE t (a int DEFAULT nextval('loose'))");
+    assert_eq!(text("SELECT pg_get_serial_sequence('t', 'a')"), Value::Null);
+    run("ALTER SEQUENCE loose OWNED BY t.a");
+    assert_eq!(text("SELECT pg_get_serial_sequence('t', 'a')"), held("main.loose"));
+    let error = connection.execute("ALTER SEQUENCE loose OWNED BY t.b").expect_err("no column b");
+    assert_eq!(error.message(), "column \"b\" of relation \"t\" does not exist");
+    assert_eq!(error.reported_state().as_str(), "42703");
+    let error =
+        connection.execute("SELECT pg_get_serial_sequence('gone', 'id')").expect_err("no table");
+    let postgres = error.fields().and_then(|fields| fields.postgres.as_deref());
+    assert_eq!(postgres, Some("relation \"gone\" does not exist"));
+    assert_eq!(error.reported_state().as_str(), "42P01");
+    let error =
+        connection.execute("SELECT pg_get_serial_sequence('s', 'gone')").expect_err("no column");
+    assert_eq!(error.message(), "column \"gone\" of relation \"s\" does not exist");
+    assert_eq!(error.reported_state().as_str(), "42703");
+    run("DROP TABLE t");
+    assert!(connection.execute("SELECT nextval('loose')").is_err(), "the owner took it");
+}
+
+#[test]
 fn a_postgres_session_names_columns_the_way_postgres_does() {
     use rudb_common::guc::Settings;
     use rudb_common::session::Postgres;
