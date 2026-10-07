@@ -1891,6 +1891,20 @@ impl Ast {
         out
     }
 
+    /// The source range of an expression from its leftmost part, so `a + 1` starts at `a` and
+    /// `null::int` at `null`. PostgreSQL places an error about a whole expression there, as
+    /// `exprLocation` finds it. A part that the parser made, with an empty range, does not count.
+    pub fn leftmost_span(&self, expr: ExprRef) -> Span {
+        let mut span = self.expr_span(expr);
+        for child in self.children(expr) {
+            let under = self.leftmost_span(child);
+            if under.start < under.end && (under.start < span.start || span.start == span.end) {
+                span.start = under.start;
+            }
+        }
+        span
+    }
+
     /// One `PIVOT` or `UNPIVOT`.
     pub fn pivot(&self, index: u32) -> Pivot {
         self.pivots[index as usize]
