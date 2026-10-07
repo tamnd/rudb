@@ -1777,6 +1777,24 @@ impl Vector {
     /// If the packed bits and the length disagree, which would be a bug here rather than a caller
     /// doing something wrong.
     pub fn bit_packed(&self) -> Result<Self> {
+        self.packing(false)
+    }
+
+    /// The same as [`Self::bit_packed`] followed by [`Self::on_lanes`], with the codes packed at
+    /// the width of the lanes straight away.
+    ///
+    /// For a page the native reader decodes flat and holds packed. Packed at the width the range
+    /// needs and then widened, each code was laid down twice, and on TPC-H q06 run once the two
+    /// were more than two fifths of the query.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bit_packed`].
+    pub fn bit_packed_on_lanes(&self) -> Result<Self> {
+        self.packing(true)
+    }
+
+    fn packing(&self, widen: bool) -> Result<Self> {
         let Body::Flat(data) = &self.body else {
             return Ok(self.clone());
         };
@@ -1805,6 +1823,10 @@ impl Vector {
         let Some(base) = packing_base(&self.ty, low, high, width) else {
             return Ok(self.clone());
         };
+        let width = match lanes_for(width) {
+            Some(lanes) if widen && fits_lanes(&self.ty, base, lanes) => lanes,
+            _ => width,
+        };
         let words = pack(data, self.len, base, width);
         let packed = Self::packed(self.ty.clone(), words, width, base, self.len)?;
         Ok(packed.with_validity(self.validity.clone()))
@@ -1827,14 +1849,8 @@ impl Vector {
             return self;
         };
         let (width, base, offset) = (*width, *base, *offset);
-        let lanes = match width {
-            6..=7 => 8,
-            12..=15 => 16,
-            _ => return self,
-        };
-        if layout_range(&self.ty)
-            .is_none_or(|(_, high)| base + i128::from(u64::MAX >> (64 - lanes)) > high)
-        {
+        let Some(lanes) = lanes_for(width) else { return self };
+        if !fits_lanes(&self.ty, base, lanes) {
             return self;
         }
         let mut held = vec![0_u64; words_for(self.len, lanes)];
@@ -5310,6 +5326,21 @@ fn share<T: ?Sized>(bytes: usize, held: &Arc<T>) -> usize {
 }
 
 /// How many words hold `len` codes of `width` bits.
+/// The lanes a code of `width` bits is widened to, a byte or two when it is a few bits short of one,
+/// see [`Vector::on_lanes`].
+fn lanes_for(width: u32) -> Option<u32> {
+    match width {
+        6..=7 => Some(8),
+        12..=15 => Some(16),
+        _ => None,
+    }
+}
+
+/// Whether every code of `lanes` bits up from `base` is a value of the type.
+fn fits_lanes(ty: &LogicalType, base: i128, lanes: u32) -> bool {
+    layout_range(ty).is_some_and(|(_, high)| base + i128::from(u64::MAX >> (64 - lanes)) <= high)
+}
+
 fn words_for(len: usize, width: u32) -> usize {
     (len * width as usize).div_ceil(u64::BITS as usize)
 }
@@ -5402,11 +5433,15 @@ fn pack(data: &Data, len: usize, base: i128, width: u32) -> Vec<u64> {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
             match data {
                 $(Data::$variant(values) => {
-                    for (row, &value) in values.as_slice().iter().take(len).enumerate() {
-                        // In range because `base` and `width` came from the span of this same run.
-                        let code = u64::try_from(i128::from(value) - base).unwrap_or(0);
-                        write_code(&mut words, row * width as usize, width, code);
-                    }
+                    // In range because `base` and `width` came from the span of this same run, so
+                    // the code is the difference in the low 64 bits, which wrap the same way.
+                    let base = base as u64;
+                    let codes = values
+                        .as_slice()
+                        .iter()
+                        .take(len)
+                        .map(|&value| (i128::from(value) as u64).wrapping_sub(base));
+                    lay_codes(&mut words, width, codes);
                 })+
                 _ => {}
             }
@@ -5524,6 +5559,31 @@ fn code_at(words: &[u64], bit: usize, width: u32) -> u64 {
     let high = words.get(word + 1).copied().unwrap_or(0);
     let both = u128::from(high) << u64::BITS | u128::from(low);
     (both >> shift) as u64 & mask
+}
+
+/// Lays `codes`, each under `width` bits, end to end into `words` from the first bit, a word at a
+/// time.
+///
+/// A word is filled in a register and stored once, where writing each code into the words it
+/// lands in read and stored a word per code, and a code was an `i128` sum checked on the way. On
+/// TPC-H q06 run once that was a fifth of the query, since every page of a strided column is
+/// decoded flat and packed again.
+fn lay_codes(words: &mut [u64], width: u32, codes: impl Iterator<Item = u64>) {
+    let (mut word, mut filled, mut at) = (0_u64, 0_u32, 0);
+    for code in codes {
+        word |= code << filled;
+        filled += width;
+        if filled >= u64::BITS {
+            words[at] = word;
+            at += 1;
+            filled -= u64::BITS;
+            // What of the code did not fit, which shifting it by its whole width would not leave.
+            word = if filled == 0 { 0 } else { code >> (width - filled) };
+        }
+    }
+    if filled > 0 {
+        words[at] = word;
+    }
 }
 
 /// Writes `width` bits of `code` starting at `bit`, over words that started out zero.
@@ -8628,6 +8688,9 @@ mod tests {
                 Vector::flat(LogicalType::BigInt, Data::Int64(values.clone().into())).unwrap();
             let packed = flat.bit_packed().unwrap();
             assert_eq!(packed.packed_parts().expect("packed").width(), width);
+            let straight = flat.bit_packed_on_lanes().unwrap();
+            assert_eq!(straight.packed_parts().expect("packed").width(), held, "width {width}");
+            assert_eq!(straight.iter().collect::<Vec<_>>(), flat.iter().collect::<Vec<_>>());
             // A cut partway into a block goes a code at a time, and one on a block a block at a
             // time with the last rows a code at a time.
             for (at, len) in [(70, 900), (0, 1000), (128, 872)] {
