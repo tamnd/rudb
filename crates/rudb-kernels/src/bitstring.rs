@@ -68,10 +68,15 @@ fn whole(value: &Value) -> Result<i64> {
 }
 
 /// A bit string shifted left or right by some bits, keeping its length and filling with zeros. A
-/// shift past the end, or one that is negative, leaves no bit standing.
+/// shift past the end, or a right shift that is negative, leaves no bit standing, and a left shift
+/// that is negative is the pin's error.
 fn shifted(bits: &[u8], shift: &Value, left: bool) -> Result<Value> {
     let len = bit::len(bits);
-    let shift = usize::try_from(whole(shift)?).unwrap_or(usize::MAX);
+    let shift = whole(shift)?;
+    if left && shift < 0 {
+        return Err(Error::out_of_range(format!("Cannot left-shift by negative number {shift}")));
+    }
+    let shift = usize::try_from(shift).unwrap_or(usize::MAX);
     let mut out = bits.to_vec();
     for n in 0..len {
         let from = if left {
@@ -244,6 +249,9 @@ mod tests {
         assert_eq!(call("<<", &[a.clone(), Value::Integer(1)]).unwrap(), "1000");
         assert_eq!(call(">>", &[a.clone(), Value::Integer(1)]).unwrap(), "0110");
         assert_eq!(call(">>", &[a.clone(), Value::Integer(9)]).unwrap(), "0000");
+        assert_eq!(call(">>", &[a.clone(), Value::Integer(-2)]).unwrap(), "0000");
+        let error = call("<<", &[a.clone(), Value::Integer(-2)]).unwrap_err();
+        assert_eq!(error.message(), "Cannot left-shift by negative number -2");
         let error = call("&", &[a, bits("10")]).unwrap_err();
         assert_eq!(error.message(), "Cannot AND bit strings of different sizes");
     }

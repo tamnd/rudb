@@ -13384,3 +13384,48 @@ fn an_unpivot_takes_columns_apart_into_rows() {
     let error = db.query("UNPIVOT t ON b + c").expect_err("refused");
     assert!(error.to_string().contains("contains multiple (b, c)"));
 }
+
+#[test]
+fn a_whole_number_literal_takes_the_integer_type_it_meets_when_it_fits() {
+    let db = Database::new();
+    let text = |s: &str| Value::Varchar(s.into());
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(1::UINT32 << 31), typeof(1::UTINYINT + 1), typeof(3 << 1::UTINYINT), \
+             typeof(1::UHUGEINT >> 2), typeof(1::UTINYINT * 1000), typeof(1::UINT32 + -1), \
+             typeof(1::UTINYINT + 1::INTEGER)"
+        ),
+        vec![vec![
+            text("UINTEGER"),
+            text("UTINYINT"),
+            text("UTINYINT"),
+            text("UHUGEINT"),
+            text("INTEGER"),
+            text("BIGINT"),
+            text("INTEGER"),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT typeof(coalesce(1::UTINYINT, NULL, 1)), typeof(greatest(1::SMALLINT, 2)), \
+             typeof([1::UTINYINT, 1]), typeof(CASE WHEN true THEN 1::UTINYINT ELSE 1 END), \
+             typeof(1 + 1)"
+        ),
+        vec![vec![
+            text("UTINYINT"),
+            text("SMALLINT"),
+            text("UTINYINT[]"),
+            text("UTINYINT"),
+            text("INTEGER"),
+        ]]
+    );
+    assert_eq!(rows(&db, "SELECT (1::UHUGEINT << 100) >> 99"), vec![vec![Value::UHugeInt(2)]]);
+    let error = db.query("SELECT 255::UTINYINT + 1").expect_err("overflows");
+    assert!(error.to_string().contains("Overflow in addition of UINT8 (255 + 1)"), "{error}");
+    let error = db.query("SELECT 1::UINT32 << 32").expect_err("overflows");
+    assert!(error.to_string().contains("Overflow in left shift (1 << 32)"), "{error}");
+    let error = db.query("SELECT '010101'::BIT << -2").expect_err("refused");
+    assert!(error.to_string().contains("Cannot left-shift by negative number -2"), "{error}");
+}
