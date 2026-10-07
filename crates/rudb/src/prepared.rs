@@ -501,6 +501,22 @@ impl Direct {
         if select.filter != rudb_parse::NONE {
             return None;
         }
+        // A table written as `excluded` is the binder's to refuse in a `RETURNING`, as on the pin.
+        let excluded =
+            ast.source_list(select.from).iter().any(|&source| match ast.source(source) {
+                ast::Source::Table { name, alias, .. } => {
+                    let label = if alias == rudb_parse::NONE {
+                        ast.name(name).last().unwrap_or_default()
+                    } else {
+                        ast.string(alias)
+                    };
+                    label.eq_ignore_ascii_case("excluded")
+                }
+                _ => false,
+            });
+        if excluded {
+            return None;
+        }
         Lookup::listing(ast, select, compare)
     }
 }

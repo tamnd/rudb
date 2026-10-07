@@ -10129,6 +10129,107 @@ fn an_insert_that_meets_a_held_key_does_what_its_conflict_clause_says() {
 }
 
 #[test]
+fn a_unique_index_is_a_conflict_target_as_a_key_is() {
+    let db = scripted(&[
+        "CREATE TABLE t (i INTEGER, j INTEGER, k INTEGER DEFAULT 3)",
+        "INSERT INTO t VALUES (5, 3, 0), (3, 2, 0)",
+        "CREATE UNIQUE INDEX t_i ON t (i)",
+        "INSERT INTO t VALUES (5, 2, 0) ON CONFLICT (i) DO UPDATE SET j = 10",
+        "INSERT INTO t VALUES (3, 2, 0) ON CONFLICT DO UPDATE SET j = 11, k = DEFAULT",
+        "INSERT OR IGNORE INTO t VALUES (3, 9, 9), (4, 4, 4)",
+    ]);
+    assert_eq!(
+        rows(&db, "SELECT * FROM t ORDER BY i"),
+        vec![
+            vec![integer(3), integer(11), integer(3)],
+            vec![integer(4), integer(4), integer(4)],
+            vec![integer(5), integer(10), integer(0)],
+        ]
+    );
+    assert_eq!(
+        rows(&db, "SELECT i, j FROM t ORDER BY ALL DESC"),
+        vec![
+            vec![integer(5), integer(10)],
+            vec![integer(4), integer(4)],
+            vec![integer(3), integer(11)],
+        ]
+    );
+    db.execute("INSERT OR REPLACE INTO t VALUES (4, 7, 7)").unwrap();
+    assert_eq!(rows(&db, "SELECT j FROM t WHERE i = 4"), vec![vec![integer(7)]]);
+    db.execute("CREATE UNIQUE INDEX t_j ON t (j)").unwrap();
+    assert_eq!(
+        refusal(&db, "INSERT INTO t VALUES (4, 1, 1) ON CONFLICT DO UPDATE SET k = 1"),
+        "Conflict target has to be provided for a DO UPDATE operation when the table has \
+         multiple UNIQUE/PRIMARY KEY constraints"
+    );
+    db.execute("CREATE TABLE plain (i INTEGER)").unwrap();
+    db.execute("CREATE INDEX plain_i ON plain (i)").unwrap();
+    assert_eq!(
+        refusal(&db, "INSERT INTO plain VALUES (1) ON CONFLICT (i) DO NOTHING"),
+        "The specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY \
+         CONSTRAINT or INDEX"
+    );
+}
+
+#[test]
+fn a_do_update_is_refused_where_the_pin_refuses_one() {
+    let db = scripted(&[
+        "CREATE TABLE t (a INTEGER UNIQUE, b INTEGER)",
+        "CREATE TABLE excluded (key INTEGER UNIQUE, data VARCHAR)",
+    ]);
+    for (statement, message) in [
+        (
+            "INSERT OR REPLACE INTO t VALUES (1, 2) ON CONFLICT DO NOTHING",
+            "You can not provide both OR REPLACE|IGNORE and an ON CONFLICT clause, please remove \
+             the first if you want to have more granular control",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT ON CONSTRAINT c DO NOTHING",
+            "ON CONSTRAINT conflict target is not supported yet",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.bb",
+            "Values list \"excluded\" does not have a column named \"bb\"",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = t.bb",
+            "Table \"t\" does not have a column named \"bb\"",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = (SELECT 1)",
+            "DO UPDATE SET clause cannot contain a subquery",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 1 WHERE EXISTS \
+             (SELECT 1)",
+            "DO UPDATE SET clause cannot contain a subquery",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 1 WHERE b = DEFAULT",
+            "WHERE clause cannot contain DEFAULT clause",
+        ),
+        (
+            "INSERT INTO t AS excluded VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.b",
+            "Ambiguous reference to table \"excluded\" (duplicate alias \"excluded\", explicitly \
+             alias one of the tables using \"AS my_alias\")",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) RETURNING excluded.b",
+            "'excluded' qualified columns are not supported in the RETURNING clause yet",
+        ),
+        (
+            "INSERT INTO excluded VALUES (1, 'x') RETURNING *",
+            "'excluded' qualified columns are not supported in the RETURNING clause yet",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    db.execute("INSERT INTO t AS excluded VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = 5")
+        .unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM t"), vec![vec![Value::BigInt(1)]]);
+}
+
+#[test]
 fn a_conflict_clause_that_names_no_key_is_refused_the_way_the_pin_refuses_it() {
     let db = scripted(&[
         "CREATE TABLE plain (i INTEGER)",

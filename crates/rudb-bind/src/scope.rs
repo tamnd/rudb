@@ -340,11 +340,17 @@ impl Scope {
                     .state(SqlState::UNDEFINED_TABLE)
                     .pg(format!("missing FROM-clause entry for table \"{table}\""))
             }
-            Some(table) => Error::binder(format!(
-                "Referenced column \"{column}\" not found in table \"{table}\"!"
-            ))
-            .state(SqlState::UNDEFINED_COLUMN)
-            .pg(format!("column {table}.{column} does not exist")),
+            // The pin says `Values list` for a table that is not one, the `excluded` row among
+            // them, and that row is the one whose columns only a qualified name reaches.
+            Some(table) => {
+                let mut held = self.columns.iter().filter(|held| compare.same(&held.table, table));
+                let kind = if held.all(|held| held.qualified) { "Values list" } else { "Table" };
+                Error::binder(format!(
+                    "{kind} \"{table}\" does not have a column named \"{column}\""
+                ))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!("column {table}.{column} does not exist"))
+            }
             None => Error::binder(format!(
                 "Referenced column \"{column}\" not found in FROM clause!{}",
                 self.candidates()

@@ -447,7 +447,8 @@ pub struct Checks {
 /// A bound `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.
 #[derive(Debug)]
 pub struct Conflict {
-    /// Which of the table's keys a clash is on, or `None` for any of them.
+    /// Which of the table's guards a clash is on, its keys and then its unique indexes, or `None`
+    /// for any of them.
     pub key: Option<usize>,
     /// What happens to a row that clashes.
     pub action: ConflictAction,
@@ -3364,6 +3365,7 @@ fn insert(
     let root = binder.plan_mut().add_node(Node::Project { input: root, index, exprs, names });
     let root = generate(&mut binder, (root, index), &fields, target, 0)?;
     let source = finish(binder, root)?;
+    excluded_returning(ast, written.returning)?;
     let returning = returning(ast, catalog, parameters, session, written.returning)?;
     let conflict = match written.conflict {
         Some(conflict) => {
@@ -3576,7 +3578,8 @@ fn bind_conflict(
 ) -> Result<Conflict> {
     let table = catalog.table(name)?;
     let fields = table.columns();
-    let keys = table.keys();
+    // A unique index is a conflict target as a key is, which is how the pin counts them too.
+    let keys = table.guards();
     let key = if conflict.target.is_empty() {
         if keys.is_empty() {
             return Err(Error::binder(
@@ -3652,17 +3655,26 @@ fn bind_conflict(
                 }
                 columns.push(at);
             }
+            let defaulted = conflict_defaults(ast, query)?;
             let mut binder = Binder::with(catalog, parameters, session);
             binder.upsert = true;
+            binder.default_as_null = defaulted.contains(&true);
             let (root, scope) = binder.bind_query(ast, query)?;
+            binder.default_as_null = false;
             // Each value is cast to its column's type here, so the write only has to place it,
-            // and the condition is cast to a boolean, so the write only has to test it.
+            // and the condition is cast to a boolean, so the write only has to test it. A value
+            // that is `DEFAULT` is its column's default instead.
             let mut exprs = Vec::with_capacity(scope.columns.len());
             let mut names = Vec::with_capacity(scope.columns.len());
             for (at, column) in scope.columns.iter().enumerate() {
+                let ty = columns.get(at).map_or(LogicalType::Boolean, |&to| fields[to].ty.clone());
+                if defaulted.get(at) == Some(&true) {
+                    exprs.push(binder.bind_default(table.default(columns[at]), &ty)?);
+                    names.push(binder.plan_mut().intern(&column.name));
+                    continue;
+                }
                 let expr =
                     binder.plan_mut().add_expr(Expr::Column(column.binding), column.ty.clone());
-                let ty = columns.get(at).map_or(LogicalType::Boolean, |&to| fields[to].ty.clone());
                 exprs.push(binder.checked_cast_to(expr, &ty, false)?);
                 names.push(binder.plan_mut().intern(&column.name));
             }
@@ -3681,6 +3693,104 @@ fn bind_conflict(
         }
     };
     Ok(Conflict { key, action })
+}
+
+/// Refuses what the pin refuses in a `DO UPDATE`, and says which of its values are a bare
+/// `DEFAULT`. A subquery is refused anywhere in it, a `DEFAULT` in its `WHERE` or inside a value,
+/// and a name qualified with `excluded` when the table is written with that alias as well.
+fn conflict_defaults(ast: &Ast, query: ast::QueryRef) -> Result<Vec<bool>> {
+    let ast::QueryBody::Select(select) = ast.query(query).body else { return Ok(Vec::new()) };
+    let select = ast.select(select);
+    let aliased = ast.source_list(select.from).iter().any(|&source| {
+        let ast::Source::Join { left, .. } = ast.source(source) else { return false };
+        matches!(ast.source(left), ast::Source::Table { alias, .. }
+            if alias != NONE && same_name(ast.string(alias), "excluded"))
+    });
+    let targets = ast.target_list(select.targets);
+    let mut defaulted = Vec::with_capacity(targets.len());
+    for (at, target) in targets.iter().enumerate() {
+        // The condition is the last item, after the values.
+        let condition = at + 1 == targets.len();
+        let bare = !condition && matches!(ast.expr(target.expr), ast::Expr::Default);
+        defaulted.push(bare);
+        let mut stack = if bare { Vec::new() } else { vec![target.expr] };
+        while let Some(expr) = stack.pop() {
+            match ast.expr(expr) {
+                ast::Expr::Subquery { .. }
+                | ast::Expr::Exists { .. }
+                | ast::Expr::InSubquery { .. }
+                | ast::Expr::QuantifiedSubquery { .. } => {
+                    return Err(Error::binder("DO UPDATE SET clause cannot contain a subquery"));
+                }
+                ast::Expr::Default if condition => {
+                    return Err(Error::binder("WHERE clause cannot contain DEFAULT clause"));
+                }
+                ast::Expr::Default => {
+                    return Err(Error::not_implemented(
+                        "Unimplemented expression class in ExpressionBinder::BindExpression: \
+                         DEFAULT",
+                    ));
+                }
+                ast::Expr::Column { name }
+                    if aliased
+                        && ast.name(name).count() > 1
+                        && ast
+                            .name(name)
+                            .next()
+                            .is_some_and(|first| same_name(first, "excluded")) =>
+                {
+                    return Err(Error::binder(
+                        "Ambiguous reference to table \"excluded\" (duplicate alias \"excluded\", \
+                         explicitly alias one of the tables using \"AS my_alias\")",
+                    ));
+                }
+                _ => {}
+            }
+            stack.extend(ast.children(expr));
+        }
+    }
+    defaulted.pop();
+    Ok(defaulted)
+}
+
+/// Refuses a `RETURNING` of an `INSERT` that reads the `excluded` row, the way the pin does. That
+/// is a column qualified with `excluded`, and any column at all of a table that is itself called
+/// `excluded`, which the pin takes for the same thing.
+fn excluded_returning(ast: &Ast, query: Option<ast::QueryRef>) -> Result<()> {
+    let Some(query) = query else { return Ok(()) };
+    let ast::QueryBody::Select(select) = ast.query(query).body else { return Ok(()) };
+    let select = ast.select(select);
+    let called = ast.source_list(select.from).iter().any(|&source| match ast.source(source) {
+        ast::Source::Table { name, alias, .. } => {
+            let name = if alias == NONE {
+                ast.name(name).last().unwrap_or_default()
+            } else {
+                ast.string(alias)
+            };
+            same_name(name, "excluded")
+        }
+        _ => false,
+    });
+    let mut stack: Vec<ast::ExprRef> =
+        ast.target_list(select.targets).iter().map(|target| target.expr).collect();
+    while let Some(expr) = stack.pop() {
+        let reads = match ast.expr(expr) {
+            ast::Expr::Column { name } => {
+                called
+                    || (ast.name(name).count() > 1
+                        && ast.name(name).next().is_some_and(|first| same_name(first, "excluded")))
+            }
+            ast::Expr::Star { .. } => called,
+            _ => false,
+        };
+        if reads {
+            return Err(Error::not_implemented(
+                "'excluded' qualified columns are not supported in the RETURNING clause yet",
+            ));
+        }
+        stack.extend(ast.children(expr));
+    }
+    Ok(())
 }
 
 /// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.

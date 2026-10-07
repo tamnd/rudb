@@ -7862,7 +7862,7 @@ impl Shared {
         let table = catalog.table(name)?;
         let types = table.types();
         let fields = table.columns().to_vec();
-        let keys = table.keys().to_vec();
+        let keys = table.guards();
         let all: Vec<usize> = (0..fields.len()).collect();
         let mut stored = Vec::with_capacity(table.rows().chunk_count());
         for at in 0..table.rows().chunk_count() {
@@ -8252,6 +8252,29 @@ fn upsert_target(
         let mut held = guard.columns.clone();
         held.sort_unstable();
         if named != held {
+            return None;
+        }
+    }
+    // A name the table does not have is the binder's to refuse, whether or not a row is held.
+    if let crate::prepared::Action::Update(changes) = &upsert.action {
+        let fields = table.columns();
+        let known = |column: &str| {
+            upsert
+                .insert
+                .compare
+                .find(fields.iter().map(|field| field.name.as_str()), column)
+                .is_some()
+        };
+        let named = changes.iter().all(|(column, change)| {
+            let (crate::prepared::Change::To(source) | crate::prepared::Change::Add(source, _)) =
+                change;
+            known(column)
+                && match source {
+                    crate::prepared::Source::Excluded(read) => known(read),
+                    crate::prepared::Source::Given(_) => true,
+                }
+        });
+        if !named {
             return None;
         }
     }
