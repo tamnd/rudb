@@ -6124,6 +6124,21 @@ impl Shared {
         cancel: &Cancel,
         parse_ns: u64,
     ) -> Result<QueryResult> {
+        if let [_, _, ..] = ast.statements.as_slice()
+            && ast.statements.iter().all(|s| matches!(s, ast::Statement::Delete(_)))
+        {
+            // `TRUNCATE a, b` of a PostgreSQL session, which is one delete for each table. They
+            // run in one transaction, so a table that is not there truncates none of them.
+            return self.atomically(|| {
+                let mut last = None;
+                for &statement in &ast.statements {
+                    let mut step = ast.clone();
+                    step.statements = vec![statement];
+                    last = Some(self.execute_ast(&step, sql, parameters, cancel, parse_ns)?);
+                }
+                last.ok_or_else(|| Error::internal("a truncate of no table"))
+            });
+        }
         let unwritten = unwritten_definitions(ast, parameters);
         if !unwritten.is_empty() {
             return self.execute_written(ast, sql, parameters, cancel, parse_ns, &unwritten);
