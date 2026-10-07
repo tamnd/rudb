@@ -8255,6 +8255,29 @@ fn upsert_target(
             return None;
         }
     }
+    // A name the table does not have is the binder's to refuse, whether or not a row is held.
+    if let crate::prepared::Action::Update(changes) = &upsert.action {
+        let fields = table.columns();
+        let known = |column: &str| {
+            upsert
+                .insert
+                .compare
+                .find(fields.iter().map(|field| field.name.as_str()), column)
+                .is_some()
+        };
+        let named = changes.iter().all(|(column, change)| {
+            let (crate::prepared::Change::To(source) | crate::prepared::Change::Add(source, _)) =
+                change;
+            known(column)
+                && match source {
+                    crate::prepared::Source::Excluded(read) => known(read),
+                    crate::prepared::Source::Given(_) => true,
+                }
+        });
+        if !named {
+            return None;
+        }
+    }
     let pointed = catalog.tables().any(|held| held.foreign().iter().any(|key| key.table == name));
     // A `DO UPDATE` of a column of the key moves the row to another key, which is the plan's.
     let rekeys = match &upsert.action {

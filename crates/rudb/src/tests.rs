@@ -10146,6 +10146,14 @@ fn a_unique_index_is_a_conflict_target_as_a_key_is() {
             vec![integer(5), integer(10), integer(0)],
         ]
     );
+    assert_eq!(
+        rows(&db, "SELECT i, j FROM t ORDER BY ALL DESC"),
+        vec![
+            vec![integer(5), integer(10)],
+            vec![integer(4), integer(4)],
+            vec![integer(3), integer(11)],
+        ]
+    );
     db.execute("INSERT OR REPLACE INTO t VALUES (4, 7, 7)").unwrap();
     assert_eq!(rows(&db, "SELECT j FROM t WHERE i = 4"), vec![vec![integer(7)]]);
     db.execute("CREATE UNIQUE INDEX t_j ON t (j)").unwrap();

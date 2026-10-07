@@ -2346,7 +2346,7 @@ impl<'a> Binder<'a> {
         above: &mut Vec<PendingSubquery>,
     ) -> Result<Vec<SortKey>> {
         if query.order_by_all {
-            return Ok(self.every_column(output));
+            return Ok(self.every_column(ast, query, output));
         }
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
@@ -2405,7 +2405,7 @@ impl<'a> Binder<'a> {
         targets: &[ast::Target],
     ) -> Result<Vec<SortKey>> {
         if query.order_by_all {
-            return Ok(self.every_column(output));
+            return Ok(self.every_column(ast, query, output));
         }
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
@@ -2433,13 +2433,19 @@ impl<'a> Binder<'a> {
         Ok(keys)
     }
 
-    fn every_column(&mut self, output: &Scope) -> Vec<SortKey> {
+    fn every_column(&mut self, ast: &Ast, query: &ast::Query, output: &Scope) -> Vec<SortKey> {
+        // `ORDER BY ALL DESC` is one item with no expression, which carries the direction and the
+        // null placement for every column.
+        let written = ast.order_list(query.order_by).first().copied();
         let columns: Vec<(ColumnBinding, LogicalType)> =
             output.columns.iter().map(|column| (column.binding, column.ty.clone())).collect();
         columns
             .into_iter()
             .map(|(binding, ty)| {
                 let expr = self.plan.add_expr(Expr::Column(binding), ty);
+                if let Some(item) = written {
+                    return self.sort_key(expr, item);
+                }
                 let expr = self.by_position(expr);
                 let descending = self.semantics.default_descending();
                 SortKey { expr, descending, nulls_first: self.semantics.nulls_first(descending) }
