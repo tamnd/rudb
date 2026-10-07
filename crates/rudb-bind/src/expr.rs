@@ -12,9 +12,9 @@
 
 use rudb_common::{
     CastInput, CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, LogicalType,
-    MAX_DECIMAL_WIDTH, NumberLiterals, OperatorRules, Result, Semantics, Session, SetFunctions,
-    SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule,
-    rule_names,
+    MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, Result, Semantics, Session,
+    SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting,
+    looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -3547,6 +3547,14 @@ impl Binder<'_> {
         if from == ty {
             return Ok(expr);
         }
+        if !try_cast
+            && self.semantics.number_casts() == NumberCasts::Postgres
+            && number_cast_can_fail(from, ty)
+        {
+            let name = self.plan_mut().intern("__rudb_pg_number");
+            let args = self.plan_mut().add_expr_list(&[expr]);
+            return Ok(self.add_expr(Expr::Function { name, args }, ty.clone()));
+        }
         struct_members_meet(from, ty)?;
         self.resolve_placeholder(expr, ty);
         Ok(self.add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
@@ -4938,6 +4946,30 @@ fn undefined_operator(
 
 /// The type of an argument as `format_type` names it, with `unknown` for a string literal and a
 /// null, which have no type yet when PostgreSQL looks for a function or an operator.
+/// Whether a cast between two PostgreSQL number types can fail, so that a PostgreSQL session casts
+/// it with `__rudb_pg_number`, which fails as PostgreSQL does. A cast to a wider type never fails,
+/// and the engine casts it. A `numeric` with a typmod is a DECIMAL here.
+fn number_cast_can_fail(from: &LogicalType, to: &LogicalType) -> bool {
+    use LogicalType as L;
+    let width = |ty: &LogicalType| match ty {
+        L::SmallInt => Some(2),
+        L::Integer => Some(4),
+        L::BigInt => Some(8),
+        _ => None,
+    };
+    match (from, to) {
+        (L::SmallInt | L::Integer | L::BigInt, _) => {
+            matches!((width(from), width(to)), (Some(from), Some(to)) if from > to)
+        }
+        (
+            L::Float | L::Double | L::Numeric | L::Decimal { .. },
+            L::SmallInt | L::Integer | L::BigInt,
+        ) => true,
+        (L::Double, L::Float) | (L::Numeric, L::Float | L::Double) => true,
+        _ => false,
+    }
+}
+
 fn postgres_type_name(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
     match ast.expr(arg) {
         ast::Expr::Literal { kind: LiteralKind::String, .. } => "unknown".into(),

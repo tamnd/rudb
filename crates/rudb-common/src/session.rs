@@ -183,6 +183,7 @@ impl Eq for Variables {}
 pub struct Semantics {
     aggregate_types: AggregateTypes,
     cast_input: CastInput,
+    number_casts: NumberCasts,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -220,6 +221,7 @@ impl Default for Semantics {
         Self {
             aggregate_types: AggregateTypes::Pin,
             cast_input: CastInput::Pin,
+            number_casts: NumberCasts::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -339,6 +341,11 @@ impl Semantics {
     #[must_use]
     pub fn cast_input(self) -> CastInput {
         self.cast_input
+    }
+    /// How a cast between two number types checks the range of its value.
+    #[must_use]
+    pub fn number_casts(self) -> NumberCasts {
+        self.number_casts
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -623,6 +630,18 @@ pub enum CastInput {
     Pin,
     /// As in PostgreSQL: the input function of the type reads the string, with its rules and its
     /// errors, so `'1.5'::text::int` is `22P02 invalid input syntax for type integer`.
+    Postgres,
+}
+
+/// How a cast between two number types checks the range of its value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NumberCasts {
+    /// As in DuckDB: the cast of the engine checks it, so `70000::int2` is a conversion error, and
+    /// a double too big for a `FLOAT` becomes infinity.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the cast function of the type pair checks it, so `70000::int2` is `22003
+    /// smallint out of range`, and `1e300::float8::float4` is `22003 value out of range: overflow`.
     Postgres,
 }
 
@@ -1055,6 +1074,7 @@ impl Session {
             self.semantics.function_rules = FunctionRules::Postgres;
             self.semantics.plan_errors = PlanErrors::Postgres;
             self.semantics.cast_input = CastInput::Postgres;
+            self.semantics.number_casts = NumberCasts::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
         }
