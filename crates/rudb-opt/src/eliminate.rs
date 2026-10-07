@@ -463,7 +463,8 @@ mod tests {
         let text = "Join INNER on=[(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n  \
              Get memory.main.orders AS orders #0 [o_orderkey::BIGINT, o_custkey::BIGINT]\n  \
              Get memory.main.customer AS customer #1 [c_custkey::BIGINT, c_name::VARCHAR]\n";
-        let plan = Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
         let side = plan.node(plan.root()).children().into_iter().flatten().nth(1);
         assert_eq!(read_above(&plan, plan.root(), side.expect("a right side")), None);
     }
