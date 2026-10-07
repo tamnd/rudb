@@ -2969,6 +2969,7 @@ fn laid_keys(keying: Keying<'_>, rows: &Build) -> Option<Vec<Vector>> {
         .map(|&expr| match *keying.plan.expr(expr) {
             // A constant is kept as one in the side, and the table is built over keys a row each.
             Expr::Column(binding) => match rows.column(keying.schema.position_of(binding)?) {
+                // flatten: the table reads a key per row, so a constant key is laid out a row each.
                 Some(key) if key.constant_value().is_some() => key.flatten().ok(),
                 key => key.cloned(),
             },

@@ -22,6 +22,7 @@ pub(crate) fn call<V: AsRef<Vector>>(
     };
     let owner = owner.as_ref().try_value_at(0)?.as_i64().unwrap_or(0);
     let cancel = advisory::cancel_of(i32::try_from(owner).unwrap_or(0));
+    // row at a time: each row waits its own time, one after the other, as in PostgreSQL.
     for row in 0..rows {
         // A null, a negative and a NaN wait do not wait, as in PostgreSQL.
         let Value::Double(seconds) = seconds.as_ref().try_value_at(row)? else {

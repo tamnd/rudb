@@ -757,6 +757,8 @@ fn found_again(before: &Table, now: &Table, done: &Redone) -> Result<Option<(Vec
     let find = |numbers: &[u64]| -> Result<Option<Vec<u64>>> {
         let mut found: Vec<u64> = Vec::with_capacity(numbers.len());
         for chunk in picked(before, numbers)? {
+            // row at a time: each row is a lookup by its key, and the rows are the few the
+            // transaction wrote.
             for row in 0..chunk.len() {
                 let values =
                     key.iter().map(|&column| chunk.value_at(row, column)).collect::<Vec<_>>();
