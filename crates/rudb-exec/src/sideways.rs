@@ -72,7 +72,7 @@ use std::sync::{Arc, OnceLock};
 use rudb_common::bounds::{Bound, Op};
 use rudb_common::{LogicalType, Result, SessionTimeZone};
 use rudb_graph::link::Form;
-use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids};
+use rudb_graph::{Adjacency, KeyMap, Link, PART_ROWS, Pushed, Rids, Spans};
 use rudb_metrics::Reduced;
 use rudb_plan::{BuildSide, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
 use rudb_storage::{Blocked, Range};
@@ -185,10 +185,10 @@ struct Listing {
 /// What [`listed_keys`] found out before gathering anything.
 #[derive(Debug)]
 enum Planned {
-    /// The parents the keys name, to push through the adjacency, and how many rows they reach.
+    /// Where the lists of the parents the keys name are, to push through the adjacency, and how
+    /// many rows they reach.
     Through {
-        held: Rids,
-        reach: u64,
+        spans: Spans,
         /// Whether the rows go in however thickly they sit in their parts, which they do when they
         /// are a join's own or narrow a set the scan already reads one at a time.
         placed: bool,
@@ -201,7 +201,7 @@ enum Planned {
 impl Planned {
     fn reach(&self) -> u64 {
         match self {
-            Self::Through { reach, .. } => *reach,
+            Self::Through { spans, .. } => spans.rows(),
             Self::Ready(pushed) => pushed.rids.len(),
         }
     }
@@ -1114,12 +1114,13 @@ impl<'a> Sideways<'a> {
         self.found.get()?.reach(self.exact(), within)
     }
 
-    /// The rows of a scan of `index` the kept keys reach, gathered the first time this is asked.
-    pub(crate) fn gather(&self, index: u32) -> Option<&Rids> {
+    /// The rows of a scan of `index` the kept keys reach, gathered the first time this is asked,
+    /// on up to `threads` threads.
+    pub(crate) fn gather(&self, index: u32, threads: usize) -> Option<&Rids> {
         if self.binding.get()?.table != index {
             return None;
         }
-        Some(&self.found.get()?.gather(self.exact())?.rids)
+        Some(&self.found.get()?.gather(self.exact(), threads)?.rids)
     }
 
     /// What the exact reduction came to for a scan of `index`, for `EXPLAIN ANALYZE` to show.
@@ -1321,7 +1322,7 @@ pub(crate) fn found_for(
         .is_some_and(|(_, held)| exact.and_then(Exact::keys).is_some_and(|map| *held < map.len()));
     let (listed, deferred) = match (exact, planned) {
         (_, Some(planned)) if testable => (None, Some(planned)),
-        (Some(exact), Some(planned)) => (gathered(exact, &planned), None),
+        (Some(exact), Some(planned)) => (gathered(exact, &planned, 1), None),
         _ => (own_rows, None),
     };
     // A monotone link is pushed whatever it could skip, because the push walks from one held
@@ -1611,11 +1612,10 @@ fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Op
     let Some(held) = held.parents(map, adjacency.parents())? else {
         return Ok(None);
     };
-    let reach = adjacency.reached(held)?;
-    if reach.saturating_mul(LISTED) >= children {
+    let Some(spans) = adjacency.spans(held, below(children, LISTED))? else {
         return Ok(None);
-    }
-    Ok(Some(Planned::Through { held: held.clone(), reach, placed: true }))
+    };
+    Ok(Some(Planned::Through { spans, placed: true }))
 }
 
 /// How the driving rows that hold one of `count` key values would be read off the backward
@@ -1662,11 +1662,15 @@ fn listed_keys(
         return pushed_keys(exact, map, keys, worth, within.is_some()).map(Planned::Ready);
     };
     let held = keyed_parents(map, adjacency.parents(), keys)?;
-    let reach = adjacency.reached(&held).ok()?;
-    if !worth(reach) {
+    let most = match within {
+        Some(held) => held.saturating_sub(1),
+        None => below(children, exact.gathered),
+    };
+    let spans = adjacency.spans(&held, most).ok()??;
+    if !worth(spans.rows()) {
         return None;
     }
-    Some(Planned::Through { held, reach, placed: within.is_some() })
+    Some(Planned::Through { spans, placed: within.is_some() })
 }
 
 /// The parents that hold `keys`, as a set over the `parents` rows of the parent table, `None` when
@@ -1702,14 +1706,20 @@ fn pushed_keys(
     (worth(pushed.rids.len()) && (within || thin(&pushed.rids))).then_some(pushed)
 }
 
+/// The most rows that are fewer than one in `share` of `children`, which is where [`listed`] and
+/// [`listed_keys`] turn a set of lists down.
+fn below(children: u64, share: u64) -> u64 {
+    children.saturating_sub(1).checked_div(share).unwrap_or(u64::MAX)
+}
+
 /// The rows a plan of [`listed_keys`] names, `None` when they sit too thickly in their parts to be
 /// worth reading one at a time.
-fn gathered(exact: &Exact, planned: &Planned) -> Option<Pushed> {
+fn gathered(exact: &Exact, planned: &Planned, threads: usize) -> Option<Pushed> {
     match planned {
         Planned::Ready(pushed) => Some(pushed.clone()),
-        Planned::Through { held, placed, .. } => {
+        Planned::Through { spans, placed } => {
             let children = exact.children?;
-            let rids = exact.adjacency()?.push(held).ok()?;
+            let rids = exact.adjacency()?.push_spans(spans, threads).ok()?;
             if !placed && !thin(&rids) {
                 return None;
             }
@@ -2055,11 +2065,11 @@ impl Found {
     }
 
     /// The rows the kept keys reach, gathered the first time they are asked for.
-    fn gather(&self, exact: Option<&Exact>) -> Option<&Pushed> {
+    fn gather(&self, exact: Option<&Exact>, threads: usize) -> Option<&Pushed> {
         self.reach(exact, None)?;
         let listing = self.listing.as_ref()?;
         let planned = listing.planned.get()?.as_ref()?;
-        listing.gathered.get_or_init(|| gathered(exact?, planned)).as_ref()
+        listing.gathered.get_or_init(|| gathered(exact?, planned, threads)).as_ref()
     }
 
     /// A build side that turned out to hold this, for the tests that stand in for one.
@@ -2547,7 +2557,7 @@ mod tests {
 
         assert!(found.rows.is_none() && found.domain.is_some(), "left for the scan to read");
         assert_eq!(found.reach(Some(&exact), None), Some(2_000));
-        let rows = &found.gather(Some(&exact)).expect("an exact side").rids;
+        let rows = &found.gather(Some(&exact), 1).expect("an exact side").rids;
         let kept: Vec<u64> = rows.iter().collect();
         let expected: Vec<u64> =
             (0..50_000).filter(|child| child % 50 == 3 || child % 50 == 40).collect();
@@ -2575,13 +2585,13 @@ mod tests {
 
         let found = Found::kept(words(&[103]), Some(&exact));
         assert_eq!(found.reach(Some(&exact), None), Some(100));
-        let rows = &found.gather(Some(&exact)).expect("listed").rids;
+        let rows = &found.gather(Some(&exact), 1).expect("listed").rids;
         assert!(found.domain.is_some(), "the bitmap stays for a scan that gathers another set");
         let expected: Vec<u64> = (0..100_000).filter(|child| child % 1_000 == 3).collect();
         assert_eq!(rows.iter().collect::<Vec<u64>>(), expected);
 
         let found = Found::kept(words(&[103, 2_000]), Some(&exact));
-        assert!(found.gather(Some(&exact)).is_none() && found.domain.is_some());
+        assert!(found.gather(Some(&exact), 1).is_none() && found.domain.is_some());
 
         // Few enough rows of the table, but each parent's children are stored together, so the one
         // kept parent fills the part it is in and reading it whole is no worse than reading its
@@ -2592,7 +2602,7 @@ mod tests {
             Adjacency::build(&parents_of, 1_000).expect("every parent exists"),
         );
         let found = Found::kept(words(&[103]), Some(&clustered));
-        assert!(found.gather(Some(&clustered)).is_none() && found.domain.is_some());
+        assert!(found.gather(Some(&clustered), 1).is_none() && found.domain.is_some());
     }
 
     /// A join set aside under another one places no rows, but its keys can still be read as the
@@ -2615,7 +2625,7 @@ mod tests {
         let found = found_for(&keyed, Some(&exact), &side, false, false).expect("integers");
         assert!(found.rows.is_none() && found.domain.is_some(), "no rows of its own");
         assert_eq!(found.reach(Some(&exact), None), Some(8));
-        let rows = &found.gather(Some(&exact)).expect("pushed").rids;
+        let rows = &found.gather(Some(&exact), 1).expect("pushed").rids;
         let expected: Vec<u64> = (12..16).chain(20_000..20_004).collect();
         assert_eq!(rows.iter().collect::<Vec<u64>>(), expected);
     }
@@ -2648,7 +2658,7 @@ mod tests {
         let found =
             found_for(&keyed, Some(&exact), &chunks(&keys), false, false).expect("integers");
         assert_eq!(found.reach(Some(&exact), Some(5_000)), Some(4_000));
-        let rows = &found.gather(Some(&exact)).expect("pushed").rids;
+        let rows = &found.gather(Some(&exact), 1).expect("pushed").rids;
         assert_eq!(rows.iter().collect::<Vec<u64>>(), (0..4_000).collect::<Vec<u64>>());
     }
 

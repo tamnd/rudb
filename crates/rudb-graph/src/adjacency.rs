@@ -50,6 +50,14 @@ const BUCKET_ROWS: usize = 1 << 16;
 /// dozen nanoseconds a list.
 const AHEAD: usize = 16;
 
+/// The fewest children [`Adjacency::push_spans`] hands a thread of its own, so that what a thread
+/// costs to start, tens of microseconds, is a small part of what it does.
+const SHARED_ROWS: u64 = 1 << 16;
+
+/// The fewest children a bucket of [`Adjacency::buckets`] is expected to get before it is given
+/// room for them ahead, so that a push of a few lists does not make room in every bucket.
+const ROOMY: usize = 64;
+
 /// How many bits of a parent `rid` [`Adjacency::build`] deals the children by, which is about a
 /// thousand ranges, each sorted on its own with eight kilobytes of counters on the IMDb `name`.
 const RANGE_BITS: u32 = 10;
@@ -58,6 +66,26 @@ const RANGE_BITS: u32 = 10;
 ///
 /// `children`, `parents`, `edges`, then the width, the layout and padding to an eight byte boundary.
 pub const HEADER_BYTES: usize = 32;
+
+/// Where the lists of some parents lie among an adjacency's child rows, which [`Adjacency::spans`]
+/// finds and [`Adjacency::push_spans`] reads.
+#[derive(Debug, Clone)]
+pub struct Spans {
+    /// The lists that hold a child, in rising order of parent.
+    lists: Vec<std::ops::Range<usize>>,
+    /// The child rows the lists hold between them.
+    rows: u64,
+    /// Rows in the child table of the adjacency the lists are in.
+    children: u64,
+}
+
+impl Spans {
+    /// How many child rows the lists hold, which is what [`Adjacency::reached`] counts.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+}
 
 /// A relationship's parent to children map.
 #[derive(Debug, Clone)]
@@ -337,6 +365,45 @@ impl Adjacency {
         Ok(reached)
     }
 
+    /// Where the lists of the parents of `held` lie, and how many child rows they hold, from one
+    /// walk over the starts, or `None` once they hold more than `most`.
+    ///
+    /// For a caller that counts the rows before it decides to read them, and then reads them with
+    /// [`Self::push_spans`]. Counting with [`Self::reached`] and reading with [`Self::push`] walked
+    /// the starts twice, and the walk is most of what a count costs. On JOB 13a at one thread the
+    /// walk was 6.6 percent of the query and the iteration over the held parents feeding it
+    /// another 3.6.
+    ///
+    /// `most` is where the caller would turn the rows down. The walk stops there, because a set
+    /// that is turned down needs no more of a count, and a range kept for each list of a set of
+    /// millions of parents was a write of tens of megabytes for nothing: JOB 6f was a fifth slower
+    /// for it.
+    ///
+    /// # Errors
+    ///
+    /// If `held` is not a set over the parent table.
+    pub fn spans(&self, held: &Rids, most: u64) -> Result<Option<Spans>> {
+        let mut spans = Spans { lists: Vec::new(), rows: 0, children: self.children };
+        let mut over = false;
+        let walked = self.lists(held, |list| {
+            spans.rows += count(list.len());
+            if spans.rows > most {
+                // Only to stop the walk, and dropped below.
+                over = true;
+                return Err(Error::internal("past the rows a caller reads"));
+            }
+            if !list.is_empty() {
+                spans.lists.push(list);
+            }
+            Ok(())
+        });
+        if over {
+            return Ok(None);
+        }
+        walked?;
+        Ok(Some(spans))
+    }
+
     /// The child rows that point into `held`, which is a set over the parent table.
     ///
     /// The lists of the members, set as bits of one bitmap over the children, which the set then
@@ -355,8 +422,138 @@ impl Adjacency {
     ///
     /// If `held` is not a set over the parent table.
     pub fn push(&self, held: &Rids) -> Result<Rids> {
-        let mut words = vec![0_u64; usize::try_from(self.children.div_ceil(64)).unwrap_or(0)];
-        let mut buckets: Vec<Vec<u16>> = vec![Vec::new(); words.len().div_ceil(BUCKET_ROWS / 64)];
+        self.dealt(0, |deal| {
+            // A list is asked for from memory when the walk reaches it and read [`AHEAD`] lists
+            // later. The lists of a sparse set of parents are a cache line or two each, megabytes
+            // apart, and read where the walk found them every one was a wait on memory. On JOB 17f
+            // that was most of the push, which was a sixth of the query. Which order the lists are
+            // dealt in does not matter, because each child is a bit.
+            let mut waiting: [std::ops::Range<usize>; AHEAD] = std::array::from_fn(|_| 0..0);
+            let mut next = 0;
+            self.lists(held, |list| {
+                self.ask(&list);
+                let due = std::mem::replace(&mut waiting[next], list);
+                next = (next + 1) % AHEAD;
+                deal(due)
+            })?;
+            for list in waiting {
+                deal(list)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// [`Self::push`] of the parents [`Self::spans`] found the lists of, on up to `threads`
+    /// threads.
+    ///
+    /// The push runs after the relation before has finished and before any worker of the scan
+    /// starts, on the query's thread, so it is time every worker waits for. On JOB 13a at one
+    /// thread it was a third of the query. With [`SHARED_ROWS`] children or more for each, the
+    /// lists are cut into a share a thread, each thread deals its share into buckets of its own,
+    /// and then each thread sets the bits of a stretch of buckets from all of them, which is the
+    /// same two steps the push takes on one thread and touches no bit two threads could both set.
+    ///
+    /// # Errors
+    ///
+    /// If `spans` was found over an adjacency with another number of children.
+    pub fn push_spans(&self, spans: &Spans, threads: usize) -> Result<Rids> {
+        if spans.children != self.children {
+            return Err(Error::internal(format!(
+                "lists over {} children pushed through an adjacency over {}",
+                spans.children, self.children
+            )));
+        }
+        let lists = spans.lists.as_slice();
+        let shares = usize::try_from(spans.rows / SHARED_ROWS)
+            .unwrap_or(usize::MAX)
+            .clamp(1, threads.max(1));
+        if shares == 1 {
+            return self.dealt(spans.rows, |deal| self.read_lists(lists, deal));
+        }
+        let per = spans.rows.div_ceil(count(shares));
+        let mut groups: Vec<(&[std::ops::Range<usize>], u64)> = Vec::with_capacity(shares);
+        let (mut start, mut held) = (0, 0);
+        for (at, list) in lists.iter().enumerate() {
+            held += count(list.len());
+            if held >= per && groups.len() + 1 < shares {
+                groups.push((&lists[start..=at], held));
+                (start, held) = (at + 1, 0);
+            }
+        }
+        groups.push((&lists[start..], held));
+        let dealt = std::thread::scope(|scope| {
+            let handles: Vec<_> = groups
+                .iter()
+                .map(|&(group, rows)| {
+                    scope.spawn(move || self.buckets(rows, |deal| self.read_lists(group, deal)))
+                })
+                .collect();
+            handles.into_iter().map(joined).collect::<Result<Vec<_>>>()
+        })?;
+        let mut words = vec![0_u64; self.words()];
+        let stretch = words.len().div_ceil(BUCKET_ROWS / 64).div_ceil(shares) * (BUCKET_ROWS / 64);
+        std::thread::scope(|scope| {
+            let dealt = &dealt;
+            let handles: Vec<_> = words
+                .chunks_mut(stretch.max(1))
+                .enumerate()
+                .map(|(at, words)| {
+                    let first = at * stretch / (BUCKET_ROWS / 64);
+                    scope.spawn(move || set_bits(words, first, dealt))
+                })
+                .collect();
+            handles.into_iter().map(joined).collect::<Result<Vec<()>>>()
+        })?;
+        Rids::from_words(self.children, words)
+    }
+
+    /// Hands `deal` each of `lists`, asking memory for each [`AHEAD`] lists before it is read.
+    fn read_lists(
+        &self,
+        lists: &[std::ops::Range<usize>],
+        deal: &mut dyn FnMut(std::ops::Range<usize>) -> Result<()>,
+    ) -> Result<()> {
+        for list in lists.iter().take(AHEAD) {
+            self.ask(list);
+        }
+        for (at, list) in lists.iter().enumerate() {
+            if let Some(ahead) = lists.get(at + AHEAD) {
+                self.ask(ahead);
+            }
+            deal(list.clone())?;
+        }
+        Ok(())
+    }
+
+    /// The child rows of the lists `walk` hands its dealer, as a set over the children. `rows` is
+    /// how many there are when the caller knows, see [`Self::buckets`].
+    fn dealt(
+        &self,
+        rows: u64,
+        walk: impl FnOnce(&mut dyn FnMut(std::ops::Range<usize>) -> Result<()>) -> Result<()>,
+    ) -> Result<Rids> {
+        let buckets = self.buckets(rows, walk)?;
+        let mut words = vec![0_u64; self.words()];
+        set_bits(&mut words, 0, std::slice::from_ref(&buckets))?;
+        Rids::from_words(self.children, words)
+    }
+
+    /// The child rows of the lists `walk` hands its dealer, dealt into one bucket per
+    /// [`BUCKET_ROWS`] of them as their place in the bucket.
+    ///
+    /// `rows` is how many children the lists hold, or zero when the caller does not know. Each
+    /// bucket starts with room for a share of them and a quarter over, so that a bucket of a child
+    /// table in no order of its parent is not grown a doubling at a time. Growing them was about an
+    /// eighth of the pushes of the 113 JOB queries at one thread.
+    fn buckets(
+        &self,
+        rows: u64,
+        walk: impl FnOnce(&mut dyn FnMut(std::ops::Range<usize>) -> Result<()>) -> Result<()>,
+    ) -> Result<Vec<Vec<u16>>> {
+        let many = self.words().div_ceil(BUCKET_ROWS / 64);
+        let share = usize::try_from(rows / count(many.max(1))).unwrap_or(0);
+        let room = if share >= ROOMY { share + share / 4 } else { 0 };
+        let mut buckets: Vec<Vec<u16>> = (0..many).map(|_| Vec::with_capacity(room)).collect();
         let mut deal = |list: std::ops::Range<usize>| -> Result<()> {
             for at in list {
                 let child = bitpack::tail_at(&self.rows, self.width, at)?;
@@ -368,30 +565,13 @@ impl Adjacency {
             }
             Ok(())
         };
-        // A list is asked for from memory when the walk reaches it and read [`AHEAD`] lists later.
-        // The lists of a sparse set of parents are a cache line or two each, megabytes apart, and
-        // read where the walk found them every one was a wait on memory. On JOB 17f that was most
-        // of the push, which was a sixth of the query. Which order the lists are dealt in does not
-        // matter, because each child is a bit.
-        let mut waiting: [std::ops::Range<usize>; AHEAD] = std::array::from_fn(|_| 0..0);
-        let mut next = 0;
-        self.lists(held, |list| {
-            self.ask(&list);
-            let due = std::mem::replace(&mut waiting[next], list);
-            next = (next + 1) % AHEAD;
-            deal(due)
-        })?;
-        for list in waiting {
-            deal(list)?;
-        }
-        for (words, bucket) in words.chunks_mut(BUCKET_ROWS / 64).zip(&buckets) {
-            for &row in bucket {
-                let row = usize::from(row);
-                *words.get_mut(row / 64).ok_or_else(|| malformed("a child past the end"))? |=
-                    1 << (row % 64);
-            }
-        }
-        Rids::from_words(self.children, words)
+        walk(&mut deal)?;
+        Ok(buckets)
+    }
+
+    /// Words in a bitmap over the children.
+    fn words(&self) -> usize {
+        usize::try_from(self.children.div_ceil(64)).unwrap_or(0)
     }
 
     /// Asks for the cache lines the packed rows of `list` start and end in, ahead of reading them.
@@ -434,7 +614,7 @@ impl Adjacency {
         // `at` is where the list of parent `parent` starts among the bits, which is past `parent`
         // zeros, so the children listed before it are `at - parent`.
         let (mut parent, mut at) = (0_u64, 0_usize);
-        for member in held.iter() {
+        held.try_for_each(|member| {
             if member > parent {
                 let found = if member - parent > FAR {
                     self.starts.select0(member - 1).map(|zero| zero + 1)
@@ -452,8 +632,8 @@ impl Adjacency {
             // The zero after the list, which moves on to the next parent.
             at += run + 1;
             parent += 1;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Appends the header and the body.
@@ -553,6 +733,27 @@ fn prefetch(byte: &u8) {
 }
 fn malformed(message: impl Into<String>) -> Error {
     Error::invalid_input(format!("invalid rudb backward adjacency: {}", message.into()))
+}
+
+/// Sets in `words`, which begins at bucket `first`, the bits of the rows each of `dealt` holds in
+/// the buckets it covers.
+fn set_bits(words: &mut [u64], first: usize, dealt: &[Vec<Vec<u16>>]) -> Result<()> {
+    for (at, words) in words.chunks_mut(BUCKET_ROWS / 64).enumerate() {
+        for buckets in dealt {
+            let Some(bucket) = buckets.get(first + at) else { continue };
+            for &row in bucket {
+                let row = usize::from(row);
+                *words.get_mut(row / 64).ok_or_else(|| malformed("a child past the end"))? |=
+                    1 << (row % 64);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a thread of [`Adjacency::push_spans`] came to, or an error if it panicked.
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T>>) -> Result<T> {
+    handle.join().map_err(|_| Error::internal("a thread of a push panicked"))?
 }
 
 #[cfg(test)]
@@ -710,6 +911,14 @@ mod tests {
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
         assert_eq!(adjacency.reached(&held).expect("reached"), count(expected.len()));
+        let rows = count(expected.len());
+        let spans = adjacency.spans(&held, rows).expect("spans").expect("not past the most");
+        assert_eq!(spans.rows(), rows);
+        let read = adjacency.push_spans(&spans, 1).expect("push the spans");
+        assert_eq!(read.iter().collect::<Vec<_>>(), expected, "the same rows as the push");
+        if rows > 0 {
+            assert!(adjacency.spans(&held, rows - 1).expect("spans").is_none(), "one past it");
+        }
     }
 
     #[test]
@@ -728,6 +937,37 @@ mod tests {
         expected.sort_unstable();
         let pushed = adjacency.push(&held).expect("push");
         assert_eq!(pushed.iter().collect::<Vec<_>>(), expected);
+        let spans = adjacency.spans(&held, u64::MAX).expect("spans").expect("no most");
+        let read = adjacency.push_spans(&spans, 1).expect("push the spans");
+        assert_eq!(read.iter().collect::<Vec<_>>(), expected, "the same rows as the push");
+        let other = Adjacency::build(&[0, 1], 2).expect("another adjacency");
+        assert!(other.push_spans(&spans, 1).is_err(), "lists of another adjacency");
+    }
+
+    #[test]
+    fn a_push_shared_over_threads_finds_the_rows_one_thread_finds() {
+        // Children in no order over several buckets, and enough of them that the lists are cut
+        // into a share for each of three threads, with a stretch of buckets each to set.
+        let mut seed = 11_u64;
+        let parents = 50_000;
+        let parents_of: Vec<Rid> = (0..8 * BUCKET_ROWS)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (seed >> 20) % parents
+            })
+            .collect();
+        let adjacency = Adjacency::build(&parents_of, parents).expect("build");
+        let held = Rids::from_sorted(parents, (0..parents).step_by(2).collect()).expect("held");
+        let spans = adjacency.spans(&held, u64::MAX).expect("spans").expect("no most");
+        assert!(spans.rows() >= 3 * SHARED_ROWS, "enough rows for three threads");
+        let alone = adjacency.push_spans(&spans, 1).expect("one thread");
+        for threads in [2, 3, 8] {
+            let shared = adjacency.push_spans(&spans, threads).expect("shared");
+            assert_eq!(shared, alone, "{threads} threads");
+        }
+        assert_eq!(alone, adjacency.push(&held).expect("push"));
     }
 
     #[test]

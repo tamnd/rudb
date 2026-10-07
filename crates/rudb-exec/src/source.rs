@@ -2568,6 +2568,7 @@ impl<'a> Scan<'a> {
         // keys refused against the rows handed are asked again against the fewest the lists reach.
         let total = u64::try_from(self.table.rows().len()).unwrap_or(u64::MAX);
         let sparse = |rows: u64| rows.saturating_mul(SPARSE_READ as u64) <= total;
+        let threads = self.threads.load(Ordering::Relaxed);
         let mut within = held.as_ref().map(Rids::len).filter(|&rows| sparse(rows));
         let mut reaching: Vec<(u64, &Arc<Sideways<'_>>)> = joins()
             .filter_map(|sideways| Some((sideways.reach(self.index, within)?, sideways)))
@@ -2596,7 +2597,7 @@ impl<'a> Scan<'a> {
                 if place > 0 && held.as_ref().is_some_and(|rows| !leaves_parts(rows, reach)) {
                     continue;
                 }
-                if let Some(rows) = sideways.gather(self.index) {
+                if let Some(rows) = sideways.gather(self.index, threads) {
                     held = Some(narrowed(held, rows.clone()));
                 }
             }

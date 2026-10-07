@@ -42,7 +42,7 @@ pub mod span;
 mod tail;
 pub mod wire;
 
-pub use adjacency::Adjacency;
+pub use adjacency::{Adjacency, Spans};
 pub use bits::BitVector;
 pub use degree::{BUCKETS, Degrees};
 pub use keymap::{DENSE_THRESHOLD, Form, KeyMap, Keys, Observed};
