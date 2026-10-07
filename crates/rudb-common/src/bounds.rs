@@ -598,6 +598,17 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// The same parent, when every row of the column that is not null was found in it exactly once.
+    ///
+    /// A join to such a parent drops the rows with a null key and keeps every other row once, so a
+    /// caller that drops the nulls itself can drop the parent. In JOB 19a `char_name` is joined on
+    /// `cast_info.person_role_id`, which is null in half of `cast_info`, and nothing else is asked
+    /// of it, and it was read whole, three million keys, to say which roles are not null.
+    fn found_link(&self, column: usize) -> Option<(String, usize, u64)> {
+        let _ = column;
+        None
+    }
+
     /// Which version of its table the store holds, for checking a [`Self::total_link`] against.
     fn generation(&self) -> Option<u64> {
         None

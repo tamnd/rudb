@@ -588,9 +588,14 @@ fn rewrite(
 ///
 /// A relation goes when it has no filter, nothing is read of it past its key, it holds one class,
 /// and every other relation in that class holds a column the store linked to its key and found a
-/// parent for in every row. Then each of their rows has exactly one partner in it, so the join to it
-/// neither drops a row nor repeats one. The classes are already built, so an equality that ran
-/// through it still joins the others.
+/// parent for in every row that is not null. Then each of their rows has exactly one partner in it
+/// or a null key, so the join to it neither repeats a row nor drops one but those. The classes are
+/// already built, so an equality that ran through it still joins the others, and the columns stay
+/// keys of their relations, whose sinks drop a row with a null key whatever class it is in.
+///
+/// The nulls are the common case in JOB. `cast_info.person_role_id` is null in half its rows, so
+/// its link to `char_name` was never total, and 19a to 19d read all three million `char_name` keys
+/// to keep the roles that are not null, a fifth of the time 19a took.
 ///
 /// This matters for the tree more than for the scan it saves. In JOB 26b `name` is joined on
 /// `cast_info.person_id` alone, and while it is in the graph `cast_info` has three neighbours and
@@ -638,7 +643,7 @@ fn without_parents(
         let found = |&(child, column): &Place| {
             let zones = plan.zones(relations[child].index)?;
             let column = zones.column(&field(plan, &relations, (child, column)).name)?;
-            let (parent, parent_column, stamp) = zones.total_link(column)?;
+            let (parent, parent_column, stamp) = zones.found_link(column)?;
             Some(parent.eq_ignore_ascii_case(name) && parent_column == key && stamp == generation)
         };
         if !children.is_empty() && children.iter().all(|child| found(child) == Some(true)) {
