@@ -46,8 +46,7 @@ rudb-seam = 2
 # read vectors and write PostgreSQL bytes, and the grammar builds the AST of rudb-parse. Neither
 # reads the catalog. The deparser prints bound trees, so it is in rudb-pgcatalog and not here.
 rudb-pgtypes = 2
-# rudb-pgparse = 2, which goes in with the crate. The check refuses a rank for a crate that does
-# not exist.
+rudb-pgparse = 2
 rudb-kernels = 3
 rudb-qc-interp = 3
 # The query compiler's second tier, which lowers QIR through Cranelift. Rank 3, beside the

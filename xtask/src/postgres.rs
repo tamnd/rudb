@@ -12,8 +12,16 @@
 //! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`, and the
 //! samples of `pg_hba.conf`, `pg_ident.conf` and `postgresql.conf` are the files that
 //! `rudb-server init` writes.
+//!
+//! `gram.y` gives the parse tables of `rudb-pgparse` through `postgres/gram.rs`, which removes the
+//! C, and `postgres/lalr.rs`, which makes the LALR(1) tables as bison 2.3 makes them. `kwlist.h`
+//! gives its keywords. `scan.l` and `parser.c` are the reference for its lexer. `cargo xtask
+//! pg-grammar` runs bison on the same grammar and compares the two sets of tables entry by entry.
 
+mod gram;
 mod guc;
+mod lalr;
+mod pgparse;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -29,7 +37,7 @@ struct Vendor {
     files: &'static [(&'static str, &'static str)],
 }
 
-const VENDORS: [Vendor; 4] = [
+const VENDORS: [Vendor; 5] = [
     Vendor {
         dir: "crates/rudb-common/vendor",
         files: &[
@@ -55,6 +63,16 @@ const VENDORS: [Vendor; 4] = [
         ],
     },
     Vendor {
+        dir: "crates/rudb-pgparse/vendor",
+        files: &[
+            ("src/backend/parser/gram.y", "gram.y"),
+            ("src/backend/parser/scan.l", "scan.l"),
+            ("src/backend/parser/parser.c", "parser.c"),
+            ("src/include/parser/kwlist.h", "kwlist.h"),
+            ("COPYRIGHT", "LICENSE.postgres"),
+        ],
+    },
+    Vendor {
         dir: "crates/rudb-server/vendor",
         files: &[
             ("src/backend/libpq/pg_hba.conf.sample", "pg_hba.conf.sample"),
@@ -73,7 +91,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 4] = [
+const GENERATED: [Generated; 8] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -96,6 +114,26 @@ const GENERATED: [Generated; 4] = [
         output: "crates/rudb-pgtypes/src/generated/oids.rs",
         inputs: &["crates/rudb-pgtypes/vendor/pg_type.dat"],
         generate: |texts| pgtype(&texts[0]),
+    },
+    Generated {
+        output: "crates/rudb-pgparse/src/generated/gram.rules",
+        inputs: &["crates/rudb-pgparse/vendor/gram.y"],
+        generate: |texts| gram::rules(&texts[0]),
+    },
+    Generated {
+        output: "crates/rudb-pgparse/src/generated/productions.txt",
+        inputs: &["crates/rudb-pgparse/vendor/gram.y"],
+        generate: |texts| gram::productions(&texts[0]),
+    },
+    Generated {
+        output: "crates/rudb-pgparse/src/generated/tables.rs",
+        inputs: &["crates/rudb-pgparse/vendor/gram.y"],
+        generate: pgparse::tables,
+    },
+    Generated {
+        output: "crates/rudb-pgparse/src/generated/keywords.rs",
+        inputs: &["crates/rudb-pgparse/vendor/kwlist.h", "crates/rudb-pgparse/vendor/gram.y"],
+        generate: pgparse::keywords,
     },
 ];
 
@@ -153,6 +191,12 @@ pub(crate) fn vendor(checkout: Option<&str>) -> Result<(), String> {
     }
     println!("vendored {copied} files at {version} ({commit})");
     Ok(())
+}
+
+/// Runs bison on the PostgreSQL grammar without its C and compares its tables with the generated
+/// tables of `rudb-pgparse`, entry by entry.
+pub(crate) fn grammar() -> Result<(), String> {
+    pgparse::compare_with_bison()
 }
 
 /// Checks the vendored files against `VENDOR` and the generated files against their generators.
