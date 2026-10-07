@@ -1,6 +1,6 @@
 //! The calls that add nodes to the arenas of an [`Ast`].
 //!
-//! Two transforms build an [`Ast`]: the one in [`crate::transform`], from the parse tree of the
+//! Two transforms build an [`Ast`]: the one in [`crate::transform`](mod@crate::transform), from the parse tree of the
 //! vendored DuckDB grammar, and the one in `rudb-pgparse`, from the raw parse tree of PostgreSQL.
 //! Both add their nodes through these calls, so an index and a run mean the same thing whichever
 //! of them made the tree.

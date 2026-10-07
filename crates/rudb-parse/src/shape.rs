@@ -1,6 +1,6 @@
 //! An [`Ast`] written out as text with every field, so that a test can compare two trees.
 //!
-//! Two transforms build an [`Ast`]: the one in [`crate::transform`], from the parse tree of the
+//! Two transforms build an [`Ast`]: the one in [`crate::transform`](mod@crate::transform), from the parse tree of the
 //! vendored DuckDB grammar, and the one in `rudb-pgparse`, from the raw parse tree of PostgreSQL.
 //! For a statement that both dialects read the same way, the two trees must be the same. The
 //! arenas of the two can hold the nodes in a different order, so `==` on two [`Ast`] values does
@@ -8,7 +8,7 @@
 //! when their text is the same.
 //!
 //! This is not the printer of [`crate::deparse`], which writes SQL the way DuckDB writes it, and
-//! it is not the printer of the tests of [`crate::transform`], which leaves fields out on purpose.
+//! it is not the printer of the tests of [`crate::transform`](mod@crate::transform), which leaves fields out on purpose.
 //! This one leaves nothing out of a query or an expression. The source ranges are not written,
 //! because the two grammars do not end a node at the same byte.
 //!
