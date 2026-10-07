@@ -19912,10 +19912,7 @@ mod tests {
         assert!(buckets.windows(2).all(|pair| pair[0].high < pair[1].low));
         assert!(buckets.contains(&Bucket { low: 2006, high: 2006, rows: 6_000, values: 1 }));
         let common = Common::new(reader);
-        let between = [
-            (Op::GreaterOrEqual, rudb_common::bounds::Bound::Int(2005)),
-            (Op::LessOrEqual, rudb_common::bounds::Bound::Int(2009)),
-        ];
+        let between = [(Op::GreaterOrEqual, Bound::Int(2005)), (Op::LessOrEqual, Bound::Int(2009))];
         assert_eq!(
             common.rows_passing(0, &between),
             Stat::estimated(18_000, Provenance::Quantiles)
