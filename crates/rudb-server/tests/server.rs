@@ -383,6 +383,52 @@ fn a_string_literal_in_a_cast_uses_the_input_function_of_the_type() {
 }
 
 #[test]
+fn a_string_literal_next_to_an_operator_takes_the_type_of_the_other_side() {
+    let dirs = Dirs::new("unknown-operand");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values of the PostgreSQL 19 oracle.
+    for (sql, value) in [
+        ("select 1 + '5'", "6"),
+        ("select '5' + 1", "6"),
+        ("select 1.5 + '2'", "3.5"),
+        ("select '1.5' * 2.0", "3.00"),
+        ("select pg_typeof(1::smallint + '3')", "smallint"),
+        ("select 2::bigint * '3'", "6"),
+        ("select 1 & '3'", "1"),
+        ("select interval '1 day' * '2'", "2 days"),
+        ("select date '2020-01-01' - '2019-12-01'", "31"),
+        ("select 1 || '2'", "12"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    // The literal is read by the input function of the type, and an operator that is not there or
+    // that is not unique is refused at the operator.
+    for (sql, code, message, place) in [
+        ("select 1 + 'x'", "22P02", "invalid input syntax for type integer: \"x\"", "12"),
+        ("select 1 + '1.5'", "22P02", "invalid input syntax for type integer: \"1.5\"", "12"),
+        (
+            "select now() - '1 day'",
+            "22007",
+            "invalid input syntax for type timestamp with time zone: \"1 day\"",
+            "16",
+        ),
+        ("select '1' + '2'", "42725", "operator is not unique: unknown + unknown", "12"),
+        ("select date '2020-01-01' + '1'", "42725", "operator is not unique: date + unknown", "26"),
+        ("select 1 + 'abc'::text", "42883", "operator does not exist: integer + text", "10"),
+        ("select true + 'a'", "42883", "operator does not exist: boolean + unknown", "13"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(place), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_string_type_with_a_length_cuts_on_a_cast_and_refuses_a_long_value_on_a_store() {
     let dirs = Dirs::new("length");
     let server = Server::start(dirs.config()).unwrap();
