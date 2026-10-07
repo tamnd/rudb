@@ -953,6 +953,21 @@ impl Binder<'_> {
         let mut op = op;
         if self.session.postgres().is_some() {
             self.unknown_operand(op, &mut left, &mut right);
+            // A string literal joined to a `bytea` is a `bytea` too.
+            if op == BinaryOp::Concat {
+                let literal = |at: usize| {
+                    matches!(
+                        ast.expr(written[at]),
+                        ast::Expr::Literal { kind: LiteralKind::String, .. }
+                    )
+                };
+                let blob = |side: ExprRef| *self.plan().expr_type(side) == LogicalType::Blob;
+                if literal(1) && blob(left) {
+                    right = self.cast_to(right, &LogicalType::Blob);
+                } else if literal(0) && blob(right) {
+                    left = self.cast_to(left, &LogicalType::Blob);
+                }
+            }
             if let Some(done) = self.pg_datetime_operator(op, left, right)? {
                 return Ok(done);
             }
@@ -1136,6 +1151,7 @@ impl Binder<'_> {
             ) => other.clone(),
             (BinaryOp::Subtract, L::TimeTz) if !unknown_left => L::Interval,
             (BinaryOp::Divide | BinaryOp::IntegerDivide, L::Interval) if !unknown_left => L::Double,
+            (BinaryOp::Concat, L::Blob) => L::Blob,
             _ => return,
         };
         let side = if unknown_left { left } else { right };
@@ -1319,7 +1335,14 @@ impl Binder<'_> {
         for &arg in &arguments {
             bound.push(self.bind_expr(ast, arg, scope)?);
         }
-        if let Some(expanded) = self.list_macro(&written, &bound)? {
+        // A string literal has no type in PostgreSQL until the call gives it one.
+        let untyped: Vec<bool> = arguments
+            .iter()
+            .map(|&arg| {
+                matches!(ast.expr(arg), ast::Expr::Literal { kind: LiteralKind::String, .. })
+            })
+            .collect();
+        if let Some(expanded) = self.list_macro(&written, &bound, &untyped)? {
             return Ok(expanded);
         }
         if rudb_catalog::same_name(&written, "if") {
@@ -1722,7 +1745,12 @@ impl Binder<'_> {
     ///
     /// The one thing that is the macro's and not `list_concat`'s is the wrong number of arguments,
     /// which the pin reports as a macro and not as a function, in the words below.
-    fn list_macro(&mut self, written: &str, bound: &[ExprRef]) -> Result<Option<ExprRef>> {
+    fn list_macro(
+        &mut self,
+        written: &str,
+        bound: &[ExprRef],
+        untyped: &[bool],
+    ) -> Result<Option<ExprRef>> {
         let Some(&(name, parameters, element, front)) =
             LIST_MACROS.iter().find(|(name, ..)| rudb_catalog::same_name(written, name))
         else {
@@ -1734,7 +1762,16 @@ impl Binder<'_> {
                  explicit type casts.\nCandidate macros:\n\t{name}({parameters})"
             )));
         }
-        let wrapped = self.call("list_value", vec![bound[element]])?;
+        // In PostgreSQL a value of no type is of the type of the elements of the array.
+        let mut value = bound[element];
+        let list = self.plan().expr_type(bound[1 - element]).clone();
+        if let LogicalType::List(inner) = list
+            && self.session.postgres().is_some()
+            && (self.is_placeholder(value) || untyped[element])
+        {
+            value = self.cast_to(value, &inner);
+        }
+        let wrapped = self.call("list_value", vec![value])?;
         let list = bound[1 - element];
         let args = if front { vec![wrapped, list] } else { vec![list, wrapped] };
         self.call("list_concat", args).map(Some)
