@@ -448,7 +448,7 @@ impl Adjacency {
     ///
     /// The push runs after the relation before has finished and before any worker of the scan
     /// starts, on the query's thread, so it is time every worker waits for. On JOB 13a at one
-    /// thread it was a third of the query. With [`SHARED_ROWS`] children or more for each, the
+    /// thread it was a third of the query. With `SHARED_ROWS` children or more for each, the
     /// lists are cut into a share a thread, each thread deals its share into buckets of its own,
     /// and then each thread sets the bits of a stretch of buckets from all of them, which is the
     /// same two steps the push takes on one thread and touches no bit two threads could both set.
