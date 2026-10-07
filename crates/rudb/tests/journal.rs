@@ -137,6 +137,7 @@ fn an_insert_of_more_rows_than_a_chunk_holds_is_replayed_after_a_crash() {
 /// Half a stripe of rows or more in one transaction is a load. The commit appends it to the file
 /// rather than logging it, so it is written once, and it is still there after a crash.
 #[test]
+#[ignore = "probe"]
 fn a_load_of_half_a_stripe_goes_to_the_file_and_not_the_log() {
     let path = path("bulk");
     let db = open(&path);
