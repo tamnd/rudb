@@ -5534,7 +5534,7 @@ fn unpack(
 
 /// How many rows ahead a sparse gather asks for the cache line of. A miss is a few hundred cycles
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
-const PREFETCH_AHEAD: usize = 16;
+pub const PREFETCH_AHEAD: usize = 16;
 
 /// Asks for the cache line that holds `words[word]`, without waiting for it, and nothing for a word
 /// past the end.
@@ -5545,18 +5545,25 @@ const PREFETCH_AHEAD: usize = 16;
 /// and the gather was the largest cost over all 22 queries.
 #[inline]
 fn prefetch_word(words: &[u64], word: usize) {
-    if let Some(word) = words.get(word) {
+    prefetch(words, word);
+}
+
+/// Asks for the cache line that holds `values[at]`, without waiting for it, and nothing for a place
+/// past the end. [`PREFETCH_AHEAD`] rows ahead of a read at rows far apart, as `prefetch_word`.
+#[inline]
+pub fn prefetch<T>(values: &[T], at: usize) {
+    if let Some(value) = values.get(at) {
         #[cfg(target_arch = "x86_64")]
         #[allow(unsafe_code)]
         // SAFETY: a prefetch is a hint. It reads nothing into the program and does not fault
-        // whatever the address, and this one is of a word the slice holds.
+        // whatever the address, and this one is of a value the slice holds.
         unsafe {
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                std::ptr::from_ref(word).cast::<i8>(),
+                std::ptr::from_ref(value).cast::<i8>(),
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
-        let _ = word;
+        let _ = value;
     }
 }
 
