@@ -1,5 +1,8 @@
 //! The LR parser that runs the generated tables.
 
+use std::vec::Drain;
+
+use crate::actions::Parser;
 use crate::error::{Error, Notice};
 use crate::filter::Tokens;
 use crate::generated::keywords::{self, Keyword};
@@ -71,13 +74,38 @@ fn goto(state: usize, nonterminal: usize) -> usize {
     usize::from(DEFAULT_GOTO[nonterminal])
 }
 
-/// Runs the grammar. `next` gives the next token, and the end of the input is token 0. The parser
-/// asks for a token only when the state needs one, as the parser of bison does, so an error of the
-/// lexer after a syntax error does not come first. Gives `false` at a syntax error, which is at the
-/// last token that `next` gave.
-fn run<E>(mut next: impl FnMut() -> Result<u16, E>) -> Result<bool, E> {
+/// What the parser does with the tokens and the rules: [`run`] asks it for the tokens and gives it
+/// each reduction.
+pub(crate) trait Machine {
+    /// The value of a symbol.
+    type Value;
+    /// The error of the lexer or of an action.
+    type Error;
+
+    /// The next token, its value and its location. The end of the input is token 0.
+    fn token(&mut self) -> Result<(u16, Self::Value, i32), Self::Error>;
+
+    /// Runs the action of `rule` on the values of its right side, with their locations and the
+    /// location of the rule, and gives the value of the rule.
+    fn reduce(
+        &mut self,
+        rule: usize,
+        rhs: Drain<'_, Self::Value>,
+        at: &[i32],
+        here: i32,
+    ) -> Result<Self::Value, Self::Error>;
+}
+
+/// Runs the grammar. The parser asks for a token only when the state needs one, as the parser of
+/// bison does, so an error of the lexer after a syntax error does not come first. Gives the value
+/// of the start symbol, or `None` at a syntax error, which is at the last token that the machine
+/// gave.
+pub(crate) fn run<M: Machine>(machine: &mut M) -> Result<Option<M::Value>, M::Error> {
     let mut stack: Vec<usize> = vec![0];
-    let mut ahead: Option<u16> = None;
+    // The value and the location of each symbol on the stack. The first state has no symbol.
+    let mut values: Vec<M::Value> = Vec::new();
+    let mut locations: Vec<i32> = Vec::new();
+    let mut ahead: Option<(u16, M::Value, i32)> = None;
     loop {
         // The stack is never empty: a reduction pops the symbols of its right side, and the first
         // state is under all of them.
@@ -88,63 +116,118 @@ fn run<E>(mut next: impl FnMut() -> Result<u16, E>) -> Result<bool, E> {
                 rule => -(rule as i16),
             }
         } else {
-            let token = match ahead {
-                Some(token) => token,
-                None => *ahead.insert(next()?),
+            let token = match &ahead {
+                Some((token, _, _)) => *token,
+                None => ahead.insert(machine.token()?).0,
             };
             action(state, token)
         };
         if entry == ERROR {
             if ahead.is_none() {
-                next()?;
+                machine.token()?;
             }
-            return Ok(false);
+            return Ok(None);
         }
         if entry > 0 {
             if entry == FINAL {
-                return Ok(true);
+                return Ok(values.pop());
             }
+            let Some((_, value, location)) = ahead.take() else {
+                // A shift is only in a state that reads a token, so there is a token.
+                return Ok(None);
+            };
             stack.push(entry as usize);
-            ahead = None;
+            values.push(value);
+            locations.push(location);
             continue;
         }
         let rule = usize::from(entry.unsigned_abs());
-        stack.truncate(stack.len() - usize::from(RULE_LENGTH[rule]));
+        let from = stack.len() - 1 - usize::from(RULE_LENGTH[rule]);
+        let at = &locations[from..];
+        // `YYLLOC_DEFAULT` of `gram.y`: the first location of the right side that is known.
+        let here = at.iter().copied().find(|&location| location >= 0).unwrap_or(-1);
+        let value = machine.reduce(rule, values.drain(from..), at, here)?;
+        locations.truncate(from);
+        values.push(value);
+        locations.push(here);
+        stack.truncate(from + 1);
         let state = stack[stack.len() - 1];
         stack.push(goto(state, usize::from(RULE_LHS[rule])));
+    }
+}
+
+/// The machine of [`recognize`]: a list of tokens and no actions.
+struct List<'a> {
+    tokens: &'a [u16],
+    at: usize,
+}
+
+impl Machine for List<'_> {
+    type Value = ();
+    type Error = std::convert::Infallible;
+
+    fn token(&mut self) -> Result<(u16, (), i32), Self::Error> {
+        self.at += 1;
+        Ok((self.tokens.get(self.at - 1).copied().unwrap_or(0), (), -1))
+    }
+
+    fn reduce(&mut self, _: usize, _: Drain<'_, ()>, _: &[i32], _: i32) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
 /// Runs the grammar over a list of tokens. The list does not end with the end token; the end of
 /// the slice is the end of the input.
 pub fn recognize(tokens: &[u16]) -> Result<(), SyntaxError> {
-    let mut at = 0;
-    let next = || -> Result<u16, std::convert::Infallible> {
-        at += 1;
-        Ok(tokens.get(at - 1).copied().unwrap_or(0))
-    };
-    match run(next) {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(SyntaxError { token: at - 1 }),
+    let mut list = List { tokens, at: 0 };
+    match run(&mut list) {
+        Ok(Some(())) => Ok(()),
+        Ok(None) | Err(_) => Err(SyntaxError { token: list.at - 1 }),
+    }
+}
+
+/// The machine of [`check`]: the tokens of a text and no actions.
+struct Check<'a> {
+    tokens: Tokens<'a>,
+    last: (usize, usize),
+}
+
+impl Machine for Check<'_> {
+    type Value = ();
+    type Error = Error;
+
+    fn token(&mut self) -> Result<(u16, (), i32), Error> {
+        let token = self.tokens.next_token()?;
+        self.last = (token.start, token.end);
+        Ok((token.kind, (), -1))
+    }
+
+    fn reduce(&mut self, _: usize, _: Drain<'_, ()>, _: &[i32], _: i32) -> Result<(), Error> {
+        Ok(())
     }
 }
 
 /// Lexes and parses `text` as PostgreSQL does, and gives the first error of the lexer or the
 /// grammar, or the notices when there is no error.
 pub fn check(text: &str) -> Result<Vec<Notice>, Error> {
-    let mut tokens = Tokens::new(text);
-    let mut last = (0, 0);
-    let accepted = run(|| {
-        let token = tokens.next_token()?;
-        last = (token.start, token.end);
-        Ok::<_, Error>(token.kind)
-    })?;
-    if accepted {
-        Ok(tokens.take_notices())
+    let mut check = Check { tokens: Tokens::new(text), last: (0, 0) };
+    if run(&mut check)?.is_some() {
+        Ok(check.tokens.take_notices())
     } else {
         let text = Lexer::new(text).text().as_bytes();
-        Err(Error::syntax(text, "syntax error", last.0, last.1))
+        Err(Error::syntax(text, "syntax error", check.last.0, check.last.1))
     }
+}
+
+/// The raw parse tree of `text` and the notices of the parse, as `raw_parser` of PostgreSQL gives
+/// them: a list with a `RawStmt` for each statement. An error is the first error of the lexer, the
+/// grammar or an action.
+pub fn parse(text: &str) -> Result<(crate::nodes::List, Vec<Notice>), Error> {
+    let mut parser = Parser::new(text);
+    if run(&mut parser)?.is_none() {
+        return Err(parser.yyerror("syntax error"));
+    }
+    Ok(parser.finish())
 }
 
 #[cfg(test)]

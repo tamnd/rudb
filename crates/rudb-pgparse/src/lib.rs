@@ -26,6 +26,7 @@
 //! trees. The actions of `gram.y` that build this tree come next, and after them the transform
 //! from this tree to the AST of `rudb-parse`.
 
+mod actions;
 mod error;
 mod filter;
 mod generated;
@@ -33,9 +34,11 @@ mod lexer;
 pub mod nodes;
 mod parser;
 
-pub use error::{Error, Notice};
+pub use error::{Error, Notice, Severity};
 pub use filter::Tokens;
 pub use generated::keywords::{Category, Keyword};
 pub use generated::tables::{RULES, STATES, TOKENS, token};
 pub use lexer::{Lexer, Token, Value};
-pub use parser::{SyntaxError, character, check, keyword, recognize, rule_name, symbol_name};
+pub use parser::{
+    SyntaxError, character, check, keyword, parse, recognize, rule_name, symbol_name,
+};

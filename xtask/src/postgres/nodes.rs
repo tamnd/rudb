@@ -51,7 +51,7 @@ const CUSTOM: [&str; 3] = ["A_Const", "A_Expr", "BoolExpr"];
 
 /// The keywords and the reserved words of Rust. A C field with one of these names is a raw
 /// identifier in Rust.
-const RUST_KEYWORDS: [&str; 49] = [
+pub(super) const RUST_KEYWORDS: [&str; 49] = [
     "abstract", "as", "async", "await", "become", "box", "break", "const", "continue", "crate",
     "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if", "impl",
     "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub", "ref",
@@ -60,35 +60,71 @@ const RUST_KEYWORDS: [&str; 49] = [
 ];
 
 /// One C enum: its name and its constants with their values, in order.
-struct Enum {
-    name: String,
-    constants: Vec<(String, i64)>,
+pub(super) struct Enum {
+    pub(super) name: String,
+    pub(super) constants: Vec<(String, i64)>,
 }
+
+/// One `#define` of a number, of a character or of a string.
+pub(super) struct Define {
+    pub(super) name: String,
+    pub(super) value: DefineValue,
+}
+
+/// The value of a `#define`.
+pub(super) enum DefineValue {
+    Number(i64),
+    /// A character literal, as `'a'`.
+    Char(u8),
+    /// A string literal, as `"btree"`.
+    Text(String),
+    /// An `Oid`, as the type OIDs of `pg_type_d.h` are.
+    Oid(u32),
+}
+
+impl Define {
+    /// The Rust type and the Rust expression of the value. A number that does not fit `i32` is an
+    /// `i64`, as `LONG_MAX` is on the 64-bit platforms.
+    pub(super) fn rust(&self) -> (&'static str, String) {
+        match &self.value {
+            DefineValue::Number(v) if i32::try_from(*v).is_ok() => ("i32", v.to_string()),
+            DefineValue::Number(v) => ("i64", v.to_string()),
+            DefineValue::Char(c) => ("u8", format!("b{:?}", char::from(*c))),
+            DefineValue::Text(t) => ("&str", format!("{t:?}")),
+            DefineValue::Oid(v) => ("u32", v.to_string()),
+        }
+    }
+}
+
+/// The limits of `c.h` and `limits.h` that the headers and `gram.y` use.
+const LIMITS: [(&str, i64); 3] =
+    [("PG_INT16_MAX", i16::MAX as i64), ("PG_INT32_MAX", i32::MAX as i64), ("LONG_MAX", i64::MAX)];
 
 /// One field of a C struct, with the type as `gen_node_support.pl` normalizes it.
 #[derive(Clone)]
-struct Field {
-    name: String,
-    ctype: String,
+pub(super) struct Field {
+    pub(super) name: String,
+    pub(super) ctype: String,
     ignored: bool,
 }
 
 /// One C struct and the attributes that `pg_node_attr` gives it.
-struct Struct {
-    name: String,
-    fields: Vec<Field>,
+pub(super) struct Struct {
+    pub(super) name: String,
+    pub(super) fields: Vec<Field>,
     attributes: Vec<String>,
 }
 
 /// What the headers declare.
 #[derive(Default)]
-struct Headers {
-    enums: Vec<Enum>,
-    structs: Vec<Struct>,
+pub(super) struct Headers {
+    pub(super) enums: Vec<Enum>,
+    pub(super) structs: Vec<Struct>,
+    pub(super) defines: Vec<Define>,
 }
 
 /// Removes the C comments and keeps the line breaks.
-fn strip_comments(text: &str) -> String {
+pub(super) fn strip_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("/*") {
@@ -174,31 +210,90 @@ fn top_level(text: &str, operator: &str) -> Option<usize> {
     found
 }
 
-/// Reads the enums and the structs of one header.
-fn read_header(file: &str, text: &str, headers: &mut Headers) -> Result<(), String> {
+/// Reads the `ERRCODE_` names of `errcodes.txt` as text defines of their SQLSTATE codes, as
+/// `errcodes.h` defines them with `MAKE_SQLSTATE`.
+fn read_errcodes(text: &str, headers: &mut Headers) -> Result<(), String> {
+    for (number, line) in text.lines().enumerate() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if line.starts_with('#') || line.starts_with("Section:") || fields.is_empty() {
+            continue;
+        }
+        match fields[..] {
+            [state, _, name, ..] if name.starts_with("ERRCODE_") => {
+                let value = DefineValue::Text(state.to_string());
+                headers.defines.push(Define { name: name.to_string(), value });
+            }
+            _ => return Err(format!("errcodes.txt line {}: not a code line: {line}", number + 1)),
+        }
+    }
+    Ok(())
+}
+
+/// Reads the type OIDs of `pg_type.dat` as `Oid` defines, with the names that `genbki.pl` gives
+/// them in `pg_type_d.h`: the `oid_symbol` of the entry, or else the type name in upper case and
+/// `OID`, and the name, `ARRAY` and `OID` for the array type.
+fn read_types(text: &str, headers: &mut Headers) -> Result<(), String> {
+    for entry in super::dat_entries("pg_type.dat", text)? {
+        let name = entry.get("typname").ok_or("pg_type.dat: an entry with no typname")?;
+        let oid = |key: &str| {
+            let value = entry.get(key)?;
+            value.parse().ok().map(DefineValue::Oid)
+        };
+        let upper = name.to_uppercase();
+        let symbol = entry.get("oid_symbol").cloned().unwrap_or_else(|| format!("{upper}OID"));
+        let value = oid("oid").ok_or_else(|| format!("pg_type.dat: {name} has a bad oid"))?;
+        headers.defines.push(Define { name: symbol, value });
+        if let Some(value) = oid("array_type_oid") {
+            headers.defines.push(Define { name: format!("{upper}ARRAYOID"), value });
+        }
+    }
+    Ok(())
+}
+
+/// Reads the enums, the defines and, for [`Read::Nodes`], the structs of one header.
+pub(super) fn read_header(
+    file: &str,
+    text: &str,
+    read: Read,
+    headers: &mut Headers,
+) -> Result<(), String> {
     let text = strip_comments(text);
     let mut rest = text.as_str();
-    // The limits of `c.h` that the headers use.
-    let mut known: HashMap<String, i64> = HashMap::from([
-        ("PG_INT32_MAX".to_string(), i64::from(i32::MAX)),
-        ("PG_INT16_MAX".to_string(), i64::from(i16::MAX)),
-    ]);
+    let mut known: HashMap<String, i64> =
+        LIMITS.iter().map(|(name, value)| (name.to_string(), *value)).collect();
     for e in &headers.enums {
         for (name, value) in &e.constants {
             known.insert(name.clone(), *value);
         }
     }
-    // A `#define` of a number can be the value of an enum constant.
-    for line in text.lines() {
+    for d in &headers.defines {
+        if let DefineValue::Number(v) = d.value {
+            known.insert(d.name.clone(), v);
+        }
+    }
+    // A `#define` of a number can be the value of an enum constant. A define can go on over
+    // more lines, each one with a backslash at the end.
+    for line in text.replace("\\\n", " ").lines() {
         let mut words = line.split_whitespace();
         if words.next() == Some("#define")
             && let Some(name) = words.next()
             && !name.contains('(')
         {
-            let value: Vec<&str> = words.collect();
-            if let Ok(value) = evaluate(&value.join(" "), &known) {
-                known.insert(name.to_string(), value);
-            }
+            let value = words.collect::<Vec<&str>>().join(" ");
+            let value = if let Some(t) = value.strip_prefix('"').and_then(|t| t.strip_suffix('"'))
+                && !t.contains(['"', '\\'])
+            {
+                DefineValue::Text(t.to_string())
+            } else if let Ok(number) = evaluate(&value, &known) {
+                known.insert(name.to_string(), number);
+                match u8::try_from(number) {
+                    Ok(c) if value.starts_with('\'') => DefineValue::Char(c),
+                    _ => DefineValue::Number(number),
+                }
+            } else {
+                continue;
+            };
+            headers.defines.push(Define { name: name.to_string(), value });
         }
     }
     // A definition is `typedef enum|struct Name { ... } Name;`, or `struct Name { ... };` at the
@@ -213,8 +308,13 @@ fn read_header(file: &str, text: &str, headers: &mut Headers) -> Result<(), Stri
             (None, None) => break,
         };
         rest = &rest[at..];
-        let is_enum = is_typedef && rest.starts_with("enum ");
-        if !is_enum && !rest.starts_with("struct ") {
+        // The keyword can have a line break after it, as in `typedef enum\n{`.
+        let keyword = |word: &str| {
+            rest.strip_prefix(word)
+                .is_some_and(|r| r.starts_with(|c: char| c.is_whitespace() || c == '{'))
+        };
+        let is_enum = is_typedef && keyword("enum");
+        if !is_enum && !keyword("struct") {
             continue;
         }
         let Some(open) = rest.find(['{', ';']) else { break };
@@ -250,7 +350,7 @@ fn read_header(file: &str, text: &str, headers: &mut Headers) -> Result<(), Stri
                 next = value + 1;
             }
             headers.enums.push(Enum { name, constants });
-        } else {
+        } else if read == Read::Nodes {
             let mut fields = Vec::new();
             let mut attributes = Vec::new();
             for line in body.split(';') {
@@ -310,7 +410,8 @@ fn read_header(file: &str, text: &str, headers: &mut Headers) -> Result<(), Stri
 }
 
 /// How a field is stored and written.
-enum Kind {
+#[derive(Clone)]
+pub(super) enum Kind {
     Bool,
     Char,
     Int(&'static str),
@@ -325,7 +426,7 @@ enum Kind {
 }
 
 /// The kind of a field of a C type.
-fn kind(
+pub(super) fn kind(
     ctype: &str,
     emitted: &BTreeSet<String>,
     enums: &BTreeSet<String>,
@@ -358,19 +459,77 @@ fn kind(
 }
 
 /// The Rust name of a C field.
-fn field_name(name: &str) -> String {
+pub(super) fn field_name(name: &str) -> String {
     if RUST_KEYWORDS.contains(&name) { format!("r#{name}") } else { name.to_string() }
 }
 
-/// Writes `src/generated/nodes.rs` from the vendored headers and `gram.y`. The texts are, in
-/// order, `nodes.h`, `lockoptions.h`, `primnodes.h`, `parsenodes.h`, `value.h` and `gram.y`.
-pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
-    let names = ["nodes.h", "lockoptions.h", "primnodes.h", "parsenodes.h", "value.h"];
+/// The node types, the enums and the constants that the raw parse tree and the actions of
+/// `gram.y` use.
+pub(super) struct Model {
+    pub(super) headers: Headers,
+    /// Every node struct of the headers.
+    pub(super) nodes: BTreeSet<String>,
+    /// The node structs of the raw tree, which the generator writes.
+    pub(super) emitted: BTreeSet<String>,
+    /// Every enum of the headers.
+    pub(super) enum_names: BTreeSet<String>,
+    /// The enums that the generator writes: those of the fields of the emitted structs, and
+    /// those that `gram.y` names or whose constants it names.
+    pub(super) used_enums: BTreeSet<String>,
+    /// The `#define` constants that `gram.y` names.
+    pub(super) used_defines: BTreeSet<String>,
+    /// The fields of each emitted struct, with their kinds.
+    layouts: BTreeMap<String, Vec<(Field, Kind)>>,
+}
+
+/// What the generator reads in a header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Read {
+    /// The node structs, the enums and the defines.
+    Nodes,
+    /// The enums and the defines only, for a catalog or a utility header whose structs are not
+    /// nodes.
+    Constants,
+}
+
+/// The vendored headers, in the order that `GENERATED` gives them.
+pub(super) const HEADERS: [(&str, Read); 14] = [
+    ("nodes.h", Read::Nodes),
+    ("lockoptions.h", Read::Nodes),
+    ("primnodes.h", Read::Nodes),
+    ("parsenodes.h", Read::Nodes),
+    ("value.h", Read::Nodes),
+    ("pg_class.h", Read::Constants),
+    ("pg_am.h", Read::Constants),
+    ("pg_attribute.h", Read::Constants),
+    ("pg_trigger.h", Read::Constants),
+    ("index.h", Read::Constants),
+    ("trigger.h", Read::Constants),
+    ("datetime.h", Read::Constants),
+    ("timestamp.h", Read::Constants),
+    ("xml.h", Read::Constants),
+];
+
+/// The vendored data files that give constants, after the headers: `errcodes.txt` gives the
+/// `ERRCODE_` names of `errcodes.h`, and `pg_type.dat` gives the type OIDs of `pg_type_d.h`.
+pub(super) const DATA: [&str; 2] = ["errcodes.txt", "pg_type.dat"];
+
+/// The index of `gram.y` in the texts of [`model`].
+pub(super) const GRAM: usize = HEADERS.len() + DATA.len();
+
+/// Reads the headers, the data files and `gram.y`. The texts are, in order, the [`HEADERS`], the
+/// [`DATA`] files and `gram.y`.
+pub(super) fn model(texts: &[String]) -> Result<Model, String> {
     let mut headers = Headers::default();
-    for (file, text) in names.iter().zip(texts) {
-        read_header(file, text, &mut headers)?;
+    for (name, value) in LIMITS {
+        headers.defines.push(Define { name: name.to_string(), value: DefineValue::Number(value) });
     }
-    let gram = strip_comments(&texts[5]);
+    for ((file, read), text) in HEADERS.iter().zip(texts) {
+        read_header(file, text, *read, &mut headers)?;
+    }
+    read_errcodes(&texts[HEADERS.len()], &mut headers)?;
+    read_types(&texts[HEADERS.len() + 1], &mut headers)?;
+    let gram = strip_comments(&texts[GRAM]);
 
     let structs: HashMap<&str, &Struct> =
         headers.structs.iter().map(|s| (s.name.as_str(), s)).collect();
@@ -441,7 +600,8 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
         layouts.insert(name.clone(), fields);
     }
 
-    // The enums that an emitted struct uses.
+    // The enums that an emitted struct uses, and those that gram.y names, as the type of a
+    // `%union` member or by one of their constants.
     let mut used_enums = BTreeSet::new();
     for fields in layouts.values() {
         for (_, kind) in fields {
@@ -450,14 +610,31 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
             }
         }
     }
+    for e in &headers.enums {
+        let named = words.contains(e.name.as_str())
+            || e.constants.iter().any(|(c, _)| words.contains(c.as_str()));
+        if named {
+            used_enums.insert(e.name.clone());
+        }
+    }
+    let used_defines =
+        headers.defines.iter().filter(|d| words.contains(d.name.as_str())).map(|d| d.name.clone());
+    let used_defines = used_defines.collect();
+    Ok(Model { headers, nodes, emitted, enum_names, used_enums, used_defines, layouts })
+}
+
+/// Writes `src/generated/nodes.rs` from the vendored headers and `gram.y`. The texts are, in
+/// order, the [`HEADERS`] and `gram.y`.
+pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
+    let Model { headers, used_enums, used_defines, layouts, .. } = model(texts)?;
 
     let mut out = String::new();
     out.push_str(
         "//! The node types of the raw parse tree, with the names and the fields of the PostgreSQL\n\
          //! headers.\n\
          //!\n\
-         //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgparse/vendor/nodes.h`,\n\
-         //! `lockoptions.h`, `primnodes.h`, `parsenodes.h`, `value.h` and `gram.y`. Do not edit.\n\
+         //! @generated by `cargo xtask pg-generate` from the vendored headers in\n\
+         //! `crates/rudb-pgparse/vendor`, `errcodes.txt`, `pg_type.dat` and `gram.y`. Do not edit.\n\
          //! `cargo xtask pg-check` runs in the gate and fails if this file and the vendored files\n\
          //! disagree.\n\
          //!\n\
@@ -465,12 +642,21 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
          //! for `NIL`, a `char *` field is an `Option<Str>`, and a field that points to a node type\n\
          //! is an `Option<Box<..>>` of that type. An enum is a number with a constant for each\n\
          //! value, so that the zero of `makeNode` is a value of every enum. The writer of each\n\
-         //! type gives the text of `nodeToString` with the locations.\n\
+         //! type gives the text of `nodeToString` with the locations. The `#define` constants that\n\
+         //! `gram.y` names come first.\n\
          \n\
          #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, missing_docs)]\n\
          \n\
          use crate::nodes::{List, NodeType, Out, Str, w};\n",
     );
+
+    if !used_defines.is_empty() {
+        out.push('\n');
+    }
+    for d in headers.defines.iter().filter(|d| used_defines.contains(&d.name)) {
+        let (rust, value) = d.rust();
+        let _ = writeln!(out, "pub const {}: {rust} = {value};", d.name);
+    }
 
     for e in headers.enums.iter().filter(|e| used_enums.contains(&e.name)) {
         let _ = write!(
@@ -606,7 +792,7 @@ mod tests {
             typedef struct Later Later;\n\
             struct Later\n{\n\tNodeTag type;\n\tThing *thing;\n};\n";
         let mut headers = Headers::default();
-        read_header("test.h", text, &mut headers).unwrap();
+        read_header("test.h", text, Read::Nodes, &mut headers).unwrap();
         let kind = &headers.enums[0];
         assert_eq!(kind.name, "Kind");
         let constants: Vec<(&str, i64)> =

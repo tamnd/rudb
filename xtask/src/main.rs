@@ -70,6 +70,7 @@ fn main() -> ExitCode {
             unicode::generate(source, rest.iter().any(|arg| arg == "--check"))
         }
         Some("pg-vendor") => postgres::vendor(std::env::args().nth(2).as_deref()),
+        Some("pg-generate") => postgres::generate(),
         Some("pg-check") => postgres::check(),
         Some("pg-grammar") => postgres::grammar(),
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
@@ -185,6 +186,10 @@ fn usage() {
     );
     println!("  pg-vendor <checkout>  copy the PostgreSQL files from a checkout at the pin and");
     println!("           regenerate the tables made from them, the parse tables included");
+    println!(
+        "  pg-generate  regenerate the tables made from the vendored PostgreSQL files and the"
+    );
+    println!("           glue of the ported actions of gram.y, without a checkout");
     println!("  pg-check the vendored PostgreSQL files match VENDOR and the generated files match");
     println!("           what their generators write today");
     println!("  pg-grammar  bison makes the same parse tables as rudb-pgparse has, entry by entry");
