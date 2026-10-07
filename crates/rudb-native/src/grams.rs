@@ -188,12 +188,7 @@ fn within(path: &Path, reader: &Reader, share: u64) -> Result<Vec<Built>> {
 #[must_use]
 pub fn text_grams(reader: &Reader, column: usize) -> Option<Vec<u64>> {
     let table = reader.table();
-    let id = u64::try_from(column).ok()?;
-    let held =
-        table.sections().iter().find(|held| held.kind == *section::TEXT_GRAMS && held.id == id)?;
-    if !held.usable(table.generation()) {
-        return None;
-    }
+    let held = current_grams(reader, column)?;
     let bytes = reader.payload(held).ok()?;
     if bytes.is_empty() || bytes.len() % 8 != 0 || bytes.len() > table.rows().checked_mul(8)? {
         return None;
@@ -206,6 +201,27 @@ pub fn text_grams(reader: &Reader, column: usize) -> Option<Vec<u64>> {
     // with every bit set, which rules nothing out and sends them to be walked.
     words.resize(table.rows(), u64::MAX);
     Some(words)
+}
+
+/// Whether the table carries a current sketch of the column, found without reading it.
+///
+/// The sketch of a column is eight bytes a row once read, so a caller that may not need it asks
+/// this first. A `LIKE` over a column whose parts are coded with a dictionary never walks a
+/// compressed page, and reading the sketch of `URL` anyway held 130 MB on ClickBench q21.
+#[must_use]
+pub fn has_text_grams(reader: &Reader, column: usize) -> bool {
+    current_grams(reader, column).is_some()
+}
+
+/// The section holding the current sketch of a column, if the table has one.
+fn current_grams(reader: &Reader, column: usize) -> Option<&section::Section> {
+    let table = reader.table();
+    let id = u64::try_from(column).ok()?;
+    table
+        .sections()
+        .iter()
+        .find(|held| held.kind == *section::TEXT_GRAMS && held.id == id)
+        .filter(|held| held.usable(table.generation()))
 }
 
 /// Sketches a column a part at a time, and answers the bytes its values came to with the words.
