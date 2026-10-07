@@ -2800,6 +2800,9 @@ fn worth_sifting(working: usize, threads: usize, rows: usize, weight: usize) -> 
     working < threads.min(instances_for(rows, weight))
 }
 
+/// How many stripes with work in them each worker needs before [`runs_of`] keeps a stripe whole.
+const PIECES: usize = 4;
+
 /// The live parts cut into the runs a morsel covers, by the rows they hold rather than by the stripe.
 ///
 /// The unit used to be the stripe, because sixty four parts under one page is the read the disk wants
@@ -2826,18 +2829,26 @@ fn worth_sifting(working: usize, threads: usize, rows: usize, weight: usize) -> 
 /// equal. What can survive it is having more pieces than workers, so that the worker holding the dense
 /// piece is overtaken rather than waited for, and the piled case is exactly the case where cutting
 /// finer is free: the stripes are already being shared, so the page ownership that argues for a whole
-/// stripe has already been given up. A quarter of a share there, a whole share when there are as many
-/// working stripes as workers.
+/// stripe has already been given up. A quarter of a share there, a whole share when there are plenty
+/// of working stripes for every worker.
 ///
 /// Runs never cross a stripe either way. One that did would own two pages, which is the thing all of
 /// this is avoiding.
+///
+/// A stripe a worker is not even enough either, when there are only a few of them for each worker.
+/// Nine stripes for six workers is three workers reading two and three reading one, a third longer
+/// than the work divided evenly, and a worker the scheduler parks for a few milliseconds holds a
+/// ninth of the table while the rest wait. JOB reads `name`, `title` and `movie_companies` whole,
+/// which are five to nine stripes each. So stripes are kept whole only when there are [`PIECES`]
+/// of them with work in them for each worker, and below that the cut is the quarter share the piled
+/// case takes.
 fn runs_of(live: &[Live], instances: usize, rows: impl Fn(usize) -> usize) -> Vec<Range<usize>> {
     let total: usize = live.iter().map(|stripe| stripe.rows).sum();
     let working = live.iter().filter(|stripe| !stripe.parts.is_empty()).count();
     let share = total.div_ceil(instances.max(1)).max(1);
     // The biggest run allowed, and the size of the pieces an oversized stripe is cut into. They are
     // the same number in the piled case because there is nothing left to protect there.
-    let (whole, piece) = if working >= instances {
+    let (whole, piece) = if instances <= 1 || working >= instances.saturating_mul(PIECES) {
         (share, share.div_ceil(2).max(1))
     } else {
         let piece = share.div_ceil(4).max(1);
@@ -4864,7 +4875,7 @@ mod tests {
         out
     }
 
-    /// A whole stripe per morsel, once there are at least as many stripes as workers.
+    /// A whole stripe per morsel, once there are [`PIECES`] stripes for every worker.
     ///
     /// This is what stops the workers racing for a page. Handing out parts puts every worker in the
     /// same stripe at once, one of them reads the page and the rest read their own part out of the
@@ -4872,19 +4883,20 @@ mod tests {
     /// reads too small to keep the disk busy. A morsel that is a whole stripe gives the page to one
     /// worker and there is nothing left to race for.
     #[test]
-    fn a_native_scan_with_a_stripe_for_every_worker_hands_out_stripes() {
-        let (table, path) = native("stripes", 128, 200);
+    fn a_native_scan_with_stripes_enough_for_every_worker_hands_out_stripes() {
+        let (table, path) = native("stripes", 512, 50);
         let scan = scan_of(&table);
         let stripes = table.rows().stripe_parts();
-        assert_eq!(stripes.len(), 2, "two full stripes of sixty four parts");
+        assert_eq!(stripes.len(), 8, "eight full stripes of sixty four parts");
 
-        assert_eq!(scan.morsels(2, 1), Some(2), "one instance per stripe");
+        assert_eq!(scan.morsels(2, 1), Some(2), "two instances for the rows");
         let taken = taken(&scan);
 
-        assert_eq!(taken.len(), 2, "one morsel per stripe");
-        assert_eq!(taken[0].0, 0..64);
-        assert_eq!(taken[1].0, 64..128);
-        assert_eq!(taken.iter().map(|(_, rows)| rows).sum::<usize>(), 128 * 200);
+        assert_eq!(taken.len(), 8, "one morsel per stripe");
+        for (at, (parts, _)) in (0_u64..).zip(&taken) {
+            assert_eq!(*parts, at * 64..(at + 1) * 64);
+        }
+        assert_eq!(taken.iter().map(|(_, rows)| rows).sum::<usize>(), 512 * 50);
         std::fs::remove_file(path).expect("remove scratch file");
     }
 
@@ -4990,11 +5002,18 @@ mod tests {
         let live = living(&[&[0, 1, 2, 3], &[4, 5, 6, 7], &[8, 9, 10, 11]], |_| 1);
 
         assert_eq!(runs_of(&live, 1, |_| 1), [0..4, 4..8, 8..12], "one worker, one run a stripe");
-        assert_eq!(runs_of(&live, 3, |_| 1), [0..4, 4..8, 8..12], "a stripe is a share exactly");
+        let three = runs_of(&live, 3, |_| 1);
+        assert_eq!(three.len(), 12, "a stripe a worker, which is too few, so a part apiece");
         let four = runs_of(&live, 4, |_| 1);
         assert_eq!(four.len(), 12, "three stripes for four workers, so a part apiece");
         assert_eq!(four.first(), Some(&(0..1)));
         assert_eq!(four.last(), Some(&(11..12)));
+
+        let stripes: Vec<Vec<usize>> = (0..12).map(|at| vec![2 * at, 2 * at + 1]).collect();
+        let stripes: Vec<&[usize]> = stripes.iter().map(Vec::as_slice).collect();
+        let many = living(&stripes, |_| 1);
+        let whole: Vec<_> = (0..12).map(|at| 2 * at..2 * at + 2).collect();
+        assert_eq!(runs_of(&many, 3, |_| 1), whole, "four stripes a worker stay whole");
     }
 
     /// The reason the cut is by rows. Three stripes with work in them are not three pieces of work
@@ -5007,9 +5026,11 @@ mod tests {
 
         let runs = runs_of(&live, 2, rows);
 
-        assert_eq!(runs, [0..1, 1..3, 3..5, 5..7, 7..9, 9..10], "the big stripe in four, not one");
+        let big: Vec<_> = (1..9).map(|at| at..at + 1).collect();
+        assert_eq!(runs[1..9], big, "the big stripe in eight, not one");
+        assert_eq!((runs.first(), runs.last()), (Some(&(0..1)), Some(&(9..10))));
         let held: Vec<usize> = runs.iter().map(|run| run.clone().map(rows).sum()).collect();
-        assert_eq!(held, [10, 2_000, 2_000, 2_000, 2_000, 10], "and the four are the same size");
+        assert!(held[1..9].iter().all(|&rows| rows == 1_000), "and the eight are the same size");
     }
 
     /// And the other half of it. One stripe holding all the work is cut into runs of its live parts,
