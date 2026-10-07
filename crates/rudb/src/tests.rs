@@ -14133,6 +14133,65 @@ fn a_postgres_session_words_binder_errors_as_postgres() {
 }
 
 #[test]
+fn a_postgres_session_words_operator_errors_as_postgres() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let db = Database::new();
+    let connection = db.connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    // The text and the position that the PostgreSQL 19 oracle sends for each one.
+    let cases = [
+        ("SELECT 1 + 'abc'::text", "integer + text", 10),
+        ("SELECT 1 < true", "integer < boolean", 10),
+        ("SELECT true + 'a'", "boolean + unknown", 13),
+        ("SELECT 'a'::text - 1", "text - integer", 18),
+        ("SELECT now() + 1.5", "timestamp with time zone + numeric", 14),
+        ("SELECT array[1] + 1", "integer[] + integer", 17),
+        ("SELECT 1 & 1.5", "integer & numeric", 10),
+        ("SELECT 1 || 2", "integer || integer", 10),
+        ("SELECT now() || 1.5", "timestamp with time zone || numeric", 14),
+        ("SELECT 'a' LIKE 1", "unknown ~~ integer", 12),
+        ("SELECT 'a'::text * 'b'::text", "text * text", 18),
+        ("SELECT date '2020-01-01' * 2", "date * integer", 26),
+        ("SELECT 1.5 % true", "numeric % boolean", 12),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, types, position) in cases {
+        let Err(error) = connection.execute(sql) else {
+            wrong.push(format!("{sql}: no error"));
+            continue;
+        };
+        let fields = error.fields();
+        let sent = fields.and_then(|fields| fields.postgres.clone()).unwrap_or_default();
+        let at = error.span().map(|span| span.start + 1);
+        let found = (error.reported_state().as_str().to_string(), sent, at);
+        let wanted =
+            ("42883".to_string(), format!("operator does not exist: {types}"), Some(position));
+        if found != wanted {
+            wrong.push(format!("{sql}: {found:?} ({})", error.message()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // A string, a null, a `bytea` and an array have a `||` of their own.
+    for sql in ["SELECT 1 || 'a'", "SELECT 1 || NULL", "SELECT '\\x01'::bytea || '\\x02'::bytea"] {
+        connection.execute(sql).expect(sql);
+    }
+    connection.execute("SELECT array[1] || array[2]").expect("array");
+    // A DuckDB session joins any two values as strings.
+    let db = Database::new();
+    let connection = db.connect();
+    let error = connection.execute("SELECT 1 + 'abc'::text").expect_err("+");
+    assert!(error.message().starts_with("No function matches"), "{}", error.message());
+    connection.execute("SELECT 1 || 2").expect("||");
+}
+
+#[test]
 fn a_duckdb_session_compares_identifiers_without_case() {
     let db = Database::new();
     let connection = db.connect();
