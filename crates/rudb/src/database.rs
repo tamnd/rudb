@@ -3197,11 +3197,20 @@ fn appended(
                 && catalog.table(held).is_ok_and(|table| table.rows().grown_from().is_some())
         })
     };
+    // A table whose declared row order the file does not hold yet is written again, because one
+    // carried forward or extended keeps the entry the file has, which has no declaration.
+    let declared = |name: &str| {
+        names.iter().any(|held| {
+            held.table == name
+                && catalog.table(held).is_ok_and(|table| table.clustering_is_stored())
+        })
+    };
     let native = names
         .iter()
         .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_stored()))
         .map(|name| name.table.clone())
         .chain(marks.iter().filter(|(name, _)| !growing(name)).map(|(name, _)| name.clone()))
+        .filter(|name| declared(name))
         .collect::<BTreeSet<_>>();
     let dirty =
         names.iter().filter(|name| !native.contains(&name.table)).cloned().collect::<Vec<_>>();
@@ -3212,6 +3221,9 @@ fn appended(
     for name in &dirty {
         let table = catalog.table(name)?;
         let Some((rows, parts)) = table.rows().grown_from() else { continue };
+        if !table.clustering_is_stored() {
+            continue;
+        }
         let marked = marks.iter().any(|(marked, _)| *marked == name.table);
         if held.get(&name.table) == Some(&rows)
             && rudb_native::extendable(path, &name.table, table.columns(), rows, marked)?
