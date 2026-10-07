@@ -1,0 +1,81 @@
+//! The errors and the notices of the lexer and the parser, with the fields that PostgreSQL puts in
+//! an `ErrorResponse` and a `NoticeResponse`.
+
+use std::fmt;
+
+/// An error of the lexer or the parser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error {
+    /// The SQLSTATE, for example `42601`.
+    pub code: &'static str,
+    /// The primary message, as PostgreSQL writes it.
+    pub message: String,
+    /// The hint, or `None`.
+    pub hint: Option<&'static str>,
+    /// The byte offset in the text that the error points to, or `None`.
+    pub location: Option<usize>,
+}
+
+impl Error {
+    /// An error in the form of `scanner_yyerror`: the message, then `at end of input` when the
+    /// location is at the end of the text, or `at or near` and the text from `start` to `end`.
+    pub(crate) fn syntax(text: &[u8], message: &str, start: usize, end: usize) -> Error {
+        let message = if start >= text.len() {
+            format!("{message} at end of input")
+        } else {
+            let near = String::from_utf8_lossy(&text[start..end.clamp(start, text.len())]);
+            format!("{message} at or near \"{near}\"")
+        };
+        Error { code: "42601", message, hint: None, location: Some(start) }
+    }
+
+    /// An error with a location and no `at or near` part.
+    pub(crate) fn at(code: &'static str, message: &str, location: usize) -> Error {
+        Error { code, message: message.to_owned(), hint: None, location: Some(location) }
+    }
+
+    /// The error that `report_invalid_encoding` gives for bytes that are not UTF-8, or that
+    /// contain a zero byte. `bad` starts at the first bad byte.
+    pub(crate) fn encoding(bad: &[u8]) -> Error {
+        let first = bad.first().copied().unwrap_or(0);
+        let length = match first {
+            b if b & 0x80 == 0 => 1,
+            b if b & 0xe0 == 0xc0 => 2,
+            b if b & 0xf0 == 0xe0 => 3,
+            b if b & 0xf8 == 0xf0 => 4,
+            _ => 1,
+        };
+        let bytes: Vec<String> = bad.iter().take(length).map(|b| format!("0x{b:02x}")).collect();
+        Error {
+            code: "22021",
+            message: format!("invalid byte sequence for encoding \"UTF8\": {}", bytes.join(" ")),
+            hint: None,
+            location: None,
+        }
+    }
+
+    /// The position that an `ErrorResponse` gives: the number of the character that the location
+    /// points to in `text`, where the first character is 1.
+    pub fn position(&self, text: &str) -> Option<usize> {
+        let location = self.location?.min(text.len());
+        let characters = text.as_bytes()[..location].iter().filter(|&&b| b & 0xc0 != 0x80).count();
+        Some(characters + 1)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// A notice of the lexer, for example for an identifier that is too long.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    /// The SQLSTATE, for example `42622`.
+    pub code: &'static str,
+    /// The message, as PostgreSQL writes it.
+    pub message: String,
+}
