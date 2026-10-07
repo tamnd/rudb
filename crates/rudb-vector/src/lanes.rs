@@ -15,6 +15,8 @@
 //! What it replaces is [`crate::vector`]'s unpack into 64 words on the stack, a compare of each
 //! word into a flag byte and the flags folded into a word, which on TPC-H q06 was a third of the
 //! query.
+// Only the AVX2 build reads these tables, so on any other target they are unused.
+#![cfg_attr(not(all(target_arch = "x86_64", target_feature = "avx2")), allow(dead_code))]
 
 /// Widest code the lanes take. A code starts up to seven bits into its first byte, and four bytes
 /// hold 32 bits, so 25 is the most that is always inside them.
