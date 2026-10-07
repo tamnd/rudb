@@ -9454,7 +9454,10 @@ fn create_table(
     if let Ok(found) = catalog.entry(&create.name) {
         let name = &create.name.table;
         if !create.or_replace {
-            return Err(Error::catalog(format!("{found} with name \"{name}\" already exists!")));
+            return Err(Error::catalog(format!("{found} with name \"{name}\" already exists!"))
+                .state(SqlState::DUPLICATE_TABLE)
+                .pg(format!("relation \"{name}\" already exists"))
+                .unplaced());
         }
         if catalog.table(&create.name).is_err() {
             return Err(Error::catalog(format!(

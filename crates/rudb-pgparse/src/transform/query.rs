@@ -413,7 +413,7 @@ impl Transform<'_> {
                 };
                 let query = self.query(select)?;
                 let (alias, columns) = self.alias(subselect.alias.as_deref())?;
-                Ok(self.ast.push_source(Source::Subquery { query, alias, columns }))
+                Ok(self.ast.push_source(Source::Subquery { query, alias, columns }, self.span))
             }
             Node::RangeFunction(function) => self.function_source(function),
             node => Err(not_yet(node)),
@@ -435,6 +435,7 @@ impl Transform<'_> {
     /// scope has that name.
     fn table(&mut self, table: &RangeVar) -> Made<SourceRef> {
         let (alias, columns) = self.alias(table.alias.as_deref())?;
+        let span = self.at(table.location);
         let parts: Vec<&str> = [&table.catalogname, &table.schemaname, &table.relname]
             .into_iter()
             .filter_map(|part| part.as_deref())
@@ -445,27 +446,25 @@ impl Transform<'_> {
             let definition = &self.scope[at];
             if definition.query == NONE {
                 let cte = definition.slot;
-                let span = self.at(table.location);
                 let made = self.ast.queries.len() as u32;
                 self.self_reads.push((cte, span, made));
-                return Ok(self.ast.push_source(Source::Cte {
-                    cte,
-                    alias,
-                    columns,
-                    recurring: false,
-                }));
+                let recurring = false;
+                return Ok(self
+                    .ast
+                    .push_source(Source::Cte { cte, alias, columns, recurring }, span));
             }
             let (query, declared) = (definition.query, definition.declared);
             let named = if alias == NONE { self.intern(name) } else { alias };
             let shown = if columns.is_empty() { declared } else { columns };
-            let source =
-                self.ast.push_source(Source::Subquery { query, alias: named, columns: shown });
+            let source = self
+                .ast
+                .push_source(Source::Subquery { query, alias: named, columns: shown }, span);
             self.scope[at].reads.push((source, alias, columns));
             return Ok(source);
         }
         let parts: Vec<u32> = parts.into_iter().map(|part| self.intern(part)).collect();
         let name = self.ast.part_slice(parts);
-        Ok(self.ast.push_source(Source::Table { name, alias, columns }))
+        Ok(self.ast.push_source(Source::Table { name, alias, columns }, span))
     }
 
     fn join(&mut self, join: &JoinExpr) -> Made<SourceRef> {
@@ -490,7 +489,8 @@ impl Transform<'_> {
             _ => return clause("JoinExpr"),
         };
         let natural = join.isNatural;
-        Ok(self.ast.push_source(Source::Join { left, right, kind, natural, on, using }))
+        let join = Source::Join { left, right, kind, natural, on, using };
+        Ok(self.ast.push_source(join, self.span))
     }
 
     /// A function in `FROM`. `WITH ORDINALITY`, `ROWS FROM` and a column definition list are not
@@ -542,7 +542,8 @@ impl Transform<'_> {
         }
         let args = self.ast.target_slice(args);
         let (alias, columns) = self.alias(function.alias.as_deref())?;
-        Ok(self.ast.push_source(Source::Function { name, args, alias, columns, pragma: false }))
+        let function = Source::Function { name, args, alias, columns, pragma: false };
+        Ok(self.ast.push_source(function, self.span))
     }
 
     // Windows.

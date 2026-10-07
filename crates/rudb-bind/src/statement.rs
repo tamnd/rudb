@@ -2879,7 +2879,14 @@ fn drop_table(ast: &Ast, catalog: &Catalog, index: ast::DropTableRef) -> Result<
             Err(_) if written.if_exists => {
                 missing.push(parts.last().copied().unwrap_or_default().to_owned());
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let what = if written.view { "view" } else { "table" };
+                let name = parts.last().copied().unwrap_or_default();
+                return Err(error
+                    .state(SqlState::UNDEFINED_TABLE)
+                    .pg(format!("{what} \"{name}\" does not exist"))
+                    .unplaced());
+            }
         }
     }
     Ok(Bound::DropTable(DropTable { names, kind, cascade: written.cascade, missing }))

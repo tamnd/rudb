@@ -51,10 +51,11 @@ impl Ast {
         index
     }
 
-    /// Add a from item.
-    pub fn push_source(&mut self, source: Source) -> SourceRef {
+    /// Add a from item that covers `span`.
+    pub fn push_source(&mut self, source: Source, span: Span) -> SourceRef {
         let index = self.sources.len() as u32;
         self.sources.push(source);
+        self.source_spans.push(span);
         index
     }
 
@@ -184,8 +185,9 @@ impl Ast {
     }
 
     /// The `FROM` of the one table that a writing statement names.
-    pub fn written_table(&mut self, name: Slice, alias: StrRef) -> Slice {
-        let source = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+    pub fn written_table(&mut self, name: Slice, alias: StrRef, span: Span) -> Slice {
+        let source =
+            self.push_source(Source::Table { name, alias, columns: Slice::default() }, span);
         self.source_slice([source])
     }
 
@@ -197,7 +199,7 @@ impl Ast {
         targets: Slice,
         span: Span,
     ) -> QueryRef {
-        let from = self.written_table(name, alias);
+        let from = self.written_table(name, alias, span);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         self.push_query(Query::bare(QueryBody::Select(select)), span)
     }
@@ -223,18 +225,21 @@ impl Ast {
         }
         targets.push(Target { expr: condition, alias: NONE });
         let targets = self.target_slice(targets);
-        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() }, span);
         let excluded = interned.intern(self, "excluded");
-        let right =
-            self.push_source(Source::Table { name, alias: excluded, columns: Slice::default() });
-        let joined = self.push_source(Source::Join {
-            left,
-            right,
-            kind: JoinKind::Positional,
-            natural: false,
-            on: NONE,
-            using: Slice::default(),
-        });
+        let right = self
+            .push_source(Source::Table { name, alias: excluded, columns: Slice::default() }, span);
+        let joined = self.push_source(
+            Source::Join {
+                left,
+                right,
+                kind: JoinKind::Positional,
+                natural: false,
+                on: NONE,
+                using: Slice::default(),
+            },
+            span,
+        );
         let from = self.source_slice([joined]);
         let select = self.push_select(Select { targets, from, ..Select::empty() });
         let query = self.push_query(Query::bare(QueryBody::Select(select)), span);
@@ -270,7 +275,7 @@ impl Ast {
                     vec![Target { expr: star, alias: NONE }, Target { expr: hit, alias: NONE }];
                 targets.extend(sets.iter().map(|&(_, expr)| Target { expr, alias: NONE }));
                 let targets = self.target_slice(targets);
-                let from = self.written_table(name, alias);
+                let from = self.written_table(name, alias, span);
                 let select = self.push_select(Select { targets, from, ..Select::empty() });
                 self.push_query(Query::bare(QueryBody::Select(select)), span)
             }
@@ -320,18 +325,23 @@ impl Ast {
         let limit = self.push_expr(Expr::Literal { kind: LiteralKind::Number, text: one }, span);
         let query =
             self.push_query(Query { limit, ..Query::bare(QueryBody::Select(select)) }, span);
-        let right =
-            self.push_source(Source::Subquery { query, alias: matched, columns: Slice::default() });
-        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() });
+        let right = self.push_source(
+            Source::Subquery { query, alias: matched, columns: Slice::default() },
+            span,
+        );
+        let left = self.push_source(Source::Table { name, alias, columns: Slice::default() }, span);
         let on = self.true_literal(span);
-        let join = self.push_source(Source::Join {
-            left,
-            right,
-            kind: JoinKind::Left,
-            natural: false,
-            on,
-            using: Slice::default(),
-        });
+        let join = self.push_source(
+            Source::Join {
+                left,
+                right,
+                kind: JoinKind::Left,
+                natural: false,
+                on,
+                using: Slice::default(),
+            },
+            span,
+        );
         let from = self.source_slice([join]);
         let qualifier = self.part_slice([alias]);
         let star = self.push_expr(Expr::Star { qualifier, replacements: Slice::default() }, span);
