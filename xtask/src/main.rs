@@ -71,6 +71,7 @@ fn main() -> ExitCode {
         }
         Some("pg-vendor") => postgres::vendor(std::env::args().nth(2).as_deref()),
         Some("pg-check") => postgres::check(),
+        Some("pg-grammar") => postgres::grammar(),
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
         // With a suite name it is the whole comparison against every engine on the machine, which
@@ -183,9 +184,10 @@ fn usage() {
         "  gen-grammar [--check]  regenerate the parser's and rudb-common's tables from that grammar"
     );
     println!("  pg-vendor <checkout>  copy the PostgreSQL files from a checkout at the pin and");
-    println!("           regenerate the SQLSTATE list and the command tags from them");
+    println!("           regenerate the tables made from them, the parse tables included");
     println!("  pg-check the vendored PostgreSQL files match VENDOR and the generated files match");
     println!("           what their generators write today");
+    println!("  pg-grammar  bison makes the same parse tables as rudb-pgparse has, entry by entry");
     println!("  gen-unicode <utf8proc_data.cpp> [--check]  regenerate the grapheme break and");
     println!("           normalization tables from the pin's copy of utf8proc, out of a duckdb");
     println!("           checkout at the pin");
