@@ -535,6 +535,51 @@ fn a_cast_between_numbers_checks_the_range_as_postgres_does() {
 }
 
 #[test]
+fn a_cast_to_text_uses_the_output_function_of_the_type() {
+    let dirs = Dirs::new("text-cast");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create table floats (a float8, b int[])");
+    client.query("insert into floats values ('NaN', array[3, 4]), (1.25, null)");
+    // The text of the PostgreSQL 19 oracle, for a cast, for `||` and for a store into a column.
+    let checks = |client: &mut Client| {
+        for (sql, text) in [
+            ("select 'NaN'::float8::text", "NaN"),
+            ("select '-Infinity'::float4::text", "-Infinity"),
+            ("select 1e20::float8::text || ' ' || 1e-7::float8::text", "1e+20 1e-07"),
+            ("select array[1, 2]::text", "{1,2}"),
+            ("select array['a b', 'c', null]::text", "{\"a b\",c,NULL}"),
+            ("select array['{\"a\"}', 'x\\y', '']::text", "{\"{\\\"a\\\"}\",\"x\\\\y\",\"\"}"),
+            ("select array[true, false]::text", "{t,f}"),
+            ("select array[1.5::float8, 'NaN'::float8]::text", "{1.5,NaN}"),
+            ("select array[]::int[]::text", "{}"),
+            ("select 'x' || 'NaN'::float8", "xNaN"),
+            ("select 'NaN'::float8 || ' ' || 2", "NaN 2"),
+            (
+                "select string_agg(a::text || ' ' || coalesce(b::text, '-'), ',' order by a) from floats",
+                "1.25 -,NaN {3,4}",
+            ),
+        ] {
+            assert_eq!(scalar(client, sql), text, "{sql}");
+        }
+    };
+    checks(&mut client);
+    assert_eq!(scalar(&mut client, "select '\\x01ff'::bytea::text"), "\\x01ff");
+    assert_eq!(scalar(&mut client, "select array['\\x01'::bytea]::text"), "{\"\\\\x01\"}");
+    client.query("create table texts (t text)");
+    client.query("insert into texts select a from floats");
+    assert_eq!(scalar(&mut client, "select string_agg(t, ',' order by t) from texts"), "1.25,NaN");
+    // The output reads `bytea_output`, and a new value of it makes a new plan.
+    client.query("set bytea_output = 'escape'");
+    assert_eq!(scalar(&mut client, "select '\\x41ff'::bytea::text"), "A\\377");
+    client.query("set bytea_output = 'hex'");
+    assert_eq!(scalar(&mut client, "select '\\x41ff'::bytea::text"), "\\x41ff");
+    checks(&mut client);
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_string_type_with_a_length_cuts_on_a_cast_and_refuses_a_long_value_on_a_store() {
     let dirs = Dirs::new("length");
     let server = Server::start(dirs.config()).unwrap();

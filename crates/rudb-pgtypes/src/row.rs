@@ -471,6 +471,36 @@ impl RowEncoder {
     }
 }
 
+/// The text of each value of a column with the output function of the type `oid`, as PostgreSQL
+/// writes a value in a cast to `text`. A NULL is `None`. The encoder of the rows writes the text,
+/// so a value cast to text and a value sent to the client always agree.
+pub fn text_values(
+    vector: &Vector,
+    oid: Oid,
+    settings: &OutputSettings<'_>,
+) -> Result<Vec<Option<String>>, TypeError> {
+    let mut encoder = RowEncoder::new(&[(vector.logical_type().clone(), oid, false)])?;
+    let mut rows = Vec::new();
+    encoder.encode(std::slice::from_ref(vector), 0..vector.len(), settings, &mut rows)?;
+    // Each message is `D`, its length, the column count 1, and the length and the bytes of the
+    // value, with the length -1 for NULL.
+    let mut values = Vec::with_capacity(vector.len());
+    let mut at = 0;
+    while let Some(len) = rows.get(at + 7..at + 11) {
+        let len = i32::from_be_bytes(<[u8; 4]>::try_from(len).unwrap_or_default());
+        at += 11;
+        values.push(match usize::try_from(len) {
+            Ok(len) => {
+                let text = String::from_utf8_lossy(&rows[at..at + len]).into_owned();
+                at += len;
+                Some(text)
+            }
+            Err(_) => None,
+        });
+    }
+    Ok(values)
+}
+
 fn internal(message: String) -> TypeError {
     TypeError::new(SqlState::INTERNAL_ERROR, message)
 }
@@ -1369,6 +1399,25 @@ mod tests {
                 ],
             ),
         ]
+    }
+
+    /// The text of each value of a column is the text that the encoder sends for it.
+    #[test]
+    fn the_text_of_a_value_is_its_output() {
+        let zone = FixedZone::utc();
+        let settings = settings(&zone);
+        let values = [Value::Double(f64::NAN), Value::Null, Value::Double(1e20)];
+        let vector = Vector::from_values(LogicalType::Double, &values).unwrap();
+        let texts = text_values(&vector, oids::FLOAT8, &settings).unwrap();
+        assert_eq!(texts, [Some("NaN".to_owned()), None, Some("1e+20".to_owned())]);
+        let list = LogicalType::List(Box::new(LogicalType::Varchar));
+        let values = [Value::List {
+            element: LogicalType::Varchar,
+            values: vec![Value::Varchar("a b".into()), Value::Null],
+        }];
+        let vector = Vector::from_values(list, &values).unwrap();
+        let texts = text_values(&vector, oids::TEXT_ARRAY, &settings).unwrap();
+        assert_eq!(texts, [Some("{\"a b\",NULL}".to_owned())]);
     }
 
     /// Each column in each format, flat and as a constant, over each range of rows, against the

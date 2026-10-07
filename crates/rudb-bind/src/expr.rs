@@ -11,10 +11,10 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CastInput, CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, LogicalType,
-    MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, Result, Semantics, Session,
-    SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting,
-    looks_like_rule, rule_names,
+    CastInput, CastOutput, CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules,
+    LogicalType, MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, Result, Semantics,
+    Session, SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value,
+    is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
@@ -3555,9 +3555,32 @@ impl Binder<'_> {
             let args = self.plan_mut().add_expr_list(&[expr]);
             return Ok(self.add_expr(Expr::Function { name, args }, ty.clone()));
         }
+        if !try_cast
+            && *ty == LogicalType::Varchar
+            && self.semantics.cast_output() == CastOutput::Postgres
+            && let Some(oid) = plain_output(from)
+        {
+            return Ok(self.pg_output(expr, oid));
+        }
         struct_members_meet(from, ty)?;
         self.resolve_placeholder(expr, ty);
         Ok(self.add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
+    }
+
+    /// The cast of `expr` to text with the output function of the PostgreSQL type `oid`, as
+    /// `__rudb_pg_output` with the settings that the output reads. A new value of a setting makes
+    /// a new PostgreSQL session value, so a plan that read the old value is not used again.
+    fn pg_output(&mut self, expr: ExprRef, oid: u32) -> ExprRef {
+        let setting = |name: &str| self.session.postgres().and_then(|pg| pg.settings.get(name));
+        let digits =
+            setting("extra_float_digits").and_then(|digits| digits.parse().ok()).unwrap_or(1);
+        let escape = setting("bytea_output").as_deref() == Some("escape");
+        let oid = self.add_constant(Value::BigInt(i64::from(oid)));
+        let digits = self.add_constant(Value::BigInt(digits));
+        let escape = self.add_constant(Value::Boolean(escape));
+        let name = self.plan_mut().intern("__rudb_pg_output");
+        let args = self.plan_mut().add_expr_list(&[expr, oid, digits, escape]);
+        self.add_expr(Expr::Function { name, args }, LogicalType::Varchar)
     }
 
     /// Gives the parameter `expr` stands for the type `ty`, when `expr` is the null of a parameter
@@ -4946,6 +4969,35 @@ fn undefined_operator(
 
 /// The type of an argument as `format_type` names it, with `unknown` for a string literal and a
 /// null, which have no type yet when PostgreSQL looks for a function or an operator.
+/// The PostgreSQL type of a value whose cast to text a PostgreSQL session writes with the output
+/// function of the type, or `None` when the cast of the engine writes the same text. These are the
+/// types whose text differs and whose output reads no setting but `extra_float_digits` and
+/// `bytea_output`: `float4`, `float8`, `bytea`, and an array of those, of an integer, of
+/// `boolean`, of `numeric`, of `text` or of `uuid`. The type must also be the one that the OID
+/// names here, so that the folding of a constant, which has the value and not its type, finds it.
+fn plain_output(ty: &LogicalType) -> Option<u32> {
+    use LogicalType as L;
+    let plain = match ty {
+        L::Float | L::Double | L::Blob => true,
+        L::List(element) => matches!(
+            **element,
+            L::Boolean
+                | L::SmallInt
+                | L::Integer
+                | L::BigInt
+                | L::Float
+                | L::Double
+                | L::Numeric
+                | L::Varchar
+                | L::Blob
+                | L::Uuid
+        ),
+        _ => false,
+    };
+    let oid = rudb_pgtypes::pg_type(ty).oid;
+    (plain && rudb_pgtypes::logical_type(oid).as_ref() == Some(ty)).then_some(oid)
+}
+
 /// Whether a cast between two PostgreSQL number types can fail, so that a PostgreSQL session casts
 /// it with `__rudb_pg_number`, which fails as PostgreSQL does. A cast to a wider type never fails,
 /// and the engine casts it. A `numeric` with a typmod is a DECIMAL here.
