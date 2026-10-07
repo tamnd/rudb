@@ -173,8 +173,22 @@ pub(crate) struct Walking {
     cursor: Cursor,
     /// The last part read whole, by number, which the next batch's siblings are mostly in.
     part: Option<(usize, Chunk)>,
+    /// For a compared walk, the last part read whole as its sibling's side and passes.
+    flat: Flat,
+    /// The sibling's side and passes at the rows of a part read sparsely.
+    some_values: Vec<i64>,
+    some_pass: Vec<bool>,
     block: Vec<i64>,
     gauge: Gauge,
+}
+
+/// A part's sibling side at each of its rows and whether the row passed every condition on the
+/// sibling alone, worked out once for the part rather than once for each batch that reaches it.
+#[derive(Debug, Default)]
+struct Flat {
+    part: Option<usize>,
+    values: Vec<i64>,
+    pass: Vec<bool>,
 }
 
 impl Siblings {
@@ -479,9 +493,36 @@ impl Siblings {
         kept: &mut Option<(usize, Chunk)>,
         within: &mut Vec<(u32, u32)>,
     ) -> Result<Vec<Vector>> {
+        let mut pieces: Vec<Vec<Vector>> = vec![Vec::new(); self.read.len()];
+        self.by_part(runs, within, |part, within, wanted| {
+            self.read_part(part, within, wanted, kept, &mut pieces)
+        })?;
+        pieces
+            .into_iter()
+            .map(|mut piece| {
+                if piece.len() == 1 {
+                    return piece
+                        .pop()
+                        .ok_or_else(|| Error::internal("a sibling read lost its piece"));
+                }
+                let ty = piece[0].logical_type().clone();
+                rudb_vector::concat(&ty, &piece)?
+                    .ok_or_else(|| Error::internal("the parts of a sibling read did not join"))
+            })
+            .collect()
+    }
+
+    /// Runs `each` over the parts `runs` reaches, which rise and do not overlap, with the part, its
+    /// runs from its first row and how many rows they come to. `within` is room for the runs of one
+    /// part.
+    fn by_part(
+        &self,
+        runs: &[(u64, u32)],
+        within: &mut Vec<(u32, u32)>,
+        mut each: impl FnMut(usize, &[(u32, u32)], u64) -> Result<()>,
+    ) -> Result<()> {
         let starts = self.starts()?;
         let past = || Error::internal("a sibling row id is past the end of its table");
-        let mut pieces: Vec<Vec<Vector>> = vec![Vec::new(); self.read.len()];
         let mut part = 0;
         let mut wanted = 0;
         within.clear();
@@ -491,7 +532,7 @@ impl Siblings {
                 let stop = *starts.get(part + 1).ok_or_else(past)?;
                 if from < starts[part] || from >= stop {
                     if !within.is_empty() {
-                        self.read_part(part, within, wanted, kept, &mut pieces)?;
+                        each(part, within, wanted)?;
                         within.clear();
                         wanted = 0;
                     }
@@ -506,21 +547,9 @@ impl Siblings {
             }
         }
         if !within.is_empty() {
-            self.read_part(part, within, wanted, kept, &mut pieces)?;
+            each(part, within, wanted)?;
         }
-        pieces
-            .into_iter()
-            .map(|mut piece| {
-                if piece.len() == 1 {
-                    return piece
-                        .pop()
-                        .ok_or_else(|| Error::internal("a sibling read lost its piece"));
-                }
-                let ty = piece[0].logical_type().clone();
-                rudb_vector::concat(&ty, &piece)?
-                    .ok_or_else(|| Error::internal("the parts of a sibling read did not join"))
-            })
-            .collect()
+        Ok(())
     }
 
     /// The runs of part `part`, `wanted` rows between them, one piece a column.
@@ -654,16 +683,7 @@ impl Siblings {
         } else if listed {
             coalesce(&local.rids, &mut local.runs);
         }
-        let read = self.read(&local.runs, &mut local.part, &mut local.within)?;
-        let length = local.runs.iter().map(|&(_, length)| length as usize).sum();
-        values_of(
-            Chunk::with_rows(read, length)?,
-            own,
-            column,
-            &mut local.scratch,
-            &mut local.values,
-            &mut local.pass,
-        )?;
+        self.sides_at(own, column, local)?;
         // The operator is settled once for the batch, so that the loop over the siblings has no
         // match in it.
         match op {
@@ -676,6 +696,47 @@ impl Siblings {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The sibling's side at each row of `runs` in `values`, and in `pass` whether it passed every
+    /// one of `own` and is not null.
+    ///
+    /// A part the batch reaches densely has its side and passes worked out for all of its rows once
+    /// and kept, and every batch after that copies the rows it wants out of them. On TPC-H q21 the
+    /// siblings of one batch are about one row in seven of a part, and gathering them a value at a
+    /// time out of the packed columns, joining the pieces and testing them was most of what the
+    /// walk cost, where unpacking the part in blocks and testing it whole is a pass over it once.
+    /// A part reached sparsely is read at the rows asked for, as before.
+    fn sides_at(&self, own: &[Prepared], column: usize, local: &mut Walking) -> Result<()> {
+        let starts = self.starts()?;
+        let Walking { runs, within, flat, scratch, values, pass, some_values, some_pass, .. } = local;
+        values.clear();
+        pass.clear();
+        self.by_part(runs, within, |part, within, wanted| {
+            let length = starts[part + 1] - starts[part];
+            if flat.part != Some(part) && wanted * DENSE >= length {
+                flat.part = None;
+                let whole = self.rows.read(part, &self.read)?;
+                values_of(whole, own, column, scratch, &mut flat.values, &mut flat.pass)?;
+                flat.part = Some(part);
+            }
+            if flat.part == Some(part) {
+                let short = || Error::internal("a sibling run is past the end of its part");
+                for &(start, length) in within {
+                    let rows = start as usize..(start + length) as usize;
+                    values.extend_from_slice(flat.values.get(rows.clone()).ok_or_else(short)?);
+                    pass.extend_from_slice(flat.pass.get(rows).ok_or_else(short)?);
+                }
+            } else {
+                let positions: Vec<u32> =
+                    within.iter().flat_map(|&(start, length)| start..start + length).collect();
+                let read = self.rows.read_rows(part, &self.read, &positions)?;
+                values_of(read, own, column, scratch, some_values, some_pass)?;
+                values.extend_from_slice(some_values);
+                pass.extend_from_slice(some_pass);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -903,6 +964,9 @@ impl Stream for Siblings {
             hit: Vec::new(),
             cursor: Cursor::default(),
             part: None,
+            flat: Flat::default(),
+            some_values: Vec::new(),
+            some_pass: Vec::new(),
             block: Vec::new(),
             gauge: Gauge::new(1),
         }
