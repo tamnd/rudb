@@ -429,6 +429,57 @@ fn a_string_literal_next_to_an_operator_takes_the_type_of_the_other_side() {
 }
 
 #[test]
+fn a_cast_of_a_string_uses_the_input_function_of_the_type() {
+    let dirs = Dirs::new("string-cast");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let of = |text: &str, ty: &str| format!("select t::{ty} from (values ('{text}')) v(t)");
+    // The values and the errors of the PostgreSQL 19 oracle. An error of a cast that runs over
+    // the rows has no place.
+    for (text, ty, value) in [
+        (" 12 ", "int", "12"),
+        ("0x1F", "int", "31"),
+        ("1_000", "int", "1000"),
+        ("NaN", "float8", "NaN"),
+        ("1.5", "float4", "1.5"),
+        ("yes", "bool", "t"),
+        ("tru", "bool", "t"),
+        ("{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}", "uuid", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+        ("\\x01ff", "bytea", "\\x01ff"),
+        ("4294967295", "oid", "4294967295"),
+    ] {
+        let sql = of(text, ty);
+        assert_eq!(scalar(&mut client, &sql), value, "{sql}");
+    }
+    assert_eq!(scalar(&mut client, "select cast('7'::varchar as int) + 1"), "8");
+    for (sql, code, message) in [
+        (of("1.5", "int"), "22P02", "invalid input syntax for type integer: \"1.5\""),
+        (of("x", "int"), "22P02", "invalid input syntax for type integer: \"x\""),
+        (of("99999", "int2"), "22003", "value \"99999\" is out of range for type smallint"),
+        (
+            of("9223372036854775808", "int8"),
+            "22003",
+            "value \"9223372036854775808\" is out of range for type bigint",
+        ),
+        (of("1e400", "float8"), "22003", "\"1e400\" is out of range for type double precision"),
+        (of("x", "bool"), "22P02", "invalid input syntax for type boolean: \"x\""),
+        (of("x", "uuid"), "22P02", "invalid input syntax for type uuid: \"x\""),
+        ("select 'x'::text::int".into(), "22P02", "invalid input syntax for type integer: \"x\""),
+    ] {
+        // PostgreSQL folds the cast of a `VALUES` row when it plans, and rudb sends the row
+        // description first.
+        let messages = client.query(&sql);
+        assert!(tags(&messages).ends_with("EZ"), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P'), None, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_string_type_with_a_length_cuts_on_a_cast_and_refuses_a_long_value_on_a_store() {
     let dirs = Dirs::new("length");
     let server = Server::start(dirs.config()).unwrap();

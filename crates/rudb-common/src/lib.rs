@@ -59,10 +59,10 @@ pub use error::{Error, ErrorCode, Fields, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
-    AggregateTypes, CharacterTypes, ColumnNames, DefaultNullOrder, ErrorTexts, FunctionRules,
-    IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns, NumberLiterals, OperatorRules,
-    PlanErrors, PreparedStatement, Semantics, SequenceOwners, Session, SessionTimeZone,
-    SetFunctions, ShowBehavior, TypeNames, UnknownTypes, ValuesNames, Variable,
+    AggregateTypes, CastInput, CharacterTypes, ColumnNames, DefaultNullOrder, ErrorTexts,
+    FunctionRules, IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns, NumberLiterals,
+    OperatorRules, PlanErrors, PreparedStatement, Semantics, SequenceOwners, Session,
+    SessionTimeZone, SetFunctions, ShowBehavior, TypeNames, UnknownTypes, ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

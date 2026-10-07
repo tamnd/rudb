@@ -225,6 +225,10 @@ pub(crate) fn chr(code: &Value) -> Result<Value> {
 /// `__rudb_pg_bpchar_cut` is the explicit cast to `char(n)`, which cuts a longer value with no
 /// error. A `char(n)` value is kept with no trailing spaces, as they do not count in a compare, in
 /// `length()` or in a cast to text. The encoder of the rows pads it to n characters.
+///
+/// `__rudb_pg_input` is the explicit cast of a string in a PostgreSQL session to a type whose
+/// input reads no setting, which the input function of the type reads. Its second argument is
+/// the OID of the type.
 pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let text = match args.first() {
         Some(Value::Null) => return Ok(Some(Value::Null)),
@@ -232,6 +236,14 @@ pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
         None => return Ok(None),
     };
     let kept = match (name, args) {
+        ("__rudb_pg_input", [_, oid]) => {
+            let oid = u32::try_from(whole(oid)?).unwrap_or_default();
+            return match rudb_pgtypes::plain_text_value(oid, string(text)?) {
+                // PostgreSQL places no error of a value that it reads as the query runs.
+                Some(value) => Ok(Some(value.map_err(|error| Error::from(error).unplaced())?)),
+                None => Err(Error::internal(format!("no input function for the type {oid}"))),
+            };
+        }
         ("__rudb_pg_name", [_]) => rudb_pgtypes::name_in(string(text)?),
         ("__rudb_pg_varchar", [_, typmod]) => {
             rudb_pgtypes::varchar_coerce(string(text)?, whole(typmod)? as i32, false)?

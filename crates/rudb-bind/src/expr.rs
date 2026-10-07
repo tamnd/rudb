@@ -11,7 +11,7 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, LogicalType,
+    CastInput, CharacterTypes, DeclaredType, Error, ErrorTexts, Field, FunctionRules, LogicalType,
     MAX_DECIMAL_WIDTH, NumberLiterals, OperatorRules, Result, Semantics, Session, SetFunctions,
     SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule,
     rule_names,
@@ -300,7 +300,14 @@ impl Binder<'_> {
                     return self.pg_length(cast, declared, true);
                 }
                 let input = self.bind_expr(ast, operand, scope)?;
-                let cast = self.checked_cast_to(input, &target, try_cast)?;
+                let cast = match declared {
+                    Some(declared) if !try_cast => self.read_string(input, declared, &target),
+                    _ => None,
+                };
+                let cast = match cast {
+                    Some(cast) => cast,
+                    None => self.checked_cast_to(input, &target, try_cast)?,
+                };
                 match declared {
                     Some(declared) => self.pg_length(cast, declared, true),
                     None => Ok(cast),
@@ -790,6 +797,29 @@ impl Binder<'_> {
         let value = input.read(oid, ast.string(text))?;
         let span = ast.expr_span(expr);
         Some(value.map(|value| self.add_constant(value)).map_err(|e| e.with_fallback_span(span)))
+    }
+
+    /// The explicit cast of a string to the PostgreSQL type `declared` in a session where the input
+    /// function of the type reads it, as `__rudb_pg_input` over the string and the OID. `None`
+    /// when the session casts with the engine, when `expr` is not a string, or when the input of
+    /// the type reads a setting or the catalog.
+    fn read_string(
+        &mut self,
+        expr: ExprRef,
+        declared: DeclaredType,
+        target: &LogicalType,
+    ) -> Option<ExprRef> {
+        if self.semantics.cast_input() != CastInput::Postgres
+            || *self.plan().expr_type(expr) != LogicalType::Varchar
+            || rudb_pgtypes::logical_type(declared.oid).as_ref() != Some(target)
+            || !rudb_pgtypes::has_plain_input(declared.oid)
+        {
+            return None;
+        }
+        let oid = self.add_constant(Value::BigInt(i64::from(declared.oid)));
+        let name = self.plan_mut().intern("__rudb_pg_input");
+        let args = self.plan_mut().add_expr_list(&[expr, oid]);
+        Some(self.add_expr(Expr::Function { name, args }, target.clone()))
     }
 
     /// The value of a number literal. PostgreSQL reads a number with an exponent, an integer past
