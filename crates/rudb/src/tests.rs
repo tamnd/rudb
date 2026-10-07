@@ -2748,6 +2748,53 @@ fn the_session_context_answers_for_the_clock_the_catalog_and_the_user() {
 }
 
 #[test]
+fn current_query_txid_current_and_version_answer_about_the_statement() {
+    let db = database();
+    // The text from its first word to its end, the semicolon too, as the pin gives it back.
+    assert_eq!(
+        rows(&db, "  SELECT 1, current_query(), pg_catalog.current_query();"),
+        vec![vec![
+            Value::Integer(1),
+            text("SELECT 1, current_query(), pg_catalog.current_query();"),
+            text("SELECT 1, current_query(), pg_catalog.current_query();"),
+        ]]
+    );
+    // A view is parsed from text of its own, and the query that reads it is still the answer.
+    db.execute("CREATE VIEW asked AS SELECT current_query() AS q").expect("a view");
+    assert_eq!(rows(&db, "SELECT q FROM asked"), vec![vec![text("SELECT q FROM asked")]]);
+    // Every statement outside a block is a transaction of its own, and every statement in a block
+    // runs in the one the block began.
+    let number = |db: &Database| match rows(db, "SELECT txid_current()")[0][0] {
+        Value::UBigInt(number) => number,
+        ref other => panic!("{other:?}"),
+    };
+    let first = number(&db);
+    let second = number(&db);
+    assert!(second > first, "{first} then {second}");
+    db.execute("BEGIN").expect("a block");
+    let inside = number(&db);
+    assert!(inside > second, "{second} then {inside}");
+    assert_eq!(number(&db), inside);
+    db.execute("COMMIT").expect("the block closes");
+    assert!(number(&db) > inside);
+    assert_eq!(
+        rows(&db, "SELECT version() = library_version FROM pragma_version()"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    // A built-in macro is in the system database and in no other.
+    assert_eq!(
+        failure(&db, "SELECT temp.current_user()"),
+        "Scalar Function with name current_user does not exist!\nDid you mean \
+         \"main.current_user\"?"
+    );
+    assert_eq!(rows(&db, "SELECT system.current_user()"), vec![vec![text("duckdb")]]);
+    assert_eq!(
+        rows(&db, "SELECT sleep_ms(1), sleep_ms(NULL), sleep_ms(-10), pg_sleep(0.001)"),
+        vec![vec![Value::Null, Value::Null, Value::Null, Value::Null]]
+    );
+}
+
+#[test]
 fn the_session_time_zone_moves_local_context_and_one_argument_age() {
     let db = database();
     let default_zone = db.setting("TimeZone").expect("the operating-system zone");

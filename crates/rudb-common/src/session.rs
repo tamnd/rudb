@@ -42,6 +42,7 @@ pub struct Session {
     variables: Variables,
     postgres: Postgreses,
     begun: Begun,
+    transaction: Transaction,
 }
 
 /// When the open transaction began and when the statement arrived, in microseconds since the
@@ -105,6 +106,22 @@ impl PartialEq for Postgreses {
 }
 
 impl Eq for Postgreses {}
+
+/// The number of the transaction a statement runs in, which `txid_current()` answers with.
+///
+/// Every copy compares equal, because the number changes with every statement outside a block and
+/// a plan kept for a statement's text would otherwise never be used twice. No kept plan reads it:
+/// `txid_current()` is a call, and a statement with a call in it is not kept.
+#[derive(Debug, Clone, Copy, Default)]
+struct Transaction(u64);
+
+impl PartialEq for Transaction {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Transaction {}
 
 /// One value `SET VARIABLE` left behind, with the type it was computed at.
 ///
@@ -460,6 +477,7 @@ impl Default for Session {
             variables: Variables::default(),
             postgres: Postgreses::default(),
             begun: Begun::default(),
+            transaction: Transaction::default(),
         }
     }
 }
@@ -680,6 +698,18 @@ impl Session {
     #[must_use]
     pub fn postgres(&self) -> Option<&Postgres> {
         self.postgres.0.as_deref()
+    }
+
+    /// Records the number of the transaction the statement runs in.
+    pub fn set_transaction(&mut self, number: u64) {
+        self.transaction = Transaction(number);
+    }
+
+    /// The number of the transaction the statement runs in, which is the same for every statement
+    /// of a block and different for every transaction, and zero for a session no database made.
+    #[must_use]
+    pub fn transaction(&self) -> u64 {
+        self.transaction.0
     }
 
     /// Whether this name is the one the relationship declarations are written under.

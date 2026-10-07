@@ -71,17 +71,24 @@ use crate::ast::{
 use crate::matcher::NONE;
 use crate::tokenize::quoted;
 
-/// A `CREATE VIEW` written back out, which is what `duckdb_views()` reports as `sql`.
+/// A `CREATE VIEW` written back out, which is what `duckdb_views()` reports as `sql`, for a view
+/// that went into `schema`.
 ///
-/// The name loses its qualification, which was measured: `CREATE VIEW main.v AS ...` comes back as
-/// `CREATE VIEW v AS ...`. So does `OR REPLACE` and so does `IF NOT EXISTS`, since what the column
-/// answers is what this view is and not what the statement that made it asked for.
+/// The name loses its database and keeps its schema unless that is `main`, which was measured:
+/// `CREATE VIEW main.v AS ...` and `CREATE VIEW db2.v AS ...` both come back as `CREATE VIEW v AS
+/// ...`, and `CREATE VIEW s.v AS ...` comes back as it was. `OR REPLACE` and `IF NOT EXISTS` go
+/// too, since what the column answers is what this view is and not what the statement that made
+/// it asked for.
 #[must_use]
-pub fn create_view(ast: &Ast, index: CreateViewRef) -> String {
+pub fn create_view(ast: &Ast, index: CreateViewRef, schema: &str) -> String {
     let written = ast.create_view(index);
     let name = ast.name(written.name).last().unwrap_or_default();
     let temporary = if written.temporary { "TEMP " } else { "" };
-    let mut out = format!("CREATE {temporary}VIEW {}", quoted(name));
+    let mut out = format!("CREATE {temporary}VIEW ");
+    if schema != "main" {
+        out += &format!("{}.", quoted(schema));
+    }
+    out += &quoted(name);
     if !written.columns.is_empty() {
         // A space before the parenthesis, where `CREATE TABLE t(x INTEGER)` has none. Both were
         // measured and they really do differ.
@@ -1104,7 +1111,9 @@ mod tests {
         let Statement::CreateView(index) = ast.statements[0] else {
             panic!("that was not a create view");
         };
-        create_view(&ast, index)
+        let written = ast.name(ast.create_view(index).name).collect::<Vec<_>>();
+        let schema = if written.len() > 1 { written[written.len() - 2] } else { "main" };
+        create_view(&ast, index, schema)
     }
 
     /// Just the body, which is what most of these are about.
@@ -1123,6 +1132,11 @@ mod tests {
         assert_eq!(whole("CREATE OR REPLACE VIEW v AS SELECT 1"), "CREATE VIEW v AS SELECT 1;");
         assert_eq!(whole("CREATE VIEW IF NOT EXISTS v AS SELECT 1"), "CREATE VIEW v AS SELECT 1;");
         assert_eq!(whole("CREATE TEMP VIEW v AS SELECT 1"), "CREATE TEMP VIEW v AS SELECT 1;");
+        assert_eq!(whole("CREATE VIEW s.v AS SELECT 1"), "CREATE VIEW s.v AS SELECT 1;");
+        assert_eq!(
+            whole(r#"CREATE VIEW "Odd S".v AS SELECT 1"#),
+            r#"CREATE VIEW "Odd S".v AS SELECT 1;"#
+        );
     }
 
     /// A space before the parenthesis here, and none in a `CREATE TABLE`. Both measured.

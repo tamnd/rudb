@@ -663,6 +663,9 @@ struct Conn {
     /// [`Shared::claim`] as it fails the statement, and taken by [`Shared::execute_ast`], which
     /// waits once the statement has let go of everything and runs it again.
     blocked: AtomicU64,
+    /// The number of the transaction the statement runs in, which `txid_current()` answers with.
+    /// See [`Shared::in_transaction`].
+    transaction: AtomicU64,
     /// The statements `PREPARE` named, by the name in lower case, since the pin finds `"S"` under
     /// `s`.
     prepared: Mutex<BTreeMap<String, Arc<Named>>>,
@@ -719,6 +722,7 @@ impl Conn {
             staged: Mutex::default(),
             registry,
             blocked: AtomicU64::new(0),
+            transaction: AtomicU64::new(0),
             prepared: Mutex::default(),
             simple: Mutex::default(),
             postgres: Mutex::default(),
@@ -799,6 +803,8 @@ struct Inner {
     declined: Mutex<BTreeSet<(String, bool)>>,
     /// A successful setting statement invalidates the one cached native aggregate plan.
     settings_revision: AtomicU64,
+    /// How many transactions have begun, a statement outside a block being one of its own.
+    transactions: AtomicU64,
     native_aggregate_plan: Mutex<Option<CachedNativeAggregate>>,
     /// What the compiled engine handed back under `SET engine = 'compiled'`, one line per query
     /// and the latest [`REFUSALS_KEPT`] of them, for [`Database::refusals`].
@@ -1400,6 +1406,7 @@ impl Database {
             relationships: Mutex::default(),
             declined: Mutex::default(),
             settings_revision: AtomicU64::new(0),
+            transactions: AtomicU64::new(0),
             native_aggregate_plan: Mutex::default(),
             refusals: Mutex::default(),
             switches: Mutex::default(),
@@ -1582,6 +1589,7 @@ impl Database {
             relationships: Mutex::default(),
             declined: Mutex::default(),
             settings_revision: AtomicU64::new(0),
+            transactions: AtomicU64::new(0),
             native_aggregate_plan: Mutex::default(),
             refusals: Mutex::default(),
             switches: Mutex::default(),
@@ -4082,6 +4090,7 @@ impl Shared {
         if received != 0 {
             session.set_statement_start(Some(received));
         }
+        session.set_transaction(self.conn.transaction.load(Ordering::Relaxed));
         session
     }
 
@@ -4144,6 +4153,15 @@ impl Shared {
         sql: &str,
         run: impl FnOnce() -> Result<QueryResult>,
     ) -> Result<QueryResult> {
+        // A statement outside a block is a transaction of its own, and one that opens a block
+        // begins the transaction the statements in it run in, so each takes the next number.
+        // The pin counts the start and the commit of a transaction on one clock and answers
+        // `txid_current()` with the start, which goes up by two from one transaction to the next,
+        // so the numbers here go up the same way.
+        if self.open().is_none() {
+            let begun = self.inner.transactions.fetch_add(1, Ordering::Relaxed) + 1;
+            self.conn.transaction.store(begun * 2, Ordering::Relaxed);
+        }
         let aborted = self.open().as_ref().is_some_and(|open| open.aborted);
         if aborted && crate::syntax::statement_kind(sql) != Some("TransactionStatement") {
             // The pin binds before it looks at the transaction, so a statement that would not bind

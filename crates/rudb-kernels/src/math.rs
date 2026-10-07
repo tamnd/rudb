@@ -129,6 +129,14 @@ pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option
     let answer = match (name, args) {
         ("pi", []) => Ok(Value::Double(std::f64::consts::PI)),
         ("setseed", [seed]) => crate::random::setseed(seed),
+        ("sleep_ms", [milliseconds]) => {
+            // A wait of no time or less than none is no wait, which is what the pin does with it.
+            if let Some(milliseconds) = milliseconds.as_i64().and_then(|ms| u64::try_from(ms).ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+            }
+            Ok(Value::Null)
+        }
         ("log", [base, x]) => two(base, x, |base, x| x.log10() / base.log10()),
         ("pow", [x, y]) => two(x, y, f64::powf),
         ("atan2", [y, x]) => two(y, x, f64::atan2),

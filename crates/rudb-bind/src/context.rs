@@ -32,9 +32,10 @@
 //! being what happens when resolution fails.
 //!
 //! `current_schemas` takes an argument and returns a list, so it has a function of its own below.
-//! `current_query` and `version` are not here. The first is the one name in this family the pin
-//! marks VOLATILE and it needs the statement text threaded down to the binder, and the second is a
-//! question about what rudb should call itself that is worth answering on its own.
+//! `current_query`, `txid_current` and `version` fold beside these in the call binder rather than
+//! here. The first is the text of the statement, which the binder keeps from the tree it was parsed
+//! into, the second is the number of the transaction, which the session carries, and the third is
+//! the version of rudb, which is what `pragma_version()` reports too.
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_parse::ast::{self, Ast};

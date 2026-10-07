@@ -2213,10 +2213,11 @@ fn create_view(
         scope.rename(&written, "unnamed_subquery")?;
     }
 
+    let statement = deparse::create_view(ast, index, &name.schema);
     Ok(Bound::CreateView(CreateView {
         name,
         sql: ast.string(written.sql).to_string(),
-        statement: deparse::create_view(ast, index),
+        statement,
         aliases,
         if_not_exists: written.if_not_exists,
         or_replace: written.or_replace,

@@ -484,6 +484,9 @@ pub(crate) struct Binder<'a> {
     next_cte: u32,
     /// When this statement started, read once and kept, which is what `now()` folds to.
     started: Option<i64>,
+    /// The text of the statement, kept from the first tree bound so that a view or a macro body,
+    /// which is parsed from text of its own, still answers `current_query()` with the statement.
+    source: Option<Arc<str>>,
     /// The join sides being held so they run once, as their definitions, innermost last.
     ///
     /// See [`Binder::bind_held_side`]. Each is wrapped around the join that held it once the join is
@@ -564,6 +567,7 @@ impl<'a> Binder<'a> {
             materialized: Vec::new(),
             next_cte: 0,
             started: None,
+            source: None,
             held: Vec::new(),
             held_sources: Vec::new(),
         }
@@ -582,6 +586,19 @@ impl<'a> Binder<'a> {
     pub(crate) fn instant(&mut self) -> i64 {
         let begun = self.session.begun().or(self.session.statement_start());
         *self.started.get_or_insert_with(|| begun.unwrap_or_else(crate::context::micros_now))
+    }
+
+    /// The text of the statement being bound, which is what `current_query()` folds to.
+    pub(crate) fn statement_text(&mut self, ast: &Ast) -> Arc<str> {
+        Arc::clone(self.source.get_or_insert_with(|| Arc::clone(&ast.source)))
+    }
+
+    /// Keeps the text of `ast` as the statement's, unless a tree was kept before it.
+    ///
+    /// Called with the tree a view or a macro is bound from, before its body is parsed, so that
+    /// the tree of the body, which has text of its own, is not the first one to be asked.
+    pub(crate) fn keep_statement(&mut self, ast: &Ast) {
+        self.source.get_or_insert_with(|| Arc::clone(&ast.source));
     }
 
     pub(crate) fn plan(&self) -> &Plan {
@@ -2995,6 +3012,7 @@ impl<'a> Binder<'a> {
                 name.table
             )));
         }
+        self.keep_statement(ast);
         let body = parse_ast_with_case(view.sql(), self.semantics.identifier_case())?;
         let query = match body.statements.as_slice() {
             [ast::Statement::Query(query)] => *query,

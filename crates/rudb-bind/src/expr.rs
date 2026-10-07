@@ -1230,6 +1230,22 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<ExprRef> {
         let mut written = ast.name(name).last().unwrap_or_default().to_string();
+        // The built-in macros are kept in the system database, so a call that names any other
+        // database in front of one finds nothing there, and the pin says where it would have.
+        if name.len == 2
+            && let Some(database) = ast.name(name).next()
+            && !rudb_catalog::same_name(database, "system")
+            && self.catalog().attached(database).is_some()
+            && (crate::macros::is_macro(&written)
+                || ["current_user", "session_user", "user", "current_catalog"]
+                    .iter()
+                    .any(|held| rudb_catalog::same_name(&written, held)))
+        {
+            return Err(Error::catalog(format!(
+                "Scalar Function with name {written} does not exist!\nDid you mean \
+                 \"main.{written}\"?"
+            )));
+        }
         let arguments = ast.expr_list(args).to_vec();
         // `every` is the SQL standard name of `bool_and`, which PostgreSQL has and the pin does not.
         let postgres = self.session.postgres().is_some();
@@ -1462,6 +1478,22 @@ impl Binder<'_> {
             && let Some(postgres) = self.session.postgres()
         {
             return Ok(self.add_constant(Value::Varchar(postgres.version.clone())));
+        }
+        // Anywhere else it is the version of rudb, written the way `pragma_version()` writes it.
+        if bound.is_empty() && rudb_catalog::same_name(&written, "version") {
+            let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+            return Ok(self.add_constant(Value::Varchar(version)));
+        }
+        // `current_query()` is the text of the statement from its first word, which is as much of
+        // it as the pin gives back, and `txid_current()` is the number of the transaction it runs
+        // in. Neither changes from one row to the next, so both fold the way the session context
+        // does below.
+        if bound.is_empty() && rudb_catalog::same_name(&written, "current_query") {
+            let text = self.statement_text(ast);
+            return Ok(self.add_constant(Value::Varchar(text.trim_start().to_string())));
+        }
+        if bound.is_empty() && rudb_catalog::same_name(&written, "txid_current") {
+            return Ok(self.add_constant(Value::UBigInt(self.session.transaction())));
         }
         // `getvariable` is folded for the reason `current_setting` is: it is declared to return
         // ANY and the type is the variable's, which is only known once the name is read.
