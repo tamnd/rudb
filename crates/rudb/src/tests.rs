@@ -14642,3 +14642,33 @@ fn an_unnest_in_a_correlated_subquery_is_made_for_each_outer_row() {
         vec![vec![integer(2)], vec![integer(3)], vec![integer(4)]]
     );
 }
+
+/// Every arm of a `CASE` in a lambda's body reads the parameter, not only the first one. The arms
+/// after the first run over the elements no earlier arm took, and that cut kept the columns of the
+/// row but dropped the parameter, so each of those arms saw a null.
+#[test]
+fn every_arm_of_a_case_in_a_lambda_reads_the_parameter() {
+    let db = database();
+    let texts = |values: &[Option<&str>]| Value::List {
+        element: LogicalType::Varchar,
+        values: values
+            .iter()
+            .map(|v| v.map_or(Value::Null, |v| Value::Varchar(v.into())))
+            .collect(),
+    };
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT list_transform([1, 2, 3], lambda e: CASE WHEN e = 1 THEN 'a' WHEN e = 2 THEN 'b' END)"
+        ),
+        [[texts(&[Some("a"), Some("b"), None])]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT list_transform([x, NULL], lambda e: CASE WHEN e THEN 't' WHEN NOT e THEN 'f' END) \
+             FROM (VALUES (true), (false)) t(x)"
+        ),
+        [[texts(&[Some("t"), None])], [texts(&[Some("f"), None])]]
+    );
+}
