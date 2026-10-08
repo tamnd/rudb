@@ -8,17 +8,24 @@
 
 use rudb_common::{Result, Value};
 
-use crate::{pgdatetime, pgmath, pgstring};
+use crate::{pgdatetime, pgmath, pgnormalize, pgstring};
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// The C functions of each module of kernels, sorted.
-const SOURCES: [&[&str]; 3] = [pgmath::SOURCES, pgdatetime::SOURCES, pgstring::SOURCES];
+const SOURCES: [&[&str]; 4] =
+    [pgmath::SOURCES, pgdatetime::SOURCES, pgstring::SOURCES, pgnormalize::SOURCES];
 
 /// Whether the C function `src` has a kernel.
 pub fn has(src: &str) -> bool {
     SOURCES.iter().any(|sources| sources.binary_search(&src).is_ok())
+}
+
+/// The C function with a kernel that gives as an array the rows of the C function `src`, which
+/// returns a set. A call of `src` is an unnest of that array.
+pub fn rows_of(src: &str) -> Option<&'static str> {
+    pgstring::ROWS.iter().find(|(rows, _)| *rows == src).map(|&(_, array)| array)
 }
 
 /// The value of a call of a kernel of a C function, or `None` for any other name. A null
@@ -35,7 +42,10 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     if let Some(value) = pgdatetime::call(src, args)? {
         return Ok(Some(value));
     }
-    pgstring::call(src, args)
+    if let Some(value) = pgstring::call(src, args)? {
+        return Ok(Some(value));
+    }
+    pgnormalize::call(src, args)
 }
 
 /// The function of one `float8` of the kernel `name`, for the loop over a column.
@@ -51,6 +61,16 @@ mod tests {
     fn the_sources_are_sorted() {
         for sources in SOURCES {
             assert!(sources.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn a_function_of_rows_has_the_strictness_of_its_array_function() {
+        for proc in rudb_pgtypes::builtin_procs() {
+            if let Some(array) = rows_of(proc.src) {
+                assert!(proc.retset && has(array), "{}", proc.src);
+                assert_eq!(proc.strict, !pgstring::NULLS.contains(&array), "{}", proc.src);
+            }
         }
     }
 

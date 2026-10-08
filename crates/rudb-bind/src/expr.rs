@@ -48,7 +48,10 @@ const LIST_MACROS: &[(&str, &str, usize, bool)] = &[
 fn set_function(name: &str, semantics: Semantics) -> bool {
     let regexp = semantics.regex_rules() == RegexRules::Postgres
         && Function::named(name).is_some_and(Function::is_set);
-    rudb_catalog::same_name(name, "generate_series") || JsonSet::of(name).is_some() || regexp
+    rudb_catalog::same_name(name, "generate_series")
+        || JsonSet::of(name).is_some()
+        || regexp
+        || crate::pgcalls::rows_function(name)
 }
 
 impl Binder<'_> {

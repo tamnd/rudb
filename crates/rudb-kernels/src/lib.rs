@@ -97,6 +97,7 @@ mod pgformat;
 pub mod pginput;
 pub mod pgjson;
 mod pgmath;
+mod pgnormalize;
 pub mod pgproc;
 pub mod pgregexp;
 mod pgstring;

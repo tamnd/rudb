@@ -42,6 +42,19 @@ fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
     exact.then_some(oid)
 }
 
+/// A function of `pg_proc` named `written` whose every form returns a set that a kernel here
+/// gives as an array, such as `string_to_table`, which a select list and `FROM` unnest.
+pub(crate) fn rows_function(written: &str) -> bool {
+    let procs = rudb_pgtypes::procs(written);
+    !procs.is_empty()
+        && procs.iter().all(|proc| {
+            proc.kind == b'f'
+                && proc.retset
+                && matches!(proc.lang, b'i' | b'c')
+                && rudb_kernels::pgproc::rows_of(proc.src).is_some()
+        })
+}
+
 /// A function of `pg_proc` named `written` whose every form has a kernel here, so that a call of
 /// it in a PostgreSQL session is the kernel and not a macro of the pin with the same name.
 pub(crate) fn kernel_function(written: &str) -> bool {
@@ -382,7 +395,18 @@ impl Binder<'_> {
             return self.variadic_any_call(ast, written, arguments, bound, scope).map(Some);
         }
         let Some(returns) = rudb_pgtypes::logical_type(proc.result) else { return Ok(None) };
-        let kernel = matches!(proc.lang, b'i' | b'c') && rudb_kernels::pgproc::has(proc.src);
+        // A function that returns a set is the unnest of the array of its kernel, so it binds
+        // only as the argument of the unnest of a select list or of `FROM`.
+        let rows = match proc.retset {
+            false => None,
+            true => match rudb_kernels::pgproc::rows_of(proc.src) {
+                Some(_) if !self.in_unnest => return Err(self.misplaced_set_function()),
+                Some(array) => Some(array),
+                None => return Ok(None),
+            },
+        };
+        let kernel = matches!(proc.lang, b'i' | b'c')
+            && (rudb_kernels::pgproc::has(proc.src) || rows.is_some());
         let body = match proc.lang {
             b's' if proc.src != "see system_functions.sql" => {
                 let src = proc.src;
@@ -438,6 +462,10 @@ impl Binder<'_> {
         }
         if !kernel {
             return self.call(written, cast).map(Some);
+        }
+        if let Some(array) = rows {
+            let list = LogicalType::List(Box::new(returns));
+            return Ok(Some(self.pgproc_kernel(array, &cast, list)));
         }
         Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
     }

@@ -1656,6 +1656,91 @@ fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
 }
 
 #[test]
+fn string_to_table_and_normalize_give_the_rows_and_the_values_of_postgres() {
+    let dirs = Dirs::new("pgrows");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
+    let cases: [(&str, &[&str]); 27] = [
+        ("select * from string_to_table('a,b', ',');", &["a", "b"]),
+        ("select string_to_table('a,b,,c', ',', '');", &["a", "b", "", "c"]),
+        (
+            "select * from string_to_table('a|b|x', '|', 'x') with ordinality;",
+            &["a|1", "b|2", "|3"],
+        ),
+        ("select string_to_table('abc', null);", &["a", "b", "c"]),
+        ("select string_to_table('abc', '');", &["abc"]),
+        ("select string_to_table(null, ',');", &[]),
+        ("select string_to_table('', ',');", &[]),
+        ("select pg_typeof(string_to_table('a', ','));", &["text"]),
+        ("select * from regexp_split_to_table('a,b', ',');", &["a", "b"]),
+        ("select regexp_split_to_table('a1b2c', '\\d');", &["a", "b", "c"]),
+        ("select normalize('a');", &["a"]),
+        ("select normalize(U&'\\0061\\0301', nfc) = U&'\\00E1';", &["t"]),
+        (
+            "select normalize(U&'\\00E1', NFD) = U&'\\0061\\0301', normalize(U&'\\FB01', nfkc), normalize(U&'\\FB01', nfkd);",
+            &["t|fi|fi"],
+        ),
+        (
+            "select U&'\\00E1' is normalized, U&'\\0061\\0301' is nfc normalized, U&'\\0061\\0301' is not nfd normalized, U&'\\FB01' is nfkc normalized;",
+            &["t|f|f|f"],
+        ),
+        ("select is_normalized('a', 'NFC'), is_normalized(U&'\\0061\\0301');", &["t|f"]),
+        ("select normalize(null), null::text is normalized;", &["|"]),
+        ("select string_to_table('a,b,c', ','), generate_series(1, 2);", &["a|1", "b|2", "c|"]),
+        (
+            "select x, string_to_table(x, '-') from (values ('p-q'), ('r')) t(x);",
+            &["p-q|p", "p-q|q", "r|r"],
+        ),
+        (
+            "select * from (values ('p-q'), ('r')) t(x), lateral string_to_table(x, '-') s;",
+            &["p-q|p", "p-q|q", "r|r"],
+        ),
+        ("select s, length(s) from string_to_table('aa bbb', ' ') s;", &["aa|2", "bbb|3"]),
+        ("select count(*) from string_to_table(repeat('x,', 1000), ',');", &["1001"]),
+        ("select * from string_to_table('a b', ' ') where string_to_table = 'b';", &["b"]),
+        ("select string_to_table('a', ',') from generate_series(1, 2);", &["a", "a"]),
+        ("select normalize(x, nfkc) from (values (U&'\\FB01'), (U&'\\2460')) t(x);", &["fi", "1"]),
+        ("select x is nfkd normalized from (values (U&'\\FB01'), ('a')) t(x);", &["f", "t"]),
+        ("select pg_typeof(normalize('a')), pg_typeof('a' is normalized);", &["text|boolean"]),
+        ("select string_to_table(1::text || ',2', ',');", &["1", "2"]),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        ("select normalize('a', nfx);", "42601", "syntax error at or near \"nfx\""),
+        ("select normalize('a', 'NFC');", "42601", "syntax error at or near \"'NFC'\""),
+        (
+            "select 1 where string_to_table('a', ',') = 'a';",
+            "0A000",
+            "set-returning functions are not allowed in WHERE",
+        ),
+        ("select is_normalized('a', 'x');", "22023", "invalid normalization form: x"),
+        ("select normalize('a', 'x');", "42601", "syntax error at or near \"'x'\""),
+    ] {
+        // An error of a kernel comes after the row description.
+        let messages = client.query(sql);
+        assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_parameter_in_a_call_gets_the_type_of_postgres() {
     let dirs = Dirs::new("unknowns");
     let server = Server::start(dirs.config()).unwrap();

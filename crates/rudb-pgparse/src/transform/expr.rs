@@ -656,9 +656,11 @@ impl Transform<'_> {
             _ => return clause("FuncCall"),
         };
         match (name, &call.args[..]) {
-            ("substring" | "position" | "overlay" | "ltrim" | "rtrim", _) => {
-                self.call(name, &call.args, location)
-            }
+            (
+                "substring" | "position" | "overlay" | "ltrim" | "rtrim" | "normalize"
+                | "is_normalized",
+                _,
+            ) => self.call(name, &call.args, location),
             ("btrim", _) => self.call("trim", &call.args, location),
             ("extract", [Some(Node::A_Const(part)), Some(value)]) => {
                 let Some(Node::String(written)) = &part.val else {
