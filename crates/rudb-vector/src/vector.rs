@@ -3890,6 +3890,7 @@ impl Vector {
     }
 
     /// Whether this is a flat vector with no nulls, which is said without reading a mask.
+    #[inline]
     fn flat_and_all_valid(&self) -> bool {
         matches!(self.validity, Validity::AllValid) && matches!(self.body, Body::Flat(_))
     }
@@ -4068,6 +4069,15 @@ impl Vector {
             if null || (valid && below(indices, self.len)) {
                 return Ok(Self::constant(self.ty.clone(), value.as_ref().clone(), indices.len()));
             }
+        }
+        // Runs laid out are their rows, and a gather of them is a gather of the rows. The copy below
+        // got there too, through a walk that checked every position against the runs and again
+        // against the rows, and on q09 that was half again what the gather of the rows costs.
+        if let Body::Runs { laid, .. } = &self.body
+            && let Some(flat) = laid.flat()
+            && matches!(self.validity, Validity::AllValid)
+        {
+            return flat.gather(indices);
         }
         if let Some(gathered) = self.unpacked_at(indices) {
             return Ok(gathered);
@@ -7718,6 +7728,9 @@ mod tests {
         let handed = Vector::runs_laid_out(ends.to_vec(), values.clone(), flat.clone()).unwrap();
         assert!(format!("{handed:?}").contains("Laid(out)"));
         assert_eq!(handed.gather(&wanted).unwrap(), flat.gather(&wanted).unwrap());
+        let past = handed.gather(&[3, 999]).unwrap();
+        assert_eq!(past, flat.gather(&[3, 999]).unwrap());
+        assert!(past.is_null_at(1));
         assert!(
             Vector::runs_laid_out(ends.to_vec(), values.clone(), flat.slice(0, 5).unwrap())
                 .is_err()
