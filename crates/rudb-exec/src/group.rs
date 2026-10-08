@@ -9052,6 +9052,8 @@ mod tests {
         let flat = Vector::from_values(LogicalType::BigInt, &values).expect("keys");
         let packed = flat.bit_packed().expect("packed");
         assert!(packed.packed_parts().is_some());
+        let runs = flat.run_encoded().expect("runs");
+        assert!(runs.run_parts().is_some());
         for rows in [300, 64, 130, 65, 7] {
             let mut walked = (1..rows)
                 .filter(|&row| keys[row] != keys[row - 1])
@@ -9060,9 +9062,11 @@ mod tests {
             let to = walked.pop().expect("runs") as usize;
             let (from, end) = interior(&flat, rows, false).expect("closed runs");
             assert_eq!((walked[0] as usize, to), (from, end), "{rows} rows");
-            for vector in [&flat, &packed] {
+            let held = runs.slice(0, rows).expect("a cut of the runs");
+            for vector in [&flat, &packed, &held] {
                 assert_eq!(closed_runs(vector, rows, false), Some((walked.clone(), to)), "{rows}");
             }
+            assert_eq!(interior(&held, rows, false), Some((from, end)), "{rows} rows as runs");
         }
         assert_eq!(closed_runs(&flat, 3, false), None, "one run of three");
         assert_eq!(run_total(&[1, 2, 3]), 6);

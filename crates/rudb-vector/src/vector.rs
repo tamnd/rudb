@@ -3633,7 +3633,7 @@ impl Vector {
             return Ok(self.clone());
         }
         slow::took(Cause::Flatten);
-        if let Some(flat) = self.decoded_codes() {
+        if let Some(flat) = self.decoded_codes().or_else(|| self.expanded_runs()) {
             return Ok(flat);
         }
         if let Some(flat) = self.unpacked_whole() {
@@ -3772,6 +3772,36 @@ impl Vector {
         })
     }
 
+    /// A run length vector of fixed width values written out flat, a run at a time.
+    ///
+    /// The general copy finds the run of every row with a search over the ends, which over a part
+    /// held as runs of four rows, the way `l_orderkey` is, was a search a row. Here each run's
+    /// place is laid out as long as the run is, and the values are copied through those places the
+    /// way a dictionary's values are copied through its codes.
+    fn expanded_runs(&self) -> Option<Self> {
+        let Body::Runs { ends, values } = &self.body else {
+            return None;
+        };
+        if !matches!(values.validity, Validity::AllValid)
+            || ends.last().map(|&end| end as usize) != Some(self.len)
+        {
+            return None;
+        }
+        let Body::Flat(data) = &values.body else {
+            return None;
+        };
+        let mut places = Vec::with_capacity(self.len);
+        for (run, &end) in ends.iter().enumerate() {
+            places.resize(end as usize, run as u32);
+        }
+        Some(Self {
+            ty: self.ty.clone(),
+            len: self.len,
+            validity: Validity::AllValid,
+            body: Body::flat(copy_by_codes(data, &places)?),
+        })
+    }
+
     /// The same values in flat form, taking the vector rather than borrowing it.
     ///
     /// A vector that is already flat comes back as itself, which is the whole reason this exists
@@ -3799,7 +3829,7 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
         }
-        if let Some(flat) = self.decoded_codes() {
+        if let Some(flat) = self.decoded_codes().or_else(|| self.expanded_runs()) {
             return Ok(flat);
         }
         self.copied((0..self.len).collect(), false)
@@ -4433,9 +4463,7 @@ impl Vector {
                 // rather than stored, so the walk down is the same walk with a search where the
                 // lookup was. `NOWHERE` searches for nothing and stays `NOWHERE`.
                 Body::Runs { ends, values } => {
-                    for slot in &mut at {
-                        *slot = run_holding(ends, *slot).unwrap_or(NOWHERE);
-                    }
+                    runs_holding(ends, &mut at);
                     values.as_ref()
                 }
                 // The same walk the dictionary above takes, with the sentinel folded into the one
@@ -5766,6 +5794,33 @@ fn run_holding(ends: &[u32], row: usize) -> Option<usize> {
         Err(at) => at,
     };
     (run < ends.len()).then_some(run)
+}
+
+/// [`run_holding`] of every position, each replaced by its run, and [`NOWHERE`] for one past the
+/// last run or already [`NOWHERE`].
+///
+/// A gather after a filter asks for rows that rise, and a search a row over a part held as runs of
+/// four rows cost more than reading the row would have flat. So the walk goes on from the run the
+/// last row was in, a few runs at a time, and searches only the rest of the ends when the next row
+/// is further on than that or goes back.
+fn runs_holding(ends: &[u32], at: &mut [usize]) {
+    const STEPS: usize = 4;
+    let mut run = 0;
+    for slot in at {
+        let Ok(row) = u32::try_from(*slot) else {
+            *slot = NOWHERE;
+            continue;
+        };
+        if run > 0 && ends[run - 1] > row {
+            run = 0;
+        }
+        let near = ends.len().min(run + STEPS);
+        match ends[run..near].iter().position(|&end| end > row) {
+            Some(step) => run += step,
+            None => run = near + ends[near..].partition_point(|&end| end <= row),
+        }
+        *slot = if run < ends.len() { run } else { NOWHERE };
+    }
 }
 
 /// The row each run ends at, for a flat body read alongside the validity that goes with it.
@@ -7396,6 +7451,29 @@ mod tests {
         assert!(Vector::runs(vec![4, 2], values.clone()).is_err(), "an end that goes backwards");
         assert!(Vector::runs(vec![0, 2], values.clone()).is_err(), "a first run holding no rows");
         assert_eq!(Vector::runs(vec![4, 9], values).unwrap().len(), 9);
+    }
+
+    #[test]
+    fn runs_flatten_and_gather_to_the_rows_they_stand_for() {
+        let lengths = [3_usize, 1, 4, 1, 5, 9, 2, 6];
+        let mut ends = Vec::new();
+        let mut rows = Vec::new();
+        for (run, &length) in lengths.iter().enumerate() {
+            rows.extend(std::iter::repeat_n(run as i32 * 10, length));
+            ends.push(rows.len() as u32);
+        }
+        let values: Vec<i32> = (0..lengths.len() as i32).map(|run| run * 10).collect();
+        let runs = Vector::runs(ends, integers(&values)).unwrap();
+        assert_eq!(runs.flatten().unwrap(), integers(&rows));
+        let cut = runs.slice(2, 20).unwrap();
+        assert_eq!(cut.flatten().unwrap(), integers(&rows[2..22]));
+        // Rising, rising past several runs at once, going back, and the last row.
+        let wanted = [0_u32, 1, 3, 4, 5, 9, 25, 2, 8, 30, 30, 0];
+        let flat = integers(&rows);
+        assert_eq!(
+            runs.gather(&wanted).unwrap().flatten().unwrap(),
+            flat.gather(&wanted).unwrap().flatten().unwrap()
+        );
     }
 
     #[test]
