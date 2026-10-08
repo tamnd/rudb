@@ -211,6 +211,7 @@ impl Kind {
                 Kind::Text
             }
             oids::JSON if matches!(logical, L::Json | L::Varchar) => Kind::Text,
+            oids::XML if *logical == L::Varchar => Kind::Text,
             oids::JSONB if *logical == L::Jsonb => Kind::Jsonb,
             oids::BYTEA if *logical == L::Blob => Kind::Bytea,
             oids::DATE if *logical == L::Date => Kind::Date,

@@ -36,7 +36,7 @@ pub fn statement(ast: &Ast, statement: Statement) -> String {
     let shape = Shape { ast };
     match statement {
         Statement::Query(query) => shape.query(query),
-        Statement::Explain { query, analyze, statistics, codegen } => {
+        Statement::Explain { query, analyze, statistics, codegen, .. } => {
             format!(
                 "explain{{analyze: {analyze}, statistics: {statistics}, codegen: {codegen}, {}}}",
                 shape.query(query)

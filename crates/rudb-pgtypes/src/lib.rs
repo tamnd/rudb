@@ -186,4 +186,4 @@ pub use scalar::{
     name_in, uuid_in, uuid_out,
 };
 pub use string::{bpchar_coerce, bpchar_in, varchar_coerce, varchar_in};
-pub use types::{Oid, PgType, TypeInfo, format_type};
+pub use types::{Oid, PgType, TypeInfo, format_type, format_type_with_typmod};

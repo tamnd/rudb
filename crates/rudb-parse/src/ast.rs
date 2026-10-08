@@ -159,7 +159,12 @@ pub enum Statement {
     ///
     /// `CODEGEN` asks for what the compiled engine would run instead of the plan: its stages and
     /// the QIR it generated for them, or the reason it refuses the query.
-    Explain { query: QueryRef, analyze: bool, statistics: bool, codegen: bool },
+    ///
+    /// `options` is the option list of the PostgreSQL grammar, `EXPLAIN (FORMAT JSON, COSTS off)`,
+    /// as a run of [`Ast::utility_options`]. PostgreSQL checks the options after it binds the query,
+    /// so a wrong option is reported after a wrong column, and the binder is where both are checked.
+    /// The DuckDB grammar reads its own options into the flags and leaves this empty.
+    Explain { query: QueryRef, analyze: bool, statistics: bool, codegen: bool, options: Slice },
     /// `COPY t TO 'file'` or `COPY (query) TO 'file'`, as an index into [`Ast::copies`].
     CopyTo(CopyToRef),
     /// `PREPARE name AS statement`, with the text of the statement.
@@ -173,6 +178,35 @@ pub enum Statement {
     Execute { name: StrRef, values: QueryRef },
     /// `DEALLOCATE name` or `DEALLOCATE PREPARE name`.
     Deallocate(StrRef),
+}
+
+/// One option of a PostgreSQL utility statement, such as `FORMAT JSON` in `EXPLAIN (FORMAT JSON)`.
+///
+/// The name is in lower case, as the PostgreSQL grammar folds it. The value is kept in the form it
+/// was written in, because which forms an option takes is the option's business: `COSTS 0` and
+/// `COSTS off` are the same and `COSTS 2` is an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtilityOption {
+    /// The option name.
+    pub name: StrRef,
+    /// The value, if one was written.
+    pub arg: OptionArg,
+    /// Where the option was written, which is where an error about it points.
+    pub span: Span,
+}
+
+/// The value of a [`UtilityOption`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionArg {
+    /// No value, as in `EXPLAIN (ANALYZE)`.
+    None,
+    /// A word or a string, as in `FORMAT JSON` or `COSTS 'off'`. `TRUE`, `FALSE` and `ON` are
+    /// words here too, in lower case.
+    Word(StrRef),
+    /// A whole number.
+    Integer(i64),
+    /// Any other number, as it was written.
+    Number(StrRef),
 }
 
 /// `COPY ... TO`, which writes what a query answers to a file.
@@ -1731,6 +1765,8 @@ pub struct Ast {
     pub attaches: Vec<Attach>,
     /// The `COPY ... TO` arena.
     pub copies: Vec<CopyTo>,
+    /// Backing store for every [`Slice`] of utility options.
+    pub utility_options: Vec<UtilityOption>,
     /// Backing store for every [`Slice`] of column definitions.
     pub column_defs: Vec<ColumnDef>,
     /// Backing store for every [`Slice`] of names, which is a name list rather than a name.

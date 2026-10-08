@@ -24,6 +24,7 @@ mod binder;
 mod collate;
 mod columns;
 mod context;
+mod explain;
 mod expr;
 mod figure;
 pub mod fold;

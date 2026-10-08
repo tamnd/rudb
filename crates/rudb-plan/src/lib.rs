@@ -60,6 +60,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod explain;
 mod expr;
 mod node;
 mod parse;

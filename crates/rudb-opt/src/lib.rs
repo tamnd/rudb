@@ -40,6 +40,7 @@ pub mod nonulls;
 pub mod nulls;
 pub mod order;
 pub mod pass;
+pub mod pgexplain;
 pub mod pregroup;
 pub mod presize;
 pub mod reach;

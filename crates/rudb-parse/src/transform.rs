@@ -865,7 +865,7 @@ impl<'a> Transform<'a> {
                 "EXPLAIN (CODEGEN) cannot be combined with ANALYZE or STATISTICS",
             ));
         }
-        Ok(Statement::Explain { query, analyze, statistics, codegen })
+        Ok(Statement::Explain { query, analyze, statistics, codegen, options: Slice::default() })
     }
 
     /// `CallStatement <- 'CALL' QualifiedTableFunction TableFunctionArguments`, which is the table
@@ -7904,7 +7904,7 @@ mod tests {
             }
             Statement::Transaction(Transaction::Commit) => "COMMIT".to_string(),
             Statement::Transaction(Transaction::Rollback) => "ROLLBACK".to_string(),
-            Statement::Explain { query, analyze, statistics, codegen } => {
+            Statement::Explain { query, analyze, statistics, codegen, .. } => {
                 let analyze = if analyze { "ANALYZE " } else { "" };
                 let statistics = if statistics { "(STATISTICS) " } else { "" };
                 let codegen = if codegen { "(CODEGEN) " } else { "" };
