@@ -542,6 +542,92 @@ pub fn decode_flat_at(bytes: &[u8], positions: &[u32]) -> Result<Flat> {
     Ok(flat)
 }
 
+/// The first `count` values of a chunk written by [`encode`], laid end to end, decoding no more of
+/// the chunk than those values need where its kind allows that.
+///
+/// A matched chunk's copies only point back, so a replay that stops once the first `count` values
+/// are built has every byte of them, and a compressed chunk's runs are a value each. A reader
+/// after one value of a block it does not keep wants the values up to that one and nothing past
+/// it, and on average that is half the block. The other kinds are decoded whole and cut.
+///
+/// # Errors
+///
+/// As [`decode`], and if the chunk holds fewer than `count` values.
+pub fn decode_leading(bytes: &[u8], count: usize) -> Result<Vec<u8>> {
+    let short = |held: usize| {
+        Error::internal(format!("the first {count} values of a chunk of {held} were asked for"))
+    };
+    let mut reader = Reader::new(bytes);
+    let out = match bytes.first().copied().map(Kind::from_tag).transpose()? {
+        Some(Kind::Lz) => {
+            reader.u8()?;
+            let held = reader.u32()? as usize;
+            let sizes = decode_integers(&mut reader)?;
+            let lengths = decode_integers(&mut reader)?;
+            let offsets = decode_integers(&mut reader)?;
+            if sizes.len() != held {
+                return Err(Error::internal(format!(
+                    "a matched chunk says it holds {held} values and has {} lengths",
+                    sizes.len()
+                )));
+            }
+            if count > held {
+                return Err(short(held));
+            }
+            let (mut total, mut limit) = (0usize, 0usize);
+            for (index, &size) in sizes.iter().enumerate() {
+                let width = usize::try_from(size)
+                    .map_err(|_| Error::internal("a negative string length"))?;
+                total = total
+                    .checked_add(width)
+                    .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
+                if index < count {
+                    limit = total;
+                }
+            }
+            let mut out = Vec::new();
+            replay_literals(&mut reader, &lengths, &offsets, total, limit, &mut out)?;
+            if out.len() != limit {
+                return Err(Error::internal(format!(
+                    "a matched chunk rebuilt {} bytes of the {limit} its first values take",
+                    out.len()
+                )));
+            }
+            out
+        }
+        Some(Kind::Fsst) => {
+            reader.u8()?;
+            let held = reader.u32()? as usize;
+            let runs = read_compressed(&mut reader, held)?;
+            if count > held {
+                return Err(short(held));
+            }
+            let mut out = Vec::new();
+            let mut at = 0;
+            for index in 0..count {
+                runs.run_into(index, &mut at, &mut out)?;
+            }
+            out
+        }
+        _ => {
+            let mut flat = decode_chunk(&mut reader)?;
+            if count > flat.len() {
+                return Err(short(flat.len()));
+            }
+            let end = count.checked_sub(1).map_or(0, |last| flat.ends[last]);
+            flat.bytes.truncate(end);
+            flat.bytes
+        }
+    };
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a string chunk",
+            reader.remaining()
+        )));
+    }
+    Ok(out)
+}
+
 /// A compressed chunk read once for the reads of a few of its values that come after, with its
 /// symbol table parsed and where each of its runs starts.
 ///
@@ -1176,7 +1262,7 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
             // The room past the end is what the replay's wide stores want, and leaving it out had
             // the replay grow the buffer, which copied every block once more into fresh pages.
             let mut flat = Flat::with_capacity(count, total.saturating_add(REPLAY_SLACK));
-            replay_literals(reader, &lengths, &offsets, total, &mut flat.bytes)?;
+            replay_literals(reader, &lengths, &offsets, total, total, &mut flat.bytes)?;
             if flat.bytes.len() != total {
                 return Err(Error::internal(format!(
                     "a matched chunk rebuilt {} bytes where its lengths add up to {total}",
@@ -1318,6 +1404,9 @@ fn read_compressed<'a>(reader: &mut Reader<'a>, count: usize) -> Result<Compress
 /// Decompressing a run straight to where it belongs skips the buffer, the length array that would
 /// cut it up, and that second pass over the bytes.
 ///
+/// Only the first `limit` bytes of the `total` are wanted back, which is all of them unless the
+/// caller asked for the first values of the chunk alone, see [`decode_leading`].
+///
 /// # Errors
 ///
 /// Whatever reading the literals or replaying the tokens reports.
@@ -1326,16 +1415,22 @@ fn replay_literals(
     lengths: &[i64],
     offsets: &[i64],
     total: usize,
+    limit: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     if reader.rest().first() == Some(&Kind::Fsst.tag()) {
         reader.u8()?;
         let runs = reader.u32()? as usize;
         let compressed = read_compressed(reader, runs)?;
-        return replay_in_place(&compressed, lengths, offsets, total, out);
+        return replay_in_place(&compressed, lengths, offsets, total, limit, out);
     }
+    let base = out.len();
     let literals = decode_chunk(reader)?;
-    lz::rebuild_into(&literals, lengths, offsets, out)
+    lz::rebuild_into(&literals, lengths, offsets, out)?;
+    if limit < total {
+        out.truncate(base + limit);
+    }
+    Ok(())
 }
 
 /// Room past the end of a replay, for the stores that write whole words past where a value ends.
@@ -1353,6 +1448,9 @@ const REPLAY_SLACK: usize = 16;
 /// the reason: on ClickBench `URL` a block of a thousand values replays about eight thousand seven
 /// hundred of them, most of them a few tens of bytes, and each one was a call into `memmove`.
 ///
+/// The copies only ever point back, so the replay stops at the first token that ends past `limit`
+/// and every byte before `limit` is already the one the whole replay would have left there.
+///
 /// # Errors
 ///
 /// As [`lz::replay`], and if the tokens build more than `total` bytes.
@@ -1361,6 +1459,7 @@ fn replay_in_place(
     lengths: &[i64],
     offsets: &[i64],
     total: usize,
+    limit: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let runs = compressed.lengths.len();
@@ -1372,20 +1471,41 @@ fn replay_in_place(
         )));
     }
     let base = out.len();
-    let room = total
+    let full = total
         .checked_add(REPLAY_SLACK)
         .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
+    // A replay of the first values alone makes room for those and grows it a token at a time, since
+    // the buffer is zeroed as it is made. Made for the whole block, a sample that wants one value of
+    // each block zeroed and faulted in a whole block of `URL` for every value it read.
+    let leading = limit < total;
+    let room = if leading { limit.saturating_add(REPLAY_SLACK).min(full) } else { full };
     out.resize(base + room, 0);
     let mut payload = compressed.payload;
     let mut at = base;
     for ((&run, &length), &offset) in compressed.lengths.iter().zip(lengths).zip(offsets) {
+        if leading && at - base >= limit {
+            break;
+        }
         let Some((codes, rest)) = payload.split_at_checked(run) else {
             return Err(Error::internal("a compressed run is past the end of its chunk"));
         };
         payload = rest;
-        at = compressed.table.decompress_at(codes, out, at)?;
         let length =
             usize::try_from(length).map_err(|_| Error::internal("a negative copy length"))?;
+        if leading {
+            // A run writes at most one symbol a code and the copy its length, and both store whole
+            // words past where they end. The whole block's room is always enough, so it is the cap.
+            let need = (at - base)
+                .saturating_add(run.saturating_mul(MAX_SYMBOL_LEN))
+                .saturating_add(length)
+                .saturating_add(REPLAY_SLACK)
+                .min(full);
+            let made = out.len() - base;
+            if need > made {
+                out.resize(base + need.max(made.saturating_mul(2)).min(full), 0);
+            }
+        }
+        at = compressed.table.decompress_at(codes, out, at)?;
         if length == 0 {
             continue;
         }
@@ -1399,7 +1519,7 @@ fn replay_in_place(
             at - base
         )));
     }
-    out.truncate(at);
+    out.truncate(at.min(base + limit));
     Ok(())
 }
 
@@ -2045,6 +2165,31 @@ mod tests {
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Constant);
         assert_eq!(bytes.len(), 9 + 24);
+    }
+
+    #[test]
+    fn the_first_values_of_a_chunk_decode_alone_under_every_shape() {
+        let values = keyed(urls(1024));
+        let borrowed: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        let shapes = [
+            vec![Kind::Front, Kind::Lz],
+            vec![Kind::Lz, Kind::Fsst],
+            vec![Kind::Lz, Kind::Plain],
+            vec![Kind::Fsst],
+            vec![Kind::Plain],
+        ];
+        for kinds in shapes {
+            let shape = with_symbols(
+                Settled::new(kinds.clone(), vec![integer::Kind::Packed]),
+                std::slice::from_ref(&borrowed),
+            );
+            let bytes = encode_with(&borrowed, &shape).unwrap();
+            for count in [0, 1, 2, 17, 500, 1023, 1024] {
+                let leading = decode_leading(&bytes, count).unwrap();
+                assert_eq!(leading, values[..count].concat(), "{kinds:?} {count}");
+            }
+            assert!(decode_leading(&bytes, 1025).is_err(), "{kinds:?}");
+        }
     }
 
     #[test]
