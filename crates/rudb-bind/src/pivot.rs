@@ -56,7 +56,17 @@ impl Binder<'_> {
         let (inner, filter) = if pivot.unpivot {
             self.unpivot_query(ast, &pivot, &names, &held, &scope)?
         } else {
-            (self.pivot_query(ast, &pivot, &names, &held)?, Vec::new())
+            // The query reads the source under the name it was written with, so that a qualified
+            // read such as `count(piv.*)` still finds it.
+            let source = scope.columns.first().map(|column| column.table.as_str());
+            let source = source.filter(|label| {
+                !label.is_empty() && scope.columns.iter().all(|column| column.table == *label)
+            });
+            let from = match source {
+                Some(label) => format!("{} AS {}", ident(&held), ident(label)),
+                None => ident(&held),
+            };
+            (self.pivot_query(ast, &pivot, &names, &from)?, Vec::new())
         };
         let label = if pivot.alias == NONE {
             "__unnamed_pivot".to_string()
@@ -95,13 +105,13 @@ impl Binder<'_> {
             .map(|(_, node, scope)| (*node, scope.clone()))
     }
 
-    /// The grouped query with a filtered aggregate for each column a pivot makes.
+    /// The grouped query with a filtered aggregate for each column a pivot makes, reading `from`.
     fn pivot_query(
         &mut self,
         ast: &Ast,
         pivot: &ast::Pivot,
         names: &[String],
-        held: &str,
+        from: &str,
     ) -> Result<String> {
         let mut handled = Vec::new();
         let aggregates = ast.target_list(pivot.aggregates).to_vec();
@@ -276,7 +286,7 @@ impl Binder<'_> {
         for (item, name) in items.iter_mut().zip(&output).skip(groups.len()) {
             item.push_str(&format!(" AS {}", ident(name)));
         }
-        let mut text = format!("SELECT {} FROM {}", items.join(", "), ident(held));
+        let mut text = format!("SELECT {} FROM {from}", items.join(", "));
         if !groups.is_empty() {
             let ordinals: Vec<String> = (1..=groups.len()).map(|at| at.to_string()).collect();
             text.push_str(&format!(" GROUP BY {}", ordinals.join(", ")));

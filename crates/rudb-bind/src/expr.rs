@@ -1589,6 +1589,9 @@ impl Binder<'_> {
                 if qualifier.is_empty() && replacements.is_empty())
         });
         // Inside the argument of a `COLUMNS` a star is the list of names it stands for.
+        if self.columns_scope.is_none() && self.star_name.is_none() {
+            crate::counted::refuse_star(ast, &written, distinct, &arguments)?;
+        }
         if starred && self.columns_scope.is_none() && self.star_name.is_none() {
             if !rudb_catalog::same_name(&written, "count") || arguments.len() != 1 {
                 return Err(Error::binder(format!("* is not allowed in {written}()")));
@@ -4453,10 +4456,10 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         }
         ast::Expr::Function { name, args, distinct, filter } => {
             let written = ast.name(name).last().unwrap_or_default();
-            let starred = ast
-                .expr_list(args)
-                .iter()
-                .any(|&arg| matches!(ast.expr(arg), ast::Expr::Star { .. }));
+            // `count(t.*)` is not `count(*)` and keeps the name it was written with.
+            let starred = ast.expr_list(args).iter().any(|&arg| {
+                matches!(ast.expr(arg), ast::Expr::Star { qualifier, .. } if qualifier.is_empty())
+            });
             // `count()` with nothing in it is named after the function it really is, the same way
             // `count(*)` is, and it is the one spelling of the three that does not survive as
             // written.
