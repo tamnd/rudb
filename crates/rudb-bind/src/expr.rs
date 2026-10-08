@@ -611,7 +611,7 @@ impl Binder<'_> {
         self.outer_scopes.pop();
         let mut correlations = Vec::new();
         for binding in read {
-            if outer_scope.columns.iter().any(|column| column.binding == binding) {
+            if outer_scope.holds(binding) {
                 correlations.push(binding);
             } else if let Some(enclosing) = self.correlations.last_mut()
                 && !enclosing.contains(&binding)

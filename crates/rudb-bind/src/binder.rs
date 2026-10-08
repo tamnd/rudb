@@ -380,6 +380,9 @@ pub(crate) struct Binder<'a> {
     /// Whether this binds the query of an `ON CONFLICT DO UPDATE`, whose `excluded` reads the new
     /// rows rather than the table.
     pub(crate) upsert: bool,
+    /// Whether the next table bound has no `rowid`, which is the table an `INSERT` or an `UPDATE`
+    /// returns its rows from. Only that one, so a query in its `RETURNING` reads its own.
+    pub(crate) unnumbered: bool,
     /// The type and the default of each column an `INSERT` writes, handed to the `VALUES` right
     /// under it so that a `DEFAULT` item there can be the default of the column it lands in.
     pub(crate) insert_defaults: Option<Vec<(LogicalType, Option<String>)>>,
@@ -542,6 +545,7 @@ impl<'a> Binder<'a> {
             aggregation: None,
             want_ascending: false,
             upsert: false,
+            unnumbered: false,
             insert_defaults: None,
             insert_inputs: None,
             copy_into: None,
@@ -2868,6 +2872,7 @@ impl<'a> Binder<'a> {
         for (at, column) in scope.columns.iter_mut().enumerate() {
             column.binding = ColumnBinding::new(index, at as u32);
         }
+        self.carry_rowids(scope, 0..usize::MAX, index, &mut exprs, &mut names);
         let exprs = self.plan.add_expr_list(&exprs);
         let names = self.plan.add_name_list(&names);
         self.add_node(Node::Project { input: node, index, exprs, names })
@@ -3010,7 +3015,7 @@ impl<'a> Binder<'a> {
 
         let mut here = Vec::new();
         for binding in read {
-            if left.columns.iter().any(|column| column.binding == binding) {
+            if left.holds(binding) {
                 here.push(binding);
             } else if let Some(enclosing) = self.correlations.last_mut()
                 && !enclosing.contains(&binding)
@@ -3367,7 +3372,9 @@ impl<'a> Binder<'a> {
         // The pin keeps the number of a row that is gone unused and the store here moves the rows
         // after it down, so after a `DELETE` the two count differently.
         let compare = self.semantics.identifier_compare();
-        if !excluded && !fields.iter().any(|field| compare.same(&field.name, ROWID)) {
+        let unnumbered = std::mem::take(&mut self.unnumbered);
+        if !excluded && !unnumbered && !fields.iter().any(|field| compare.same(&field.name, ROWID))
+        {
             let column = Visible {
                 table: label.clone(),
                 name: ROWID.to_string(),
@@ -3400,6 +3407,26 @@ impl<'a> Binder<'a> {
         if let Node::Get { columns, .. } = self.plan.node_mut(node) {
             *columns = widened;
         }
+    }
+
+    /// Reads the `rowid` of each table placed in `places` through the projection `index` that is
+    /// being built over its scan, after the expressions already in `exprs`. The scan numbers its
+    /// rows from here on, since nothing can tell yet whether a name above reads them.
+    pub(crate) fn carry_rowids(
+        &mut self,
+        scope: &mut Scope,
+        places: std::ops::Range<usize>,
+        index: u32,
+        exprs: &mut Vec<ExprRef>,
+        names: &mut Vec<rudb_plan::StrRef>,
+    ) {
+        let width = exprs.len();
+        for (binding, scan) in scope.rowids_in(places.clone()) {
+            self.number_rows(scan);
+            exprs.push(self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt));
+            names.push(self.plan.intern(ROWID));
+        }
+        scope.move_rowids(places, index, width);
     }
 
     /// A view where a table goes, which is the body bound again right here.
@@ -4624,11 +4651,12 @@ impl<'a> Binder<'a> {
             };
             let mut exprs = Vec::with_capacity(others.len().max(1));
             let mut names = Vec::with_capacity(others.len().max(1));
-            for (at, column) in scope.columns[others].iter_mut().enumerate() {
+            for (at, column) in scope.columns[others.clone()].iter_mut().enumerate() {
                 exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
                 names.push(self.plan.intern(&column.name));
                 column.binding = ColumnBinding::new(index, at as u32);
             }
+            self.carry_rowids(&mut scope, others, index, &mut exprs, &mut names);
             if exprs.is_empty() {
                 let yes = self.plan.add_value(Value::Boolean(true));
                 exprs.push(self.plan.add_expr(Expr::Constant(yes), LogicalType::Boolean));
@@ -4691,6 +4719,30 @@ impl<'a> Binder<'a> {
             });
             names.push(self.plan.intern(&column.name));
         }
+        // A `rowid` of the left side is null in the half that has no left row, as a column is.
+        let (left_rowids, right_rowids) =
+            (matched_scope.rowids_in(0..split), matched_scope.rowids_in(split..usize::MAX));
+        let lone_rowids = lone_scope.rowids_in(0..usize::MAX);
+        let carried = right_rowids.len() == lone_rowids.len()
+            && left_rowids.len() + right_rowids.len() == scope.rowids.len();
+        if carried {
+            for (binding, scan) in left_rowids {
+                self.number_rows(scan);
+                kept.push(self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt));
+                let null = self.plan.add_value(Value::Null);
+                padded.push(self.plan.add_expr(Expr::Constant(null), LogicalType::BigInt));
+                names.push(self.plan.intern(ROWID));
+            }
+            for ((binding, scan), (lone_binding, lone_scan)) in
+                right_rowids.into_iter().zip(lone_rowids)
+            {
+                self.number_rows(scan);
+                self.number_rows(lone_scan);
+                kept.push(self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt));
+                padded.push(self.plan.add_expr(Expr::Column(lone_binding), LogicalType::BigInt));
+                names.push(self.plan.intern(ROWID));
+            }
+        }
         let names = self.plan.add_name_list(&names);
         let mut sides = [matched, lone];
         for (side, exprs) in sides.iter_mut().zip([kept, padded]) {
@@ -4706,6 +4758,12 @@ impl<'a> Binder<'a> {
         for (at, column) in scope.columns.iter_mut().enumerate() {
             column.binding = ColumnBinding::new(index, at as u32);
             column.not_null = false;
+        }
+        if carried {
+            let width = scope.columns.len();
+            scope.move_rowids(0..usize::MAX, index, width);
+        } else {
+            scope.rowids.clear();
         }
         Ok((node, scope))
     }
@@ -4763,13 +4821,19 @@ impl<'a> Binder<'a> {
                     names.push(self.plan.intern(&column.name));
                 }
                 let index = self.fresh_index();
+                let mut scope = scope;
+                self.carry_rowids(&mut scope, 0..usize::MAX, index, &mut exprs, &mut names);
                 let exprs = self.plan.add_expr_list(&exprs);
                 let names = self.plan.add_name_list(&names);
                 let definition = self.add_node(Node::Project { input: node, index, exprs, names });
                 let cte = self.next_cte;
                 self.next_cte += 1;
                 let name = self.plan.intern("pair_side");
-                let columns = self.plan.add_fields(&scope.fields());
+                let mut fields = scope.fields();
+                for _ in scope.rowids_in(0..usize::MAX) {
+                    fields.push(Field::required(ROWID.to_string(), LogicalType::BigInt));
+                }
+                let columns = self.plan.add_fields(&fields);
                 let side = HeldSide { definition, cte, name, columns };
                 self.held.push(side);
                 self.held_sources.push((source, side, scope.clone()));
@@ -4788,6 +4852,8 @@ impl<'a> Binder<'a> {
         for (at, column) in scope.columns.iter_mut().enumerate() {
             column.binding = ColumnBinding::new(index, at as u32);
         }
+        let width = scope.columns.len();
+        scope.move_rowids(0..usize::MAX, index, width);
         Some((node, scope))
     }
 
@@ -5131,6 +5197,7 @@ impl<'a> Binder<'a> {
                     computed.push((binding, self.plan.expr_type(value).clone()));
                 }
             }
+            self.carry_rowids(scope, 0..usize::MAX, index, &mut exprs, &mut names);
             let exprs = self.plan.add_expr_list(&exprs);
             let names = self.plan.add_name_list(&names);
             node = self.add_node(Node::Project { input: node, index, exprs, names });

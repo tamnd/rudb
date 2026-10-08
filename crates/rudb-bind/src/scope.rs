@@ -11,6 +11,7 @@
 
 use rudb_common::{Error, Field, IdentifierCompare, LogicalType, Origin, Result, SqlState};
 use rudb_plan::{ColumnBinding, NodeRef};
+use std::ops::Range;
 
 /// One visible column.
 #[derive(Debug, Clone)]
@@ -136,6 +137,30 @@ impl Scope {
         self.rowids.iter().find(|rowid| rowid.column.binding == binding).map(|rowid| rowid.scan)
     }
 
+    /// The `rowid` of each table placed in `places`, with the scan that numbers its rows.
+    pub(crate) fn rowids_in(&self, places: Range<usize>) -> Vec<(ColumnBinding, NodeRef)> {
+        self.rowids
+            .iter()
+            .filter(|rowid| places.contains(&rowid.at))
+            .map(|rowid| (rowid.column.binding, rowid.scan))
+            .collect()
+    }
+
+    /// Points the `rowid` of each table placed in `places` at the node `index`, which has them in
+    /// order after `width` columns of its own.
+    pub(crate) fn move_rowids(&mut self, places: Range<usize>, index: u32, width: usize) {
+        let moved = self.rowids.iter_mut().filter(|rowid| places.contains(&rowid.at));
+        for (next, rowid) in moved.enumerate() {
+            rowid.column.binding = ColumnBinding::new(index, (width + next) as u32);
+        }
+    }
+
+    /// Whether `binding` is read from this scope, as one of its columns or as a `rowid`.
+    pub(crate) fn holds(&self, binding: ColumnBinding) -> bool {
+        self.columns.iter().any(|column| column.binding == binding)
+            || self.rowids.iter().any(|rowid| rowid.column.binding == binding)
+    }
+
     pub(crate) fn push(&mut self, column: Visible) {
         self.columns.push(column);
     }
@@ -240,6 +265,15 @@ impl Scope {
         match matched.as_slice() {
             [one] => Ok(Some(one)),
             [] => Ok(None),
+            _ if table.is_some() => {
+                // A qualified name that still matches twice has two tables under one label, and
+                // the pin blames the label rather than the column.
+                let table = table.unwrap_or_default();
+                Err(Error::binder(format!(
+                    "Ambiguous reference to table \"{table}\" (duplicate alias \"{table}\", \
+                     explicitly alias one of the tables using \"AS my_alias\")"
+                )))
+            }
             many => {
                 let candidates: Vec<String> =
                     many.iter().map(|held| format!("{}.{}", held.table, held.name)).collect();
