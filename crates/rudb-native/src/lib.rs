@@ -5720,10 +5720,12 @@ type Whole = (Arc<Vector>, Arc<AtomicBool>);
 #[derive(Debug)]
 struct Shelf {
     columns: Vec<Mutex<Cached>>,
-    /// Every part of each column as decoding left it, made the first time a read of the column
-    /// asks, since a query reads a few of a table's columns and a slot for every part of every one
-    /// of them came to 9 MB on ClickBench's hits before the query read a row. See [`PartSlot`].
-    parts: Vec<OnceLock<Box<[Mutex<PartSlot>]>>>,
+    /// Every part of each column as decoding left it, made [`SLOT_GROUP`] parts at a time the first
+    /// time a read of one of them asks, since a query reads a few of a table's columns and a slot
+    /// for every part of every one of them came to 9 MB on ClickBench's hits before the query read
+    /// a row. Made a column at a time it was still 12 MB on q24, which reads the ten rows it keeps
+    /// out of all 105 columns, ten parts of each out of 2867. See [`PartSlot`].
+    parts: Vec<OnceLock<Box<[SlotGroup]>>>,
     /// How many parts the table has, which is how many slots a column gets.
     places: usize,
     /// How many pages each column holds right now. Counted outside the column locks so that the
@@ -5737,19 +5739,30 @@ struct Shelf {
     wholes: Vec<Mutex<Option<Whole>>>,
 }
 
+/// How many neighbouring parts of a column have their slots made together. See [`Shelf::parts`].
+const SLOT_GROUP: usize = 32;
+
+/// The slots of [`SLOT_GROUP`] neighbouring parts of a column, made when a read first asks for one.
+type SlotGroup = OnceLock<Box<[Mutex<PartSlot>]>>;
+
 impl Shelf {
-    /// The slot of part `part` of `column`, if a read of the column has made its slots.
+    /// The slot of part `part` of `column`, if a read of the part's group has made its slots.
     fn slot(&self, column: usize, part: usize) -> Option<&Mutex<PartSlot>> {
-        self.parts.get(column)?.get()?.get(part)
+        self.parts.get(column)?.get()?.get(part / SLOT_GROUP)?.get()?.get(part % SLOT_GROUP)
     }
 
-    /// The slot of part `part` of `column`, making the column's slots if no read has yet.
+    /// The slot of part `part` of `column`, making the slots of its group if no read has yet.
     fn made(&self, column: usize, part: usize) -> Option<&Mutex<PartSlot>> {
-        let slots = self
-            .parts
-            .get(column)?
-            .get_or_init(|| (0..self.places).map(|_| Mutex::new(PartSlot::Unseen)).collect());
-        slots.get(part)
+        let groups = self.parts.get(column)?.get_or_init(|| {
+            (0..self.places.div_ceil(SLOT_GROUP)).map(|_| OnceLock::new()).collect()
+        });
+        let first = part / SLOT_GROUP * SLOT_GROUP;
+        let slots = groups.get(part / SLOT_GROUP)?.get_or_init(|| {
+            (first..self.places.min(first + SLOT_GROUP))
+                .map(|_| Mutex::new(PartSlot::Unseen))
+                .collect()
+        });
+        slots.get(part - first)
     }
 }
 
@@ -19241,6 +19254,43 @@ mod tests {
         scan(&c);
         scan(&c);
         assert!(pool.bytes() <= one, "only what the live reader holds is counted");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A read of a few rows makes the slots of the parts beside the one it reads and of no others,
+    /// and the last group is as short as the parts left for it.
+    #[test]
+    fn a_read_makes_the_slots_of_its_own_group_of_parts() {
+        let path = path("slot-groups");
+        let mut writer =
+            Writer::create(&path, "a", vec![Field::required("id", LogicalType::Integer)])
+                .expect("new file");
+        let parts = SLOT_GROUP * 2 + 3;
+        for part in 0..parts {
+            let values = [Value::Integer(part as i32), Value::Integer(-(part as i32))];
+            let chunk = Chunk::new(vec![
+                Vector::from_values(LogicalType::Integer, &values).expect("integers"),
+            ])
+            .expect("matching rows");
+            writer.append(&chunk).expect("one part");
+        }
+        writer.finish().expect("commit");
+
+        let pool = PagePool::new(usize::MAX);
+        let catalog = Catalog::open_in(&path, &pool).expect("the file opens");
+        let reader = catalog.table("a").expect("a");
+        assert_eq!(reader.parts(), parts);
+        let read = reader.read_rows(SLOT_GROUP + 1, &[0], &[1], false).expect("one row");
+        assert_eq!(read.value_at(0, 0), Value::Integer(-(SLOT_GROUP as i32) - 1));
+        let made = |part: usize| reader.cache.slot(0, part).is_some();
+        assert!(made(SLOT_GROUP) && made(SLOT_GROUP + 1) && made(SLOT_GROUP * 2 - 1));
+        assert!(!made(0) && !made(SLOT_GROUP - 1) && !made(SLOT_GROUP * 2));
+
+        let last = reader.read_rows(parts - 1, &[0], &[0], false).expect("one row");
+        assert_eq!(last.value_at(0, 0), Value::Integer(parts as i32 - 1));
+        assert!(made(SLOT_GROUP * 2) && made(parts - 1));
+        assert!(!made(parts) && reader.cache.made(0, parts).is_none(), "no slot past the end");
+        drop((reader, catalog));
         fs::remove_file(path).expect("remove scratch file");
     }
 
