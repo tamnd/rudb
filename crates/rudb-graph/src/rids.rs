@@ -31,6 +31,8 @@
 //! nothing reads is an eighth more memory to build on every push, so it arrives with the first
 //! caller that needs it.
 
+use std::ops::ControlFlow;
+
 use rudb_common::{Error, Result};
 
 use crate::bits::BitVector;
@@ -306,6 +308,26 @@ impl Rids {
         }
     }
 
+    /// Hands `each` every member in order until it breaks, as a loop over the one form the set is
+    /// in, for the same reason as [`Self::try_for_each`].
+    fn each_until<B>(&self, mut each: impl FnMut(Rid) -> ControlFlow<B>) -> ControlFlow<B> {
+        match &self.body {
+            Body::Full => (0..self.rows).try_for_each(each),
+            Body::Sparse(members) => members.iter().try_for_each(|&member| each(member)),
+            Body::Dense { words, .. } => {
+                for (at, &word) in words.iter().enumerate() {
+                    let base = count(at) * 64;
+                    let mut rest = word;
+                    while rest != 0 {
+                        each(base + u64::from(rest.trailing_zeros()))?;
+                        rest &= rest - 1;
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
     /// The rows in both sets.
     ///
     /// # Errors
@@ -496,18 +518,63 @@ impl Rids {
     /// that starts past the mark rather than at a part boundary, which is the same question asked a
     /// few rows later at most.
     fn push_runs(&self, runs: &BitVector, children: u64, parts: u64, stopping: bool) -> Pushed {
-        let stopped = || Pushed { rids: Self::full(children), parts, skipped: 0, stopped: true };
         let expected = u128::from(self.len()) * u128::from(children) / u128::from(self.rows.max(1));
-        // The two forms each get a walk of their own, so the one a push takes tests nothing for
-        // the other in its loop.
-        if expected * u128::from(SPARSE_RATIO) < u128::from(children) {
-            let mut list: Vec<Rid> =
-                Vec::with_capacity(index(u64::try_from(expected).unwrap_or(0)));
-            if self
-                .walk_runs(runs, children, stopping, |child, run| list.extend(child..child + run))
-            {
-                return stopped();
+        let listed = expected * u128::from(SPARSE_RATIO) < u128::from(children);
+        let mut list: Vec<Rid> = Vec::new();
+        let mut words = Vec::new();
+        if listed {
+            list.reserve(index(u64::try_from(expected).unwrap_or(0)));
+        } else {
+            words = vec![0_u64; index(children.div_ceil(64))];
+        }
+        let bits = runs.words();
+        let len = runs.len();
+        let mark = children.div_ceil(STOP_AFTER);
+        let mut asked = !stopping;
+        // `at` is where the run of parent `parent` starts, which is past `parent` zeros, so the
+        // children before it are `at - parent`.
+        let (mut parent, mut at, mut kept) = (0_u64, 0_usize, 0_u64);
+        // Broken with true when the early stop finds every child so far kept.
+        let walked = self.each_until(|held| {
+            if held > parent {
+                // The run of `held` starts just past the zero that ends the run before it.
+                let next = if held - parent > FAR {
+                    runs.select0(held - 1).map(|zero| zero + 1)
+                } else {
+                    past_zeros(bits, at, held - parent)
+                };
+                let Some(next) = next else { return ControlFlow::Break(false) };
+                at = next;
+                parent = held;
             }
+            if at > len {
+                return ControlFlow::Break(false);
+            }
+            let run = count(ones_from(bits, at, len));
+            let child = count(at) - parent;
+            if run > 0 {
+                if !asked && child >= mark {
+                    asked = true;
+                    if kept == child {
+                        return ControlFlow::Break(true);
+                    }
+                }
+                if listed {
+                    list.extend(child..child + run);
+                } else {
+                    set_range(&mut words, child, child + run);
+                }
+                kept += run;
+            }
+            // The zero after the run, which moves on to the next parent.
+            at += index(run) + 1;
+            parent += 1;
+            ControlFlow::Continue(())
+        });
+        if walked == ControlFlow::Break(true) {
+            return Pushed { rids: Self::full(children), parts, skipped: 0, stopped: true };
+        }
+        if listed {
             let part = count(PART_ROWS);
             let reached = count(list.chunk_by(|a, b| a / part == b / part).count());
             return Pushed {
@@ -517,66 +584,10 @@ impl Rids {
                 stopped: false,
             };
         }
-        let mut words = vec![0_u64; index(children.div_ceil(64))];
-        if self.walk_runs(runs, children, stopping, |child, run| {
-            set_range(&mut words, child, child + run);
-        }) {
-            return stopped();
-        }
         let per_part = PART_ROWS / 64;
         let skipped =
             count(words.chunks(per_part).filter(|part| part.iter().all(|&word| word == 0)).count());
         Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
-    }
-
-    /// The runs of children of the held parents, handed to `keep` as a first child and a length in
-    /// order, and true when the early stop found every child kept so far.
-    fn walk_runs(
-        &self,
-        runs: &BitVector,
-        children: u64,
-        stopping: bool,
-        mut keep: impl FnMut(u64, u64),
-    ) -> bool {
-        let bits = runs.words();
-        let len = runs.len();
-        let mark = children.div_ceil(STOP_AFTER);
-        let mut asked = !stopping;
-        // `at` is where the run of parent `parent` starts, which is past `parent` zeros, so the
-        // children before it are `at - parent`.
-        let (mut parent, mut at, mut kept) = (0_u64, 0_usize, 0_u64);
-        for held in self.iter() {
-            if held > parent {
-                // The run of `held` starts just past the zero that ends the run before it.
-                let next = if held - parent > FAR {
-                    runs.select0(held - 1).map(|zero| zero + 1)
-                } else {
-                    past_zeros(bits, at, held - parent)
-                };
-                let Some(next) = next else { break };
-                at = next;
-                parent = held;
-            }
-            if at > len {
-                break;
-            }
-            let run = count(ones_from(bits, at, len));
-            let child = count(at) - parent;
-            if run > 0 {
-                if !asked && child >= mark {
-                    asked = true;
-                    if kept == child {
-                        return true;
-                    }
-                }
-                keep(child, run);
-                kept += run;
-            }
-            // The zero after the run, which moves on to the next parent.
-            at += index(run) + 1;
-            parent += 1;
-        }
-        false
     }
 
     /// The members from `first` for `len` rows, as offsets from `first`, in order.
