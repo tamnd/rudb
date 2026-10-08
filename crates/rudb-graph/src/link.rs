@@ -396,9 +396,9 @@ impl Link {
     /// last one was found in and gallops out over the count of ones before each word, which finds
     /// a near child in a load or two and a far one in a few halvings. The parent is then the zeros
     /// before the child's bit, which is the bit less the ones before it, and the ones before the
-    /// `n`th one are `n`. The child after the last one answered is the next one bit after the last
-    /// one's, which is the next child of the same parent, and that takes no search at all when it
-    /// is in the same word. On a link of 200,000 parents of four children each with one parent in
+    /// `n`th one are `n`. A child a few past the last one answered is a few one bits after the last
+    /// one's, and when those are in the same word it takes no search at all, and the next child of
+    /// the same parent is just the next bit set. On a link of 200,000 parents of four children each with one parent in
     /// 268 held, which is the shape of the `partsupp` rows q02 keeps through `part`, this came to 96
     /// instructions a child where a walk of up to a thousand children a word at a time and a
     /// `select1` past that was 142. A child before the last starts the search from the first word
@@ -433,12 +433,20 @@ impl Link {
                 out.push(NO_PARENT);
                 continue;
             }
-            // The child after the last is the next one after its bit, and when that one is in the
-            // same word a trailing zero count finds it without the search or the select.
-            if last.checked_add(1) == Some(child) {
+            // A child `step` past the last is the `step`th one after the last one's bit, and when
+            // that is still in the same word it is found there without the search. The next child
+            // of the same parent is the next one, a trailing zero count rather than a select.
+            if child > last {
                 let rest = words[at / 64] & (!1_u64 << (at % 64));
-                if rest != 0 {
-                    (last, at) = (child, at / 64 * 64 + rest.trailing_zeros() as usize);
+                let step = child - last;
+                if step <= u64::from(rest.count_ones()) {
+                    #[expect(clippy::cast_possible_truncation, reason = "at most 64")]
+                    let within = if step == 1 {
+                        rest.trailing_zeros()
+                    } else {
+                        crate::bits::nth_set(rest, (step - 1) as u32)
+                    };
+                    (last, at) = (child, at / 64 * 64 + within as usize);
                     out.push(count(at) - child);
                     continue;
                 }
