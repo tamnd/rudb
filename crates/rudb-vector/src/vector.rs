@@ -41,6 +41,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 
 use rudb_common::{Cause, Error, Field, LogicalType, Result, Value, slow};
@@ -493,11 +494,32 @@ fn held_as(ty: LogicalType) -> LogicalType {
 /// part of what the vector holds, which the runs already say, so it never makes two vectors equal
 /// or unequal.
 #[derive(Clone, Default)]
-struct Laid(Arc<OnceLock<Option<Vector>>>);
+struct Laid(Arc<Layout>);
+
+#[derive(Default)]
+struct Layout {
+    flat: OnceLock<Option<Vector>>,
+    /// Rows found by walking the ends rather than read from the flat form, over every gather.
+    walked: AtomicUsize,
+}
+
+impl Laid {
+    fn flat(&self) -> Option<&Vector> {
+        self.0.flat.get().and_then(Option::as_ref)
+    }
+
+    /// Counts `rows` more found by walking the ends, and says whether the walking has now come to
+    /// as many rows as there are runs, which is what laying the runs out costs. Laying out only
+    /// then means a vector gathered once from walks and one gathered many times, a parent column a
+    /// link join reads a chunk at a time, pays at most twice what the cheaper of the two would.
+    fn walked(&self, rows: usize, runs: usize) -> bool {
+        self.0.walked.fetch_add(rows, std::sync::atomic::Ordering::Relaxed) + rows >= runs
+    }
+}
 
 impl std::fmt::Debug for Laid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.get().is_some() { "Laid(out)" } else { "Laid" })
+        f.write_str(if self.0.flat.get().is_some() { "Laid(out)" } else { "Laid" })
     }
 }
 
@@ -3850,7 +3872,7 @@ impl Vector {
         let Body::Runs { laid, .. } = &self.body else {
             return None;
         };
-        laid.0.get_or_init(|| self.expanded_runs()).as_ref()
+        laid.0.flat.get_or_init(|| self.expanded_runs()).as_ref()
     }
 
     /// The flat form of a run length vector, taken from what [`Self::laid_runs`] kept when there
@@ -3859,7 +3881,7 @@ impl Vector {
         let Body::Runs { laid, .. } = &self.body else {
             return None;
         };
-        match laid.0.get() {
+        match laid.0.flat.get() {
             Some(flat) => flat.clone(),
             None => self.expanded_runs(),
         }
@@ -4549,11 +4571,16 @@ impl Vector {
                 // A run length body is a dictionary whose code is worked out from the position
                 // rather than stored, so the walk down is the same walk with a search where the
                 // lookup was. `NOWHERE` searches for nothing and stays `NOWHERE`.
-                // Laid out already, the runs are a flat vector and the positions are the rows of it.
-                // They are not laid out for this, since the walk over the ends costs no more than
-                // laying them out would, and an aggregate gathering its keys at the start of each
-                // run asks for a quarter of the rows of a key it otherwise reads only as runs.
-                Body::Runs { ends, values, laid } => match laid.0.get().and_then(Option::as_ref) {
+                //
+                // Laid out, the runs are a flat vector and the positions are the rows of it. Gathers
+                // walk the ends until they have walked as many rows as there are runs and then lay
+                // the runs out for themselves and the readers after them (see [`Laid::walked`]),
+                // since the walk is a dozen or more instructions a row and laying out is a copy. An
+                // aggregate gathering its keys at the start of each run of a key it otherwise reads
+                // only as runs stays under that and never lays them out.
+                Body::Runs { ends, values, laid } => match laid.flat().or_else(|| {
+                    laid.walked(at.len(), ends.len()).then(|| source.laid_runs()).flatten()
+                }) {
                     Some(flat) => flat,
                     None => {
                         runs_holding(ends, &mut at);
