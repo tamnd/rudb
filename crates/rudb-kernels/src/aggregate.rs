@@ -57,7 +57,7 @@ use std::mem;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, StateKey, Value};
-use rudb_vector::{Data, Form, Live, Validity, Vector};
+use rudb_vector::{Data, Form, Live, StringView, Validity, Vector};
 
 use crate::arg_extreme::Key;
 use crate::compare::extreme_order as order;
@@ -4794,6 +4794,15 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
     // A string extreme is decided on the bytes, which the loops below have no arm for, and the row
     // at a time path built a value per row. JOB 16b folds `MIN(name)` over the rows a join kept, a
     // selection over a column of strings in memory, and that was a fifth of the query.
+    // The rows of a join come out as views over the arena the build side kept, which is the form
+    // JOB 16b, 13d and 9d hand their `MIN` over, and those went the row at a time way at about 170
+    // nanoseconds a row, 645 ms of 16b. The views decide most comparisons on their own.
+    if let Want::Extreme(least) = want
+        && matches!(input.logical_type(), LogicalType::Varchar | LogicalType::Blob)
+        && let Some((views, arena)) = input.text_parts()
+    {
+        return extreme_views(views.get(..rows)?, arena, nulls, least).map(Contribution::Extreme);
+    }
     if let Want::Extreme(least) = want
         && matches!(input.logical_type(), LogicalType::Varchar | LogicalType::Blob)
         && matches!(input.form(), Form::Flat | Form::Dictionary)
@@ -4975,6 +4984,42 @@ fn extreme_bytes(
         }
     }
     Some(winner.map(|(row, _)| row))
+}
+
+/// The row that wins an extreme over a column of string views.
+///
+/// Two views decide their order between themselves unless they share their first four bytes and one
+/// of them is long, so the arena is read only for those. A tie keeps the earlier row, as the byte
+/// loop does. `None` declines, for a view that points past its arena.
+fn extreme_views(
+    views: &[StringView],
+    arena: &[u8],
+    nulls: &Validity,
+    least: bool,
+) -> Option<Option<usize>> {
+    let mut winner: Option<usize> = None;
+    // row at a time: which row wins depends on the ones before it, and most rows are settled by the
+    // view alone.
+    for (row, view) in views.iter().enumerate() {
+        if !nulls.is_valid(row) {
+            continue;
+        }
+        let ahead = match winner {
+            None => true,
+            Some(held) => {
+                let best = &views[held];
+                let ordering = match view.known_order(best) {
+                    Some(ordering) => ordering,
+                    None => view.bytes_in(arena)?.cmp(best.bytes_in(arena)?),
+                };
+                if least { ordering.is_lt() } else { ordering.is_gt() }
+            }
+        };
+        if ahead {
+            winner = Some(row);
+        }
+    }
+    Some(winner)
 }
 
 /// The row that wins an extreme, out of the sorted order the file wrote beside the dictionary.
@@ -5478,6 +5523,46 @@ mod tests {
             state.update_run(std::slice::from_ref(column), rows).expect("folds them in");
             assert_eq!(state.finish().expect("finishes"), Value::Varchar(answer.into()));
             let form = column.form();
+            assert_eq!(fallback::count(Kernel::Aggregate, form, form), 0, "{name} went row by row");
+        }
+    }
+
+    /// The same over string views, the form a join hands its rows on in, with long strings that
+    /// share their first four bytes so that some comparisons have to read the arena.
+    #[test]
+    fn a_string_extreme_over_views_is_decided_on_the_views_and_the_arena() {
+        let words = [
+            "Smith, Johnathan",
+            "Smith, Jo",
+            "Smith, Johnathan Jr.",
+            "Abe",
+            "Smith, Joanna Maria",
+            "Zed",
+            "Smith",
+        ];
+        let mut arena = Vec::new();
+        let views: Vec<StringView> = words
+            .iter()
+            .map(|word| {
+                let view = StringView::over(word.as_bytes(), arena.len() as u64);
+                arena.extend_from_slice(word.as_bytes());
+                view
+            })
+            .collect();
+        let column = Vector::string_views(LogicalType::Varchar, views, Arc::new(arena.into()))
+            .expect("views inside their arena");
+        let form = column.form();
+        for (name, rows, answer) in [
+            ("min", 7, "Abe"),
+            ("max", 7, "Zed"),
+            ("min", 3, "Smith, Jo"),
+            ("max", 3, "Smith, Johnathan Jr."),
+            ("max", 2, "Smith, Johnathan"),
+        ] {
+            fallback::reset();
+            let mut state = Accumulator::new(name, &LogicalType::Varchar).expect("known");
+            state.update_run(std::slice::from_ref(&column), rows).expect("folds them in");
+            assert_eq!(state.finish().expect("finishes"), Value::Varchar(answer.into()));
             assert_eq!(fallback::count(Kernel::Aggregate, form, form), 0, "{name} went row by row");
         }
     }
