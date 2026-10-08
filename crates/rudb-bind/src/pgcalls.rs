@@ -10,8 +10,11 @@
 //! that reads the type from the RowDescription gets the type it expects.
 
 use rudb_catalog::{Catalog, same_name};
-use rudb_common::{Error, FunctionRules, LogicalType, Result, SetFunctions, SqlState, Value};
+use rudb_common::{
+    Error, FunctionRules, LogicalType, RegexRules, Result, SetFunctions, SqlState, Value,
+};
 use rudb_kernels::pgjson::JsonSet;
+use rudb_kernels::pgregexp::Function;
 use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
@@ -205,6 +208,9 @@ impl Binder<'_> {
         {
             return Ok(Some(call));
         }
+        if let Some(call) = self.regexp_call(ast, written, arguments, scope)? {
+            return Ok(Some(call));
+        }
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = match texts.as_slice() {
@@ -233,16 +239,6 @@ impl Binder<'_> {
             [string, length] if named("lpad") || named("rpad") => {
                 format!("{written}(({string}), ({length}), ' ')")
             }
-            [string, pattern] if named("regexp_count") => {
-                format!("CAST(len(regexp_extract_all(({string}), ({pattern}))) AS INTEGER)")
-            }
-            // The first match starts after the text that is left when the first match and all
-            // that follows it are taken away.
-            [string, pattern] if named("regexp_instr") => format!(
-                "CAST(CASE WHEN ((({string}) IS NULL) OR (({pattern}) IS NULL)) THEN (NULL) WHEN \
-                 regexp_matches(({string}), ({pattern})) THEN ((length(regexp_replace(({string}), \
-                 (('(?:' || ({pattern})) || ')(?s:.*)'), '')) + 1)) ELSE 0 END AS INTEGER)"
-            ),
             [array] if named("cardinality") => {
                 let depth = self.array_depth(ast, arguments[0], scope)?;
                 let mut flat = format!("({array})");
@@ -345,6 +341,83 @@ impl Binder<'_> {
         let name = self.plan_mut().intern(rudb_kernels::pgjson::KERNEL);
         let args = self.plan_mut().add_expr_list(&[document, called]);
         Ok(self.add_expr(Expr::Function { name, args }, LogicalType::List(Box::new(set.element()))))
+    }
+
+    /// `text ~ pattern` of a PostgreSQL session, and `text ~* pattern` when `insensitive`.
+    pub(crate) fn pg_regex_match(
+        &mut self,
+        text: ExprRef,
+        pattern: ExprRef,
+        insensitive: bool,
+    ) -> ExprRef {
+        let letters = if insensitive { "i" } else { "" };
+        let letters = self.add_constant(Value::Varchar(letters.to_owned()));
+        self.regexp_kernel(Function::Match, vec![text, pattern, letters])
+    }
+
+    /// A regular expression function of a PostgreSQL session, such as `regexp_match` or
+    /// `regexp_instr`, or `None` for any other call. The kernel takes every parameter, so the call
+    /// gets the default of each one it leaves out. `regexp_matches` gives the list of its rows,
+    /// which the unnest around the call gives one at a time.
+    fn regexp_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let Some(function) = Function::named(written) else { return Ok(None) };
+        let parameters = function.parameters();
+        if self.semantics.regex_rules() != RegexRules::Postgres
+            || !(2..=parameters.len()).contains(&arguments.len())
+        {
+            return Ok(None);
+        }
+        let mut bound = Vec::with_capacity(parameters.len());
+        for &argument in arguments {
+            bound.push(self.bind_expr(ast, argument, scope)?);
+        }
+        let unknown: Vec<bool> =
+            arguments.iter().map(|&argument| string_literal(ast, argument).is_some()).collect();
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&argument| self.plan().expr_type(argument).clone()).collect();
+        let fits = |(at, ty): (usize, &LogicalType)| match parameters[at].is_text() {
+            true => matches!(ty, LogicalType::Varchar | LogicalType::Null),
+            false => {
+                unknown[at]
+                    || matches!(
+                        ty,
+                        LogicalType::Integer | LogicalType::SmallInt | LogicalType::Null
+                    )
+            }
+        };
+        if !types.iter().enumerate().all(fits) {
+            return Err(no_such_function(function.name(), &types, &unknown));
+        }
+        if function == Function::Every && !self.in_unnest {
+            return Err(self.misplaced_set_function());
+        }
+        for parameter in &parameters[bound.len()..] {
+            bound.push(self.add_constant(parameter.default_value()));
+        }
+        Ok(Some(self.regexp_kernel(function, bound)))
+    }
+
+    /// The call of one of the kernels of `pgregexp`, with an argument for each parameter.
+    fn regexp_kernel(&mut self, function: Function, arguments: Vec<ExprRef>) -> ExprRef {
+        let parameters = function.parameters();
+        let arguments: Vec<ExprRef> = arguments
+            .into_iter()
+            .zip(parameters)
+            .map(|(argument, parameter)| {
+                let ty =
+                    if parameter.is_text() { LogicalType::Varchar } else { LogicalType::Integer };
+                self.cast_to(argument, &ty)
+            })
+            .collect();
+        let name = self.plan_mut().intern(function.kernel());
+        let args = self.plan_mut().add_expr_list(&arguments);
+        self.add_expr(Expr::Function { name, args }, function.returns())
     }
 
     /// The error of PostgreSQL for a set-returning function in a place that cannot give rows.

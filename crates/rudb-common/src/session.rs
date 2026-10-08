@@ -214,6 +214,7 @@ pub struct Semantics {
     pivot_limit: u64,
     plan_errors: PlanErrors,
     regex_match_full: bool,
+    regex_rules: RegexRules,
     row_fields: RowFields,
     scalar_subquery_error_on_multiple_rows: bool,
     sequence_owners: SequenceOwners,
@@ -263,6 +264,7 @@ impl Default for Semantics {
             pivot_limit: 100_000,
             plan_errors: PlanErrors::Pin,
             regex_match_full: false,
+            regex_rules: RegexRules::Pin,
             scalar_subquery_error_on_multiple_rows: true,
             sequence_owners: SequenceOwners::Table,
             set_functions: SetFunctions::Pin,
@@ -484,6 +486,12 @@ impl Semantics {
     #[must_use]
     pub fn regex_match_full(self) -> bool {
         self.regex_match_full
+    }
+
+    /// Which syntax and which matching rules a regular expression has.
+    #[must_use]
+    pub fn regex_rules(self) -> RegexRules {
+        self.regex_rules
     }
 
     /// Whether a lambda may be written with the deprecated arrow, `x -> x + 1`, which is what
@@ -840,6 +848,17 @@ pub enum CountTypes {
     /// As in PostgreSQL: a `bigint`, or a type with an implicit or an assignment cast to
     /// `bigint`. A string literal is read with the input function of `bigint`. Any other type is
     /// `42804 argument of LIMIT must be type bigint, not type boolean`.
+    Postgres,
+}
+
+/// Which syntax and which matching rules a regular expression has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RegexRules {
+    /// As in DuckDB: the syntax of RE2, and the first match that the leftmost alternative gives.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the syntax of Spencer's engine, and the longest match from the leftmost
+    /// start. `regexp_match` gives a `text[]` and `regexp_matches` gives a set of them.
     Postgres,
 }
 
@@ -1379,6 +1398,7 @@ impl Session {
             self.semantics.row_fields = RowFields::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
+            self.semantics.regex_rules = RegexRules::Postgres;
         }
         self.postgres = Postgreses(postgres);
     }
