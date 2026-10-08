@@ -2052,14 +2052,15 @@ impl<'a> Aggregate<'a> {
         // packed. [`interior`] finds the runs by comparing what the rows hold, and a key a filter
         // left as a dictionary over its page is not a form it reads, so every filtered chunk went
         // to the table instead. `GROUP BY l_orderkey` under a filter on lineitem was ten times the
-        // instructions of the same grouping without one.
+        // instructions of the same grouping without one. A key the page held as runs is left alone
+        // as well, since its runs are the groups and [`held_runs`] reads them as they are.
         let closing = self.closes();
         if keys.len() > 1 || closing {
             for key in &mut keys {
                 if key.logical_type().is_integer()
                     && key.data().is_none()
                     && key.constant_value().is_none()
-                    && !(closing && key.packed_parts().is_some())
+                    && !(closing && (key.packed_parts().is_some() || key.run_parts().is_some()))
                 {
                     *key = key.opened()?;
                 }
