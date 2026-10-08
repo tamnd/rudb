@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.9.1
+
+This release publishes the PG1 work, because the release gate of 0.9.0 failed and nothing from 0.9.0 was published. 0.9.0 failed on an xtask test that still looked for the old lists of implicit and assignment casts after #2836 wrote them as one table. #2844 fixes the test.
+
+#2843 adds named arguments, defaults and `VARIADIC` to a call in a PostgreSQL session, with the resolver of `func_get_detail` and `MatchNamedCall` and the PostgreSQL error details and hints. `concat` and `concat_ws` now write each value with the output function of its type, and `make_interval` has a kernel with the range checks of PostgreSQL. #2842 fixes a lambda body with a `CASE` of more than one arm: each arm after the first saw a null parameter, in both dialects.
+
+#2841 scores the FSST symbols of one byte at eight times their gain.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.9.0
 
 This release closes PG1 (#2489). A PostgreSQL client connects to `rudb-server` over the wire protocol, authenticates, runs simple and extended queries and gets its rows, types and errors in the PostgreSQL format. The PG series now names the minor version.
