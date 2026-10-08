@@ -15260,3 +15260,30 @@ fn a_correlated_aggregate_answers_its_projection_over_an_empty_group() {
         ]
     );
 }
+
+#[test]
+fn a_mark_join_compares_unnamed_structs_with_not_equal_a_field_at_a_time() {
+    let db = Database::new();
+    let t = Value::Boolean(true);
+    let marks = rows(
+        &db,
+        "SELECT __mark_join_marker FROM (VALUES (1, row(1, 2)), (2, row(3, 2)), \
+         (3, row(1, NULL::INT)), (4, NULL)) p(i, c) JOIN BY (TYPE MARK) \
+         (VALUES (row(1, NULL::INT))) b(d) ON c <> d ORDER BY i",
+    );
+    assert_eq!(
+        marks,
+        vec![vec![Value::Null], vec![t.clone()], vec![Value::Null], vec![Value::Null]]
+    );
+    // The values the pin answers, a struct inside one taken apart too and a named one not.
+    let cases = [
+        ("SELECT row(1, 2) <> ANY (SELECT row(1, NULL::INT))", Value::Null),
+        ("SELECT row(3, 2) <> ANY (SELECT row(1, NULL::INT))", t.clone()),
+        ("SELECT row(row(1, 2), 1) <> ANY (SELECT row(row(1, NULL::INT), 1))", Value::Null),
+        ("SELECT {'a': 1, 'b': 2} <> ANY (SELECT {'a': 1, 'b': NULL::INT})", t.clone()),
+        ("SELECT row(1, 2) <> row(1, NULL::INT)", t.clone()),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(rows(&db, sql), vec![vec![expected]], "{sql}");
+    }
+}

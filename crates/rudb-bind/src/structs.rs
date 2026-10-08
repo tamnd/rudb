@@ -11,7 +11,7 @@
 
 use rudb_common::{Error, Field, LogicalType, Result, RowFields, SqlState, Value};
 use rudb_parse::ast::{self, Ast};
-use rudb_plan::{Expr, ExprRef};
+use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef};
 
 use crate::binder::Binder;
 use crate::fold;
@@ -52,6 +52,42 @@ impl Binder<'_> {
             }
         }
         Ok(self.pack_row(names, values))
+    }
+
+    /// A `<>` in the condition of a mark join, which between two unnamed structs is a `<>` a field
+    /// at a time joined by `OR`, as it is between two rows.
+    ///
+    /// `row(1, 2) <> ANY (SELECT row(1, NULL))` is NULL on the pin, where `row(1, 2) <> row(1,
+    /// NULL)` on its own is true, and so is an explicit mark join on the same two values. A struct
+    /// inside one is taken apart the same way, and a named struct, a list and every other type
+    /// compare as one value, so `{'a': 1, 'b': 2} <> ANY (SELECT {'a': 1, 'b': NULL})` is true.
+    /// Anything other than such a `<>` is given back as it is.
+    pub(crate) fn tuple_not_equal(&mut self, condition: ExprRef) -> ExprRef {
+        let Expr::Compare { op: CompareOp::NotEqual, left, right } = *self.plan().expr(condition)
+        else {
+            return condition;
+        };
+        let LogicalType::Struct(fields) = self.plan().expr_type(left).clone() else {
+            return condition;
+        };
+        if fields.is_empty() || !Field::unnamed(&fields) {
+            return condition;
+        }
+        let name = self.plan_mut().intern(STRUCT_EXTRACT);
+        let mut tests = Vec::with_capacity(fields.len());
+        for (at, field) in fields.iter().enumerate() {
+            let place = self.add_constant(Value::BigInt(at as i64 + 1));
+            let [left, right] = [left, right].map(|side| {
+                let args = self.plan_mut().add_expr_list(&[side, place]);
+                self.add_expr(Expr::Function { name, args }, field.ty.clone())
+            });
+            let test = self.add_expr(
+                Expr::Compare { op: CompareOp::NotEqual, left, right },
+                LogicalType::Boolean,
+            );
+            tests.push(self.tuple_not_equal(test));
+        }
+        self.conjunction(ConjunctionOp::Or, tests)
     }
 
     /// A struct of bound values with these field names, which can repeat.
