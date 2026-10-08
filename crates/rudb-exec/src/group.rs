@@ -862,7 +862,7 @@ impl Put for Vec<EncodedCountRun<()>> {
     fn put(&mut self, partition: usize, record: EncodedCountRecord, valid: u8, weight: u32) {
         let EncodedCountRecord { first, hash, third, .. } = record;
         let record = EncodedCountRecord { first, second: (), hash, third };
-        self[partition].scatter(record, valid, weight);
+        self[partition].scatter(record, valid, weight, 0);
     }
 }
 
@@ -885,9 +885,10 @@ impl Put for Tucking<'_> {
                 EncodedCountRecord { first, second: Tucked, hash, third },
                 valid,
                 weight,
+                self.code_bits,
             );
         } else {
-            self.wide[partition].scatter(record, valid, weight);
+            self.wide[partition].scatter(record, valid, weight, self.code_bits);
         }
     }
 }
@@ -930,6 +931,39 @@ impl EncodedValid {
     const SECOND: u8 = 2;
     const THIRD: u8 = 4;
     const ALL: u8 = Self::FIRST | Self::SECOND | Self::THIRD;
+}
+
+/// The hash the scatter gives a record of these keys, out of the keys alone.
+///
+/// A null key hashes as [`NOTHING`] and a missing second key as zero, the way the scatter hashes
+/// them, so the hash worked out again for a group is the one every record of it arrived with.
+#[inline]
+fn encoded_hash<S: Second>(first: i64, second: S, third: u32, valid: u8, code_bits: u32) -> u32 {
+    const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
+    let (second, third) = second.keys(third, code_bits);
+    let word = |bit: u8, value: u64| if valid & bit != 0 { value } else { NOTHING };
+    let wide = spread(mix(
+        mix(
+            mix(0, word(EncodedValid::FIRST, first as u64)),
+            word(EncodedValid::SECOND, second as u64),
+        ),
+        word(EncodedValid::THIRD, u64::from(third)),
+    ));
+    (wide ^ (wide >> 32)) as u32
+}
+
+/// A group a compaction found, which holds how many rows it stands for where a record holds its
+/// hash.
+///
+/// The hash is only wanted when a compaction or the fold puts the group in a table, and it is
+/// worked out again from the keys there. Kept beside the record, the weight was four bytes a group
+/// more: on ClickBench q19, four million groups at the peak, 17 MB of 109.
+#[derive(Debug, Clone, Copy)]
+struct EncodedCountGroup<S = i64> {
+    first: i64,
+    second: S,
+    weight: u32,
+    third: u32,
 }
 
 impl<S: Second> EncodedCountPartition<S> {
@@ -988,10 +1022,9 @@ impl<S: Second> EncodedCountPartition<S> {
 /// of the groups, so neither list is rewritten in place, and only the groups carry a weight.
 #[derive(Debug)]
 struct EncodedCountRun<S = i64> {
-    /// One record a group for the groups the last compaction found, in the order they arrived.
-    groups: Blocks<EncodedCountRecord<S>>,
-    /// How many rows each group stands for, in step with `groups`.
-    weights: Blocks<u32>,
+    /// One record a group for the groups the last compaction found, in the order they arrived,
+    /// each with how many rows it stands for.
+    groups: Blocks<EncodedCountGroup<S>>,
     /// The validity of each group, empty while all three keys of every group are valid.
     group_validity: Vec<u8>,
     /// The records scattered since the last compaction, each of them a run of rows with one key.
@@ -1008,7 +1041,6 @@ impl<S> Default for EncodedCountRun<S> {
     fn default() -> Self {
         Self {
             groups: Blocks::default(),
-            weights: Blocks::default(),
             group_validity: Vec::new(),
             pending: Blocks::default(),
             pending_validity: Vec::new(),
@@ -1047,11 +1079,11 @@ impl<S: Second> EncodedCountRun<S> {
     }
 
     /// Takes one scattered record for `weight` rows, compacting the run first when it has grown to
-    /// its limit.
+    /// its limit. `code_bits` is how many bits of a string code are the code, for [`Second::keys`].
     #[inline]
-    fn scatter(&mut self, row: EncodedCountRecord<S>, valid: u8, weight: u32) {
+    fn scatter(&mut self, row: EncodedCountRecord<S>, valid: u8, weight: u32, code_bits: u32) {
         if self.pending.len() >= self.room {
-            self.compact();
+            self.compact(code_bits);
         }
         self.push_weighted(row, valid, weight);
     }
@@ -1076,7 +1108,7 @@ impl<S: Second> EncodedCountRun<S> {
     /// adds up like any other. The run is let grow to twice its length before the next compaction
     /// if this did not free a quarter of it, which is when a vector used to double.
     #[cold]
-    fn compact(&mut self) {
+    fn compact(&mut self, code_bits: u32) {
         let len = self.len();
         // A bucket holds the group's block and its place in the block in [`SLOT_BITS`], packed as
         // [`blocks::WITHIN_BITS`] says so a match is found with a shift rather than by working out
@@ -1097,23 +1129,27 @@ impl<S: Second> EncodedCountRun<S> {
         // a quarter million buckets does not use either.
         let tag = |hash: u32| ((hash >> 18) & 0xff) << SLOT_BITS;
         let place = |block: usize, within: usize| (block << blocks::WITHIN_BITS | within) as u32;
-        // The groups are one record a group already, so they go into the table without being
-        // compared with anything.
-        for (block, values) in self.groups.slices().enumerate() {
-            for (within, row) in values.iter().enumerate() {
-                let mut slot = row.hash as usize & mask;
-                while buckets[slot] != EMPTY_SLOT {
-                    slot = (slot + 1) & mask;
-                }
-                buckets[slot] = tag(row.hash) | place(block, within);
-            }
-        }
         let pending_valid = self.pending_validity.is_empty();
         // Kept from the first null on, and filled in behind it, which with no groups yet is
         // nothing, so whether to keep it is not read off its length.
         let all_valid = pending_valid && self.group_validity.is_empty();
         if !all_valid {
             self.group_validity.resize(self.groups.len(), EncodedValid::ALL);
+        }
+        // The groups are one record a group already, so they go into the table without being
+        // compared with anything.
+        let mut source = 0;
+        for (block, values) in self.groups.slices().enumerate() {
+            for (within, row) in values.iter().enumerate() {
+                let valid = if all_valid { EncodedValid::ALL } else { self.group_validity[source] };
+                source += 1;
+                let hash = encoded_hash(row.first, row.second, row.third, valid, code_bits);
+                let mut slot = hash as usize & mask;
+                while buckets[slot] != EMPTY_SLOT {
+                    slot = (slot + 1) & mask;
+                }
+                buckets[slot] = tag(hash) | place(block, within);
+            }
         }
         let pending_validity = std::mem::take(&mut self.pending_validity);
         let pending_weights = std::mem::take(&mut self.pending_weights);
@@ -1132,8 +1168,8 @@ impl<S: Second> EncodedCountRun<S> {
                     let bucket = buckets[slot];
                     if bucket == EMPTY_SLOT {
                         buckets[slot] = tagged | place(block, within);
-                        self.groups.push(row);
-                        self.weights.push(weight);
+                        let EncodedCountRecord { first, second, third, .. } = row;
+                        self.groups.push(EncodedCountGroup { first, second, weight, third });
                         if !all_valid {
                             self.group_validity.push(valid);
                         }
@@ -1148,19 +1184,17 @@ impl<S: Second> EncodedCountRun<S> {
                         let held = ((bucket & SLOT_MASK) >> blocks::WITHIN_BITS) as usize;
                         let offset =
                             (bucket & SLOT_MASK) as usize & ((1 << blocks::WITHIN_BITS) - 1);
-                        let other = self.groups.slot(held, offset);
-                        if other.hash == row.hash
-                            && other.first == row.first
+                        let same =
+                            all_valid || self.group_validity[blocks::start(held) + offset] == valid;
+                        let other = self.groups.slot_mut(held, offset);
+                        if other.first == row.first
                             && other.second == row.second
                             && other.third == row.third
-                            && (all_valid
-                                || self.group_validity[blocks::start(held) + offset] == valid)
+                            && same
+                            && let Some(total) = other.weight.checked_add(weight)
                         {
-                            let sum = self.weights.slot_mut(held, offset);
-                            if let Some(total) = sum.checked_add(weight) {
-                                *sum = total;
-                                break;
-                            }
+                            other.weight = total;
+                            break;
                         }
                     }
                     slot = (slot + 1) & mask;
@@ -1174,7 +1208,6 @@ impl<S: Second> EncodedCountRun<S> {
 
     fn footprint(&self) -> usize {
         self.groups.footprint()
-            + self.weights.footprint()
             + self.group_validity.capacity() * size_of::<u8>()
             + self.pending.footprint()
             + self.pending_validity.capacity() * size_of::<u8>()
@@ -2360,7 +2393,6 @@ impl<'a> Aggregate<'a> {
             return Err(Error::internal("an encoded count exchange changed key width"));
         }
         let shift = u32::BITS - RADIX_PARTITIONS.ilog2();
-        const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
         // Every key of this chunk read the way the chunk holds it, once, and `None` as soon as one
         // of them has a null in it or is in a form the run reader does not cover. The loop below
         // that covers every form and every null is still there and still right, and this is the same
@@ -2404,11 +2436,8 @@ impl<'a> Aggregate<'a> {
                         *weight,
                     );
                 }
-                let wide = spread(mix(
-                    mix(mix(0, first_value as u64), second_value as u64),
-                    u64::from(third_code),
-                ));
-                let hash = (wide ^ (wide >> 32)) as u32;
+                let hash =
+                    encoded_hash(first_value, second_value, third_code, EncodedValid::ALL, 0);
                 let record = EncodedCountRecord {
                     first: first_value,
                     second: second_value,
@@ -2455,14 +2484,7 @@ impl<'a> Aggregate<'a> {
                 }
                 third_code
             };
-            let first_word =
-                if valid & EncodedValid::FIRST != 0 { first_value as u64 } else { NOTHING };
-            let second_word =
-                if valid & EncodedValid::SECOND != 0 { second_value as u64 } else { NOTHING };
-            let third_word =
-                if valid & EncodedValid::THIRD != 0 { u64::from(third_value) } else { NOTHING };
-            let wide = spread(mix(mix(mix(0, first_word), second_word), third_word));
-            let hash = (wide ^ (wide >> 32)) as u32;
+            let hash = encoded_hash(first_value, second_value, third_value, valid, 0);
             partitions.put(
                 (hash >> shift) as usize,
                 EncodedCountRecord {
@@ -7566,13 +7588,13 @@ fn encoded_count_partition<S: Second>(
     let timing = stage::Timing::start(Stage::Merge);
     for run in std::mem::take(&mut runs.runs) {
         let all_valid = run.group_validity.is_empty();
-        // The weights are kept in step with the groups, so they sit in blocks of the same sizes and
-        // are read a block alongside a block.
         let mut source = 0;
-        for (block, weights) in run.groups.slices().zip(run.weights.slices()) {
-            for (&row, &weight) in block.iter().zip(weights) {
+        for block in run.groups.slices() {
+            for &EncodedCountGroup { first, second, weight, third } in block {
                 let valid = if all_valid { EncodedValid::ALL } else { run.group_validity[source] };
-                parts[encoded_split(row.hash, splits)].push_weighted(row, valid, weight);
+                let hash = encoded_hash(first, second, third, valid, code_bits);
+                let row = EncodedCountRecord { first, second, hash, third };
+                parts[encoded_split(hash, splits)].push_weighted(row, valid, weight);
                 source += 1;
             }
         }
@@ -8920,12 +8942,12 @@ mod tests {
 
     use super::{
         Aggregate, BigIntDistinct, BigIntDistinctRuns, COMPACT_FROM, Call, CompactNumeric,
-        Distinct, DistinctSet, EncodedCountRecord, EncodedCountRun, EncodedCountRuns, EncodedValid,
-        FixedPartition, FixedRecord, FixedRun, FixedRuns, HeldDistinct, PARTITION_FROM,
-        RADIX_PARTITIONS, RUN_BLOCK, Second, Share, Signed, Tucked, WINDOW_RATE, WINDOW_SLACK,
-        bigint_distinct_partition, by_set, closed_runs, cut_runs, drop_unkept,
-        encoded_count_partition, first_kept, fixed_partition, interior, packed_run_totals,
-        run_total, slot_runs_of, spread_runs, spread_slots,
+        Distinct, DistinctSet, EncodedCountGroup, EncodedCountRecord, EncodedCountRun,
+        EncodedCountRuns, EncodedValid, FixedPartition, FixedRecord, FixedRun, FixedRuns,
+        HeldDistinct, PARTITION_FROM, RADIX_PARTITIONS, RUN_BLOCK, Second, Share, Signed, Tucked,
+        WINDOW_RATE, WINDOW_SLACK, bigint_distinct_partition, by_set, closed_runs, code_bits,
+        cut_runs, drop_unkept, encoded_count_partition, encoded_hash, first_kept, fixed_partition,
+        interior, packed_run_totals, run_total, slot_runs_of, spread_runs, spread_slots,
     };
     use crate::buffer::Buffered;
     use crate::schema::Schema;
@@ -9920,13 +9942,13 @@ mod tests {
     fn an_encoded_count_partition_split_for_cache_adds_weights_across_runs_and_splits() {
         let dictionary = Vector::from_values(LogicalType::Varchar, &[Value::Varchar("one".into())])
             .expect("a string dictionary");
-        // A hash that spreads the groups over every split, and a first run compacted so that its
-        // records carry weights while the second's are single rows.
+        // The hash the scatter gives, which spreads the groups over every split, and a first run
+        // compacted so that its records carry weights while the second's are single rows.
         let groups = (super::FIXED_SPLIT_ROWS * 8) as i64;
         let row = |first: i64| EncodedCountRecord {
             first,
             second: 0,
-            hash: (first as u32).wrapping_mul(0x9e37_79b9),
+            hash: encoded_hash(first, 0_i64, 0, EncodedValid::ALL, 0),
             third: 0,
         };
         let mut early = EncodedCountRun::default();
@@ -9938,7 +9960,7 @@ mod tests {
                 into.push(row(first), EncodedValid::ALL);
             }
         }
-        early.compact();
+        early.compact(0);
         let part = encoded_count_partition(
             &mut EncodedCountRuns { runs: vec![early, late] },
             &dictionary,
@@ -10014,6 +10036,24 @@ mod tests {
         assert_eq!(rows, expected, "a group is one group however many runs it arrived in");
     }
 
+    /// A group tucked into fewer bytes hashes as the record it was tucked from, since a compaction
+    /// works its hash out again from what it holds and has to land where the scatter put the rest.
+    #[test]
+    fn a_tucked_group_hashes_as_the_record_it_came_from() {
+        let code_bits = code_bits(30);
+        let tucked = 17 | (3 << code_bits);
+        assert_eq!(
+            encoded_hash(42, Tucked, tucked, EncodedValid::ALL, code_bits),
+            encoded_hash(42, 3_i64, 17, EncodedValid::ALL, 0),
+        );
+        assert_ne!(
+            encoded_hash(0, 3_i64, 17, EncodedValid::ALL, 0),
+            encoded_hash(0, 3_i64, 17, EncodedValid::SECOND | EncodedValid::THIRD, 0),
+            "a null key hashes apart from a zero",
+        );
+        assert_eq!(size_of::<EncodedCountGroup<Tucked>>(), 16);
+    }
+
     #[test]
     fn a_full_encoded_run_folds_its_repeats_and_the_counts_come_out_the_same() {
         let dictionary = Vector::from_values(
@@ -10021,16 +10061,25 @@ mod tests {
             &[Value::Varchar("one".into()), Value::Varchar("two".into())],
         )
         .expect("a string dictionary");
-        // Five groups, one of them with a null key, sharing a hash so every probe walks past the
-        // others, scattered round after round until the run has filled and folded several times.
-        // The null one arrives as runs of two rows, which a compaction has to add up as two.
-        let row = |first, third| EncodedCountRecord { first, second: 0, hash: 7, third };
+        // Five groups, one of them with a null key, scattered round after round until the run has
+        // filled and folded several times. The null one arrives as runs of two rows, which a
+        // compaction has to add up as two, and holds the same keys as a valid group, so only its
+        // validity tells the two apart. Each record has the hash the scatter gives it, which a
+        // compaction works out again for the groups it keeps.
+        let row = |first, third, valid| EncodedCountRecord {
+            first,
+            second: 0,
+            hash: encoded_hash(first, 0_i64, third, valid, 0),
+            third,
+        };
+        let null = EncodedValid::SECOND | EncodedValid::THIRD;
         let mut folded = EncodedCountRun::default();
         let rounds = COMPACT_FROM * 3;
         for round in 0..rounds {
-            folded.scatter(row(round as i64 % 4, (round % 2) as u32), EncodedValid::ALL, 1);
+            let valid = EncodedValid::ALL;
+            folded.scatter(row(round as i64 % 4, (round % 2) as u32, valid), valid, 1, 0);
             if round % 3 == 0 {
-                folded.scatter(row(0, 1), EncodedValid::SECOND | EncodedValid::THIRD, 2);
+                folded.scatter(row(0, 1, null), null, 2, 0);
             }
         }
         assert!(
@@ -10040,7 +10089,7 @@ mod tests {
         );
         // Never compacted, so its one record of five rows reaches the fold as it was scattered.
         let mut other = EncodedCountRun::default();
-        other.scatter(row(1, 1), EncodedValid::ALL, 5);
+        other.scatter(row(1, 1, EncodedValid::ALL), EncodedValid::ALL, 5, 0);
         let leading = [LogicalType::BigInt];
         let part = encoded_count_partition(
             &mut EncodedCountRuns { runs: vec![other, folded] },
@@ -10433,8 +10482,8 @@ mod tests {
         assert_eq!(Tucked.keys(5 << 21 | 12_345, 21), (5, 12_345));
         assert_eq!(Tucked.keys(u32::MAX, 32), (0, u32::MAX));
         assert_eq!(Tucked.keys(9, 0), (9, 0));
-        assert_eq!(super::code_bits(2), 1);
-        assert_eq!(super::code_bits(1), 0);
+        assert_eq!(code_bits(2), 1);
+        assert_eq!(code_bits(1), 0);
         assert_eq!(super::tuck_limit(32), 0);
         assert_eq!(super::tuck_limit(0), 1 << 32);
     }
