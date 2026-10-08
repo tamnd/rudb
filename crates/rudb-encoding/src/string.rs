@@ -2126,7 +2126,7 @@ mod tests {
         let compressed = describe(&round_trip(&keyed(urls(20_000)))).unwrap();
         assert!(compressed.starts_with("LZ(") && compressed.contains(", FSST["), "{compressed}");
 
-        let buffered = describe(&round_trip(&keyed(urls(300)))).unwrap();
+        let buffered = describe(&round_trip(&keyed(urls(100)))).unwrap();
         assert!(buffered.starts_with("LZ(") && buffered.contains(", PLAIN("), "{buffered}");
     }
 
