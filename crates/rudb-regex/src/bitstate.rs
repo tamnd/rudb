@@ -35,7 +35,7 @@
 use std::cell::RefCell;
 
 use crate::compile::{Inst, Program};
-use crate::vm::holds;
+use crate::vm::{holds, look};
 
 /// The most bits the memo may take, which is RE2's quarter of a megabyte.
 ///
@@ -175,6 +175,13 @@ impl Cache {
                     }
                     Inst::Assert(assertion) => {
                         if !holds(assertion, text, at) {
+                            break;
+                        }
+                        pc += 1;
+                        continue;
+                    }
+                    Inst::Look(id) => {
+                        if !look(program, id, text, at) {
                             break;
                         }
                         pc += 1;

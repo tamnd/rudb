@@ -13,7 +13,7 @@
 
 use rudb_common::{Error, Result};
 
-use crate::parse::{Assertion, Ast, Class};
+use crate::parse::{Assertion, Ast, Class, Named};
 
 /// The most instructions a pattern may compile to.
 ///
@@ -33,6 +33,8 @@ pub(crate) enum Inst {
     Any(bool),
     /// Reads nothing and holds only where the assertion holds.
     Assert(Assertion),
+    /// Reads nothing and holds only where the lookaround at this index holds.
+    Look(usize),
     /// Records the current position in a capture slot.
     Save(usize),
     /// Two ways on, the first preferred over the second.
@@ -50,14 +52,20 @@ pub(crate) enum Inst {
 /// written over other alphabets is still right rather than still fast.
 #[derive(Debug, Clone)]
 pub(crate) struct Set {
+    /// The answer for every ASCII character, with the negation applied.
     ascii: u128,
+    /// The ranges the class names, sorted and merged, before the negation.
     ranges: Vec<(char, char)>,
+    /// The named classes of PostgreSQL past ASCII, each with whether the set holds it or its
+    /// complement, before the negation.
+    named: Vec<(Named, bool)>,
+    negated: bool,
 }
 
 impl Set {
-    /// Normalizes a class from the tree: sorted, merged and with the negation applied, so that the
-    /// question the machine asks is a lookup rather than a rule.
-    fn new(class: &Class) -> Self {
+    /// Normalizes a class from the tree: sorted, merged and with the ASCII half worked out, so that
+    /// the question the machine asks is a lookup rather than a rule.
+    pub(crate) fn new(class: &Class) -> Self {
         let mut ranges = class.ranges.clone();
         ranges.sort_unstable();
         let mut merged: Vec<(char, char)> = Vec::with_capacity(ranges.len());
@@ -72,9 +80,6 @@ impl Set {
                 _ => merged.push((low, high)),
             }
         }
-        if class.negated {
-            merged = invert(&merged);
-        }
         let mut ascii = 0u128;
         for &(low, high) in &merged {
             let mut code = low as u32;
@@ -83,7 +88,10 @@ impl Set {
                 code += 1;
             }
         }
-        Self { ascii, ranges: merged }
+        if class.negated {
+            ascii = !ascii;
+        }
+        Self { ascii, ranges: merged, named: class.named.clone(), negated: class.negated }
     }
 
     /// Folds every byte a character in this set may begin with into a table.
@@ -96,7 +104,10 @@ impl Set {
         // Above the ASCII line a character begins with a lead byte, and which lead byte depends on
         // how many bytes it takes. Working that out range by range is more care than a prefilter is
         // worth, so a set that reaches above the line takes every lead byte there is.
-        if self.ranges.iter().any(|&(_, high)| high as u32 >= 128) {
+        if self.negated
+            || !self.named.is_empty()
+            || self.ranges.iter().any(|&(_, high)| high as u32 >= 128)
+        {
             for byte in 0xc2..=0xf4u8 {
                 into[byte as usize / 64] |= 1 << (byte % 64);
             }
@@ -109,7 +120,8 @@ impl Set {
         if code < 128 {
             return self.ascii >> code & 1 == 1;
         }
-        self.ranges
+        let ranged = self
+            .ranges
             .binary_search_by(|&(low, high)| {
                 if high < ch {
                     std::cmp::Ordering::Less
@@ -119,32 +131,20 @@ impl Set {
                     std::cmp::Ordering::Equal
                 }
             })
-            .is_ok()
+            .is_ok();
+        let held = ranged || self.named.iter().any(|&(named, holds)| named.holds(ch) == holds);
+        held != self.negated
     }
 }
 
-/// Everything a sorted, merged list of ranges does not hold.
-fn invert(ranges: &[(char, char)]) -> Vec<(char, char)> {
-    let mut out = Vec::with_capacity(ranges.len() + 1);
-    let mut next = 0u32;
-    for &(low, high) in ranges {
-        let low = low as u32;
-        if low > next
-            && let (Some(from), Some(to)) = (char::from_u32(next), char::from_u32(low - 1))
-        {
-            out.push((from, to));
-        }
-        next = next.max(high as u32 + 1);
-        // The surrogate block is not made of characters, so a range that ends just under it has to
-        // step over the hole rather than ask `char::from_u32` about a code point there.
-        if next == 0xd800 {
-            next = 0xe000;
-        }
-    }
-    if let Some(from) = char::from_u32(next) {
-        out.push((from, char::MAX));
-    }
-    out
+/// A lookaround of PostgreSQL: a program of its own, run at the position rather than read through.
+#[derive(Debug, Clone)]
+pub(crate) struct Look {
+    /// Whether the program reads the text after the position, and not the text before it.
+    pub(crate) ahead: bool,
+    /// Whether the lookaround holds where the program does not match.
+    pub(crate) negated: bool,
+    pub(crate) program: Program,
 }
 
 /// The bytes a match may begin with.
@@ -219,7 +219,7 @@ fn first(insts: &[Inst], sets: &[Set]) -> First {
             // An assertion decides nothing about the first byte and is followed through, which is
             // conservative in the only direction that is safe: a position the assertion would have
             // ruled out is still offered to the machine, which then rules it out itself.
-            Inst::Assert(_) | Inst::Save(_) => stack.push(pc + 1),
+            Inst::Assert(_) | Inst::Look(_) | Inst::Save(_) => stack.push(pc + 1),
             Inst::Split(one, other) => {
                 stack.push(one);
                 stack.push(other);
@@ -242,6 +242,8 @@ pub(crate) struct Program {
     pub(crate) insts: Vec<Inst>,
     /// The character sets the `Set` instructions index into.
     pub(crate) sets: Vec<Set>,
+    /// The lookarounds the `Look` instructions index into.
+    pub(crate) looks: Vec<Look>,
     /// How many capturing groups the pattern has, not counting the whole match.
     pub(crate) groups: usize,
     /// Whether every way through the program asserts the start of the text first.
@@ -260,13 +262,20 @@ pub(crate) struct Program {
 ///
 /// If the program would be longer than the budget.
 pub(crate) fn compile(ast: &Ast, groups: usize) -> Result<Program> {
-    let mut builder = Builder { insts: Vec::new(), sets: Vec::new() };
+    let mut builder = Builder { insts: Vec::new(), sets: Vec::new(), looks: Vec::new() };
     builder.push(Inst::Save(0))?;
     builder.emit(ast)?;
     builder.push(Inst::Save(1))?;
     builder.push(Inst::Match)?;
     let first = first(&builder.insts, &builder.sets);
-    Ok(Program { insts: builder.insts, sets: builder.sets, groups, anchored: anchored(ast), first })
+    Ok(Program {
+        insts: builder.insts,
+        sets: builder.sets,
+        looks: builder.looks,
+        groups,
+        anchored: anchored(ast),
+        first,
+    })
 }
 
 /// Whether the tree can only match at the start of the text.
@@ -287,6 +296,7 @@ fn anchored(ast: &Ast) -> bool {
 struct Builder {
     insts: Vec<Inst>,
     sets: Vec<Set>,
+    looks: Vec<Look>,
 }
 
 impl Builder {
@@ -335,6 +345,12 @@ impl Builder {
             Ast::Alternate(branches) => self.alternate(branches)?,
             Ast::Repeat { inner, least, most, greedy } => {
                 self.repeat(inner, *least, *most, *greedy)?;
+            }
+            Ast::Look { ahead, negated, inner } => {
+                let program = compile(inner, 0)?;
+                self.looks.push(Look { ahead: *ahead, negated: *negated, program });
+                let id = self.looks.len() - 1;
+                self.push(Inst::Look(id))?;
             }
         }
         Ok(())
