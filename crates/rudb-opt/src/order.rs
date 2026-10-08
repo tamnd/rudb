@@ -123,6 +123,8 @@ struct Part {
     /// once, at the join that first saw the side it sits under, and the unfiltered size is what
     /// carries up so that no join above charges it again.
     side: Side,
+    /// The node, while the part is still one leaf, for [`estimate::named`] to read its filters.
+    leaf: Option<NodeRef>,
 }
 
 /// One node of the order the search chose, before any of it is put in the arena.
@@ -223,6 +225,7 @@ fn order(
             build,
             tables: produced(plan, leaf),
             side: estimate::side(plan, leaf, stats)?,
+            leaf: Some(leaf),
         });
     }
     let mut whole = TableSet::new();
@@ -260,7 +263,7 @@ fn order(
         built += usize::from(conditions.is_empty());
         builds.push(Build::Pair { left: left.build, right: right.build, conditions });
         after = after.saturating_add(side.rows);
-        parts.push(Part { build: builds.len() - 1, tables: union, side });
+        parts.push(Part { build: builds.len() - 1, tables: union, side, leaf: None });
     }
     // An order that builds more cross products than the region already had is refused whatever the
     // sum says, because a cross product is worse than a join with a condition on it whatever the two
@@ -268,7 +271,14 @@ fn order(
     // that the rows it adds up come from [`estimate::matched`] rather than from the containment
     // assumption alone. That is the change #917 made: a join on a low cardinality key is scored at
     // what it produces, so the order that puts one first no longer looks like the cheap one.
-    if built > was || after >= before {
+    //
+    // An order that builds fewer of them is taken whatever the sum says, for the same reason. The
+    // sum undercounts a cross product of one row dimensions, because each of them is charged once
+    // at the join that first reads it and a cross product reads none of them. JOB 13d with the
+    // consistent rule off kept its `FROM` list, five dimensions crossed and then joined to
+    // `movie_companies` on two keys, once the joins to the dimensions were priced at what they
+    // keep, and ran in two seconds where the joined order runs in two hundred milliseconds.
+    if built > was || (built == was && after >= before) {
         return None;
     }
     Some(put(plan, &builds, parts[0].build))
@@ -336,7 +346,11 @@ fn cheapest(
             let (this, that) = (parts[left].side, parts[right].side);
             let side = if linked {
                 let keys = estimate::keyspace_of(plan, &testable, stats);
-                estimate::matched_sides(this, that, keys)
+                let shares = (
+                    named(plan, parts[left].leaf, this, &testable),
+                    named(plan, parts[right].leaf, that, &testable),
+                );
+                estimate::matched_shares(this, that, keys, shares)
             } else {
                 Side {
                     rows: this.rows.saturating_mul(that.rows),
@@ -351,6 +365,13 @@ fn cheapest(
     }
     let best = best.expect("a region has at least two parts");
     (best.left, best.right, best.side)
+}
+
+/// The share of the join a part keeps: what [`estimate::named`] counted on the other side where the
+/// part is one leaf whose filters name its key values, and the share of its own rows otherwise.
+fn named(plan: &Plan, leaf: Option<NodeRef>, side: Side, testable: &[ExprRef]) -> f64 {
+    leaf.and_then(|leaf| estimate::named(plan, leaf, testable))
+        .map_or(side.share(), |(share, _)| share)
 }
 
 /// One pair [`cheapest`] is considering, with what it would cost and where that puts it.
@@ -381,11 +402,14 @@ fn cost(plan: &Plan, at: NodeRef, stats: &Facts) -> Option<(Side, u64, usize)> {
         _ => return Some((estimate::side(plan, at, stats)?, 0, 0)),
     };
     let linked = !testable.is_empty();
+    let leaves = ((!joining(plan, left)).then_some(left), (!joining(plan, right)).then_some(right));
     let (left, under_left, crossed_left) = cost(plan, left, stats)?;
     let (right, under_right, crossed_right) = cost(plan, right, stats)?;
     let side = if linked {
         let keys = estimate::keyspace_of(plan, &testable, stats);
-        estimate::matched_sides(left, right, keys)
+        let shares =
+            (named(plan, leaves.0, left, &testable), named(plan, leaves.1, right, &testable));
+        estimate::matched_shares(left, right, keys, shares)
     } else {
         Side {
             rows: left.rows.saturating_mul(right.rows),

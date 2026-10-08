@@ -392,6 +392,7 @@ pub fn unfiltered(plan: &Plan, node: NodeRef, stats: &Facts) -> Stat<u64> {
             kind,
             plan.expr_list(conditions).len(),
             keyspace(plan, conditions, stats, &mut Vec::new()),
+            (None, None),
         ),
         Node::CrossProduct { left, right } => {
             unfiltered(plan, left, stats).zip(unfiltered(plan, right, stats), u64::saturating_mul)
@@ -599,13 +600,23 @@ pub fn rows_stat_into(
             }
             known => known.map(|n| n.saturating_sub(offset).min(count)),
         },
-        Node::Join { left, right, kind, conditions, .. } => join(
-            Both { rows: of(left), base: unfiltered(plan, left, stats) },
-            Both { rows: of(right), base: unfiltered(plan, right, stats) },
-            kind,
-            plan.expr_list(conditions).len(),
-            keyspace(plan, conditions, stats, reads),
-        ),
+        Node::Join { left, right, kind, conditions, .. } => {
+            let tested = plan.expr_list(conditions);
+            // Only an inner join, where the shares are what the join keeps. An outer join keeps its
+            // preserved side whatever a filter on the other one named.
+            let named = match kind {
+                JoinKind::Inner => (named(plan, left, tested), named(plan, right, tested)),
+                _ => (None, None),
+            };
+            join(
+                Both { rows: of(left), base: unfiltered(plan, left, stats) },
+                Both { rows: of(right), base: unfiltered(plan, right, stats) },
+                kind,
+                tested.len(),
+                keyspace(plan, conditions, stats, reads),
+                named,
+            )
+        }
         // The one join in the engine whose shape is known before any number is. A forward link
         // answers at most one parent per child row, so the child's count is the answer rather than
         // a number to take a constant fraction of: a left join emits exactly the child's rows, and
@@ -1909,7 +1920,8 @@ impl Side {
     }
 
     /// What fraction of its rows the filters underneath left, which is one where there are none.
-    fn share(self) -> f64 {
+    #[must_use]
+    pub fn share(self) -> f64 {
         (widened(self.rows) / widened(self.base)).min(1.0)
     }
 }
@@ -1932,9 +1944,114 @@ impl Side {
 /// join above.
 #[must_use]
 pub fn matched_sides(left: Side, right: Side, keys: Option<u64>) -> Side {
+    matched_shares(left, right, keys, (left.share(), right.share()))
+}
+
+/// [`matched_sides`] with the share each side keeps of the join given rather than read off it,
+/// which is how a side whose filters [`named`] its key values is charged.
+#[must_use]
+pub fn matched_shares(left: Side, right: Side, keys: Option<u64>, shares: (f64, f64)) -> Side {
     let base = matched(left.base, right.base, keys);
-    let rows = scale(base, left.share() * right.share()).max(1).min(base);
+    let rows = scale(base, shares.0 * shares.1).max(1).min(base);
     Side { rows, base }
+}
+
+/// The most key values a dimension's filters may name for [`named`] to count their rows on the
+/// other side, the bound the consistent rule counts named values to as well.
+const NAMED: usize = 64;
+
+/// What share of the rows on the other side of a join a dimension's filters keep, where they name
+/// the dimension's key values, and where that share came from.
+///
+/// [`matched_sides`] charges a filtered side at the share of its own rows its filters kept, which
+/// is right only when every key value holds as many rows on the other side as every other. A
+/// dimension a query names a value of is where that breaks. `it.info = 'mini biography'` keeps one
+/// of the 113 rows of `info_type`, and JOB 7c estimated its join to `person_info` at 744 rows when
+/// it made 84,183, because that one type is a large part of the table. `rt.role = 'actress'` in 9d,
+/// `k.keyword = 'character-name-in-title'` in 16b and the kinds of 13d are the same thing. With the
+/// values in hand the other side's frequency synopsis counts their rows, and where it does not list
+/// them the ends of its parts or a sample say what share they hold, as the consistent rule reads
+/// them.
+///
+/// `near` is the dimension, a scan under nothing but filters, and every conjunct of those filters
+/// has to resolve to values of its key, since one that does not would leave values in that the
+/// filters take out. Of `conditions`, the ones the join tests, exactly one may read `near`, and it
+/// has to be an equality against a column of a scan on the other side.
+#[must_use]
+pub fn named(plan: &Plan, near: NodeRef, conditions: &[ExprRef]) -> Option<(f64, Provenance)> {
+    let mut at = near;
+    let mut predicates = Vec::new();
+    let (index, columns) = loop {
+        match *plan.node(at) {
+            Node::Filter { input, predicate } => {
+                predicates.push(predicate);
+                at = input;
+            }
+            Node::Get { index, columns, .. } => break (index, columns),
+            _ => return None,
+        }
+    };
+    if predicates.is_empty() {
+        return None;
+    }
+    let mut pair = None;
+    for &condition in conditions {
+        let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+            return None;
+        };
+        let (&Expr::Column(left), &Expr::Column(right)) = (plan.expr(left), plan.expr(right))
+        else {
+            return None;
+        };
+        let found = match (left.table == index, right.table == index) {
+            (true, false) => (left, right),
+            (false, true) => (right, left),
+            (false, false) => continue,
+            (true, true) => return None,
+        };
+        if pair.replace(found).is_some() {
+            return None;
+        }
+    }
+    let (key, far) = pair?;
+    let key = &plan.field_list(columns).get(key.column as usize)?.name;
+    let Node::Get { columns: held, .. } = *plan.node(producer(plan, far.table)?) else {
+        return None;
+    };
+    let column = &plan.field_list(held).get(far.column as usize)?.name;
+    let mut kept: Option<Vec<Bound>> = None;
+    for &predicate in &predicates {
+        for conjunct in conjuncts(plan, predicate) {
+            let values = picked(plan, at, conjunct, key, NAMED)?;
+            kept = Some(match kept {
+                Some(held) => held.into_iter().filter(|value| values.contains(value)).collect(),
+                None => values,
+            });
+        }
+    }
+    let mut values: Vec<Bound> = Vec::new();
+    for value in kept? {
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    if let Some(frequencies) = plan.frequencies(far.table)
+        && let Some(listed) = frequencies.column(column)
+        && let Some(counted) = values
+            .iter()
+            .map(|value| frequencies.rows_with(listed, value).exact_value().copied())
+            .sum::<Option<u64>>()
+    {
+        return Some((share(counted, frequencies.rows()), Provenance::FrequencySynopsis));
+    }
+    // Not all of them listed. Where the table is laid out by the column the ends of its parts say
+    // where the values are, and where it is not a sample says how many rows they hold.
+    let zones = plan.zones(far.table)?;
+    let stored = zones.column(column)?;
+    match zones.spans(stored, &values) {
+        Some((parts, rows)) if parts < 0.5 => Some((rows.clamp(0.0, 1.0), Provenance::ZoneMap)),
+        _ => Some((zones.holding(stored, &values)?.clamp(0.0, 1.0), Provenance::Sample)),
+    }
 }
 
 /// A side as the two numbers [`join`] reads: what it produces and what it would produce unfiltered.
@@ -1956,6 +2073,7 @@ fn join(
     kind: JoinKind,
     conditions: usize,
     keys: Option<u64>,
+    named: (Option<(f64, Provenance)>, Option<(f64, Provenance)>),
 ) -> Stat<u64> {
     let (left, right, bases) = (left.rows, right.rows, (left.base, right.base));
     match kind {
@@ -1994,7 +2112,11 @@ fn join(
                 Side { rows: left, base: bases.0.value().copied().unwrap_or(left).max(left) },
                 Side { rows: right, base: bases.1.value().copied().unwrap_or(right).max(right) },
             );
-            let matched = matched_sides(sides.0, sides.1, keys).rows;
+            let shares = (
+                named.0.map_or(sides.0.share(), |(share, _)| share),
+                named.1.map_or(sides.1.share(), |(share, _)| share),
+            );
+            let matched = matched_shares(sides.0, sides.1, keys, shares).rows;
             let value = match kind {
                 // An outer join emits every row of the preserved side whether it matched or not,
                 // so the estimate cannot fall below that side.
@@ -2006,8 +2128,10 @@ fn join(
             // The containment assumption is the guess, so this is one however exact both sides
             // were. Two counted tables joined on a column nobody has a distinct count for is the
             // single most common way a plan goes wrong, and a class saying exact here would hide
-            // exactly that.
-            Stat::Known { value, class: both.combine(GUESSED), provenance: FROM_A_CONSTANT }
+            // exactly that. Where a side's share was counted on the other side, the count is where
+            // the number came from.
+            let provenance = named.0.or(named.1).map_or(FROM_A_CONSTANT, |(_, from)| from);
+            Stat::Known { value, class: both.combine(GUESSED), provenance }
         }
     }
 }
@@ -3706,5 +3830,76 @@ mod tests {
             common_stat(&text, 3, &Counted::of(None)),
             Stat::estimated(500_000, Provenance::Dictionary)
         );
+    }
+
+    /// A dimension store whose filter `name = 'mini biography'` keeps the one row whose `id` is 3,
+    /// which is `info_type` in JOB 7c.
+    #[derive(Debug)]
+    struct Naming;
+
+    impl Zones for Naming {
+        fn column(&self, name: &str) -> Option<usize> {
+            match name {
+                "name" => Some(0),
+                "id" => Some(1),
+                _ => None,
+            }
+        }
+
+        fn surviving(&self, _tests: &[Test]) -> Option<u64> {
+            None
+        }
+
+        fn spread(&self, _tests: &[Test]) -> Option<Spread> {
+            None
+        }
+
+        fn extreme(&self, _column: usize, _end: End) -> Stat<Bound> {
+            Stat::Unknown
+        }
+
+        fn nulls(&self, _column: usize) -> Stat<u64> {
+            Stat::Unknown
+        }
+
+        fn matching(&self, _column: usize, _function: &str, _pattern: &str) -> Option<f64> {
+            None
+        }
+
+        fn picked(
+            &self,
+            column: usize,
+            function: &str,
+            pattern: &str,
+            key: usize,
+            most: usize,
+        ) -> Option<Vec<Bound>> {
+            let named = (column, function, pattern, key) == (0, "=", "mini biography", 1);
+            (named && most > 0).then(|| vec![Bound::Int(3)])
+        }
+    }
+
+    #[test]
+    fn a_dimension_that_names_its_key_values_is_charged_the_rows_they_hold_on_the_other_side() {
+        // The share the filter keeps of `info_type` says nothing about how many rows of the
+        // other side the type it names holds, and the synopsis there counted two fifths.
+        let text = concat!(
+            "Join INNER on=[(#0.1::INTEGER = #1.1::INTEGER)::BOOLEAN]\n",
+            "  Filter (#0.0::VARCHAR = 'mini biography'::VARCHAR)::BOOLEAN\n",
+            "    Get memory.main.info_type AS it #0 [name::VARCHAR, id::INTEGER]\n",
+            "  Get memory.main.person_info AS pi #1 [b::INTEGER, a::INTEGER]\n"
+        );
+        let stats = facts(&[("info_type", 113), ("person_info", 1_500_000)]);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        let uniform = rows_stat(&plan, plan.root(), &stats);
+        assert_ne!(uniform.value(), Some(&600_000));
+        plan.set_zones(0, Arc::new(Naming) as Arc<dyn Zones>);
+        let held = Counted::of(Some(vec![(3, 600_000), (4, 900_000)]));
+        plan.set_frequencies(1, held as Arc<dyn Frequencies>);
+        let Stat::Known { value, provenance, .. } = rows_stat(&plan, plan.root(), &stats) else {
+            panic!("a join of two counted tables is known");
+        };
+        assert_eq!((value, provenance), (600_000, Provenance::FrequencySynopsis));
     }
 }
