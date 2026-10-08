@@ -41,13 +41,16 @@ use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 
 /// Below one member in this many rows, a set is held as a sorted list rather than a bitmap.
 ///
-/// Section 4.3's number. At one in a thousand the list is eight bytes a member against a bitmap's
-/// thousand bits, so the list is about a sixteenth of the size, and it stays smaller until one in
-/// sixty four, so the threshold is on the side of the bitmap. That side is the one a scan wants.
-/// Moving the line to sixty four took 2.7 million instructions off q17 at SF1 and put 2.8 million
-/// on q20 and 1.7 million on q08, whose sets between the two lines are tested a row at a time
-/// further on, so it stays here until those tests walk the list instead.
-pub const SPARSE_RATIO: u64 = 1000;
+/// A list is eight bytes a member and a bitmap a bit a row, so the list is the smaller one up to one
+/// member in sixty four rows. What decides the line is what the two cost to use rather than to
+/// hold, though: most of what is done with a set is done a member at a time to a list and a word at
+/// a time to a bitmap, and a member costs a few times what a word does. So the line is at a few
+/// times sixty four rows a member. Section 4.3 put it at one in a thousand, which left the sets of
+/// q17 and q02 at SF1, one part in a thousand and one `partsupp` row in 268, as bitmaps written,
+/// counted and walked a word at a time for a few hundred members. At one in sixty four, q20's one
+/// part in 94 became a list, and counting its parts and laying it out cost 2.4 million
+/// instructions more than the bitmap.
+pub const SPARSE_RATIO: u64 = 256;
 
 /// Parents apart past which a push finds the next held parent's run with a select rather than by
 /// reading on through the link, as [`crate::adjacency`] does for the same reason.
@@ -246,10 +249,12 @@ impl Rids {
         match &self.body {
             Body::Full => self.rows.div_ceil(part),
             Body::Sparse(members) => {
-                let (mut touched, mut last) = (0, u64::MAX);
+                // The first row past the last part counted, so a member costs a compare and only
+                // a part costs a division.
+                let (mut touched, mut next) = (0, 0);
                 for &member in members {
-                    if member / part != last {
-                        last = member / part;
+                    if member >= next {
+                        next = (member / part + 1) * part;
                         touched += 1;
                     }
                 }
