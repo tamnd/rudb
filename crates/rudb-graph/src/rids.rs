@@ -430,7 +430,9 @@ impl Rids {
         // Every child of a part the walk reaches is tested, so a set held as a list is laid out as a
         // bitmap of the parent first, a load a test rather than a search.
         let laid = matches!(self.body, Body::Sparse(_)).then(|| self.words());
-        let held = |parent: Rid| laid.as_ref().map_or_else(|| self.contains(parent), |words| bit(words, parent));
+        let held = |parent: Rid| {
+            laid.as_ref().map_or_else(|| self.contains(parent), |words| bit(words, parent))
+        };
         // Asked once, at the first part boundary past the mark, because a push that has removed a
         // row by then has shown the set is worth finishing and asking again later would only give up
         // work already paid for.
