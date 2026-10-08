@@ -3207,6 +3207,61 @@ fn rows_from_puts_the_rows_of_its_calls_side_by_side() {
     server.stop().unwrap();
 }
 
+/// `(r).*` is a column for each field of `r`, named by the field, in a select list and in a row.
+/// Anywhere else it is refused.
+#[test]
+fn a_star_after_a_record_is_a_column_for_each_field() {
+    let dirs = Dirs::new("fields");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            return (format!("{code} {text}"), String::new());
+        }
+        let shape = messages.iter().find(|m| m.tag == b'T').unwrap();
+        let names: Vec<String> = row_shape(shape).into_iter().map(|(name, ..)| name).collect();
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(String::new, |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        (names.join(","), rows.join(";"))
+    };
+    // The values and the names of the columns of the PostgreSQL 19 oracle.
+    for (sql, names, rows) in [
+        ("select (row(1, 'a'::text)).*", "f1,f2", "1|a"),
+        (
+            "select (pg_input_error_info('x', 'int4')).* as q",
+            "message,detail,hint,sql_error_code",
+            "invalid input syntax for type integer: \"x\"|||22P02",
+        ),
+        ("select (r).*, 9 as z from (select row(1, 'a'::text) r) s", "f1,f2,z", "1|a|9"),
+        ("select (r).f1, ((r).*) from (select row(2, 3) r) s", "f1,f1,f2", "2|2|3"),
+        ("select (row(row(1, 2), 3)).*", "f1,f2", "(1,2)|3"),
+        ("select sum((r).f1), (r).* from (select row(1, 2) r) s group by r", "sum,f1,f2", "1|1|2"),
+        ("select row((r).*, 3) from (select row(1, 2) r) s", "row", "(1,2,3)"),
+        ("select (1).*", "42809 type integer is not composite", ""),
+        ("select ('a'::text).*", "42809 type text is not composite", ""),
+        (
+            "select count((r).*) from (select row(1, 2) r) s",
+            "0A000 row expansion via \"*\" is not supported here",
+            "",
+        ),
+    ] {
+        assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");

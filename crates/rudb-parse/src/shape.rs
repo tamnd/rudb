@@ -175,6 +175,7 @@ impl Shape<'_> {
             Expr::Columns { inner, unpacked } => {
                 format!("columns{{{}, unpacked: {unpacked}}}", self.expr(inner))
             }
+            Expr::Fields { record } => format!("fields{{{}}}", self.expr(record)),
             Expr::Column { name } => format!("column{}", self.names(name)),
             Expr::Positional { index } => format!("#{index}"),
             Expr::Literal { kind, text } => match kind {

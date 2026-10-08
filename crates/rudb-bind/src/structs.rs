@@ -10,10 +10,12 @@
 //! struct's fields and the kernel finds the same field again by name.
 
 use rudb_common::{Error, Field, LogicalType, Result, RowFields, SqlState, Value};
+use rudb_parse::ast::{self, Ast};
 use rudb_plan::{Expr, ExprRef};
 
 use crate::binder::Binder;
 use crate::fold;
+use crate::scope::Scope;
 
 /// The name the plan records for a struct literal, which is the one the kernel dispatches on.
 pub(crate) const STRUCT_PACK: &str = "struct_pack";
@@ -60,6 +62,57 @@ impl Binder<'_> {
         let args = self.plan_mut().add_expr_list(values);
         let recorded = self.plan_mut().intern(STRUCT_PACK);
         Ok(self.add_expr(Expr::Function { name: recorded, args }, LogicalType::Struct(fields)))
+    }
+
+    /// `(r).*`: each field of a composite value as a value of its own, with the name of its
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// If the value is not a composite, which is `42809` as PostgreSQL has it.
+    pub(crate) fn bind_fields(
+        &mut self,
+        ast: &Ast,
+        record: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<Vec<(ExprRef, String)>> {
+        let value = self.bind_expr(ast, record, scope)?;
+        let fields = match self.plan().expr_type(value).clone() {
+            LogicalType::Struct(fields) => fields,
+            LogicalType::Null => {
+                return Err(Error::binder("record type has not been registered")
+                    .state(SqlState::WRONG_OBJECT_TYPE));
+            }
+            ty => {
+                let name = rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&ty).oid);
+                return Err(Error::binder(format!("type {name} is not composite"))
+                    .state(SqlState::WRONG_OBJECT_TYPE));
+            }
+        };
+        Ok(self.struct_fields(value, &fields))
+    }
+
+    /// A `struct_extract` of each field of a struct value, with the name of the field. A field of
+    /// `row(...)` has no name and is named by its place, `f1`, `f2` and so on, as PostgreSQL
+    /// names it.
+    pub(crate) fn struct_fields(
+        &mut self,
+        value: ExprRef,
+        fields: &[Field],
+    ) -> Vec<(ExprRef, String)> {
+        let recorded = self.plan_mut().intern(STRUCT_EXTRACT);
+        let mut out = Vec::with_capacity(fields.len());
+        for (at, field) in fields.iter().enumerate() {
+            let key = self.add_constant(Value::BigInt(at as i64 + 1));
+            let args = self.plan_mut().add_expr_list(&[value, key]);
+            let expr = self.add_expr(Expr::Function { name: recorded, args }, field.ty.clone());
+            let name = match field.name.is_empty() {
+                true => format!("f{}", at + 1),
+                false => field.name.clone(),
+            };
+            out.push((expr, name));
+        }
+        out
     }
 
     /// A bound call that picks a field out of a struct, or `None` when the call is not one.

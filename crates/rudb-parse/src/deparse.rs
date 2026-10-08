@@ -526,6 +526,7 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
         Expr::Columns { inner, unpacked } => {
             format!("{}COLUMNS({})", if unpacked { "*" } else { "" }, expr(ast, inner))
         }
+        Expr::Fields { record } => format!("({}).*", expr(ast, record)),
         Expr::Column { name } => parts(ast, name),
         Expr::Positional { index } => format!("#{index}"),
         Expr::Literal { kind, text } => literal(ast, kind, text),

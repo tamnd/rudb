@@ -2234,6 +2234,17 @@ impl<'a> Binder<'a> {
             if let Some(aliases) = &mut self.aliases {
                 aliases.defined = at;
             }
+            // `(r).*` is a column for each field of `r`, named by the fields whatever the alias.
+            if let ast::Expr::Fields { record } = ast.expr(target.expr) {
+                let before = self.scalar_subqueries.len();
+                let fields = self.bind_fields(ast, record, input)?;
+                self.lift_over_aggregate(before, above, input)?;
+                for (expr, name) in fields {
+                    exprs.push(self.over_aggregate(expr, input)?);
+                    names.push(name);
+                }
+                continue;
+            }
             if let Some(picks) = self.star_like(ast, target.expr, input)? {
                 let alias = (target.alias != NONE).then(|| ast.string(target.alias));
                 for picked in &picks.entries {
