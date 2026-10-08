@@ -585,7 +585,7 @@ pub fn decode_leading(bytes: &[u8], count: usize) -> Result<Vec<u8>> {
                     limit = total;
                 }
             }
-            let mut out = Vec::with_capacity(total.saturating_add(REPLAY_SLACK));
+            let mut out = Vec::new();
             replay_literals(&mut reader, &lengths, &offsets, total, limit, &mut out)?;
             if out.len() != limit {
                 return Err(Error::internal(format!(
@@ -1471,23 +1471,41 @@ fn replay_in_place(
         )));
     }
     let base = out.len();
-    let room = total
+    let full = total
         .checked_add(REPLAY_SLACK)
         .ok_or_else(|| Error::internal("a string chunk longer than memory"))?;
+    // A replay of the first values alone makes room for those and grows it a token at a time, since
+    // the buffer is zeroed as it is made. Made for the whole block, a sample that wants one value of
+    // each block zeroed and faulted in a whole block of `URL` for every value it read.
+    let leading = limit < total;
+    let room = if leading { limit.saturating_add(REPLAY_SLACK).min(full) } else { full };
     out.resize(base + room, 0);
     let mut payload = compressed.payload;
     let mut at = base;
     for ((&run, &length), &offset) in compressed.lengths.iter().zip(lengths).zip(offsets) {
-        if limit < total && at - base >= limit {
+        if leading && at - base >= limit {
             break;
         }
         let Some((codes, rest)) = payload.split_at_checked(run) else {
             return Err(Error::internal("a compressed run is past the end of its chunk"));
         };
         payload = rest;
-        at = compressed.table.decompress_at(codes, out, at)?;
         let length =
             usize::try_from(length).map_err(|_| Error::internal("a negative copy length"))?;
+        if leading {
+            // A run writes at most one symbol a code and the copy its length, and both store whole
+            // words past where they end. The whole block's room is always enough, so it is the cap.
+            let need = (at - base)
+                .saturating_add(run.saturating_mul(MAX_SYMBOL_LEN))
+                .saturating_add(length)
+                .saturating_add(REPLAY_SLACK)
+                .min(full);
+            let made = out.len() - base;
+            if need > made {
+                out.resize(base + need.max(made.saturating_mul(2)).min(full), 0);
+            }
+        }
+        at = compressed.table.decompress_at(codes, out, at)?;
         if length == 0 {
             continue;
         }
