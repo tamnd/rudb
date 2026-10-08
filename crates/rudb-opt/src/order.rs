@@ -44,11 +44,11 @@
 //! Both orders are scored the same way and by the same function the greedy step minimises one pair
 //! at a time.
 //!
-//! Greedy rather than the dynamic program over connected subgraphs that the literature wants, which
-//! is exponential in the number of leaves and needs a deadline and a fallback. Greedy is one pass
-//! over the pairs per join and it gets the orders that matter here, which are the ones where a join
-//! on a low cardinality key is being built before the joins that would have cut the sides down. The
-//! search goes in when there is a query it gets wrong.
+//! A region of up to fourteen leaves is searched exhaustively instead, over the connected subgraphs
+//! and their complements, which is DPccp and is described at [`searched`]. Greedy is what a larger
+//! region gets, and what a region gets whose graph has a shape that would make the search score too
+//! many pairs. Both are scored by the same measure, so the search only ever finds an order greedy
+//! would have scored the same way or a cheaper one.
 //!
 //! # What it refuses
 //!
@@ -79,6 +79,8 @@
 //! in the table and the answer is sixty million. Greedy believed it, built that join first and made
 //! q5 seventy times slower. The distinct counts are what took the refusal out, and the same join now
 //! scores at what it produces, so greedy leaves it until the sides have been cut down.
+
+use std::collections::HashMap;
 
 use rudb_common::Result;
 use rudb_plan::{BuildSide, ExprRef, JoinKind, Node, NodeRef, Plan};
@@ -245,6 +247,12 @@ fn order(
         pending.push((condition, reads));
     }
     let (_, before, was) = cost(plan, at, stats)?;
+    if let Some((top, after)) = searched(plan, &parts, &pending, stats, &mut builds) {
+        // The search builds no cross product, so it wins outright over an order that builds one,
+        // and otherwise the sum decides. Greedy has nothing to add either way: the order it would
+        // find is one of the orders the search already scored.
+        return (was > 0 || after < before).then(|| put(plan, &builds, top));
+    }
     let mut after = 0u64;
     let mut built = 0usize;
     while parts.len() > 1 {
@@ -282,6 +290,274 @@ fn order(
         return None;
     }
     Some(put(plan, &builds, parts[0].build))
+}
+
+/// The most leaves a region may have for [`searched`] to look at every order of it.
+///
+/// Fourteen, which covers all but the four largest JOB queries. The pairs the search scores grow
+/// with the shape of the graph rather than with the leaves alone, from a few hundred for a chain of
+/// fourteen to fifty thousand for a star of fourteen, and [`PAIRS`] is what bounds a shape this
+/// does not expect.
+const SEARCHED: usize = 14;
+
+/// The most pairs [`searched`] scores before it gives the region to the greedy search instead.
+const PAIRS: usize = 100_000;
+
+/// The cheapest order of the region with no cross product in it, appended to `builds`, with where
+/// its top is in the list and what it costs. `None`, with `builds` as it was, where the region has
+/// more leaves than [`SEARCHED`], a condition the search cannot place, no order without a cross
+/// product, or more pairs than [`PAIRS`].
+///
+/// This is the search over connected subgraphs and their complements of Moerkotte and Neumann,
+/// DPccp. It takes every pair of disjoint connected sets of leaves with a condition between them
+/// exactly once, and takes them in an order where both halves of a pair have already been solved,
+/// so the best tree of each set is the best of its pairs. Nothing it looks at is a cross product,
+/// and nothing a cross product would have led to is looked at. The measure is the one [`cost`] and
+/// the greedy step use: the sum of the rows every join produces, with each pair scored by
+/// [`estimate::matched_shares`] and each leaf by [`named`] where its filters name its key values.
+///
+/// Greedy gets the order wrong where the cheapest join to take first is not part of the cheapest
+/// tree, which is what a join that is small on its own and large once the rest is joined to it
+/// looks like.
+fn searched(
+    plan: &Plan,
+    parts: &[Part],
+    pending: &[(ExprRef, TableSet)],
+    stats: &Facts,
+    builds: &mut Vec<Build>,
+) -> Option<(usize, u64)> {
+    let count = parts.len();
+    if count > SEARCHED || pending.len() > 64 {
+        return None;
+    }
+    let reads: Vec<u32> = pending
+        .iter()
+        .map(|(_, read)| {
+            (0..count).filter(|&leaf| read.meets(&parts[leaf].tables)).fold(0, |m, l| m | 1 << l)
+        })
+        .collect();
+    let mut neighbours = vec![0u32; count];
+    for &read in &reads {
+        // A condition over three leaves or more is placed where all of them are joined, but it does
+        // not make any two of them neighbours, since neither pair can test it on its own.
+        if read.count_ones() == 2 {
+            for (leaf, near) in neighbours.iter_mut().enumerate() {
+                if read & 1 << leaf != 0 {
+                    *near |= read & !(1 << leaf);
+                }
+            }
+        }
+    }
+    let mut search = Search {
+        plan,
+        stats,
+        parts,
+        pending,
+        reads,
+        neighbours,
+        best: vec![None; 1 << count],
+        keys: HashMap::new(),
+        named: HashMap::new(),
+        pairs: 0,
+    };
+    for (leaf, part) in parts.iter().enumerate() {
+        search.best[1 << leaf] = Some(Tree { left: 0, right: 0, side: part.side, cost: 0 });
+    }
+    for leaf in (0..count).rev() {
+        let start = 1u32 << leaf;
+        if !search.complements(start) || !search.grow(start, below(leaf)) {
+            return None;
+        }
+    }
+    let whole = (1u32 << count) - 1;
+    let tree = search.best[whole as usize]?;
+    let top = search.place(whole, builds);
+    Some((top, tree.cost))
+}
+
+/// The leaves numbered `leaf` and below, which is `B_i` in the paper.
+fn below(leaf: usize) -> u32 {
+    (1u32 << (leaf + 1)) - 1
+}
+
+/// The non empty subsets of `set`, smallest first.
+fn subsets(set: u32) -> impl Iterator<Item = u32> {
+    let mut held = 0u32;
+    std::iter::from_fn(move || {
+        held = held.wrapping_sub(set) & set;
+        (held != 0).then_some(held)
+    })
+}
+
+/// The best tree [`searched`] has found for a set of leaves so far.
+#[derive(Clone, Copy)]
+struct Tree {
+    /// The two sets it joins, both zero for a leaf.
+    left: u32,
+    right: u32,
+    /// What it produces.
+    side: Side,
+    /// The sum of the rows its joins produce.
+    cost: u64,
+}
+
+/// What [`searched`] carries through the enumeration.
+struct Search<'a> {
+    plan: &'a Plan,
+    stats: &'a Facts,
+    parts: &'a [Part],
+    pending: &'a [(ExprRef, TableSet)],
+    /// The leaves each condition reads, as a set.
+    reads: Vec<u32>,
+    /// The leaves a condition joins each leaf to.
+    neighbours: Vec<u32>,
+    /// The best tree of each set of leaves, by the set.
+    best: Vec<Option<Tree>>,
+    /// The key space of each set of conditions, which many pairs share.
+    keys: HashMap<u64, Option<u64>>,
+    /// The share [`named`] gives a leaf against a set of conditions.
+    named: HashMap<(u32, u64), f64>,
+    /// How many pairs have been scored.
+    pairs: usize,
+}
+
+impl Search<'_> {
+    /// The leaves a condition joins to `set` that are not in it.
+    fn around(&self, set: u32) -> u32 {
+        let mut found = 0;
+        for (leaf, &next) in self.neighbours.iter().enumerate() {
+            if set & 1 << leaf != 0 {
+                found |= next;
+            }
+        }
+        found & !set
+    }
+
+    /// `EnumerateCsgRec`: every connected set that grows out of `set` without touching `out`.
+    fn grow(&mut self, set: u32, out: u32) -> bool {
+        let next = self.around(set) & !out;
+        if next == 0 {
+            return true;
+        }
+        for more in subsets(next) {
+            if !self.complements(set | more) {
+                return false;
+            }
+        }
+        subsets(next).all(|more| self.grow(set | more, out | next))
+    }
+
+    /// `EmitCsg`: every connected complement of `set` above its lowest leaf, paired with it.
+    fn complements(&mut self, set: u32) -> bool {
+        let out = set | below(set.trailing_zeros() as usize);
+        let next = self.around(set) & !out;
+        for leaf in (0..self.parts.len()).rev() {
+            if next & 1 << leaf == 0 {
+                continue;
+            }
+            if !self.pair(set, 1 << leaf)
+                || !self.extend(set, 1 << leaf, out | (below(leaf) & next))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `EnumerateCmpRec`: the complement `other` grown without touching `out`, each one paired.
+    fn extend(&mut self, set: u32, other: u32, out: u32) -> bool {
+        let next = self.around(other) & !out;
+        if next == 0 {
+            return true;
+        }
+        for more in subsets(next) {
+            if !self.pair(set, other | more) {
+                return false;
+            }
+        }
+        subsets(next).all(|more| self.extend(set, other | more, out | next))
+    }
+
+    /// The conditions that become testable when `left` and `right` are joined.
+    fn crossing(&self, left: u32, right: u32) -> u64 {
+        let both = left | right;
+        let mut found = 0u64;
+        for (at, &read) in self.reads.iter().enumerate() {
+            if read & !both == 0 && read & !left != 0 && read & !right != 0 {
+                found |= 1 << at;
+            }
+        }
+        found
+    }
+
+    /// The conditions in a set, in the order the region held them.
+    fn listed(&self, conditions: u64) -> Vec<ExprRef> {
+        let held = self.pending.iter().enumerate();
+        held.filter(|&(at, _)| conditions & 1 << at != 0).map(|(_, (expr, _))| *expr).collect()
+    }
+
+    /// The share of the join one side keeps, as [`named`] gives it for a leaf and as the side's own
+    /// share otherwise.
+    fn share(&mut self, set: u32, side: Side, conditions: u64) -> f64 {
+        if set.count_ones() != 1 {
+            return side.share();
+        }
+        let leaf = set.trailing_zeros();
+        if let Some(&held) = self.named.get(&(leaf, conditions)) {
+            return held;
+        }
+        let testable = self.listed(conditions);
+        let found = named(self.plan, self.parts[leaf as usize].leaf, side, &testable);
+        self.named.insert((leaf, conditions), found);
+        found
+    }
+
+    /// `EmitCsgCmp`: scores `left` joined to `right` and keeps it where it beats the best tree of
+    /// the two together so far. False once the search has scored more than [`PAIRS`].
+    fn pair(&mut self, left: u32, right: u32) -> bool {
+        self.pairs += 1;
+        if self.pairs > PAIRS {
+            return false;
+        }
+        let (Some(one), Some(two)) = (self.best[left as usize], self.best[right as usize]) else {
+            return true;
+        };
+        let conditions = self.crossing(left, right);
+        if conditions == 0 {
+            return true;
+        }
+        let keys = match self.keys.get(&conditions) {
+            Some(&held) => held,
+            None => {
+                let found = estimate::keyspace_of(self.plan, &self.listed(conditions), self.stats);
+                self.keys.insert(conditions, found);
+                found
+            }
+        };
+        let shares =
+            (self.share(left, one.side, conditions), self.share(right, two.side, conditions));
+        let side = estimate::matched_shares(one.side, two.side, keys, shares);
+        let cost = one.cost.saturating_add(two.cost).saturating_add(side.rows);
+        let slot = &mut self.best[(left | right) as usize];
+        if slot.is_none_or(|held| cost < held.cost) {
+            *slot = Some(Tree { left, right, side, cost });
+        }
+        true
+    }
+
+    /// Appends the best tree of `set` to the build list, returning where its top went. A leaf is
+    /// already in the list, at its own position.
+    fn place(&self, set: u32, builds: &mut Vec<Build>) -> usize {
+        if set.count_ones() == 1 {
+            return self.parts[set.trailing_zeros() as usize].build;
+        }
+        let tree = self.best[set as usize].expect("a set the best tree is made of was solved");
+        let left = self.place(tree.left, builds);
+        let right = self.place(tree.right, builds);
+        let conditions = self.listed(self.crossing(tree.left, tree.right));
+        builds.push(Build::Pair { left, right, conditions });
+        builds.len() - 1
+    }
 }
 
 /// Puts one entry of the build list and everything under it into the arena.
@@ -560,7 +836,9 @@ mod tests {
         // product of the two is the cheapest pair in the region by row count and is the wrong pair
         // by a long way. Here `u` and `v` are the two copies and `t` is what both of them join to.
         // The cross product of `w` and `u` is what lets the search act at all, and the order it
-        // builds has to take that one out without putting `u` and `v` together instead.
+        // builds has to take that one out without putting `u` and `v` together instead. Joining
+        // `t` to `v` first and joining it to `u` first score the same, and the search keeps the
+        // first of the two it reaches.
         assert_eq!(
             ordered(concat!(
                 "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
@@ -575,11 +853,11 @@ mod tests {
             concat!(
                 "Join INNER on=[(#3.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
                 "  Get memory.main.w AS w #3 [d::BIGINT]\n",
-                "  Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
-                "    Get memory.main.v AS v #2 [c::BIGINT]\n",
-                "    Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-                "      Get memory.main.u AS u #1 [b::BIGINT]\n",
+                "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.u AS u #1 [b::BIGINT]\n",
+                "    Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
                 "      Get memory.main.t AS t #0 [a::BIGINT]\n",
+                "      Get memory.main.v AS v #2 [c::BIGINT]\n",
             )
         );
     }
@@ -694,11 +972,11 @@ mod tests {
             )),
             concat!(
                 "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-                "  Get memory.main.u AS u #1 [b::BIGINT]\n",
                 "  Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
                 "    Get memory.main.w AS w #0 [d::BIGINT]\n",
                 "    Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
                 "      Get memory.main.v AS v #2 [c::BIGINT]\n",
+                "  Get memory.main.u AS u #1 [b::BIGINT]\n",
             )
         );
     }

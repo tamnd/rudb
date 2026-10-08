@@ -70,6 +70,12 @@ impl TableSet {
         }
     }
 
+    /// Whether the two sets hold an index in common.
+    #[must_use]
+    pub fn meets(&self, other: &Self) -> bool {
+        self.words.iter().zip(&other.words).any(|(one, two)| one & two != 0)
+    }
+
     /// Whether everything in this set is also in `other`.
     ///
     /// The question filter pushdown asks of every predicate at every join. An empty set is a subset
