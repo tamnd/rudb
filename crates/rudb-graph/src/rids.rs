@@ -496,15 +496,48 @@ impl Rids {
     /// that starts past the mark rather than at a part boundary, which is the same question asked a
     /// few rows later at most.
     fn push_runs(&self, runs: &BitVector, children: u64, parts: u64, stopping: bool) -> Pushed {
+        let stopped = || Pushed { rids: Self::full(children), parts, skipped: 0, stopped: true };
         let expected = u128::from(self.len()) * u128::from(children) / u128::from(self.rows.max(1));
-        let listed = expected * u128::from(SPARSE_RATIO) < u128::from(children);
-        let mut list: Vec<Rid> = Vec::new();
-        let mut words = Vec::new();
-        if listed {
-            list.reserve(index(u64::try_from(expected).unwrap_or(0)));
-        } else {
-            words = vec![0_u64; index(children.div_ceil(64))];
+        // The two forms each get a walk of their own, so the one a push takes tests nothing for
+        // the other in its loop.
+        if expected * u128::from(SPARSE_RATIO) < u128::from(children) {
+            let mut list: Vec<Rid> =
+                Vec::with_capacity(index(u64::try_from(expected).unwrap_or(0)));
+            if self
+                .walk_runs(runs, children, stopping, |child, run| list.extend(child..child + run))
+            {
+                return stopped();
+            }
+            let part = count(PART_ROWS);
+            let reached = count(list.chunk_by(|a, b| a / part == b / part).count());
+            return Pushed {
+                rids: Self::settle_sparse(children, list),
+                parts,
+                skipped: parts.saturating_sub(reached),
+                stopped: false,
+            };
         }
+        let mut words = vec![0_u64; index(children.div_ceil(64))];
+        if self.walk_runs(runs, children, stopping, |child, run| {
+            set_range(&mut words, child, child + run);
+        }) {
+            return stopped();
+        }
+        let per_part = PART_ROWS / 64;
+        let skipped =
+            count(words.chunks(per_part).filter(|part| part.iter().all(|&word| word == 0)).count());
+        Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
+    }
+
+    /// The runs of children of the held parents, handed to `keep` as a first child and a length in
+    /// order, and true when the early stop found every child kept so far.
+    fn walk_runs(
+        &self,
+        runs: &BitVector,
+        children: u64,
+        stopping: bool,
+        mut keep: impl FnMut(u64, u64),
+    ) -> bool {
         let bits = runs.words();
         let len = runs.len();
         let mark = children.div_ceil(STOP_AFTER);
@@ -533,39 +566,17 @@ impl Rids {
                 if !asked && child >= mark {
                     asked = true;
                     if kept == child {
-                        return Pushed {
-                            rids: Self::full(children),
-                            parts,
-                            skipped: 0,
-                            stopped: true,
-                        };
+                        return true;
                     }
                 }
-                if listed {
-                    list.extend(child..child + run);
-                } else {
-                    set_range(&mut words, child, child + run);
-                }
+                keep(child, run);
                 kept += run;
             }
             // The zero after the run, which moves on to the next parent.
             at += index(run) + 1;
             parent += 1;
         }
-        if listed {
-            let part = count(PART_ROWS);
-            let reached = count(list.chunk_by(|a, b| a / part == b / part).count());
-            return Pushed {
-                rids: Self::settle_sparse(children, list),
-                parts,
-                skipped: parts.saturating_sub(reached),
-                stopped: false,
-            };
-        }
-        let per_part = PART_ROWS / 64;
-        let skipped =
-            count(words.chunks(per_part).filter(|part| part.iter().all(|&word| word == 0)).count());
-        Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
+        false
     }
 
     /// The members from `first` for `len` rows, as offsets from `first`, in order.
