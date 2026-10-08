@@ -51,6 +51,7 @@ use rudb_common::{
 use rudb_encoding::sequence::Sequence;
 use rudb_encoding::{bitpack, chooser, integer, string};
 use rudb_io::{Filesystem, Mapped, OpenMode, RealFilesystem};
+use rudb_kernels::Recipe;
 use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::sieve::Sieve;
 use rudb_storage::{Probe, Range, Zone};
@@ -6543,15 +6544,30 @@ impl NativeText {
     /// is decoded. A walk of the whole dictionary decodes thousands of blocks, and each one used to
     /// take and zero an allocation of its own to read into.
     fn decode_block(&self, block: usize) -> Result<Vec<u8>> {
+        self.decode_leading(block, TEXT_PAYLOAD_VALUES)
+    }
+
+    /// [`Self::decode_block`] for the first `count` values of the block alone, which is all a read
+    /// that keeps nothing wants when the values it asks for are all near the front.
+    ///
+    /// A block's values are rebuilt in order, so the bytes of a value come out of the decode no
+    /// sooner than every value before it, and none after it are needed. The sample a plan runs a
+    /// pattern over lands one row in each of thousands of blocks of `URL` and `Title`, and decoding
+    /// each of those whole to read one value from it was a sixth of ClickBench q21 to q24.
+    fn decode_leading(&self, block: usize, count: usize) -> Result<Vec<u8>> {
         thread_local! {
             static STORED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let len = usize::try_from(self.lengths[block])
             .map_err(|_| invalid("global dictionary block does not fit in memory"))?;
         let first = block * TEXT_PAYLOAD_VALUES;
-        let last = (first + TEXT_PAYLOAD_VALUES).min(self.values);
-        let want = self.end_within(last - 1)? as usize;
-        let values = STORED.with_borrow_mut(|stored| {
+        let held = TEXT_PAYLOAD_VALUES.min(self.values - first);
+        let count = count.min(held);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let want = self.end_within(first + count - 1)? as usize;
+        let bytes = STORED.with_borrow_mut(|stored| {
             if stored.len() < len {
                 stored.resize(len, 0);
             }
@@ -6560,12 +6576,15 @@ impl NativeText {
             if checksum(stored) != self.hashes[block] {
                 return Err(invalid("global dictionary payload checksum differs"));
             }
-            string::decode_flat(stored)
+            if count < held {
+                return string::decode_leading(stored, count);
+            }
+            let values = string::decode_flat(stored)?;
+            if values.len() != held {
+                return Err(invalid("global dictionary block holds the wrong value count"));
+            }
+            Ok(values.into_bytes())
         })?;
-        if values.len() != last - first {
-            return Err(invalid("global dictionary block holds the wrong value count"));
-        }
-        let bytes = values.into_bytes();
         if bytes.len() != want {
             return Err(invalid("global dictionary block decodes to the wrong length"));
         }
@@ -6578,9 +6597,13 @@ impl NativeText {
     /// time a loaned read decodes it while the column is holding less than [`Self::keep_budget`],
     /// and decoded into `decoded` and dropped with it otherwise, which is the policy
     /// [`TextSource::sweep`] explains, with the exceptions [`Loan`] lists.
+    ///
+    /// Only the first `count` values of a block decoded for the call are there, see
+    /// [`Self::decode_leading`]. A block kept or read where it is kept has all of them.
     fn loaned_block<'a>(
         &'a self,
         block: usize,
+        count: usize,
         decoded: &'a mut Vec<u8>,
         loan: Loan,
     ) -> Result<&'a [u8]> {
@@ -6613,7 +6636,7 @@ impl NativeText {
             self.payload_kept.fetch_add(kept.len(), Atomic::Relaxed);
             return Ok(kept);
         }
-        *decoded = self.decode_block(block)?;
+        *decoded = self.decode_leading(block, count)?;
         if scattered && before >= 1 {
             self.visit_dropped.fetch_add(1, Atomic::Relaxed);
         }
@@ -7052,7 +7075,12 @@ impl TextSource for NativeText {
         let block = first / TEXT_PAYLOAD_VALUES;
         let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
         let mut decoded = Vec::new();
-        let bytes = self.loaned_block(block, &mut decoded, Loan::InOrder)?;
+        let bytes = self.loaned_block(
+            block,
+            last - block * TEXT_PAYLOAD_VALUES,
+            &mut decoded,
+            Loan::InOrder,
+        )?;
         let ends = self.ends_within(first, last)?;
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
@@ -7090,7 +7118,8 @@ impl TextSource for NativeText {
             && last == ((block + 1) * TEXT_PAYLOAD_VALUES).min(self.values);
         let loan = if whole { Loan::Whole } else { Loan::InOrder };
         let mut decoded = Vec::new();
-        let bytes = self.loaned_block(block, &mut decoded, loan)?;
+        let bytes =
+            self.loaned_block(block, last - block * TEXT_PAYLOAD_VALUES, &mut decoded, loan)?;
         let ends = self.ends_within(first, last)?;
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
@@ -7144,7 +7173,8 @@ impl TextSource for NativeText {
                 break;
             };
             let upto = run + order[run..].partition_point(|&at| block_of(at) == Some(block));
-            let bytes = self.loaned_block(block, &mut decoded, Loan::Scattered)?;
+            let count = indices[order[upto - 1]] as usize + 1 - block * TEXT_PAYLOAD_VALUES;
+            let bytes = self.loaned_block(block, count, &mut decoded, Loan::Scattered)?;
             for &at in &order[run..upto] {
                 let (start, end) = self.span_within(indices[at] as usize)?;
                 let value = bytes
@@ -7184,7 +7214,8 @@ impl TextSource for NativeText {
             let whole =
                 wanted.len() == TEXT_PAYLOAD_VALUES.min(self.values - block * TEXT_PAYLOAD_VALUES);
             let loan = if whole { Loan::Whole } else { Loan::InOrder };
-            let bytes = self.loaned_block(block, &mut decoded, loan)?;
+            let count = wanted[wanted.len() - 1] + 1 - block * TEXT_PAYLOAD_VALUES;
+            let bytes = self.loaned_block(block, count, &mut decoded, loan)?;
             for (offset, &index) in wanted.iter().enumerate() {
                 let (start, end) = self.span_within(index)?;
                 let value = bytes
@@ -7437,7 +7468,7 @@ fn read_index_span<F: Positional + ?Sized>(
 /// is kept by none of them. The orderings are here because a range over a string is the condition
 /// the bounds cannot read: two strings have no distance between them, so `mi_idx.info > '5.0'` in
 /// JOB was charged the constant fifth until something counted it.
-fn passing(values: &Vector, function: &str, pattern: &str) -> Option<Vec<bool>> {
+fn passing(values: &Vector, function: &str, pattern: &str, recipe: &Recipe) -> Option<Vec<bool>> {
     let wanted = |order: Ordering| match function {
         "=" => Some(order == Ordering::Equal),
         "<" => Some(order == Ordering::Less),
@@ -7459,8 +7490,60 @@ fn passing(values: &Vector, function: &str, pattern: &str) -> Option<Vec<bool>> 
     let pattern =
         Vector::constant(LogicalType::Varchar, Value::Varchar(pattern.into()), values.len());
     let passed =
-        rudb_kernels::call(function, &[values, &pattern], &LogicalType::Boolean, None).ok()?;
+        rudb_kernels::call_prepared(recipe, &[values, &pattern], &LogicalType::Boolean, None)
+            .ok()?;
     Some((0..passed.len()).map(|row| passed.value_at(row) == Value::Boolean(true)).collect())
+}
+
+/// How many distinct values of a sample [`passing_coded`] hands the kernel at a time.
+///
+/// Fewer than a block holds, which is what the kernel takes for a sparse read and answers by
+/// deciding only the values it is handed. Handed the whole sample at once it took it for a scan and
+/// decided each block a value landed in whole, which is a whole decode of nearly every block of
+/// `URL` for one value apiece.
+const SAMPLE_RUN: usize = TEXT_PAYLOAD_VALUES / 2;
+
+/// How many of a sample's rows `function` keeps, for a sample whose rows are codes into the
+/// column's dictionary.
+///
+/// Each distinct value is asked about once, weighted by the rows that hold it, and the values are
+/// asked about in the dictionary's order a run at a time under one recipe. In that order each block
+/// is read once for the values that land in it, and only as far as the last of them.
+fn passing_coded(
+    values: &Vector,
+    codes: &[u32],
+    dictionary: &Arc<Vector>,
+    function: &str,
+    pattern: &str,
+    recipe: &Recipe,
+) -> Option<usize> {
+    let mut held: Vec<u32> = (0..values.len())
+        .filter(|&row| !values.is_null_at(row))
+        .map(|row| codes.get(row).copied())
+        .collect::<Option<_>>()?;
+    held.sort_unstable();
+    let mut distinct = Vec::new();
+    let mut weights = Vec::new();
+    for code in held {
+        if distinct.last() == Some(&code) {
+            *weights.last_mut()? += 1;
+        } else {
+            distinct.push(code);
+            weights.push(1_usize);
+        }
+    }
+    let mut kept = 0;
+    for (run, weights) in distinct.chunks(SAMPLE_RUN).zip(weights.chunks(SAMPLE_RUN)) {
+        let run = Vector::stable_dictionary(run.to_vec(), Arc::clone(dictionary)).ok()?;
+        let passed = passing(&run, function, pattern, recipe)?;
+        kept += passed
+            .iter()
+            .zip(weights)
+            .filter(|(passed, _)| **passed)
+            .map(|(_, &n)| n)
+            .sum::<usize>();
+    }
+    Some(kept)
 }
 
 /// One part's bytes out of a whole column page.
@@ -8253,11 +8336,19 @@ impl Reader {
             Some(laid) => slice::from_ref(laid),
             None => pieces.as_slice(),
         };
+        let recipe = Recipe::new(function, &[None, Some(Value::Varchar(pattern.into()))]);
         let (mut rows, mut kept) = (0_usize, 0_usize);
         for piece in runs {
-            let passed = passing(piece, function, pattern)?;
-            rows += passed.len();
-            kept += passed.iter().filter(|&&passed| passed).count();
+            rows += piece.len();
+            kept += match piece.stable_dictionary_parts() {
+                Some((codes, dictionary)) => {
+                    passing_coded(piece, codes, dictionary, function, pattern, &recipe)?
+                }
+                None => passing(piece, function, pattern, &recipe)?
+                    .iter()
+                    .filter(|&&passed| passed)
+                    .count(),
+            };
         }
         if rows == 0 {
             return None;
@@ -8327,13 +8418,14 @@ impl Reader {
         {
             return None;
         }
+        let recipe = Recipe::new(function, &[None, Some(Value::Varchar(pattern.into()))]);
         let mut kept = Vec::new();
         let mut whole = true;
         for part in 0..self.parts() {
             let chunk = self.read_sparse(part, &[column, key]).ok()?;
             let values = chunk.column(0).ok()?;
             let keys = chunk.column(1).ok()?;
-            let passed = passing(values, function, pattern)?;
+            let passed = passing(values, function, pattern, &recipe)?;
             kept.extend(
                 passed
                     .iter()
