@@ -49,6 +49,9 @@ const SAMPLE: u64 = 64;
 /// Words between two samples past which [`BitVector::select`] searches rather than walks.
 const WALK_WORDS: usize = 8;
 
+/// Words [`Rank::word_holding`] steps over one at a time before it gallops.
+const NEAR_WORDS: usize = 8;
+
 /// A two level rank index over a bitmap.
 ///
 /// Superblocks of 4096 bits hold a `u32` cumulative count from the start of the bitmap, and blocks
@@ -137,11 +140,27 @@ impl Rank {
     /// The search gallops out from `from` before it halves, because the caller walks ranks that
     /// rise and the word it wants is nearly always a word or two past the last one. Halving the
     /// whole rest of the bitmap from there was seventeen dependent loads a row on the orders of
-    /// TPC-H, and a tenth of q10.
+    /// TPC-H, and a tenth of q10. The first [`NEAR_WORDS`] words are stepped one at a time before
+    /// the gallop, since a step is a load and a compare in a line already read, and the gallop and
+    /// the halving after it came to about forty instructions for a word that was one or two on.
     pub(crate) fn word_holding(&self, nth: u64, from: usize) -> Option<(usize, u32)> {
         let words = self.fine.len().checked_sub(1)?;
         if from >= words || u64::from(self.fine[from]) > nth || u64::from(self.fine[words]) <= nth {
             return None;
+        }
+        // `fine[from]` is at most `nth` and `fine[words]` is past it, so the step stops short of
+        // the end.
+        let (mut from, near) = (from, (from + NEAR_WORDS).min(words));
+        while from < near && u64::from(self.fine[from + 1]) <= nth {
+            from += 1;
+        }
+        if from < near {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the rank is inside the word, which holds at most sixty four ones"
+            )]
+            let within = (nth - u64::from(self.fine[from])) as u32;
+            return Some((from, within));
         }
         // `fine[low]` is at most `nth` and `fine[high]` is past it, or `high` is the end.
         let (mut low, mut step) = (from, 1);

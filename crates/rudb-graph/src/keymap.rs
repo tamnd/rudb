@@ -704,9 +704,10 @@ impl KeyMap {
     #[must_use]
     pub fn keys_at(&self, rids: &[Rid]) -> Option<Vec<i128>> {
         match &self.body {
-            Body::Identity { base, count } => {
-                rids.iter().map(|&rid| (rid < *count).then(|| base + i128::from(rid))).collect()
-            }
+            // Checked first and then mapped, because collecting the map into an `Option` grew the
+            // vector a push at a time and was 43 instructions a key on the `partsupp` rows of q02.
+            Body::Identity { base, count } => (!rids.iter().any(|&rid| rid >= *count))
+                .then(|| rids.iter().map(|&rid| base + i128::from(rid)).collect()),
             Body::Dense { base, bits, rank, .. } => {
                 let mut out = Vec::with_capacity(rids.len());
                 let mut last = (0, 0);

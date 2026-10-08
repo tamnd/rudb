@@ -1775,8 +1775,14 @@ impl<'a> Scan<'a> {
                 continue;
             }
             let Some(keys) = map.keys_at(&parents) else { continue };
+            // A loop into a vector of the right length, because collecting into an `Option`
+            // grew it a push at a time.
             fn fitted<T: TryFrom<i128>>(keys: &[i128]) -> Option<Vec<T>> {
-                keys.iter().map(|&key| T::try_from(key).ok()).collect()
+                let mut out = Vec::with_capacity(keys.len());
+                for &key in keys {
+                    out.push(T::try_from(key).ok()?);
+                }
+                Some(out)
             }
             let data = match ty {
                 LogicalType::BigInt => fitted(&keys).map(|keys| Data::Int64(keys.into())),
