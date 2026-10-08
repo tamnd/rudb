@@ -12,10 +12,12 @@
 //! building the DFA. The constraints look at the whole text and not at the piece, which is what
 //! PostgreSQL's DFA does by reading one character past the end of the piece.
 
+use std::sync::Arc;
+
 use rudb_common::Result;
 
 use super::tree::{Node, Op, SHORTER};
-use crate::compile::{self, Inst, Program};
+use crate::compile::{self, Inst, Program, Set};
 use crate::vm::{holds, look};
 
 /// A node of the tree with its program built.
@@ -43,17 +45,18 @@ impl Tree {
     }
 }
 
-pub(super) fn build(node: &Node, groups: usize) -> Result<Tree> {
-    Ok(Tree { root: sub(node)?, groups })
+/// The tree with a program for each node, whose word boundaries look at the characters of `word`.
+pub(super) fn build(node: &Node, groups: usize, word: &Arc<Set>) -> Result<Tree> {
+    Ok(Tree { root: sub(node, word)?, groups })
 }
 
-fn sub(node: &Node) -> Result<Sub> {
+fn sub(node: &Node, word: &Arc<Set>) -> Result<Sub> {
     Ok(Sub {
         op: node.op,
         flags: node.flags,
         capno: node.capno,
-        children: node.children.iter().map(sub).collect::<Result<_>>()?,
-        program: compile::compile(&node.ast, 0)?,
+        children: node.children.iter().map(|child| sub(child, word)).collect::<Result<_>>()?,
+        program: compile::compile_with(&node.ast, 0, Some(word))?,
     })
 }
 
@@ -128,7 +131,7 @@ impl<'t> Machine<'t> {
                 }
                 Inst::Save(_) => self.stack.push(pc + 1),
                 Inst::Assert(assertion) => {
-                    if holds(assertion, self.text, at) {
+                    if holds(program, assertion, self.text, at) {
                         self.stack.push(pc + 1);
                     }
                 }

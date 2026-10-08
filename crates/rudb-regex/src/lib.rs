@@ -84,7 +84,7 @@ use rudb_common::{Error, Result};
 use crate::compile::Program;
 use crate::parse::{Assertion, Ast};
 
-pub use crate::postgres::PgFlags;
+pub use crate::postgres::{AsciiCtype, PgClass, PgCtype, PgFlags};
 
 /// The letters DuckDB accepts after the pattern.
 ///
@@ -168,13 +168,15 @@ impl Regex {
     }
 
     /// Compiles a pattern of PostgreSQL's flavour, which is a different syntax with different
-    /// answers about where a match ends and where its groups are. See the `postgres` module.
+    /// answers about where a match ends and where its groups are. See the `postgres` module. The
+    /// character classes, the case folding and the word boundaries are the ones of `ctype`, which
+    /// is the collation of the call.
     ///
     /// # Errors
     ///
     /// On a pattern PostgreSQL would refuse, with PostgreSQL's message and SQLSTATE.
-    pub fn postgres(pattern: &str, flags: PgFlags) -> Result<Self> {
-        let tree = postgres::compile(pattern, flags)?;
+    pub fn postgres(pattern: &str, flags: PgFlags, ctype: &dyn PgCtype) -> Result<Self> {
+        let tree = postgres::compile(pattern, flags, ctype)?;
         Ok(Self { program: tree.program().clone(), head: None, pg: Some(Arc::new(tree)) })
     }
 

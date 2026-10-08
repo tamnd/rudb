@@ -25,12 +25,19 @@
 //! huge but shallow is run where PostgreSQL would refuse it. A sweep of 3500 random patterns
 //! against PostgreSQL 19 found six of these and no other difference.
 
+mod ctype;
 mod lex;
 mod run;
 mod tree;
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Result, SqlState};
 
+use crate::compile::Set;
+use crate::parse::Class;
+
+pub use ctype::{AsciiCtype, PgClass, PgCtype};
 pub(crate) use run::{Tree, find};
 
 /// The syntax and matching flags, as PostgreSQL's `cflags` holds them.
@@ -204,25 +211,27 @@ impl Code {
     }
 }
 
-/// Compiles a pattern.
+/// Compiles a pattern with the classes and the case mapping of a collation.
 ///
 /// # Errors
 ///
 /// On a pattern PostgreSQL refuses, with PostgreSQL's message.
-pub(crate) fn compile(pattern: &str, flags: PgFlags) -> Result<Tree> {
-    let (node, groups) = tree::parse(pattern, flags.cflags).map_err(Code::error)?;
-    run::build(&node, groups).map_err(|_| Code::TooBig.error())
+pub(crate) fn compile(pattern: &str, flags: PgFlags, ctype: &dyn PgCtype) -> Result<Tree> {
+    let (node, groups) = tree::parse(pattern, flags.cflags, ctype).map_err(Code::error)?;
+    // `\m`, `\M`, `\y` and `\Y` look at `[[:alnum:]_]` of the collation, as `wordchrs` does.
+    let word = Set::new(&Class::of(ctype.class(PgClass::Word)));
+    run::build(&node, groups, &Arc::new(word)).map_err(|_| Code::TooBig.error())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{PgFlags, Regex};
+    use crate::{AsciiCtype, PgFlags, Regex};
 
-    /// What `regexp_match` gives: the groups, or the whole match for a pattern with none, with
-    /// `None` for a group that took no part.
+    /// What `regexp_match` gives in the collation `C`: the groups, or the whole match for a
+    /// pattern with none, with `None` for a group that took no part.
     fn groups(pattern: &str, text: &str, flags: &str) -> Option<Vec<Option<String>>> {
-        let regex =
-            Regex::postgres(pattern, PgFlags::parse(flags).expect("flags")).expect("compiles");
+        let flags = PgFlags::parse(flags).expect("flags");
+        let regex = Regex::postgres(pattern, flags, &AsciiCtype).expect("compiles");
         let found = regex.find_at(text, 0)?;
         let piece = |index| found.group(index).map(|(from, to)| text[from..to].to_string());
         if regex.groups() == 0 {
@@ -241,7 +250,7 @@ mod tests {
 
     fn message(pattern: &str, flags: &str) -> String {
         let error = PgFlags::parse(flags)
-            .and_then(|flags| Regex::postgres(pattern, flags))
+            .and_then(|flags| Regex::postgres(pattern, flags, &AsciiCtype))
             .expect_err("refused");
         error.message().to_string()
     }
@@ -301,19 +310,23 @@ mod tests {
     }
 
     #[test]
-    fn case_folding_is_lower_and_upper_and_not_the_character_itself() {
+    fn the_collation_c_keeps_the_case_folding_to_ascii() {
         assert_eq!(one("([a-z]+)", "ABC", "i"), some(&["ABC"]));
-        assert_eq!(groups("(\u{1c5})", "\u{1c5}", "i"), None);
-        assert_eq!(one("([\u{1c5}])", "\u{1c6}", "i"), some(&["\u{1c6}"]));
+        assert_eq!(one("([A-Z]+)", "abc", "i"), some(&["abc"]));
+        assert_eq!(groups("\u{e9}", "\u{c9}", "i"), None);
+        assert_eq!(one("([[:lower:]]+)", "aB\u{e9}", "i"), some(&["aB"]));
     }
 
     #[test]
-    fn the_classes_past_ascii_are_the_c_library_ones() {
-        assert_eq!(one("([[:alpha:]]+)", "\u{663}ab", ""), some(&["\u{663}ab"]));
-        assert_eq!(one("([[:digit:]]+)", "\u{663}12", ""), some(&["12"]));
-        assert_eq!(one("([[:punct:]]+)", "a\u{bd}\u{b2}", ""), some(&["\u{bd}\u{b2}"]));
+    fn the_collation_c_keeps_the_classes_to_ascii() {
+        assert_eq!(one("([[:alpha:]]+)", "ab\u{e9}", ""), some(&["ab"]));
+        assert_eq!(one("([^[:alpha:]]+)", "\u{e9}\u{663}a", ""), some(&["\u{e9}\u{663}"]));
+        assert_eq!(groups("\\w", "\u{e9}", ""), None);
         assert_eq!(groups("\\s", "\u{a0}", ""), None);
         assert_eq!(one("([^\\W]+)", ",.cd", ""), some(&["cd"]));
+        assert_eq!(one("([[:cntrl:]]+)", "a\u{85}", ""), some(&["\u{85}"]));
+        // The word boundaries look at the same word characters.
+        assert_eq!(one("(\\mb)", "\u{e9}b", ""), some(&["b"]));
     }
 
     #[test]

@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use crate::compile::{Inst, Program};
-use crate::parse::{Assertion, Named};
+use crate::parse::Assertion;
 
 /// Where each group of a thread's match started and ended, as byte offsets into the text.
 type Slots = Rc<Vec<Option<usize>>>;
@@ -132,7 +132,7 @@ fn add(program: &Program, text: &str, list: &mut List, pc: usize, at: usize, slo
                 stack.push((pc + 1, updated));
             }
             Inst::Assert(assertion) => {
-                if holds(assertion, text, at) {
+                if holds(program, assertion, text, at) {
                     stack.push((pc + 1, slots));
                 }
             }
@@ -146,8 +146,12 @@ fn add(program: &Program, text: &str, list: &mut List, pc: usize, at: usize, slo
     }
 }
 
-/// Whether an assertion holds at a position.
-pub(crate) fn holds(assertion: Assertion, text: &str, at: usize) -> bool {
+/// Whether an assertion of a program holds at a position.
+pub(crate) fn holds(program: &Program, assertion: Assertion, text: &str, at: usize) -> bool {
+    let pg_word = |ch: Option<char>| match &program.word {
+        Some(word) => ch.is_some_and(|ch| word.contains(ch)),
+        None => word(ch),
+    };
     match assertion {
         Assertion::TextStart => at == 0,
         Assertion::TextEnd => at == text.len(),
@@ -188,13 +192,6 @@ fn after(text: &str, at: usize) -> Option<char> {
 /// Whether a character is one of the ones a word boundary is about, which RE2 keeps to ASCII.
 fn word(ch: Option<char>) -> bool {
     ch.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-/// Whether a character is a word character to PostgreSQL, which is `[[:alnum:]_]`.
-fn pg_word(ch: Option<char>) -> bool {
-    ch.is_some_and(|ch| {
-        ch.is_ascii_alphanumeric() || ch == '_' || (!ch.is_ascii() && Named::Alnum.holds(ch))
-    })
 }
 
 /// The threads at one position, with the set of instructions already in it.

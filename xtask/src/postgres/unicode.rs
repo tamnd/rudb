@@ -18,11 +18,12 @@ use super::norm::{number, rows};
 const KINDS: [&str; 4] = ["CaseLower", "CaseTitle", "CaseUpper", "CaseFold"];
 
 /// The properties that the kernels read, by the name of their array and of their table here.
-const PROPERTIES: [(&str, &str); 4] = [
+const PROPERTIES: [(&str, &str); 5] = [
     ("unicode_alphabetic", "ALPHABETIC"),
     ("unicode_lowercase", "LOWERCASE"),
     ("unicode_uppercase", "UPPERCASE"),
     ("unicode_case_ignorable", "CASE_IGNORABLE"),
+    ("unicode_white_space", "WHITE_SPACE"),
 ];
 
 /// Renders the tables of `rudb_kernels::pgunicode` from the text of `unicode_case_table.h`,

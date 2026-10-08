@@ -174,7 +174,7 @@ impl Cache {
                         read(bytes, text, at).filter(|&(ch, _)| newline || ch != '\n')
                     }
                     Inst::Assert(assertion) => {
-                        if !holds(assertion, text, at) {
+                        if !holds(program, assertion, text, at) {
                             break;
                         }
                         pc += 1;

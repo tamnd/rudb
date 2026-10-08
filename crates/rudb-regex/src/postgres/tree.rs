@@ -8,9 +8,10 @@
 //! the groups land. Each node carries the pattern of everything below it as an [`Ast`] with no
 //! groups in it, which `run` compiles to the program that node is matched with.
 
+use super::ctype::{PgClass, PgCtype};
 use super::lex::{Cls, Lexer, Tok};
 use super::{Cflags, Code};
-use crate::parse::{Assertion, Ast, Class, Named, complement, simple_lower, simple_upper};
+use crate::parse::{Assertion, Ast, Class, complement};
 
 /// The node prefers the longer match.
 const LONGER: u8 = 1;
@@ -118,9 +119,13 @@ fn repeat(ast: Ast, least: u32, most: Option<u32>) -> Ast {
 ///
 /// A pattern with a back reference parses as PostgreSQL parses it, so that a syntax error after
 /// the back reference is still the error raised, and is refused only at the end.
-pub(super) fn parse(pattern: &str, cflags: Cflags) -> Result<(Node, usize), Code> {
+pub(super) fn parse(
+    pattern: &str,
+    cflags: Cflags,
+    ctype: &dyn PgCtype,
+) -> Result<(Node, usize), Code> {
     let lexer = Lexer::start(pattern, cflags)?;
-    let mut parser = Parser { lexer, closed: Vec::new(), backref: false, depth: 0 };
+    let mut parser = Parser { lexer, ctype, closed: Vec::new(), backref: false, depth: 0 };
     let node = parser.alternation(false, false)?;
     if parser.backref {
         return Err(Code::Backref);
@@ -128,15 +133,17 @@ pub(super) fn parse(pattern: &str, cflags: Cflags) -> Result<(Node, usize), Code
     Ok((node, parser.lexer.groups as usize))
 }
 
-struct Parser {
+struct Parser<'c> {
     lexer: Lexer,
+    /// The classes and the case mapping of the collation of the call.
+    ctype: &'c dyn PgCtype,
     /// Which groups have closed, which is what a back reference may refer to.
     closed: Vec<bool>,
     backref: bool,
     depth: usize,
 }
 
-impl Parser {
+impl<'c> Parser<'c> {
     fn advance(&mut self) -> Result<(), Code> {
         self.lexer.advance()
     }
@@ -245,11 +252,11 @@ impl Parser {
                     return Err(Code::Paren);
                 }
                 self.advance()?;
-                character(')', cflags.icase)
+                self.character(')', cflags.icase)
             }
             Tok::Plain(ch) => {
                 self.advance()?;
-                character(ch, cflags.icase)
+                self.character(ch, cflags.icase)
             }
             Tok::LBracket(positive) => {
                 let class = self.bracket(positive)?;
@@ -258,21 +265,11 @@ impl Parser {
             }
             Tok::ClassS(cls) => {
                 self.advance()?;
-                let (ranges, named) = parts(cls, cflags.icase);
-                Ast::Class(Class {
-                    negated: false,
-                    ranges: ranges.to_vec(),
-                    named: named.map(|named| vec![(named, true)]).unwrap_or_default(),
-                })
+                Ast::Class(Class::of(self.parts(cls, cflags.icase)))
             }
             Tok::ClassC(cls) => {
                 self.advance()?;
-                let (ranges, named) = parts(cls, cflags.icase);
-                Ast::Class(Class {
-                    negated: true,
-                    ranges: ranges.to_vec(),
-                    named: named.map(|named| vec![(named, true)]).unwrap_or_default(),
-                })
+                Ast::Class(Class { negated: true, ..Class::of(self.parts(cls, cflags.icase)) })
             }
             Tok::Dot => {
                 self.advance()?;
@@ -445,30 +442,18 @@ impl Parser {
     fn bracket(&mut self, positive: bool) -> Result<Class, Code> {
         let icase = self.cflags().icase;
         let mut ranges: Vec<(char, char)> = Vec::new();
-        let mut named: Vec<(Named, bool)> = Vec::new();
         let mut complemented: Vec<Cls> = Vec::new();
         self.advance()?;
         while !matches!(self.lexer.next, Tok::RBracket | Tok::Eos) {
-            self.item(icase, &mut ranges, &mut named, &mut complemented)?;
+            self.item(icase, &mut ranges, &mut complemented)?;
         }
         for cls in complemented {
-            let (held, class) = parts(cls, icase);
-            match class {
-                Some(class) => {
-                    ranges.extend(
-                        complement(held).into_iter().filter(|&(low, _)| low.is_ascii()).map(
-                            |(low, high)| (low, if high.is_ascii() { high } else { '\u{7f}' }),
-                        ),
-                    );
-                    named.push((class, false));
-                }
-                None => ranges.extend(complement(held)),
-            }
+            ranges.extend(complement(self.parts(cls, icase)));
         }
         if !positive && self.cflags().nlstop {
             ranges.push(('\n', '\n'));
         }
-        Ok(Class { negated: !positive, ranges, named })
+        Ok(Class { negated: !positive, ranges })
     }
 
     /// `brackpart`: one item of a bracket, or one range.
@@ -476,7 +461,6 @@ impl Parser {
         &mut self,
         icase: bool,
         ranges: &mut Vec<(char, char)>,
-        named: &mut Vec<(Named, bool)>,
         complemented: &mut Vec<Cls>,
     ) -> Result<(), Code> {
         let start = match self.lexer.next {
@@ -484,7 +468,7 @@ impl Parser {
             Tok::Plain(ch) => {
                 self.advance()?;
                 if !matches!(self.lexer.next, Tok::Range(_)) {
-                    add_cases(ranges, ch, icase);
+                    self.add_cases(ranges, ch, icase);
                     return Ok(());
                 }
                 ch
@@ -495,7 +479,7 @@ impl Parser {
             }
             Tok::Eclass => {
                 let name = self.lexer.name()?;
-                add_cases(ranges, element(&name)?, icase);
+                self.add_cases(ranges, element(&name)?, icase);
                 return Ok(());
             }
             Tok::Cclass => {
@@ -504,16 +488,12 @@ impl Parser {
                     return Err(Code::Ctype);
                 }
                 let cls = Cls::named(&name).ok_or(Code::Ctype)?;
-                let (held, class) = parts(cls, icase);
-                ranges.extend_from_slice(held);
-                named.extend(class.map(|class| (class, true)));
+                ranges.extend_from_slice(self.parts(cls, icase));
                 return Ok(());
             }
             Tok::ClassS(cls) => {
                 self.advance()?;
-                let (held, class) = parts(cls, icase);
-                ranges.extend_from_slice(held);
-                named.extend(class.map(|class| (class, true)));
+                ranges.extend_from_slice(self.parts(cls, icase));
                 return Ok(());
             }
             Tok::ClassC(cls) => {
@@ -539,88 +519,93 @@ impl Parser {
         } else {
             start
         };
-        range(ranges, start, end, icase)
+        self.range(ranges, start, end, icase)
+    }
+
+    /// One character, or under case folding the set `allcases` gives, which is its lower and
+    /// upper case by the collation and not necessarily the character itself: a title case letter
+    /// matches neither its own spelling nor anything but the other two.
+    fn character(&self, ch: char, icase: bool) -> Ast {
+        if !icase {
+            return Ast::Literal(ch);
+        }
+        let (lower, upper) = (self.ctype.lower(ch), self.ctype.upper(ch));
+        if lower == upper {
+            return Ast::Literal(lower);
+        }
+        Ast::Class(Class::of(&[(lower, lower), (upper, upper)]))
+    }
+
+    fn add_cases(&self, ranges: &mut Vec<(char, char)>, ch: char, icase: bool) {
+        if !icase {
+            ranges.push((ch, ch));
+            return;
+        }
+        let (lower, upper) = (self.ctype.lower(ch), self.ctype.upper(ch));
+        ranges.push((lower, lower));
+        ranges.push((upper, upper));
+    }
+
+    /// `range`: the characters from one to the other, and under case folding the other case of
+    /// each one outside the range, with PostgreSQL's limit on how many that may be.
+    fn range(
+        &self,
+        ranges: &mut Vec<(char, char)>,
+        low: char,
+        high: char,
+        icase: bool,
+    ) -> Result<(), Code> {
+        if low > high {
+            return Err(Code::Range);
+        }
+        ranges.push((low, high));
+        if !icase {
+            return Ok(());
+        }
+        let span = high as u32 - low as u32 + 1;
+        let space = if span > 100_000 { 100_000 } else { span } as usize;
+        let mut added = 0usize;
+        for ch in (low as u32..=high as u32).filter_map(char::from_u32) {
+            for other in [self.ctype.lower(ch), self.ctype.upper(ch)] {
+                if other != ch && (other < low || other > high) {
+                    if added >= space {
+                        return Err(Code::TooBig);
+                    }
+                    ranges.push((other, other));
+                    added += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `cclasscvec`: the characters of a class. The classes `ascii`, `blank`, `cntrl` and
+    /// `xdigit` are the same in every collation, and the collation gives the others. Under case
+    /// folding `lower` and `upper` are `alpha`.
+    fn parts(&self, cls: Cls, icase: bool) -> &'c [(char, char)] {
+        let class = match cls {
+            Cls::Ascii => return &[('\0', '\u{7f}')],
+            Cls::Blank => return &[('\t', '\t'), (' ', ' ')],
+            Cls::Cntrl => return &[('\0', '\u{1f}'), ('\u{7f}', '\u{9f}')],
+            Cls::Xdigit => return &[('0', '9'), ('A', 'F'), ('a', 'f')],
+            Cls::Lower | Cls::Upper if icase => PgClass::Alpha,
+            Cls::Alnum => PgClass::Alnum,
+            Cls::Alpha => PgClass::Alpha,
+            Cls::Digit => PgClass::Digit,
+            Cls::Graph => PgClass::Graph,
+            Cls::Lower => PgClass::Lower,
+            Cls::Print => PgClass::Print,
+            Cls::Punct => PgClass::Punct,
+            Cls::Space => PgClass::Space,
+            Cls::Upper => PgClass::Upper,
+            Cls::Word => PgClass::Word,
+        };
+        self.ctype.class(class)
     }
 }
 
 fn prefer(greedy: bool) -> u8 {
     if greedy { LONGER } else { SHORTER }
-}
-
-/// One character, or under case folding the set `allcases` gives, which is its lower and upper
-/// case and not necessarily the character itself: a title case letter matches neither its own
-/// spelling nor anything but the other two.
-fn character(ch: char, icase: bool) -> Ast {
-    if !icase {
-        return Ast::Literal(ch);
-    }
-    let (lower, upper) = (simple_lower(ch), simple_upper(ch));
-    if lower == upper {
-        return Ast::Literal(lower);
-    }
-    Ast::Class(Class::of(&[(lower, lower), (upper, upper)]))
-}
-
-fn add_cases(ranges: &mut Vec<(char, char)>, ch: char, icase: bool) {
-    if !icase {
-        ranges.push((ch, ch));
-        return;
-    }
-    let (lower, upper) = (simple_lower(ch), simple_upper(ch));
-    ranges.push((lower, lower));
-    ranges.push((upper, upper));
-}
-
-/// `range`: the characters from one to the other, and under case folding the other case of each
-/// one outside the range, with PostgreSQL's limit on how many that may be.
-fn range(ranges: &mut Vec<(char, char)>, low: char, high: char, icase: bool) -> Result<(), Code> {
-    if low > high {
-        return Err(Code::Range);
-    }
-    ranges.push((low, high));
-    if !icase {
-        return Ok(());
-    }
-    let span = high as u32 - low as u32 + 1;
-    let space = if span > 100_000 { 100_000 } else { span } as usize;
-    let mut added = 0usize;
-    for ch in (low as u32..=high as u32).filter_map(char::from_u32) {
-        for other in [simple_lower(ch), simple_upper(ch)] {
-            if other != ch && (other < low || other > high) {
-                if added >= space {
-                    return Err(Code::TooBig);
-                }
-                ranges.push((other, other));
-                added += 1;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `cclasscvec`: the ASCII ranges of a class and the named class that holds the rest. Under case
-/// folding `lower` and `upper` are `alpha`.
-fn parts(cls: Cls, icase: bool) -> (&'static [(char, char)], Option<Named>) {
-    let cls = match cls {
-        Cls::Lower | Cls::Upper if icase => Cls::Alpha,
-        other => other,
-    };
-    match cls {
-        Cls::Alnum => (&[('0', '9'), ('A', 'Z'), ('a', 'z')], Some(Named::Alnum)),
-        Cls::Alpha => (&[('A', 'Z'), ('a', 'z')], Some(Named::Alpha)),
-        Cls::Ascii => (&[('\0', '\u{7f}')], None),
-        Cls::Blank => (&[('\t', '\t'), (' ', ' ')], None),
-        Cls::Cntrl => (&[('\0', '\u{1f}'), ('\u{7f}', '\u{9f}')], None),
-        Cls::Digit => (&[('0', '9')], None),
-        Cls::Graph => (&[('!', '~')], Some(Named::Graph)),
-        Cls::Lower => (&[('a', 'z')], Some(Named::Lower)),
-        Cls::Print => (&[(' ', '~')], Some(Named::Print)),
-        Cls::Punct => (&[('!', '/'), (':', '@'), ('[', '`'), ('{', '~')], Some(Named::Punct)),
-        Cls::Space => (&[('\t', '\r'), (' ', ' ')], Some(Named::Space)),
-        Cls::Upper => (&[('A', 'Z')], Some(Named::Upper)),
-        Cls::Xdigit => (&[('0', '9'), ('A', 'F'), ('a', 'f')], None),
-        Cls::Word => (&[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], Some(Named::Alnum)),
-    }
 }
 
 /// `element`: the character a collating name stands for.
