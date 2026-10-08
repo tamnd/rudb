@@ -117,6 +117,7 @@ mod number;
 mod number_format;
 mod numeric;
 mod param;
+mod polymorphic;
 mod procs;
 mod reg;
 mod resolve;
@@ -166,6 +167,7 @@ pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,
     soft_input_error,
 };
+pub use polymorphic::{Generic, enforce_generic_types};
 pub use procs::{Proc, builtin_procs, func_name_as_type, procs};
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,

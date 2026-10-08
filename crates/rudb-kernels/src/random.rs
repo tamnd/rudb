@@ -84,6 +84,20 @@ pub fn random(rows: usize) -> Result<Vector> {
     Vector::flat(LogicalType::Double, Data::Float64(values.into()))
 }
 
+/// The generator of `pg_global_prng_state` in PostgreSQL, which `array_shuffle` and
+/// `array_sample` draw from and `setseed` does not move.
+static GLOBAL: Mutex<Option<Pcg32>> = Mutex::new(None);
+
+/// A number in `0..=bound` from the generator that `setseed` does not move.
+pub(crate) fn unseeded_up_to(bound: u64) -> u64 {
+    let mut global = GLOBAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let drawn = global.get_or_insert_with(|| Pcg32::seeded(entropy())).next64();
+    match bound.checked_add(1) {
+        Some(span) => drawn % span,
+        None => drawn,
+    }
+}
+
 /// Whether `name` is a call with no arguments that the executor has to give a row count to.
 #[must_use]
 pub fn draws(name: &str) -> bool {

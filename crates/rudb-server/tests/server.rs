@@ -1741,6 +1741,135 @@ fn string_to_table_and_normalize_give_the_rows_and_the_values_of_postgres() {
 }
 
 #[test]
+fn the_array_functions_resolve_their_types_and_give_the_values_of_postgres() {
+    let dirs = Dirs::new("pgarrays");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
+    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
+    let cases: [(&str, &[&str]); 16] = [
+        ("select array_dims(array[1,2,3]), array_dims('{}'::int[]);", &["[1:3]|"]),
+        (
+            "select array_position(array['a','b','c'], 'b'), array_positions(array[1,2,1], 1);",
+            &["2|{1,3}"],
+        ),
+        (
+            "select array_position(array[1,2,3], 3, 2), array_position(array[1,2,3], 1, 2), array_position(array[1], 1.5);",
+            &["3||"],
+        ),
+        (
+            "select array_position(array[1,null], null::int), array_positions(array[null,1,null], null::int);",
+            &["2|{1,3}"],
+        ),
+        (
+            "select array_remove(array[1,2,1], 1), array_replace(array[1,2,1], 1, 9), array_replace(array[1,2], 2, null);",
+            &["{2}|{9,2,9}|{1,NULL}"],
+        ),
+        ("select array_remove('{1}', 1), array_remove(array[1,null], null);", &["{}|{1}"]),
+        (
+            "select trim_array(array[1,2,3], 1), trim_array(array[1,2,3], 0), trim_array(array[1,2,3], 3);",
+            &["{1,2}|{1,2,3}|{}"],
+        ),
+        (
+            "select array_reverse(array[1,2,3]), array_sort(array[3,1,2]), array_sort(array[3,null,1], true), array_sort(array[3,null,1], false, true);",
+            &["{3,2,1}|{1,2,3}|{NULL,3,1}|{NULL,1,3}"],
+        ),
+        (
+            "select array_sample(array[1], 1), array_shuffle(array[1]), array_shuffle(array[]::int[]), cardinality(array_sample(array[1,2,3], 3));",
+            &["{1}|{1}|{}|3"],
+        ),
+        (
+            "select width_bucket(5, array[1,4,8]), width_bucket(0, array[1,2]), width_bucket(9.5, array[1,2.5,9.5]), width_bucket('b'::text, array['a','c']);",
+            &["2|0|3|1"],
+        ),
+        (
+            "select array_to_string(array[1,null,3], ','), array_to_string(array[1,null,3], ',', '*');",
+            &["1,3|1,*,3"],
+        ),
+        (
+            "select array_to_string(array[true,false,null], '-', 'n'), array_to_string(array[1.5::float8, 1e20, 'NaN'], ';');",
+            &["t-f-n|1.5;1e+20;NaN"],
+        ),
+        (
+            "select array_to_string('{}'::int[], ','), array_to_string(array[null::int], ','), array_to_string(array[null::int, 1], ',');",
+            &["||1"],
+        ),
+        (
+            "select array_to_string(array['a','b'], null, 'x'), array_to_string(null::int[], ',', 'x'), array_to_string(array[null,'b'], ',', null);",
+            &["||b"],
+        ),
+        (
+            "select array_to_string(array['2024-01-02'::date, null], '|', ''), array_to_string(array['\\x01ff'::bytea], ','), array_to_string(array[1.50::numeric], ',');",
+            &["2024-01-02||\\x01ff|1.50"],
+        ),
+        (
+            "select pg_typeof(array_reverse(array[1.5])), pg_typeof(array_positions(array['a'], 'a')), pg_typeof(array_to_string(array[1], ','));",
+            &["numeric[]|integer[]|text"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        (
+            "select array_reverse('{1,2}');",
+            "42804",
+            "could not determine polymorphic type because input has type unknown",
+        ),
+        (
+            "select array_to_string('{a,b}', ',');",
+            "42804",
+            "could not determine polymorphic type because input has type unknown",
+        ),
+        (
+            "select array_remove(array[1], 'x');",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        (
+            "select array_cat(array[1], array['a']);",
+            "42883",
+            "function array_cat(integer[], text[]) does not exist",
+        ),
+        (
+            "select array_position(array[1,2], 2, null::int);",
+            "22004",
+            "initial position must not be null",
+        ),
+        (
+            "select trim_array(array[1,2], 3);",
+            "2202E",
+            "number of elements to trim must be between 0 and 2",
+        ),
+        ("select array_sample(array[1,2], -1);", "22023", "sample size must be between 0 and 2"),
+        (
+            "select width_bucket(5, array[1,null]);",
+            "22004",
+            "thresholds array must not contain NULLs",
+        ),
+    ] {
+        // An error of a kernel comes after the row description.
+        let messages = client.query(sql);
+        assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_parameter_in_a_call_gets_the_type_of_postgres() {
     let dirs = Dirs::new("unknowns");
     let server = Server::start(dirs.config()).unwrap();

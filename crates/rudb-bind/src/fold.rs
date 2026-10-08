@@ -75,6 +75,12 @@ pub const VOLATILE: [&str; 30] = [
     "write_log",
 ];
 
+/// Whether a call of the function `name` can give two values for the same arguments: a name of
+/// [`VOLATILE`], or the kernel of a volatile function of `pg_proc`.
+pub fn volatile_function(name: &str) -> bool {
+    VOLATILE.contains(&name) || rudb_kernels::pgproc::volatile(name)
+}
+
 /// Raises the first error of a part of the plan that PostgreSQL works out when it plans the query.
 ///
 /// The planner of PostgreSQL folds each call whose arguments are all constants, in every expression
@@ -251,7 +257,7 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
         }
         Expr::Function { name, args } => {
             let name = plan.string(name);
-            if VOLATILE.contains(&name) {
+            if volatile_function(name) {
                 return Ok(None);
             }
             // A call on a `TIMESTAMPTZ`, or one that makes one, reads the session zone the same way

@@ -3726,6 +3726,26 @@ impl Binder<'_> {
         self.checked_cast_to(expr, &LogicalType::Varchar, false)
     }
 
+    /// The array `expr` with each element as text by [`output_text`](Self::output_text), and each
+    /// element of an array of more dimensions the same way.
+    pub(crate) fn output_texts(&mut self, expr: ExprRef) -> Result<ExprRef> {
+        let LogicalType::List(element) = self.plan().expr_type(expr).clone() else {
+            return self.output_text(expr);
+        };
+        let table = self.fresh_index();
+        let name = self.plan_mut().intern("x");
+        let params = self.plan_mut().add_name_list(&[name]);
+        let value =
+            self.add_expr(Expr::LambdaParam(rudb_plan::ColumnBinding::new(table, 0)), *element);
+        let body = self.output_texts(value)?;
+        let text = self.plan().expr_type(body).clone();
+        let lambda = self.add_expr(Expr::Lambda { table, params, body }, text.clone());
+        let args = self.plan_mut().add_expr_list(&[expr, lambda]);
+        let transform = self.plan_mut().intern(crate::lambda::TRANSFORM);
+        Ok(self
+            .add_expr(Expr::Function { name: transform, args }, LogicalType::List(Box::new(text))))
+    }
+
     /// The cast of `expr` to text with the output function of the PostgreSQL type `oid`, as
     /// `__rudb_pg_output` with the settings that the output reads. A new value of a setting makes
     /// a new PostgreSQL session value, so a plan that read the old value is not used again.
@@ -5087,9 +5107,7 @@ const STRICT_MATH: &[&str] = &[
 pub(crate) fn volatile(plan: &Plan, expr: ExprRef) -> bool {
     let within = |slice| plan.expr_list(slice).iter().any(|&child| volatile(plan, child));
     match *plan.expr(expr) {
-        Expr::Function { name, args } => {
-            fold::VOLATILE.contains(&plan.string(name)) || within(args)
-        }
+        Expr::Function { name, args } => fold::volatile_function(plan.string(name)) || within(args),
         Expr::Cast { input, .. } => volatile(plan, input),
         Expr::Compare { left, right, .. } => volatile(plan, left) || volatile(plan, right),
         Expr::Conjunction { children, .. } => within(children),
