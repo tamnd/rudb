@@ -116,6 +116,7 @@ mod number;
 mod number_format;
 mod numeric;
 mod param;
+mod procs;
 mod reg;
 mod row;
 mod scalar;
@@ -129,7 +130,10 @@ pub use array::{
     oidvector_in, oidvector_out, oidvector_recv, oidvector_send,
 };
 pub use binary::{Recv, name_recv};
-pub use coerce::{Mismatch, can_coerce_assigned, can_coerce_implicitly, common_type, is_preferred};
+pub use coerce::{
+    Cast, CoercionContext, CoercionPath, Mismatch, can_coerce_assigned, can_coerce_implicitly,
+    common_type, find_cast, find_coercion_pathway, is_preferred,
+};
 pub use datetime::{
     Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
     DateTemplate, DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
@@ -160,6 +164,7 @@ pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,
     soft_input_error,
 };
+pub use procs::{Proc, func_name_as_type, procs};
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };

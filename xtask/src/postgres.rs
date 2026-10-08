@@ -64,6 +64,7 @@ const VENDORS: [Vendor; 5] = [
         files: &[
             ("src/include/catalog/pg_type.dat", "pg_type.dat"),
             ("src/include/catalog/pg_cast.dat", "pg_cast.dat"),
+            ("src/include/catalog/pg_proc.dat", "pg_proc.dat"),
             ("src/timezone/tznames/Default", "tznames-Default"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
@@ -113,7 +114,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 11] = [
+const GENERATED: [Generated; 12] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -144,6 +145,14 @@ const GENERATED: [Generated; 11] = [
             "crates/rudb-pgtypes/vendor/pg_cast.dat",
         ],
         generate: |texts| pgcast(&texts[0], &texts[1]),
+    },
+    Generated {
+        output: "crates/rudb-pgtypes/src/generated/procs.rs",
+        inputs: &[
+            "crates/rudb-pgtypes/vendor/pg_type.dat",
+            "crates/rudb-pgtypes/vendor/pg_proc.dat",
+        ],
+        generate: |texts| pgproc(&texts[0], &texts[1]),
     },
     Generated {
         output: "crates/rudb-pgparse/src/generated/gram.rules",
@@ -783,25 +792,39 @@ fn pgtype(text: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Renders the preferred types of `pg_type.dat` and the implicit casts of `pg_cast.dat`, which
-/// are what `select_common_type` of PostgreSQL reads. `pg_cast.dat` names each type by its
-/// `typname`.
-fn pgcast(types: &str, casts: &str) -> Result<String, String> {
+/// The OID of each `typname` of `pg_type.dat`, with the array types that `array_type_oid` asks
+/// for under the name of the element with `_` in front, as `genbki.pl` names them.
+fn type_oids(types: &str) -> Result<BTreeMap<String, u32>, String> {
     let mut oids = BTreeMap::new();
-    let mut preferred = Vec::new();
     for entry in dat_entries("pg_type.dat", types)? {
         let name = entry.get("typname").ok_or("pg_type.dat: an entry with no typname")?;
-        let oid: u32 = entry
-            .get("oid")
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| format!("pg_type.dat: {name} has a bad oid"))?;
-        if entry.get("typispreferred").map(String::as_str) == Some("t") {
-            preferred.push(oid);
+        let oid = |key: &str| {
+            entry
+                .get(key)
+                .and_then(|v| v.parse::<u32>().ok())
+                .ok_or_else(|| format!("pg_type.dat: {name} has a bad {key}"))
+        };
+        oids.insert(name.clone(), oid("oid")?);
+        if entry.contains_key("array_type_oid") {
+            oids.insert(format!("_{name}"), oid("array_type_oid")?);
         }
-        oids.insert(name.clone(), oid);
     }
-    let mut implicit = Vec::new();
-    let mut assignment = Vec::new();
+    Ok(oids)
+}
+
+/// Renders the preferred types of `pg_type.dat` and every cast of `pg_cast.dat`, which are what
+/// `select_common_type` and `find_coercion_pathway` of PostgreSQL read. `pg_cast.dat` names each
+/// type by its `typname`.
+fn pgcast(types: &str, casts: &str) -> Result<String, String> {
+    let oids = type_oids(types)?;
+    let mut preferred = Vec::new();
+    for entry in dat_entries("pg_type.dat", types)? {
+        if entry.get("typispreferred").map(String::as_str) == Some("t") {
+            let name = entry.get("typname").map(String::as_str).unwrap_or_default();
+            preferred.push(oids[name]);
+        }
+    }
+    let mut rows = Vec::new();
     for entry in dat_entries("pg_cast.dat", casts)? {
         let oid = |key: &str| {
             let name =
@@ -809,33 +832,25 @@ fn pgcast(types: &str, casts: &str) -> Result<String, String> {
             oids.get(name).copied().ok_or_else(|| format!("pg_cast.dat: no type {name}"))
         };
         let (source, target) = (oid("castsource")?, oid("casttarget")?);
-        match entry.get("castcontext").map(String::as_str) {
-            Some("i") => implicit.push((source, target)),
-            Some("a") => assignment.push((source, target)),
-            Some("e") => {}
-            _ => {
-                return Err(format!(
-                    "pg_cast.dat: the cast {source} to {target} has a bad castcontext"
-                ));
-            }
-        }
+        let letter = |key: &str, letters: &str| match entry.get(key).map(String::as_str) {
+            Some(v) if v.len() == 1 && letters.contains(v) => Ok(v.to_string()),
+            _ => Err(format!("pg_cast.dat: the cast {source} to {target} has a bad {key}")),
+        };
+        rows.push((source, target, letter("castcontext", "iae")?, letter("castmethod", "fib")?));
     }
     preferred.sort_unstable();
-    implicit.sort_unstable();
-    assignment.sort_unstable();
-    let mut both = [implicit.as_slice(), assignment.as_slice()].concat();
-    both.sort_unstable();
-    if both.windows(2).any(|w| w[0] == w[1]) {
+    rows.sort_unstable();
+    if rows.windows(2).any(|w| (w[0].0, w[0].1) == (w[1].0, w[1].1)) {
         return Err("pg_cast.dat: two casts have the same types".to_string());
     }
     let mut out = String::from(
-        "//! The preferred types of `pg_type.dat` and the implicit and assignment casts of\n\
-         //! `pg_cast.dat`.\n\
+        "//! The preferred types of `pg_type.dat` and the casts of `pg_cast.dat`.\n\
          //!\n\
          //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgtypes/vendor/pg_type.dat` and\n\
          //! `crates/rudb-pgtypes/vendor/pg_cast.dat`. Do not edit. `cargo xtask pg-check` runs in the\n\
          //! gate and fails if this file and the vendored files disagree.\n\
          \n\
+         use crate::coerce::{Cast, c};\n\
          use crate::types::Oid;\n\
          \n",
     );
@@ -844,27 +859,149 @@ fn pgcast(types: &str, casts: &str) -> Result<String, String> {
         "/// The types with `typispreferred`, in the order of the OIDs.\n\
          pub(crate) static PREFERRED: [Oid; {}] = {preferred:?};\n\
          \n\
-         /// Every cast with `castcontext` `i`, as the source and the target, in order.\n\
-         pub(crate) static IMPLICIT: [(Oid, Oid); {}] = [",
+         /// Every cast in the order of the source and the target: the source, the target,\n\
+         /// `castcontext` and `castmethod`.\n\
+         pub(crate) static CASTS: [Cast; {}] = [",
         preferred.len(),
-        implicit.len()
+        rows.len()
     );
-    for (source, target) in implicit {
-        let _ = writeln!(out, "    ({source}, {target}),");
-    }
-    let _ = writeln!(
-        out,
-        "];\n\
-         \n\
-         /// Every cast with `castcontext` `a`, as the source and the target, in order.\n\
-         pub(crate) static ASSIGNMENT: [(Oid, Oid); {}] = [",
-        assignment.len()
-    );
-    for (source, target) in assignment {
-        let _ = writeln!(out, "    ({source}, {target}),");
+    for (source, target, context, method) in rows {
+        let _ = writeln!(out, "    c({source}, {target}, b'{context}', b'{method}'),");
     }
     out.push_str("];\n");
     Ok(out)
+}
+
+/// Renders the functions of `pg_proc.dat` in the order of the name and the OID, which is the
+/// order in which a call finds the functions of its name. A function takes its input arguments,
+/// the arguments of `proargtypes`, and the names of these come from `proargnames`, without the
+/// output arguments when `proargmodes` has some. The defaults of `proargdefaults` belong to the
+/// last input arguments. A field that an entry leaves out has the default of `pg_proc.h`.
+fn pgproc(types: &str, procs: &str) -> Result<String, String> {
+    let oids = type_oids(types)?;
+    let mut rows = Vec::new();
+    for entry in dat_entries("pg_proc.dat", procs)? {
+        let field = |key: &str| entry.get(key).map(String::as_str);
+        let name = field("proname").ok_or("pg_proc.dat: an entry with no proname")?;
+        let bad = |what: &str| format!("pg_proc.dat: {name} has a bad {what}");
+        let oid: u32 = field("oid").and_then(|v| v.parse().ok()).ok_or_else(|| bad("oid"))?;
+        let type_oid = |typname: &str| {
+            oids.get(typname).copied().ok_or_else(|| format!("pg_proc.dat: no type {typname}"))
+        };
+        let args: Vec<u32> = field("proargtypes")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(type_oid)
+            .collect::<Result<_, _>>()?;
+        let result = type_oid(field("prorettype").ok_or_else(|| bad("prorettype"))?)?;
+        let variadic = match field("provariadic") {
+            None | Some("0") => 0,
+            Some(typname) => type_oid(typname)?,
+        };
+        let letter = |key: &str, default: char, letters: &str| match field(key) {
+            None => Ok(default),
+            Some(v) if v.len() == 1 && letters.contains(v) => {
+                Ok(v.chars().next().unwrap_or(default))
+            }
+            Some(_) => Err(bad(key)),
+        };
+        let kind = letter("prokind", 'f', "fawp")?;
+        let strict = letter("proisstrict", 't', "tf")? == 't';
+        let retset = letter("proretset", 'f', "tf")? == 't';
+        let volatility = letter("provolatile", 'i', "isv")?;
+        let mut names = field("proargnames").map(array_items).unwrap_or_default();
+        if let Some(modes) = field("proargmodes").map(array_items) {
+            if modes.len() != names.len() && !names.is_empty() {
+                return Err(bad("proargnames"));
+            }
+            names = names
+                .into_iter()
+                .zip(&modes)
+                .filter(|(_, mode)| matches!(mode.as_str(), "i" | "b" | "v"))
+                .map(|(name, _)| name)
+                .collect();
+        }
+        if !names.is_empty() && names.len() != args.len() {
+            return Err(bad("proargnames"));
+        }
+        let defaults = field("proargdefaults").map(array_items).unwrap_or_default();
+        if defaults.len() > args.len() {
+            return Err(bad("proargdefaults"));
+        }
+        rows.push((
+            name.to_string(),
+            oid,
+            args,
+            result,
+            variadic,
+            kind,
+            strict,
+            retset,
+            volatility,
+            names,
+            defaults,
+        ));
+    }
+    rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    if rows.windows(2).any(|w| w[0].1 == w[1].1) {
+        return Err("pg_proc.dat: two functions have the same OID".to_string());
+    }
+    let strings = |items: &[String]| {
+        let quoted: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
+        format!("&[{}]", quoted.join(", "))
+    };
+    let mut out = String::from(
+        "//! The built-in functions of PostgreSQL, one for each entry of `pg_proc.dat`.\n\
+         //!\n\
+         //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgtypes/vendor/pg_type.dat` and\n\
+         //! `crates/rudb-pgtypes/vendor/pg_proc.dat`. Do not edit. `cargo xtask pg-check` runs in the\n\
+         //! gate and fails if this file and the vendored files disagree.\n\
+         \n\
+         use crate::procs::{Proc, p};\n\
+         \n",
+    );
+    let _ = writeln!(
+        out,
+        "/// Every function in the order of the name and the OID: the OID, `proname`, the input\n\
+         /// argument types, `prorettype`, `provariadic`, `prokind`, `proisstrict`, `proretset`,\n\
+         /// `provolatile`, the names of the input arguments and `proargdefaults`.\n\
+         pub(crate) static PROCS: [Proc; {}] = [",
+        rows.len()
+    );
+    for (name, oid, args, result, variadic, kind, strict, retset, volatility, names, defaults) in
+        &rows
+    {
+        let _ = writeln!(
+            out,
+            "    p({oid}, {name:?}, &{args:?}, {result}, {variadic}, b'{kind}', {strict}, {retset}, b'{volatility}', {}, {}),",
+            strings(names),
+            strings(defaults)
+        );
+    }
+    out.push_str("];\n");
+    Ok(out)
+}
+
+/// The items of an array literal of a `.dat` file, such as `{"{}",false}`. An item in double
+/// quotes loses them, and a backslash in it keeps the character after it.
+fn array_items(text: &str) -> Vec<String> {
+    let inner = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')).unwrap_or(text);
+    let mut items = Vec::new();
+    if inner.is_empty() {
+        return items;
+    }
+    let (mut item, mut quoted) = (String::new(), false);
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => quoted = !quoted,
+            '\\' if quoted => item.extend(chars.next()),
+            ',' if !quoted => items.push(std::mem::take(&mut item)),
+            c => item.push(c),
+        }
+    }
+    items.push(item);
+    items
 }
 
 /// The version in the `project()` call of the top `meson.build`, for example `19beta4`.
