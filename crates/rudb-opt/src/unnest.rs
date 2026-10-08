@@ -592,7 +592,7 @@ fn scalar_aggregate_domain(
         .map(|call| {
             let call = replace_inner(plan, call, inner_index, &inner_outputs);
             let call = replace_inner(plan, call, domain_index, &domain_outputs);
-            count_with_presence(plan, call, presence)
+            with_presence(plan, call, presence)
         })
         .collect();
 
@@ -665,8 +665,14 @@ fn scalar_aggregate_domain(
 ///
 /// Grouping only the matching inner rows would leave no row for a missing key, while a scalar
 /// count over an empty input is zero. A left join from the distinct outer domain creates one
-/// padded row for that key. Count filters include an inner-key presence test so the padded row is
-/// not counted, while the other aggregates keep their ordinary NULL-on-empty behavior.
+/// padded row for that key. Every aggregate gets an inner-key presence test as a filter so the
+/// padded row is not counted, and is not an element of a `list` either, while the aggregates that
+/// answer null over no rows still do.
+///
+/// A projection over the aggregates that is not null when they are takes this rule too, with no
+/// count in it, since its answer for a missing key is the projection over nulls and not a null.
+/// `(SELECT coalesce(sum(v), 7) FROM c WHERE c.g = p.g)` is 7 for a `p` row with no match on the
+/// pin, and a `CASE` over `bool_or` is whatever its `ELSE` says.
 fn scalar_count_aggregate(
     plan: &mut Plan,
     left: NodeRef,
@@ -693,9 +699,12 @@ fn scalar_count_aggregate(
     if !plan.expr_list(groups).is_empty() {
         return None;
     }
-    if !plan.expr_list(aggregates).iter().any(|&call| {
+    let counts = plan.expr_list(aggregates).iter().any(|&call| {
         matches!(*plan.expr(call), Expr::Aggregate { name, .. } if matches!(plan.string(name), "count" | "count_star"))
-    }) {
+    });
+    let padded =
+        plan.expr_list(exprs).iter().any(|&expr| !null_over_nulls(plan, expr, aggregate_index));
+    if !counts && !padded {
         return None;
     }
     let Node::Filter { input, predicate } = *plan.node(filtered) else {
@@ -775,7 +784,7 @@ fn scalar_count_aggregate(
         .expr_list(aggregates)
         .to_vec()
         .into_iter()
-        .map(|call| count_with_presence(plan, call, presence))
+        .map(|call| with_presence(plan, call, presence))
         .collect();
     let original_groups = plan.expr_list(groups).to_vec();
     let mut grouped_exprs = original_groups.clone();
@@ -845,13 +854,36 @@ fn null_safe_equality(plan: &mut Plan, expr: ExprRef) -> ExprRef {
     )
 }
 
-fn count_with_presence(plan: &mut Plan, call: ExprRef, presence: ExprRef) -> ExprRef {
+/// Whether an expression over the outputs of an aggregate is null whenever all of them are.
+///
+/// A key no inner row matched comes out of a join as nulls, which is the answer of the projection
+/// over the aggregates only when that projection keeps a null a null. A column, a cast of one and
+/// arithmetic or a comparison with one as an operand do. `coalesce`, a `CASE`, a constant and
+/// anything this does not know are taken not to.
+fn null_over_nulls(plan: &Plan, expr: ExprRef, index: u32) -> bool {
+    match *plan.expr(expr) {
+        Expr::Column(binding) => binding.table == index,
+        Expr::Cast { input, .. } => null_over_nulls(plan, input, index),
+        Expr::Compare { op, left, right } => {
+            !matches!(op, CompareOp::DistinctFrom | CompareOp::NotDistinctFrom)
+                && (null_over_nulls(plan, left, index) || null_over_nulls(plan, right, index))
+        }
+        Expr::Function { name, args } => {
+            matches!(plan.string(name), "+" | "-" | "*" | "/" | "//" | "%")
+                && plan.expr_list(args).iter().any(|&arg| null_over_nulls(plan, arg, index))
+        }
+        _ => false,
+    }
+}
+
+/// An aggregate that skips the padded row a left join from the domain adds for a missing key.
+///
+/// `count(*)` becomes a count of the presence column, and every other call gets a filter that the
+/// presence column is not null, so it answers what it answers over no rows.
+fn with_presence(plan: &mut Plan, call: ExprRef, presence: ExprRef) -> ExprRef {
     let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(call) else {
         return call;
     };
-    if !matches!(plan.string(name), "count" | "count_star") {
-        return call;
-    }
     let span = plan.expr_span(call);
     let null = plan.add_value(Value::Null);
     let null = plan.add_expr_at(Expr::Constant(null), plan.expr_type(presence).clone(), span);
