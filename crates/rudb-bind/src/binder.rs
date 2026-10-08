@@ -365,6 +365,9 @@ pub(crate) struct Binder<'a> {
     /// The span every expression is placed at while a built-in macro's body is bound, which is the
     /// span of the call. See `crate::macros`.
     pub(crate) pinned_span: Option<Span>,
+    /// The arguments of a function in SQL of `pg_proc` while its body is bound in place of the
+    /// call, which `$1` and the others name there. See `crate::pgcalls`.
+    pub(crate) inlined: Option<Vec<ExprRef>>,
     /// Set while a select block aggregates, which changes what a bare column means.
     pub(crate) aggregation: Option<Aggregation>,
     /// A grouped block may need stored column order to close groups while it scans. Other queries
@@ -530,6 +533,7 @@ impl<'a> Binder<'a> {
             next_index: 0,
             current_span: Span::new(0, 0),
             pinned_span: None,
+            inlined: None,
             aggregation: None,
             want_ascending: false,
             upsert: false,

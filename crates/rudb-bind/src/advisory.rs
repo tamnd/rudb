@@ -163,6 +163,17 @@ impl Binder<'_> {
 
 /// The error of PostgreSQL for a call of a function that no form of it takes.
 pub(crate) fn no_such_function(name: &str, types: &[LogicalType], unknown: &[bool]) -> Error {
+    let message = format!("function {} does not exist", spelled_call(name, types, unknown));
+    Error::new(ErrorCode::Binder, message.clone())
+        .state(SqlState::UNDEFINED_FUNCTION)
+        .pg(message)
+        .detail("No function of that name accepts the given argument types.")
+        .hint("You might need to add explicit type casts.")
+}
+
+/// A call as the messages of PostgreSQL name it, `name(types)`, with `unknown` for a string
+/// literal and a null.
+pub(crate) fn spelled_call(name: &str, types: &[LogicalType], unknown: &[bool]) -> String {
     let spelled = types
         .iter()
         .zip(unknown)
@@ -172,10 +183,5 @@ pub(crate) fn no_such_function(name: &str, types: &[LogicalType], unknown: &[boo
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let message = format!("function {name}({spelled}) does not exist");
-    Error::new(ErrorCode::Binder, message.clone())
-        .state(SqlState::UNDEFINED_FUNCTION)
-        .pg(message)
-        .detail("No function of that name accepts the given argument types.")
-        .hint("You might need to add explicit type casts.")
+    format!("{name}({spelled})")
 }

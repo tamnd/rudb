@@ -95,6 +95,8 @@ pub mod pgarray;
 mod pgformat;
 pub mod pginput;
 pub mod pgjson;
+mod pgmath;
+pub mod pgproc;
 pub mod pgregexp;
 pub mod prepare;
 mod printf;

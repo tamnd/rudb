@@ -404,14 +404,156 @@ impl Numeric {
         if other.digits.is_empty() {
             return Err(TypeError::new(SqlState::DIVISION_BY_ZERO, "division by zero".to_string()));
         }
+        Var::from(self).modulo(&Var::from(other)).make()
+    }
+
+    /// `numeric_sign`: -1, 0 or 1, and `NaN` for `NaN`.
+    pub fn signum(&self) -> Numeric {
+        match self.sign {
+            NumericSign::NaN => Numeric::NAN,
+            NumericSign::Negative | NumericSign::NegativeInfinity => Numeric::from_integer(-1),
+            _ if self.digits.is_empty() && self.sign.is_finite() => Numeric::from_integer(0),
+            _ => Numeric::from_integer(1),
+        }
+    }
+
+    /// `numeric_scale`: the display scale, or `None` for a value that is not finite.
+    pub fn scale(&self) -> Option<i32> {
+        self.sign.is_finite().then_some(i32::from(self.dscale))
+    }
+
+    /// `numeric_min_scale`: the fewest digits after the point that show the value exactly, or
+    /// `None` for a value that is not finite.
+    pub fn min_scale(&self) -> Option<i32> {
+        self.sign.is_finite().then(|| Var::from(self).min_scale() as i32)
+    }
+
+    /// `numeric_trim_scale`: the value with no zeros at the end of the digits after the point.
+    pub fn trim_scale(&self) -> Numeric {
+        match self.min_scale() {
+            Some(scale) => Numeric { dscale: scale as u16, ..self.clone() },
+            None => self.clone(),
+        }
+    }
+
+    /// `numeric_div_trunc`: the quotient cut to an integer.
+    pub fn div_trunc(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        let (a, b) = (self.sign, other.sign);
+        if !a.is_finite() || !b.is_finite() {
+            if a == NumericSign::NaN || b == NumericSign::NaN || (!a.is_finite() && !b.is_finite())
+            {
+                return Ok(Numeric::NAN);
+            }
+            if a.is_finite() {
+                return Ok(Numeric::from_integer(0));
+            }
+            return match (b, other.digits.is_empty()) {
+                (_, true) => Err(division_by_zero()),
+                (NumericSign::Negative, _) => Ok(self.negate()),
+                _ => Ok(self.clone()),
+            };
+        }
+        if other.digits.is_empty() {
+            return Err(division_by_zero());
+        }
+        Var::from(self).div(&Var::from(other), 0, false).make()
+    }
+
+    /// `numeric_fac`: the factorial of `n`.
+    pub fn factorial(n: i64) -> Result<Numeric, TypeError> {
+        if n < 0 {
+            let message = "factorial of a negative number is undefined".to_string();
+            return Err(TypeError::new(SqlState::NUMERIC_VALUE_OUT_OF_RANGE, message));
+        }
+        if n > 32177 {
+            return Err(overflow());
+        }
+        let mut product = Var::from(&Numeric::from_integer(1));
+        for factor in 2..=n {
+            product = product.mul(&Var::from(&Numeric::from_integer(i128::from(factor))));
+        }
+        product.dscale = 0;
+        product.make()
+    }
+
+    /// `numeric_gcd`: the greatest common divisor, with the larger display scale of the two.
+    pub fn gcd(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        if !self.sign.is_finite() || !other.sign.is_finite() {
+            return Ok(Numeric::NAN);
+        }
+        Var::from(self).gcd(&Var::from(other)).make()
+    }
+
+    /// `numeric_lcm`: the least common multiple, with the larger display scale of the two.
+    pub fn lcm(&self, other: &Numeric) -> Result<Numeric, TypeError> {
+        if !self.sign.is_finite() || !other.sign.is_finite() {
+            return Ok(Numeric::NAN);
+        }
         let (x, y) = (Var::from(self), Var::from(other));
-        let mut product = y.mul(&x.div(&y, 0, false));
-        product.dscale = y.dscale;
-        product.sign = match product.sign {
-            NumericSign::Positive if !product.digits.is_empty() => NumericSign::Negative,
-            _ => NumericSign::Positive,
+        let dscale = x.dscale.max(y.dscale);
+        let mut result = match x.digits.is_empty() || y.digits.is_empty() {
+            true => Var { sign: NumericSign::Positive, weight: 0, dscale: 0, digits: Vec::new() },
+            false => {
+                let mut result = y.mul(&x.div(&x.gcd(&y), 0, false));
+                result.round(y.dscale);
+                result.sign = NumericSign::Positive;
+                result
+            }
         };
-        x.add(&product).make()
+        result.dscale = dscale;
+        result.make()
+    }
+
+    /// `width_bucket_numeric`: the bucket of `self` among `count` buckets of the same width from
+    /// `low` to `high`, with 0 below them and `count + 1` above them.
+    pub fn width_bucket(
+        &self,
+        low: &Numeric,
+        high: &Numeric,
+        count: i32,
+    ) -> Result<i32, TypeError> {
+        let invalid = |message: &str| {
+            TypeError::new(
+                SqlState::INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION,
+                message.to_string(),
+            )
+        };
+        if count <= 0 {
+            return Err(invalid("count must be greater than zero"));
+        }
+        if low.sign == NumericSign::NaN || high.sign == NumericSign::NaN {
+            return Err(invalid("lower and upper bounds cannot be NaN"));
+        }
+        if !low.sign.is_finite() || !high.sign.is_finite() {
+            return Err(invalid("lower and upper bounds must be finite"));
+        }
+        let count_var = Var::from(&Numeric::from_integer(i128::from(count)));
+        let one = Var::from(&Numeric::from_integer(1));
+        let above = count_var.add(&one);
+        let result = match low.compare(high) {
+            std::cmp::Ordering::Equal => {
+                return Err(invalid("lower bound cannot equal upper bound"));
+            }
+            std::cmp::Ordering::Less if self.compare(low).is_lt() => return Ok(0),
+            std::cmp::Ordering::Less if self.compare(high).is_ge() => above,
+            std::cmp::Ordering::Greater if self.compare(low).is_gt() => return Ok(0),
+            std::cmp::Ordering::Greater if self.compare(high).is_le() => above,
+            _ => {
+                let (operand, low, high) = (Var::from(self), Var::from(low), Var::from(high));
+                let negate = |v: &Var| Var { sign: flip(v.sign), ..v.clone() };
+                let offset = operand.add(&negate(&low)).mul(&count_var);
+                offset.div(&high.add(&negate(&low)), 0, false).add(&one)
+            }
+        };
+        let result = result.make()?;
+        result.to_integer("integer").ok().and_then(|value| i32::try_from(value).ok()).ok_or_else(
+            || {
+                TypeError::new(
+                    SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
+                    "integer out of range".to_string(),
+                )
+            },
+        )
     }
 
     /// `cmp_numerics`: `NaN` is equal to itself and above every other value, and the display scale
@@ -420,6 +562,19 @@ impl Numeric {
         let left = self.to_bytes();
         let right = other.to_bytes();
         rudb_common::numeric::key(&left).cmp(rudb_common::numeric::key(&right))
+    }
+}
+
+fn division_by_zero() -> TypeError {
+    TypeError::new(SqlState::DIVISION_BY_ZERO, "division by zero".to_string())
+}
+
+/// The other sign of a finite value.
+fn flip(sign: NumericSign) -> NumericSign {
+    match sign {
+        NumericSign::Positive => NumericSign::Negative,
+        NumericSign::Negative => NumericSign::Positive,
+        sign => sign,
     }
 }
 
@@ -706,6 +861,56 @@ impl Var {
             std::cmp::Ordering::Less => other.add_abs(self, true, other.sign),
             _ => self.add_abs(other, true, self.sign),
         }
+    }
+
+    /// `mod_var`: the remainder of the quotient cut to an integer, with the sign of `self`. The
+    /// divisor is not zero.
+    fn modulo(&self, other: &Var) -> Var {
+        let mut product = other.mul(&self.div(other, 0, false));
+        product.dscale = other.dscale;
+        if !product.digits.is_empty() {
+            product.sign = flip(product.sign);
+        }
+        self.add(&product)
+    }
+
+    /// `gcd_var`: the greatest common divisor by the algorithm of Euclid, with the larger display
+    /// scale of the two.
+    fn gcd(&self, other: &Var) -> Var {
+        let dscale = self.dscale.max(other.dscale);
+        let (mut a, mut b) = match self.cmp_abs(other) {
+            std::cmp::Ordering::Less => (other.clone(), self.clone()),
+            _ => (self.clone(), other.clone()),
+        };
+        if !b.digits.is_empty() && a.cmp_abs(&b).is_ne() {
+            loop {
+                let rest = a.modulo(&b);
+                if rest.digits.is_empty() {
+                    break;
+                }
+                a = b;
+                b = rest;
+            }
+            a = b;
+        }
+        a.sign = NumericSign::Positive;
+        a.dscale = dscale;
+        a
+    }
+
+    /// `get_min_scale`: the fewest digits after the point that show the value exactly.
+    fn min_scale(&self) -> i64 {
+        let Some(last) = self.digits.iter().rposition(|&d| d != 0) else { return 0 };
+        let mut scale = (last as i64 - self.weight) * DEC_DIGITS;
+        if scale <= 0 {
+            return 0;
+        }
+        let mut digit = self.digits[last];
+        while digit % 10 == 0 {
+            scale -= 1;
+            digit /= 10;
+        }
+        scale
     }
 
     /// The exact product, with no rounding. The display scale is set by the caller.
@@ -1320,6 +1525,55 @@ mod tests {
 
     fn value(text: &str) -> Numeric {
         numeric_in(text, -1).unwrap()
+    }
+
+    #[test]
+    fn the_functions_of_numeric_give_the_values_of_postgres() {
+        // The texts are the ones PostgreSQL 19 prints.
+        let shown = |v: Result<Numeric, TypeError>| v.map_or_else(|e| e.message, |v| text(&v));
+        assert_eq!(text(&value("-8.4").signum()), "-1");
+        assert_eq!(text(&value("0.0").signum()), "0");
+        assert_eq!(text(&value("NaN").signum()), "NaN");
+        assert_eq!(text(&value("-Infinity").signum()), "-1");
+        assert_eq!(value("8.4100").scale(), Some(4));
+        assert_eq!(value("NaN").scale(), None);
+        assert_eq!(value("8.4100").min_scale(), Some(2));
+        assert_eq!(value("0.00").min_scale(), Some(0));
+        assert_eq!(text(&value("8.4100").trim_scale()), "8.41");
+        assert_eq!(text(&value("100.000").trim_scale()), "100");
+        assert_eq!(text(&value("0.000").trim_scale()), "0");
+        for (a, b, out) in [
+            ("9.5", "2", "4"),
+            ("-9.5", "2", "-4"),
+            ("1", "Infinity", "0"),
+            ("Infinity", "-2", "-Infinity"),
+            ("NaN", "1", "NaN"),
+            ("1.0", "0", "division by zero"),
+        ] {
+            assert_eq!(shown(value(a).div_trunc(&value(b))), out, "div({a}, {b})");
+        }
+        assert_eq!(shown(Numeric::factorial(0)), "1");
+        assert_eq!(shown(Numeric::factorial(25)), "15511210043330985984000000");
+        assert_eq!(shown(Numeric::factorial(-1)), "factorial of a negative number is undefined");
+        for (a, b, gcd, lcm) in [
+            ("1.5", "0.25", "0.25", "1.50"),
+            ("-12.0", "18", "6.0", "36.0"),
+            ("0", "5.5", "5.5", "0.0"),
+            ("NaN", "1", "NaN", "NaN"),
+        ] {
+            assert_eq!(shown(value(a).gcd(&value(b))), gcd, "gcd({a}, {b})");
+            assert_eq!(shown(value(a).lcm(&value(b))), lcm, "lcm({a}, {b})");
+        }
+        let bucket = |x: &str, low: &str, high: &str, count: i32| {
+            value(x).width_bucket(&value(low), &value(high), count).map_err(|e| e.message)
+        };
+        assert_eq!(bucket("5.35", "0.024", "10.06", 5), Ok(3));
+        assert_eq!(bucket("-1.0", "0", "10", 5), Ok(0));
+        assert_eq!(bucket("10.0", "0", "10", 5), Ok(6));
+        assert_eq!(bucket("5.0", "10", "0", 5), Ok(3));
+        assert_eq!(bucket("NaN", "0", "1", 3), Ok(4));
+        assert_eq!(bucket("1.0", "0", "10", 0), Err("count must be greater than zero".into()));
+        assert_eq!(bucket("1.0", "1", "1", 3), Err("lower bound cannot equal upper bound".into()));
     }
 
     #[test]

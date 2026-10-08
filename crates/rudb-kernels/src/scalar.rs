@@ -438,6 +438,9 @@ fn one_of<A: Fn(usize) -> usize>(
         }
         name if datetime::is_interval(name) => made_interval(name, data, at, base, rows, returns),
         "~" | "bit_count" => bits_of(name == "~", data, at, &base, rows, returns),
+        name if let Some(body) = crate::pgproc::float_unary(name) => {
+            math::over_float(body, data, at, base, rows, returns)
+        }
         _ => math::vectorized(name, data, at, base, rows, returns),
     }
 }
@@ -4306,6 +4309,9 @@ pub fn call_values(
     returns: &LogicalType,
     written: Written<'_>,
 ) -> Result<Value> {
+    if let Some(value) = crate::pgproc::call(name, args)? {
+        return Ok(value);
+    }
     if let Some(value) = crate::aggregate::state_call(name, args, returns)? {
         return Ok(value);
     }

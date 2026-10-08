@@ -30,6 +30,11 @@ pub struct Proc {
     pub names: &'static [&'static str],
     /// `proargdefaults`: the defaults of the last input arguments, as text.
     pub defaults: &'static [&'static str],
+    /// `prolang`: `i` for `internal`, `c` for `c` and `s` for `sql`.
+    pub lang: u8,
+    /// `prosrc`: the name of the C function, or for a function in SQL with a `RETURN` body in
+    /// `system_functions.sql`, the expression after `RETURN`, with `$1` for the first argument.
+    pub src: &'static str,
 }
 
 /// The row constructor of the generated table, short so that each row fits on one line.
@@ -46,8 +51,24 @@ pub(crate) const fn p(
     volatility: u8,
     names: &'static [&'static str],
     defaults: &'static [&'static str],
+    lang: u8,
+    src: &'static str,
 ) -> Proc {
-    Proc { oid, name, args, result, variadic, kind, strict, retset, volatility, names, defaults }
+    Proc {
+        oid,
+        name,
+        args,
+        result,
+        variadic,
+        kind,
+        strict,
+        retset,
+        volatility,
+        names,
+        defaults,
+        lang,
+        src,
+    }
 }
 
 impl Proc {
