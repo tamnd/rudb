@@ -80,7 +80,11 @@ fn binary(message: String) -> TypeError {
 }
 
 /// The number of elements of an array with these dimensions, `ArrayGetNItems`.
-fn item_count(dims: &[ArrayDim]) -> Result<usize, TypeError> {
+///
+/// # Errors
+///
+/// `54000` when a length is negative or the count is more than [`MAX_ARRAY_SIZE`].
+pub fn item_count(dims: &[ArrayDim]) -> Result<usize, TypeError> {
     let mut count = 1i32;
     for dim in dims {
         // A negative length is an upper bound that overflowed.
@@ -94,6 +98,19 @@ fn item_count(dims: &[ArrayDim]) -> Result<usize, TypeError> {
         return Err(too_large());
     }
     Ok(count)
+}
+
+/// `ArrayCheckBounds`: the upper bound of each dimension, which is the lower bound plus the length,
+/// is an `int4`.
+///
+/// # Errors
+///
+/// `54000` with the lower bound of the first dimension whose upper bound is too large.
+pub fn check_bounds(dims: &[ArrayDim]) -> Result<(), TypeError> {
+    match dims.iter().find(|dim| dim.len.checked_add(dim.lower).is_none()) {
+        Some(dim) => Err(limit(format!("array lower bound is too large: {}", dim.lower))),
+        None => Ok(()),
+    }
 }
 
 /// `ReadDimensionInt`: an integer with an optional sign and no white space before it. The end is
@@ -555,11 +572,7 @@ pub fn array_recv<'a, T>(
         dims.push(ArrayDim { len, lower });
     }
     let count = item_count(&dims)?;
-    for dim in &dims {
-        if dim.len.checked_add(dim.lower).is_none() {
-            return Err(limit(format!("array lower bound is too large: {}", dim.lower)));
-        }
-    }
+    check_bounds(&dims)?;
     if count == 0 {
         return Ok(Array::empty());
     }

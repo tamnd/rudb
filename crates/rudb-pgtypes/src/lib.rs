@@ -125,8 +125,8 @@ pub mod typmod;
 
 pub use array::{
     Array, ArrayDim, MAX_ARRAY_SIZE, MAXDIM, array_in, array_out, array_recv, array_send,
-    int2vector_in, int2vector_out, int2vector_recv, int2vector_send, oidvector_in, oidvector_out,
-    oidvector_recv, oidvector_send,
+    check_bounds, int2vector_in, int2vector_out, int2vector_recv, int2vector_send, item_count,
+    oidvector_in, oidvector_out, oidvector_recv, oidvector_send,
 };
 pub use binary::{Recv, name_recv};
 pub use coerce::{Mismatch, can_coerce_assigned, can_coerce_implicitly, common_type, is_preferred};

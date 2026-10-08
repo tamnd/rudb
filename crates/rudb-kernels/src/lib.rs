@@ -91,6 +91,7 @@ mod normalize;
 mod number;
 mod path;
 mod peel;
+pub mod pgarray;
 mod pgformat;
 pub mod pginput;
 pub mod pgjson;

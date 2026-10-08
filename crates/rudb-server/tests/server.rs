@@ -3666,6 +3666,88 @@ fn substring_from_a_position_keeps_the_part_that_postgresql_keeps() {
 }
 
 #[test]
+fn array_fill_gives_the_array_and_the_errors_of_postgresql() {
+    let dirs = Dirs::new("pg-array-fill");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            return format!("{code} {text}");
+        }
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(|| "NULL".into(), |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        rows.join(";")
+    };
+    // The values and the errors of the PostgreSQL 19 oracle, in the order that PostgreSQL checks
+    // the arguments. An array of more than one dimension or with another lower bound is not a
+    // list, and is the one error that PostgreSQL does not give.
+    for (sql, expected) in [
+        ("select array_fill(7, array[3])", "{7,7,7}"),
+        ("select array_fill(null::int, array[2])", "{NULL,NULL}"),
+        ("select array_fill(7, array[2], array[1])", "{7,7}"),
+        ("select array_fill(7, array[0], array[5])", "{}"),
+        ("select array_fill(7, array[]::int[])", "{}"),
+        ("select array_fill(7, '{2}', '{1}')", "{7,7}"),
+        ("select array_fill(7, array[2::smallint])", "{7,7}"),
+        ("select array_fill(row(1, 'a'), array[2])", "{\"(1,a)\",\"(1,a)\"}"),
+        ("select pg_typeof(array_fill(7, array[2]))", "integer[]"),
+        (
+            "select array_fill(x, array[2], array[y]) from (values (1, 1), (2, 1)) t(x, y)",
+            "{1,1};{2,2}",
+        ),
+        ("select array_fill(7, null)", "22004 dimension array or low bound array cannot be null"),
+        ("select array_fill(7, array[null, 2]::int[])", "22004 dimension values cannot be null"),
+        (
+            "select array_fill(7, array[1, 1, 1, 1, 1, 1, 1], array[1])",
+            "54000 number of array dimensions (7) exceeds the maximum allowed (6)",
+        ),
+        (
+            "select array_fill(7, array[1], array[]::int[])",
+            "2202E wrong number of array subscripts",
+        ),
+        (
+            "select array_fill(7, array[-1])",
+            "54000 array size exceeds the maximum allowed (134217727)",
+        ),
+        (
+            "select array_fill(7, array[2], array[2147483647])",
+            "54000 array lower bound is too large: 2147483647",
+        ),
+        (
+            "select array_fill('a', array[2])",
+            "42804 could not determine polymorphic type because input has type unknown",
+        ),
+        (
+            "select array_fill(array[1, 2], array[2])",
+            "42704 could not find array type for data type integer[]",
+        ),
+        (
+            "select array_fill(7, array[2::bigint])",
+            "42883 function array_fill(integer, bigint[]) does not exist",
+        ),
+        (
+            "select array_fill(7, array[2, 2])",
+            "0A000 arrays of more than one dimension are not supported",
+        ),
+    ] {
+        assert_eq!(result(sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();
