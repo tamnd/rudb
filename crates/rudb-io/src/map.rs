@@ -103,6 +103,21 @@ impl Mapped {
         sys::release(self.at, start, end, self.len);
     }
 
+    /// Asks the kernel to start reading `offset..offset + len` into the page cache, without waiting
+    /// for it.
+    ///
+    /// A fault on a page the cache does not hold reads a small window around it and waits, so a
+    /// long range read through the mapping from a cold cache is one wait every few pages. Asked for
+    /// first, the whole range is read ahead in large requests while the reader works through what
+    /// has arrived. A page the cache already holds costs a lookup.
+    pub fn will_need(&self, offset: u64, len: usize) {
+        let Ok(start) = usize::try_from(offset) else { return };
+        let end = start.saturating_add(len).min(self.len);
+        if start < end {
+            sys::will_need(self.at, start, end);
+        }
+    }
+
     /// How many bytes it maps.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -148,6 +163,10 @@ mod sys {
     #[cfg(target_os = "linux")]
     const MADV_DONTNEED: c_int = 4;
 
+    /// Linux's `MADV_WILLNEED`, which starts reading the pages of a file mapping ahead.
+    #[cfg(target_os = "linux")]
+    const MADV_WILLNEED: c_int = 3;
+
     /// The alignment a release starts and ends on, a multiple of every page size Linux runs with
     /// here and the window a fault maps around the page it is for.
     #[cfg(target_os = "linux")]
@@ -184,6 +203,22 @@ mod sys {
     #[cfg(not(target_os = "linux"))]
     pub(super) fn release(_: *const u8, _: usize, _: usize, _: usize) {}
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn will_need(at: *const u8, start: usize, end: usize) {
+        // The address has to start on a page and the mapping does, so rounding down stays inside
+        // it. The length need not be a whole number of pages.
+        let base = at as usize;
+        let from = (base + start) & !(4096 - 1);
+        // SAFETY: `from..base + end` lies inside the mapping, and the advice only reads pages into
+        // the page cache, which changes nothing any read of the mapping sees.
+        unsafe {
+            madvise(from as *mut c_void, base + end - from, MADV_WILLNEED);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn will_need(_: *const u8, _: usize, _: usize) {}
+
     pub(super) fn unmap(at: *const u8, len: usize) {
         // SAFETY: `at` and `len` are what `map` returned and was asked for, and the last reference
         // into the mapping ended with the `Mapped` that is being dropped.
@@ -204,6 +239,8 @@ mod sys {
     pub(super) fn unmap(_: *const u8, _: usize) {}
 
     pub(super) fn release(_: *const u8, _: usize, _: usize, _: usize) {}
+
+    pub(super) fn will_need(_: *const u8, _: usize, _: usize) {}
 }
 
 #[cfg(all(test, unix))]

@@ -3604,7 +3604,9 @@ fn ranked_extreme(
     least: bool,
 ) -> Result<bool> {
     let Some((codes, dictionary)) = input.shared_dictionary_parts() else { return Ok(false) };
-    let Some(ranks) = dictionary.code_ranks() else { return Ok(false) };
+    // Turning the order round is a read of all of it, and MIN(title) over the hundred rows JOB 1a
+    // keeps read the whole order of two and a half million titles for them on its first run.
+    let Some(ranks) = dictionary.code_ranks_for(rows) else { return Ok(false) };
     let Some(codes) = codes.get(..rows) else { return Ok(false) };
     let mut winner: Option<(u32, u32)> = None;
     // row at a time: a code is a number out of the data, so which value it lands on is not known
@@ -4943,7 +4945,7 @@ fn extreme_bytes(
     if !matches!(values.logical_type(), LogicalType::Varchar | LogicalType::Blob) {
         return None;
     }
-    if let Some(ranks) = values.code_ranks() {
+    if let Some(ranks) = values.code_ranks_for(codes.len()) {
         return extreme_ranked(ranks, codes, nulls, least);
     }
     let mut winner: Option<(usize, u32)> = None;
