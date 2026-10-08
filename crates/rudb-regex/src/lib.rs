@@ -43,6 +43,12 @@
 //! `ab` matches `a`, because the first branch of an alternation wins where both could match. POSIX
 //! asks for the longest instead and this engine deliberately does not do that.
 //!
+//! PostgreSQL asks for the longest, and `Regex::postgres` gives it. The pattern goes through a port
+//! of PostgreSQL's own lexer and parser in `postgres`, which builds the tree Spencer's engine
+//! dissects a match with, and the same machines run each node of that tree. The two flavours share
+//! the instruction set and the machines and nothing above them, so neither one's rules leak into
+//! the other.
+//!
 //! Every behaviour below was read off the DuckDB binary on server3 before it was written here,
 //! including the option letters, what each one does, the exact error text for six kinds of broken
 //! pattern, and what happens to a replacement that asks for a group the pattern does not have.
@@ -67,14 +73,18 @@
 mod bitstate;
 mod compile;
 mod parse;
+mod postgres;
 mod vm;
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use rudb_common::{Error, Result};
 
 use crate::compile::Program;
 use crate::parse::{Assertion, Ast};
+
+pub use crate::postgres::PgFlags;
 
 /// The letters DuckDB accepts after the pattern.
 ///
@@ -125,6 +135,8 @@ pub struct Regex {
     program: Program,
     /// The pattern less a trailing `.*$`, where it has one, and whether that dot takes a newline.
     head: Option<(Program, bool)>,
+    /// The tree of a pattern of PostgreSQL's flavour, which is where its groups come from.
+    pg: Option<Arc<postgres::Tree>>,
 }
 
 impl Regex {
@@ -152,13 +164,27 @@ impl Regex {
             Some((head, newline)) => Some((compile::compile(&head, groups)?, newline)),
             None => None,
         };
-        Ok(Self { program: compile::compile(&ast, groups)?, head })
+        Ok(Self { program: compile::compile(&ast, groups)?, head, pg: None })
+    }
+
+    /// Compiles a pattern of PostgreSQL's flavour, which is a different syntax with different
+    /// answers about where a match ends and where its groups are. See the `postgres` module.
+    ///
+    /// # Errors
+    ///
+    /// On a pattern PostgreSQL would refuse, with PostgreSQL's message and SQLSTATE.
+    pub fn postgres(pattern: &str, flags: PgFlags) -> Result<Self> {
+        let tree = postgres::compile(pattern, flags)?;
+        Ok(Self { program: tree.program().clone(), head: None, pg: Some(Arc::new(tree)) })
     }
 
     /// How many capturing groups the pattern has, not counting the whole match.
     #[must_use]
     pub fn groups(&self) -> usize {
-        self.program.groups
+        match &self.pg {
+            Some(tree) => tree.groups,
+            None => self.program.groups,
+        }
     }
 
     /// The first match at or after `start`.
@@ -168,6 +194,9 @@ impl Regex {
     /// `start` is zero, which is what makes a global replacement of an anchored pattern replace once.
     #[must_use]
     pub fn find_at(&self, text: &str, start: usize) -> Option<Captures> {
+        if let Some(tree) = &self.pg {
+            return postgres::find(tree, text, start).map(|slots| Captures { slots });
+        }
         let mut found = Captures { slots: Vec::new() };
         self.search(text, start, false, &mut found.slots).then_some(found)
     }
@@ -326,7 +355,7 @@ impl Regex {
 ///
 /// This is the only place the choice is made and it is made on size alone, because the two machines
 /// give the same answer and differ only in what they spend to get it.
-fn run(
+pub(crate) fn run(
     program: &Program,
     text: &str,
     start: usize,

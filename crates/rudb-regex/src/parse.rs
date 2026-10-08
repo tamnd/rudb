@@ -54,6 +54,16 @@ pub(crate) enum Ast {
         /// Whether it prefers to take the character or to leave it.
         greedy: bool,
     },
+    /// A lookahead or a lookbehind of PostgreSQL, which holds where `inner` matches the text that
+    /// starts or ends at the position. It reads nothing and captures nothing.
+    Look {
+        /// Whether the text after the position is read, and not the text before it.
+        ahead: bool,
+        /// Whether the constraint holds where `inner` does not match.
+        negated: bool,
+        /// The pattern of the constraint.
+        inner: Box<Ast>,
+    },
 }
 
 /// A place a match can be, as opposed to something a match reads.
@@ -72,6 +82,15 @@ pub(crate) enum Assertion {
     WordBoundary,
     /// Anywhere a word boundary is not.
     NotWordBoundary,
+    /// The start of a word of PostgreSQL, which is `\m`. A word character of PostgreSQL is a
+    /// letter or a digit of any alphabet, or an underscore.
+    WordStart,
+    /// The end of a word of PostgreSQL, which is `\M`.
+    WordEnd,
+    /// A word boundary of PostgreSQL, which is `\y`.
+    AnyWordBoundary,
+    /// Anywhere a word boundary of PostgreSQL is not, which is `\Y`.
+    NotAnyWordBoundary,
 }
 
 /// A set of characters, written as ranges in the order they appeared.
@@ -85,12 +104,69 @@ pub(crate) struct Class {
     pub(crate) negated: bool,
     /// The ranges, inclusive at both ends.
     pub(crate) ranges: Vec<(char, char)>,
+    /// The named classes of PostgreSQL that the set holds past ASCII, where a range list would be
+    /// the whole Unicode table, each with whether the set holds the class or its complement. Below
+    /// the ASCII line the ranges hold them too.
+    pub(crate) named: Vec<(Named, bool)>,
 }
 
 impl Class {
-    fn of(ranges: &[(char, char)]) -> Self {
-        Self { negated: false, ranges: ranges.to_vec() }
+    pub(crate) fn of(ranges: &[(char, char)]) -> Self {
+        Self { negated: false, ranges: ranges.to_vec(), named: Vec::new() }
     }
+}
+
+/// A named class of characters past ASCII, as PostgreSQL reads it in a UTF-8 database.
+///
+/// PostgreSQL asks the C library, and the C library builds its tables from Unicode with a few rules
+/// of its own: a digit is an ASCII digit only, so the decimal digits of the other scripts are
+/// letters, and the spaces that do not break a line are punctuation rather than space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Named {
+    Alpha,
+    /// A letter or a digit, which past ASCII is the same set as a letter.
+    Alnum,
+    Upper,
+    Lower,
+    Space,
+    Punct,
+    Graph,
+    Print,
+}
+
+/// The first code point of each run of ten decimal digits past ASCII.
+const DECIMAL_ZEROS: [u32; 75] = [
+    0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6,
+    0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50,
+    0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10,
+    0x104a0, 0x10d30, 0x10d40, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0,
+    0x11650, 0x116c0, 0x116d0, 0x116da, 0x11730, 0x118e0, 0x11950, 0x11bf0, 0x11c50, 0x11d50,
+    0x11da0, 0x11f50, 0x16130, 0x16a60, 0x16ac0, 0x16b50, 0x16d70, 0x1ccf0, 0x1d7ce, 0x1d7d8,
+    0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e5f1, 0x1e950, 0x1fbf0,
+];
+
+impl Named {
+    /// Whether a character past ASCII is in the class.
+    pub(crate) fn holds(self, ch: char) -> bool {
+        match self {
+            Self::Alpha | Self::Alnum => ch.is_alphabetic() || decimal(ch),
+            Self::Upper => ch.is_uppercase(),
+            Self::Lower => ch.is_lowercase(),
+            Self::Space => {
+                ch.is_whitespace() && !matches!(ch, '\u{85}' | '\u{a0}' | '\u{2007}' | '\u{202f}')
+            }
+            Self::Print => !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}'),
+            Self::Graph => Self::Print.holds(ch) && !Self::Space.holds(ch),
+            Self::Punct => Self::Graph.holds(ch) && !Self::Alpha.holds(ch),
+        }
+    }
+}
+
+/// Whether a character is a decimal digit of a script other than Latin.
+fn decimal(ch: char) -> bool {
+    let code = ch as u32;
+    let index = DECIMAL_ZEROS.partition_point(|&zero| zero <= code);
+    index > 0 && code - DECIMAL_ZEROS[index - 1] < 10
 }
 
 /// Which of the flags that can be written inside a pattern are on.
@@ -144,7 +220,7 @@ pub(crate) fn literal(pattern: &str, case_insensitive: bool) -> Ast {
 }
 
 /// One character of a pattern, as itself or as the set it folds to.
-fn character(ch: char, case_insensitive: bool) -> Ast {
+pub(crate) fn character(ch: char, case_insensitive: bool) -> Ast {
     if !case_insensitive {
         return Ast::Literal(ch);
     }
@@ -163,7 +239,7 @@ fn character(ch: char, case_insensitive: bool) -> Ast {
 /// multi character fold is not something a character set can hold. RE2 folds those through its
 /// Unicode tables and this does not, which is a difference on a handful of letters outside the
 /// alphabets any benchmark uses and is written down in the crate documentation rather than hidden.
-fn simple_lower(ch: char) -> char {
+pub(crate) fn simple_lower(ch: char) -> char {
     let mut folded = ch.to_lowercase();
     match (folded.next(), folded.next()) {
         (Some(one), None) => one,
@@ -171,7 +247,7 @@ fn simple_lower(ch: char) -> char {
     }
 }
 
-fn simple_upper(ch: char) -> char {
+pub(crate) fn simple_upper(ch: char) -> char {
     let mut folded = ch.to_uppercase();
     match (folded.next(), folded.next()) {
         (Some(one), None) => one,
@@ -525,7 +601,7 @@ impl Parser {
 
     /// The inside of a `[...]`, with the cursor just past the `[`.
     fn class(&mut self, from: usize) -> Result<Class> {
-        let mut class = Class { negated: self.eat('^'), ranges: Vec::new() };
+        let mut class = Class { negated: self.eat('^'), ranges: Vec::new(), named: Vec::new() };
         let mut first = true;
         loop {
             let Some(ch) = self.peek() else {
@@ -630,7 +706,7 @@ enum Item {
 }
 
 /// The Perl character classes, which RE2 keeps to ASCII even when the text is not.
-fn perl_class(ch: char) -> Class {
+pub(crate) fn perl_class(ch: char) -> Class {
     let ranges: &[(char, char)] = match ch.to_ascii_lowercase() {
         'd' => &[('0', '9')],
         // Tab, newline, form feed, carriage return and space, and deliberately not the vertical
@@ -639,11 +715,11 @@ fn perl_class(ch: char) -> Class {
         's' => &[('\t', '\n'), ('\u{c}', '\r'), (' ', ' ')],
         _ => &[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
     };
-    Class { negated: ch.is_ascii_uppercase(), ranges: ranges.to_vec() }
+    Class { negated: ch.is_ascii_uppercase(), ranges: ranges.to_vec(), named: Vec::new() }
 }
 
 /// The POSIX named classes, as ASCII, which is again what RE2 does with them.
-fn posix_ranges(name: &str) -> Option<&'static [(char, char)]> {
+pub(crate) fn posix_ranges(name: &str) -> Option<&'static [(char, char)]> {
     Some(match name {
         "alnum" => &[('0', '9'), ('A', 'Z'), ('a', 'z')],
         "alpha" => &[('A', 'Z'), ('a', 'z')],
@@ -664,7 +740,7 @@ fn posix_ranges(name: &str) -> Option<&'static [(char, char)]> {
 }
 
 /// Everything the ranges do not hold.
-fn complement(ranges: &[(char, char)]) -> Vec<(char, char)> {
+pub(crate) fn complement(ranges: &[(char, char)]) -> Vec<(char, char)> {
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable();
     let mut out = Vec::new();
@@ -690,7 +766,7 @@ fn complement(ranges: &[(char, char)]) -> Vec<(char, char)> {
 }
 
 /// The ranges plus the ranges they fold to, for a set written under `(?i)`.
-fn fold(ranges: &[(char, char)]) -> Vec<(char, char)> {
+pub(crate) fn fold(ranges: &[(char, char)]) -> Vec<(char, char)> {
     let mut out = ranges.to_vec();
     for &(low, high) in ranges {
         if low <= 'z' && high >= 'a' {

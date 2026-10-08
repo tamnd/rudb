@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use crate::compile::{Inst, Program};
-use crate::parse::Assertion;
+use crate::parse::{Assertion, Named};
 
 /// Where each group of a thread's match started and ended, as byte offsets into the text.
 type Slots = Rc<Vec<Option<usize>>>;
@@ -35,17 +35,29 @@ pub(crate) fn search(
     start: usize,
     whole: bool,
 ) -> Option<Vec<Option<usize>>> {
+    search_in(program, text, start, whole, whole.then_some(text.len()))
+}
+
+/// Runs the program, with the match held to begin at `start` when `sticky` is set and to end at
+/// `end` when one is given, which is what a lookaround asks of its program.
+fn search_in(
+    program: &Program,
+    text: &str,
+    start: usize,
+    sticky: bool,
+    end: Option<usize>,
+) -> Option<Vec<Option<usize>>> {
     let width = 2 * (program.groups + 1);
     let mut current = List::new(program.insts.len());
     let mut next = List::new(program.insts.len());
     let mut matched: Option<Slots> = None;
     let mut at = start;
     loop {
-        let ch = text[at..].chars().next();
+        let ch = if end == Some(at) { None } else { text[at..].chars().next() };
         // A pattern that has to start at the start of the text, and a whole text match, get one
         // thread and not one per position. Everything else is searched for at every position, which
         // is what an unanchored match means.
-        let again = matched.is_none() && !program.anchored && !whole;
+        let again = matched.is_none() && !program.anchored && !sticky;
         if matched.is_none() && (at == start || again) {
             let mut fresh = vec![None; width];
             fresh[0] = Some(at);
@@ -67,7 +79,7 @@ pub(crate) fn search(
                     // A whole text match that has text left over is not one, and the thread dies
                     // rather than the search stopping, because another branch may still reach the
                     // end.
-                    if whole && ch.is_some() {
+                    if end.is_some_and(|end| end != at) {
                         continue;
                     }
                     let mut done = slots;
@@ -124,6 +136,11 @@ fn add(program: &Program, text: &str, list: &mut List, pc: usize, at: usize, slo
                     stack.push((pc + 1, slots));
                 }
             }
+            Inst::Look(id) => {
+                if look(program, id, text, at) {
+                    stack.push((pc + 1, slots));
+                }
+            }
             _ => list.threads.push((pc, slots)),
         }
     }
@@ -138,7 +155,26 @@ pub(crate) fn holds(assertion: Assertion, text: &str, at: usize) -> bool {
         Assertion::LineEnd => at == text.len() || after(text, at) == Some('\n'),
         Assertion::WordBoundary => word(before(text, at)) != word(after(text, at)),
         Assertion::NotWordBoundary => word(before(text, at)) == word(after(text, at)),
+        Assertion::WordStart => !pg_word(before(text, at)) && pg_word(after(text, at)),
+        Assertion::WordEnd => pg_word(before(text, at)) && !pg_word(after(text, at)),
+        Assertion::AnyWordBoundary => pg_word(before(text, at)) != pg_word(after(text, at)),
+        Assertion::NotAnyWordBoundary => pg_word(before(text, at)) == pg_word(after(text, at)),
     }
+}
+
+/// Whether the lookaround at an index holds at a position.
+///
+/// A lookahead asks for a match that begins at the position and may end anywhere. A lookbehind
+/// asks for one that ends at the position and may begin anywhere before it, so it is a search from
+/// the start of the text held to end there. Neither one sees the groups of the pattern around it.
+pub(crate) fn look(program: &Program, id: usize, text: &str, at: usize) -> bool {
+    let look = &program.looks[id];
+    let found = if look.ahead {
+        search_in(&look.program, text, at, true, None).is_some()
+    } else {
+        search_in(&look.program, text, 0, false, Some(at)).is_some()
+    };
+    found != look.negated
 }
 
 fn before(text: &str, at: usize) -> Option<char> {
@@ -152,6 +188,13 @@ fn after(text: &str, at: usize) -> Option<char> {
 /// Whether a character is one of the ones a word boundary is about, which RE2 keeps to ASCII.
 fn word(ch: Option<char>) -> bool {
     ch.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Whether a character is a word character to PostgreSQL, which is `[[:alnum:]_]`.
+fn pg_word(ch: Option<char>) -> bool {
+    ch.is_some_and(|ch| {
+        ch.is_ascii_alphanumeric() || ch == '_' || (!ch.is_ascii() && Named::Alnum.holds(ch))
+    })
 }
 
 /// The threads at one position, with the set of instructions already in it.
