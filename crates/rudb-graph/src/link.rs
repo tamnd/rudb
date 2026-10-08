@@ -396,11 +396,13 @@ impl Link {
     /// last one was found in and gallops out over the count of ones before each word, which finds
     /// a near child in a load or two and a far one in a few halvings. The parent is then the zeros
     /// before the child's bit, which is the bit less the ones before it, and the ones before the
-    /// `n`th one are `n`. This replaced a walk of up to a thousand children a word at a time and a
-    /// `select1` past that, and on the 2,988 rows of `partsupp` that q02 keeps through `part` the
-    /// two came to 113 cycles a child, most of them in the select. A child before the last starts
-    /// the search from the first word again, so the answer is the same in any order and only the
-    /// cost depends on it.
+    /// `n`th one are `n`. The child after the last one answered is the next one bit after the last
+    /// one's, which is the next child of the same parent, and that takes no search at all when it
+    /// is in the same word. On a link of 200,000 parents of four children each with one parent in
+    /// 268 held, which is the shape of the `partsupp` rows q02 keeps through `part`, this came to 96
+    /// instructions a child where a walk of up to a thousand children a word at a time and a
+    /// `select1` past that was 142. A child before the last starts the search from the first word
+    /// again, so the answer is the same in any order and only the cost depends on it.
     pub fn forward_each(&self, children: &[Rid], out: &mut Vec<Rid>) {
         out.clear();
         out.reserve(children.len());

@@ -142,7 +142,7 @@ impl Rank {
     /// whole rest of the bitmap from there was seventeen dependent loads a row on the orders of
     /// TPC-H, and a tenth of q10. The first [`NEAR_WORDS`] words are stepped one at a time before
     /// the gallop, since a step is a load and a compare in a line already read, and the gallop and
-    /// the halving after it came to about forty instructions for a word that was one or two on.
+    /// the halving after it are a chain of dependent loads even for a word that is one or two on.
     pub(crate) fn word_holding(&self, nth: u64, from: usize) -> Option<(usize, u32)> {
         let words = self.fine.len().checked_sub(1)?;
         if from >= words || u64::from(self.fine[from]) > nth || u64::from(self.fine[words]) <= nth {
