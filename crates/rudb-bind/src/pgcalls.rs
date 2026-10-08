@@ -509,7 +509,7 @@ impl Binder<'_> {
             return Ok(Some(self.pgproc_kernel(array, &cast, list)));
         }
         if rudb_kernels::pgproc::collated(proc.src) {
-            let oid = self.call_collation(&cast)?;
+            let oid = self.call_collation(&cast, &format!("{}() function", proc.src))?;
             cast.push(self.add_constant(Value::BigInt(i64::from(oid))));
         }
         Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
@@ -1231,7 +1231,7 @@ impl Binder<'_> {
     /// The call of one of the kernels of `pgregexp`, with an argument for each parameter and the
     /// OID of the collation of the call after them.
     fn regexp_kernel(&mut self, function: Function, arguments: Vec<ExprRef>) -> Result<ExprRef> {
-        let collation = self.call_collation(&arguments)?;
+        let collation = self.call_collation(&arguments, "regular expression")?;
         let collation = self.add_constant(Value::BigInt(i64::from(collation)));
         let parameters = function.parameters();
         let mut arguments: Vec<ExprRef> = arguments

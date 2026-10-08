@@ -295,6 +295,9 @@ struct Materialized {
     /// a definition with `USING KEY` aggregates is bound, when the rows a round reads are not yet
     /// the rows of the table.
     finished: Vec<Field>,
+    /// The table index of the columns of the definition, which a read takes its collations from.
+    /// For a recursive definition it is the query that starts it.
+    output: Option<u32>,
 }
 
 /// An aggregate `USING KEY` names, bound against one side of a recursive definition.
@@ -814,6 +817,7 @@ impl<'a> Binder<'a> {
             fields,
             recurring: cte,
             finished,
+            output: Some(table),
         });
         Ok(node)
     }
@@ -925,6 +929,7 @@ impl<'a> Binder<'a> {
         let cte = self.next_cte;
         let recurring = cte + 1;
         self.next_cte += 2;
+        let output = self.plan.node(anchor).table_index();
         self.materialized.push(Materialized {
             written: index,
             cte,
@@ -932,6 +937,7 @@ impl<'a> Binder<'a> {
             fields: working,
             recurring,
             finished: table.clone(),
+            output,
         });
         let (recursive, other) = self.bind_query(ast, right)?;
         if other.len() != scope.len() {
@@ -1604,9 +1610,20 @@ impl<'a> Binder<'a> {
                 column.ty = ty;
             }
         }
+        let index = self.fresh_index();
+        let all = operator.quantifier == Quantifier::All;
+        let sides: Vec<[Option<(ColumnBinding, LogicalType)>; 2]> = merged
+            .iter()
+            .map(|column| {
+                let side = |scope: &Scope, at: Option<usize>| {
+                    at.map(|at| (scope.columns[at].binding, scope.columns[at].ty.clone()))
+                };
+                [side(&left_scope, column.left), side(&right_scope, column.right)]
+            })
+            .collect();
+        self.set_op_collations(index, &sides, operator.op == SetOp::Union && all)?;
         let left_node = self.conform(left_node, &left_scope, &merged, |column| column.left)?;
         let right_node = self.conform(right_node, &right_scope, &merged, |column| column.right)?;
-        let index = self.fresh_index();
         let kind = match operator.op {
             SetOp::Union => SetOpKind::Union,
             SetOp::Except => SetOpKind::Except,
@@ -1614,7 +1631,6 @@ impl<'a> Binder<'a> {
         };
         // UNION alone removes duplicates and UNION ALL keeps them, which is the one place the
         // unwritten quantifier and ALL disagree.
-        let all = operator.quantifier == Quantifier::All;
         let mut node =
             self.add_node(Node::SetOp { left: left_node, right: right_node, kind, all, index });
         let mut scope = Scope::empty();
@@ -1888,7 +1904,9 @@ impl<'a> Binder<'a> {
                     groups.extend(expanded);
                     continue;
                 }
-                groups.push(self.bind_expr(ast, *item, &input)?);
+                let group = self.bind_expr(ast, *item, &input)?;
+                self.check_sort_collation(group)?;
+                groups.push(group);
             }
             self.unnest_here = false;
             self.unnest_grouping = None;
@@ -2006,6 +2024,13 @@ impl<'a> Binder<'a> {
             &mut above,
         )?;
         let extra = sorted.iter().any(|key| key.extra);
+        // A column that is sorted on, or that `DISTINCT` compares, needs one collation.
+        let compared = if written.distinct == Distinct::Yes { visible } else { 0 };
+        let checked: Vec<usize> =
+            (0..compared).chain(sorted.iter().map(|key| key.position)).collect();
+        for at in checked {
+            self.check_sort_collation(exprs[at])?;
+        }
         self.unnest_here = outer_unnest_here;
         self.in_unnest = outer_in_unnest;
         self.unnest_grouping = outer_unnest_grouping;
@@ -3190,9 +3215,13 @@ impl<'a> Binder<'a> {
         let cte = if recurring { held.recurring } else { held.cte };
         let fields = if recurring { held.finished.clone() } else { held.fields.clone() };
         let text = held.name.clone();
+        let output = held.output;
         let label = if alias == NONE { text.clone() } else { ast.string(alias).to_string() };
         let name = self.plan.intern(&text);
         let index = self.fresh_index();
+        if let Some(output) = output {
+            self.collated.reads.insert(index, output);
+        }
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
