@@ -20,6 +20,7 @@ mod types;
 mod write;
 
 use std::cell::OnceCell;
+use std::ops::Range;
 
 use rudb_common::notice::{Level, Notice};
 use rudb_common::session::IdentifierCase;
@@ -72,6 +73,30 @@ fn transform_list(text: &str, list: &List) -> Result<Ast, Refused> {
         transform.statement(raw)?;
     }
     Ok(transform.ast)
+}
+
+/// Where each statement of a script is in `text`, from the raw parse of the whole script, the way
+/// `exec_simple_query` reads a query. `pg_parse_query` parses all of the text before one statement
+/// runs, so a syntax error in any statement fails the query, also in a failed transaction block.
+/// A statement is the text from its `stmt_location` for its `stmt_len`, where a length of 0 is the
+/// rest of the text. An empty statement between two semicolons has no `RawStmt`.
+///
+/// # Errors
+///
+/// The error of the grammar, with the SQLSTATE and the position that PostgreSQL gives.
+pub fn statements(text: &str) -> Result<Vec<Range<usize>>, Error> {
+    let (list, _) = crate::parse(text).map_err(Error::from)?;
+    let mut found = Vec::new();
+    for node in list.iter().flatten() {
+        let Node::RawStmt(raw) = node else { continue };
+        let start = usize::try_from(raw.stmt_location).unwrap_or(0).min(text.len());
+        let end = match usize::try_from(raw.stmt_len) {
+            Ok(0) | Err(_) => text.len(),
+            Ok(len) => (start + len).min(text.len()),
+        };
+        found.push(start..start + text[start..end].trim_end().len());
+    }
+    Ok(found)
 }
 
 /// The [`Ast`] of a script that a PostgreSQL session sent. This is the parse entry of such a session.

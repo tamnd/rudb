@@ -300,7 +300,7 @@ impl Extended {
             .into();
         let types: Vec<Oid> = types.collect();
         let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
-        let one = rudb::statements(&sql).map_err(engine)?.len() == 1;
+        let one = runner.connection.statements(&sql).map_err(engine)?.len() == 1;
         let cursor = if one { cursor::parse(&sql) } else { None };
         let copied = if one { copy::parse(&sql) } else { None };
         let named = if one { prepare::parse(&sql) } else { None };
@@ -1099,7 +1099,7 @@ impl Extended {
 fn statement(runner: &Runner, sql: Arc<str>, mut types: Vec<Oid>) -> Result<Statement, Problem> {
     let engine = |e: rudb::Error| Problem::failure(Failure::engine(&e, 0), &sql);
     let command = setting::parse(&sql);
-    let mut prepared = match rudb::statements(&sql).map_err(engine)?.len() {
+    let mut prepared = match runner.connection.statements(&sql).map_err(engine)?.len() {
         0 => None,
         1 if command.is_some() => None,
         1 => Some(runner.connection.prepare(&sql).map_err(engine)?),

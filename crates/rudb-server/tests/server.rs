@@ -3345,6 +3345,25 @@ fn the_transaction_rules_of_postgres() {
     );
     assert_eq!(text(&client.query("commit")[0]), "ROLLBACK");
 
+    // The grammar reads all of a query before any of it runs, as `pg_parse_query` does. So a
+    // syntax error in a later statement stops the first one, and in a failed block a syntax error
+    // comes before 25P02.
+    let messages = client.query("insert into t values (9); selec 2");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42601"));
+    assert_eq!(count(&mut client), "1");
+    client.query("begin");
+    client.query("select nope");
+    let messages = client.query("selec 1");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42601"));
+    let messages = client.query("select $$a;b$$, E'x\\';' ; select 2");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("25P02"));
+    assert_eq!(text(&client.query("rollback")[0]), "ROLLBACK");
+    // A dollar quote and an escape string hold a semicolon, and empty statements are skipped.
+    let messages = client.query("select $$a;b$$, E'x\\';' ;;; select 2 -- tail");
+    assert_eq!(tags(&messages), "TDCTDCZ");
+
     // In the extended flow the transaction ends at Sync, and an error rolls back all the
     // statements after the last Sync.
     client.parse("", "insert into t values (3)", &[]);
