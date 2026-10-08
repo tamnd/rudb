@@ -1258,8 +1258,11 @@ Section: Class 3D - Invalid Catalog Name
                      castcontext => 'i', castmethod => 'f' },";
         let out = pgcast(types, casts).expect("the sample parses");
         assert!(out.contains("PREFERRED: [Oid; 1] = [701];"));
-        assert!(out.contains("IMPLICIT: [(Oid, Oid); 2] = [\n    (23, 20),\n    (23, 701),\n];"));
-        assert!(out.contains("ASSIGNMENT: [(Oid, Oid); 1] = [\n    (20, 23),\n];"));
+        // The casts are in the order of the source and the target, with the context and the method.
+        assert!(out.contains(
+            "CASTS: [Cast; 3] = [\n    c(20, 23, b'a', b'f'),\n    c(23, 20, b'i', b'f'),\n    \
+             c(23, 701, b'i', b'f'),\n];"
+        ));
         assert!(
             pgcast(types, "{ castsource => 'int4', casttarget => 'x', castcontext => 'i' }")
                 .is_err()
