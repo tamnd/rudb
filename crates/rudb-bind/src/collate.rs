@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Error, LogicalType, Result, Span, SqlState};
+use rudb_common::{Error, LogicalType, Result, Span, SqlState, Value};
 use rudb_parse::{Ast, ast};
 use rudb_plan::{Expr, ExprRef};
 
@@ -220,5 +220,25 @@ impl Binder<'_> {
                 .map_or(DEFAULT_COLLATION, |collation| collation.oid),
             oid => oid,
         })
+    }
+
+    /// `ILIKE` or `NOT ILIKE` of two strings in PostgreSQL. `Generic_Text_IC_like` matches the
+    /// lower case of the text against the lower case of the pattern with `LIKE`, where `lower`
+    /// maps the case by the collation of the call. So the collation `C` folds only the ASCII
+    /// letters, and `pg_c_utf8` folds each letter that has a lower case.
+    pub(crate) fn pg_ilike(
+        &mut self,
+        negated: bool,
+        left: ExprRef,
+        right: ExprRef,
+    ) -> Result<ExprRef> {
+        let oid = self.call_collation(&[left, right])?;
+        let oid = self.add_constant(Value::BigInt(i64::from(oid)));
+        let mut sides = Vec::with_capacity(2);
+        for side in [left, right] {
+            let side = self.cast_to(side, &LogicalType::Varchar);
+            sides.push(self.pgproc_kernel("lower", &[side, oid], LogicalType::Varchar));
+        }
+        self.call(if negated { "!~~" } else { "~~" }, sides)
     }
 }

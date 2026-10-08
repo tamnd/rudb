@@ -2120,7 +2120,7 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
     };
     // The rows are the ones that PostgreSQL 19 gives. The default collation of a database of
     // rudb is `C`, so a call with no collation maps only the ASCII letters, as `C` does.
-    let cases: [(&str, &[&str]); 13] = [
+    let cases: [(&str, &[&str]); 19] = [
         (
             "select upper('abc é ß'), lower('ABC É'), initcap('hELLO éa'), casefold('ABC ẞ');",
             &["ABC é ß|abc É|Hello éA|abc ẞ"],
@@ -2167,6 +2167,28 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
             "select initcap('o''neil d''arcy' collate pg_c_utf8), initcap('o''neil' collate \"C\");",
             &["O'Neil D'Arcy|O'Neil"],
         ),
+        // `ILIKE` matches the lower case of both sides, by the collation of the call.
+        ("select 'ABC' ilike 'abc', 'abc' ilike 'A_C', 'É' ilike 'é';", &["t|t|f"]),
+        (
+            "select 'É' ilike 'é' collate \"C\", 'É' ilike 'é' collate pg_c_utf8, 'ÉCOLE' not ilike 'éc%' collate pg_unicode_fast;",
+            &["f|t|f"],
+        ),
+        (
+            "select 'ẞ' ilike 'ß' collate pg_c_utf8, 'ẞ' ilike 's%' collate pg_unicode_fast, 'İ' ilike 'i%' collate pg_unicode_fast;",
+            &["t|f|t"],
+        ),
+        (
+            "select 'ΑΣ' ilike 'ας' collate pg_unicode_fast, 'ΑΣ' ilike 'ασ' collate pg_unicode_fast, 'ΑΣ' ilike 'ασ' collate pg_c_utf8;",
+            &["t|f|t"],
+        ),
+        (
+            "select 'É_b' ilike 'é$_B' escape '$' collate pg_c_utf8, null::text ilike 'a' collate pg_c_utf8;",
+            &["t|"],
+        ),
+        (
+            "select x from (values ('école'), ('ÉCOLE'), ('ecole')) t(x) where x ilike 'É%' collate pg_c_utf8;",
+            &["école", "ÉCOLE"],
+        ),
     ];
     for (sql, expected) in cases {
         let messages = client.query(sql);
@@ -2189,7 +2211,14 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
             mismatch,
             Some("35"),
         ),
+        ("select 'a' collate \"C\" ilike 'a' collate pg_c_utf8;", "42P21", mismatch, Some("34")),
         ("select upper('a' collate unicode);", "0A000", "ICU is not supported in this build", None),
+        (
+            "select 'a' ilike 'A' collate unicode;",
+            "0A000",
+            "ICU is not supported in this build",
+            None,
+        ),
     ] {
         let messages = client.query(sql);
         let error = &messages[0];

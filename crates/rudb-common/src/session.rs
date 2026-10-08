@@ -954,7 +954,8 @@ pub enum Collations {
     Pin,
     /// As in PostgreSQL: `COLLATE` names a collation of `pg_collation` and is refused on a type
     /// that has no collation, and two different collations written with `COLLATE` cannot meet in
-    /// one operator or function.
+    /// one operator or function. A function that maps the case of text, and `ILIKE`, which matches
+    /// the lower case of both sides, map it by the collation of the call.
     Postgres,
 }
 

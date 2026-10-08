@@ -1235,6 +1235,17 @@ impl Binder<'_> {
             BinaryOp::NotRegexInsensitive => {
                 return self.regex_operator(left, right, true, true, false);
             }
+            BinaryOp::ILike | BinaryOp::NotILike
+                if self.semantics.collations() == Collations::Postgres
+                    && [left, right].iter().all(|&side| {
+                        matches!(
+                            self.plan().expr_type(side),
+                            LogicalType::Varchar | LogicalType::Null
+                        )
+                    }) =>
+            {
+                return self.pg_ilike(op == BinaryOp::NotILike, left, right);
+            }
             BinaryOp::SimilarTo => return self.regex_operator(left, right, false, false, true),
             BinaryOp::NotSimilarTo => {
                 return self.regex_operator(left, right, false, true, true);
