@@ -259,6 +259,9 @@ fn specialized<V: AsRef<Vector>>(
     if matches!(name, "substring" | "substr") {
         return substring_of(args, returns, rows);
     }
+    if name == text::PG_SUBSTR {
+        return cut_of(args, returns, rows, true);
+    }
     if matches!(name, "left" | "right") {
         return end_of(name, args, returns, rows);
     }
@@ -621,6 +624,17 @@ fn substring_of<V: AsRef<Vector>>(
     returns: &LogicalType,
     rows: usize,
 ) -> Result<Option<Vector>> {
+    cut_of(args, returns, rows, false)
+}
+
+/// [`substring_of`] with the rule of the pin, or with the rule of [`text::PG_SUBSTR`] when
+/// `postgres` is set.
+fn cut_of<V: AsRef<Vector>>(
+    args: &[V],
+    returns: &LogicalType,
+    rows: usize,
+    postgres: bool,
+) -> Result<Option<Vector>> {
     let (held, start, length) = match args {
         [held, start] => (held.as_ref(), start.as_ref(), None),
         [held, start, length] => (held.as_ref(), start.as_ref(), Some(length.as_ref())),
@@ -644,6 +658,15 @@ fn substring_of<V: AsRef<Vector>>(
             None => return Ok(None),
         },
         None => None,
+    };
+    // A negative length is an error on the first row that is not null, which the row at a time
+    // path finds.
+    let (start, length) = match postgres {
+        true => match text::pg_span(start, length) {
+            Ok(span) => span,
+            Err(_) => return Ok(None),
+        },
+        false => (start, length),
     };
     let base = nulls_of(held);
     let text = match held.form() {

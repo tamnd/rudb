@@ -144,4 +144,5 @@ pub use random::{drawn, draws, random};
 pub use scalar::{call, call_prepared, call_values};
 pub use select::{refine as refine_flags, selection};
 pub use similarity::jaro_winkler;
+pub use text::PG_SUBSTR;
 pub use zoned::{call_in_time_zone, zoned_steps};

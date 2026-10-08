@@ -208,6 +208,9 @@ impl Binder<'_> {
         {
             return Ok(Some(call));
         }
+        if let Some(call) = self.position_call(ast, written, arguments, scope)? {
+            return Ok(Some(call));
+        }
         if let Some(call) = self.regexp_call(ast, written, arguments, scope)? {
             return Ok(Some(call));
         }
@@ -401,10 +404,6 @@ impl Binder<'_> {
             Function::Replace if arguments.len() > 4 || (arguments.len() == 4 && integer(3)) => {
                 Function::ReplaceAt
             }
-            // `substring` from a position is not a regular expression.
-            Function::Substring if !(1..arguments.len()).all(text) => {
-                return self.call("substring", bound).map(Some);
-            }
             other => other,
         };
         // `substring(text similar pattern escape escape)`, which is `substring` from what
@@ -433,10 +432,88 @@ impl Binder<'_> {
         if function.is_set() && !self.in_unnest {
             return Err(self.misplaced_set_function());
         }
+        for (at, parameter) in parameters.iter().enumerate().take(bound.len()) {
+            if unknown[at] && !parameter.is_text() {
+                bound[at] =
+                    self.argument_as(ast, arguments[at], bound[at], &LogicalType::Integer)?;
+            }
+        }
         for parameter in &parameters[bound.len()..] {
             bound.push(self.add_constant(parameter.default_value()));
         }
         Ok(Some(self.regexp_kernel(function, bound)))
+    }
+
+    /// `substring(value from start [for length])` and `substr` of a PostgreSQL session, which keep
+    /// a part of a `text` or a `bytea` value from a position, or `None` for any other call. A
+    /// `substring` whose arguments after the first are all strings or nulls is the form with a
+    /// regular expression, which [`Self::regexp_call`] binds. A string literal as the start or the
+    /// length is an integer, and a `bigint` is not one.
+    fn position_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let substring = same_name(written, "substring");
+        if !(substring || same_name(written, "substr")) || !(2..=3).contains(&arguments.len()) {
+            return Ok(None);
+        }
+        let unknown: Vec<bool> =
+            arguments.iter().map(|&argument| string_literal(ast, argument).is_some()).collect();
+        let mut bound = Vec::with_capacity(arguments.len());
+        for &argument in arguments {
+            bound.push(self.bind_expr(ast, argument, scope)?);
+        }
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&argument| self.plan().expr_type(argument).clone()).collect();
+        let text = |at: usize| {
+            unknown[at] || matches!(types[at], LogicalType::Varchar | LogicalType::Null)
+        };
+        if substring && (1..arguments.len()).all(text) {
+            return Ok(None);
+        }
+        let integer = |at: usize| {
+            unknown[at]
+                || matches!(
+                    types[at],
+                    LogicalType::Integer | LogicalType::SmallInt | LogicalType::Null
+                )
+        };
+        let returns = match &types[0] {
+            _ if unknown[0] => LogicalType::Varchar,
+            LogicalType::Varchar | LogicalType::Null => LogicalType::Varchar,
+            LogicalType::Blob => LogicalType::Blob,
+            _ => return Err(no_such_function(written, &types, &unknown)),
+        };
+        if !(1..arguments.len()).all(integer) {
+            return Err(no_such_function(written, &types, &unknown));
+        }
+        let mut cast = Vec::with_capacity(bound.len());
+        for (at, argument) in bound.into_iter().enumerate() {
+            let ty = if at == 0 { returns.clone() } else { LogicalType::Integer };
+            cast.push(self.argument_as(ast, arguments[at], argument, &ty)?);
+        }
+        let name = self.plan_mut().intern(rudb_kernels::PG_SUBSTR);
+        let args = self.plan_mut().add_expr_list(&cast);
+        Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
+    /// The argument `bound`, written as `written`, as a `ty`. A string literal is read by the input
+    /// function of the type, so `substr('abc', 'x')` is the error of the input of `integer`.
+    fn argument_as(
+        &mut self,
+        ast: &Ast,
+        written: ast::ExprRef,
+        bound: ExprRef,
+        ty: &LogicalType,
+    ) -> Result<ExprRef> {
+        let read = match self.read_literal(ast, written, rudb_pgtypes::pg_type(ty).oid) {
+            Some(value) => value?,
+            None => bound,
+        };
+        Ok(self.cast_to(read, ty))
     }
 
     /// `similar_to_escape(pattern [, escape])` of a PostgreSQL session, which the transform also
