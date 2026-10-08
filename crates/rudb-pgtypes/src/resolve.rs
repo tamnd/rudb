@@ -20,6 +20,7 @@ use crate::coerce::{
     is_preferred,
 };
 use crate::oid;
+use crate::operators::{Operator, operators};
 use crate::procs::{Proc, procs};
 use crate::types::{Oid, TypeInfo};
 
@@ -159,7 +160,7 @@ pub fn resolve_call(name: &str, call: Call<'_>) -> Resolution {
             match matching.len() {
                 0 => return Resolution::NotFound(Failure::Types),
                 1 => matching.remove(0),
-                _ => match select_candidate(args, matching) {
+                _ => match select_candidate(args, matching, |candidate| &candidate.args) {
                     Some(best) => best,
                     None => return Resolution::Ambiguous,
                 },
@@ -174,6 +175,51 @@ pub fn resolve_call(name: &str, call: Call<'_>) -> Resolution {
         return Resolution::NotFound(Failure::Types);
     }
     Resolution::Found(best)
+}
+
+/// What [`resolve_operator`] finds for an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorResolution {
+    /// The one operator that the expression names.
+    Found(&'static Operator),
+    /// No operator takes the operands, which is `42883`.
+    NotFound,
+    /// More than one operator takes the operands and the rules cannot choose one, which is
+    /// `42725`.
+    Ambiguous,
+}
+
+/// The operator `name` over operands of the types `args`, as `oper` of
+/// `src/backend/parser/parse_oper.c` finds an operator between two values and `left_oper` finds
+/// a prefix operator with one operand.
+///
+/// An operator with the types of the operands wins. Between two values an operand of type
+/// `unknown` is taken to have the type of the other one for this match, as `binary_oper_exact`
+/// does. Otherwise the candidates are the operators of the name that the operands cast to with no
+/// cast written, and `func_select_candidate` chooses one of them.
+pub fn resolve_operator(name: &str, args: &[Oid]) -> OperatorResolution {
+    let kind = match args.len() {
+        1 => b'l',
+        _ => b'b',
+    };
+    let exact: Vec<Oid> = match *args {
+        [oid::UNKNOWN, right] => vec![right, right],
+        [left, oid::UNKNOWN] => vec![left, left],
+        _ => args.to_vec(),
+    };
+    if let Some(found) = operators(name, kind).find(|operator| operator.args == exact) {
+        return OperatorResolution::Found(found);
+    }
+    let mut matching: Vec<&'static Operator> =
+        operators(name, kind).filter(|operator| can_coerce(args, operator.args)).collect();
+    match matching.len() {
+        0 => OperatorResolution::NotFound,
+        1 => OperatorResolution::Found(matching.remove(0)),
+        _ => match select_candidate(args, matching, |operator| operator.args) {
+            Some(found) => OperatorResolution::Found(found),
+            None => OperatorResolution::Ambiguous,
+        },
+    }
 }
 
 /// What the search for candidates saw, as the flags `FGC_ARGCOUNT_MATCH` and the others of
@@ -568,31 +614,36 @@ fn preferred_in(slot: u8, oid: Oid) -> bool {
 
 /// The candidates with the most positions for which `matches` holds, which is all of them when
 /// none has one.
-fn most(candidates: Vec<Candidate>, matches: impl Fn(&Candidate) -> usize) -> Vec<Candidate> {
+fn most<T>(candidates: Vec<T>, matches: impl Fn(&T) -> usize) -> Vec<T> {
     let best = candidates.iter().map(&matches).max().unwrap_or(0);
     candidates.into_iter().filter(|candidate| matches(candidate) == best).collect()
 }
 
 /// `func_select_candidate`: the one of more than one candidate that the heuristics choose, or
-/// `None` when they cannot choose.
-fn select_candidate(args: &[Oid], candidates: Vec<Candidate>) -> Option<Candidate> {
+/// `None` when they cannot choose. `args_of` gives the argument types of a candidate, which is a
+/// function or an operator.
+fn select_candidate<T: Clone>(
+    args: &[Oid],
+    candidates: Vec<T>,
+    args_of: impl Fn(&T) -> &[Oid],
+) -> Option<T> {
     let known = |at: usize| args[at] != oid::UNKNOWN;
     let positions = 0..args.len();
-    let exact = |candidate: &Candidate| {
-        positions.clone().filter(|&at| known(at) && candidate.args[at] == args[at]).count()
+    let exact = |candidate: &T| {
+        positions.clone().filter(|&at| known(at) && args_of(candidate)[at] == args[at]).count()
     };
     let mut candidates = most(candidates, exact);
     if candidates.len() == 1 {
         return candidates.pop();
     }
     let slots: Vec<u8> = args.iter().map(|&arg| category(arg).0).collect();
-    let near = |candidate: &Candidate| {
+    let near = |candidate: &T| {
         positions
             .clone()
             .filter(|&at| {
                 known(at)
-                    && (candidate.args[at] == args[at]
-                        || preferred_in(slots[at], candidate.args[at]))
+                    && (args_of(candidate)[at] == args[at]
+                        || preferred_in(slots[at], args_of(candidate)[at]))
             })
             .count()
     };
@@ -611,7 +662,7 @@ fn select_candidate(args: &[Oid], candidates: Vec<Candidate>) -> Option<Candidat
         let mut slot: Option<(u8, bool)> = None;
         let mut conflict = false;
         for candidate in &candidates {
-            let (category, preferred) = category(candidate.args[at]);
+            let (category, preferred) = category(args_of(candidate)[at]);
             slot = match slot {
                 None => Some((category, preferred)),
                 Some((held, any)) if held == category => Some((held, any || preferred)),
@@ -633,11 +684,11 @@ fn select_candidate(args: &[Oid], candidates: Vec<Candidate>) -> Option<Candidat
         }
     }
     if !resolved.is_empty() {
-        let kept: Vec<Candidate> = candidates
+        let kept: Vec<T> = candidates
             .iter()
             .filter(|candidate| {
                 resolved.iter().all(|&(at, slot, any)| {
-                    let (category, preferred) = category(candidate.args[at]);
+                    let (category, preferred) = category(args_of(candidate)[at]);
                     category == slot && (!any || preferred)
                 })
             })
@@ -659,7 +710,7 @@ fn select_candidate(args: &[Oid], candidates: Vec<Candidate>) -> Option<Candidat
             let assumed = vec![first; args.len()];
             let mut unique = None;
             for candidate in &candidates {
-                if can_coerce(&assumed, &candidate.args[..args.len()]) {
+                if can_coerce(&assumed, &args_of(candidate)[..args.len()]) {
                     if unique.is_some() {
                         return None;
                     }
@@ -731,6 +782,26 @@ mod tests {
 
     fn named(name: &str, args: &[Oid], names: &[&str], variadic: bool) -> Resolution {
         resolve_call(name, Call { args, names, variadic })
+    }
+
+    #[test]
+    fn an_operator_finds_the_operator_that_postgresql_finds() {
+        use oid::{INT4, INT4_ARRAY, NUMERIC, TEXT, UNKNOWN};
+        let code = |name: &str, args: &[Oid]| match resolve_operator(name, args) {
+            OperatorResolution::Found(operator) => operator.code,
+            other => panic!("{name} {args:?}: {other:?}"),
+        };
+        assert_eq!(code("||", &[INT4_ARRAY, INT4]), "array_append");
+        assert_eq!(code("||", &[INT4, INT4_ARRAY]), "array_prepend");
+        assert_eq!(code("||", &[INT4_ARRAY, INT4_ARRAY]), "array_cat");
+        assert_eq!(code("||", &[UNKNOWN, UNKNOWN]), "textcat");
+        assert_eq!(code("||", &[TEXT, INT4]), "textanycat");
+        assert_eq!(code("@>", &[INT4_ARRAY, INT4_ARRAY]), "arraycontains");
+        assert_eq!(code("+", &[INT4, UNKNOWN]), "int4pl");
+        assert_eq!(code("+", &[INT4, NUMERIC]), "numeric_add");
+        assert_eq!(code("-", &[INT4]), "int4um");
+        assert_eq!(resolve_operator("@>", &[INT4, INT4]), OperatorResolution::NotFound);
+        assert_eq!(resolve_operator("nosuchop", &[INT4, INT4]), OperatorResolution::NotFound);
     }
 
     #[test]

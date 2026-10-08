@@ -34,12 +34,34 @@ pub(crate) struct Written<'a> {
 }
 
 /// The PostgreSQL type of a value of `ty` when that type binds back as `ty`, so that the rules for
-/// a call see the type that the value has. A DECIMAL is a `numeric` with a typmod.
+/// a call see the type that the value has. A DECIMAL is a `numeric` with a typmod, and a list of
+/// DECIMAL values is a `numeric[]`.
 fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
     let oid = rudb_pgtypes::pg_type(ty).oid;
     let back = rudb_pgtypes::logical_type(oid)?;
-    let exact = back == *ty || matches!(ty, LogicalType::Decimal { .. });
+    let decimal = |ty: &LogicalType| matches!(ty, LogicalType::Decimal { .. });
+    let exact =
+        back == *ty || decimal(ty) || matches!(ty, LogicalType::List(element) if decimal(element));
     exact.then_some(oid)
+}
+
+/// The PostgreSQL types of the operands of an operator, with `unknown` for a string literal and a
+/// null, or `None` when an operand has a type that PostgreSQL does not have.
+pub(crate) fn operand_oids(
+    ast: &Ast,
+    written: &[ast::ExprRef],
+    types: &[LogicalType],
+) -> Option<Vec<rudb_pgtypes::Oid>> {
+    let untyped = |at: usize| {
+        types[at] == LogicalType::Null
+            || matches!(ast.expr(written[at]), ast::Expr::Literal { kind: LiteralKind::String, .. })
+    };
+    (0..written.len())
+        .map(|at| match untyped(at) {
+            true => Some(rudb_pgtypes::oid::UNKNOWN),
+            false => exact_oid(&types[at]),
+        })
+        .collect()
 }
 
 /// A function of `pg_proc` named `written` whose every form returns a set that a kernel here
@@ -492,6 +514,47 @@ impl Binder<'_> {
         let name = self.plan_mut().intern(&format!("{}{src}", rudb_kernels::pgproc::PREFIX));
         let args = self.plan_mut().add_expr_list(args);
         self.add_expr(Expr::Function { name, args }, returns)
+    }
+
+    /// The operator `symbol` over `bound` as the operator of `pg_operator` that PostgreSQL finds
+    /// for it, or `None` when the operator takes another path here.
+    ///
+    /// The operator is found by the rules of `oper_select_candidate` over the types of the
+    /// operands, with `unknown` for a string literal and a null. An operator that takes a
+    /// polymorphic type, such as `||` of two arrays, is the kernel of its function, with each
+    /// operand cast to the actual type of its declared type. The engine has the other operators,
+    /// over its vectors, with the same values.
+    pub(crate) fn pg_operator(
+        &mut self,
+        ast: &Ast,
+        symbol: &str,
+        written: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        use rudb_pgtypes::OperatorResolution;
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&operand| self.plan().expr_type(operand).clone()).collect();
+        let Some(oids) = operand_oids(ast, written, &types) else { return Ok(None) };
+        let OperatorResolution::Found(operator) = rudb_pgtypes::resolve_operator(symbol, &oids)
+        else {
+            return Ok(None);
+        };
+        let Some(proc) = operator.proc() else { return Ok(None) };
+        if !operator.args.iter().any(|&oid| rudb_pgtypes::is_polymorphic(oid))
+            || !matches!(proc.lang, b'i' | b'c')
+            || !rudb_kernels::pgproc::has(proc.src)
+        {
+            return Ok(None);
+        }
+        let generic = rudb_pgtypes::enforce_generic_types(&oids, operator.args, operator.result)
+            .map_err(|error| Error::from(error).unplaced())?;
+        let Some(returns) = rudb_pgtypes::logical_type(generic.result) else { return Ok(None) };
+        let mut cast = Vec::with_capacity(bound.len());
+        for (index, &oid) in generic.args.iter().enumerate() {
+            let Some(ty) = rudb_pgtypes::logical_type(oid) else { return Ok(None) };
+            cast.push(self.argument_as(ast, written[index], bound[index], &ty)?);
+        }
+        Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
     }
 
     /// The default `text` of an argument of the PostgreSQL type `oid`, read by the input function

@@ -1753,7 +1753,6 @@ fn the_array_functions_resolve_their_types_and_give_the_values_of_postgres() {
             .join("|")
     };
     // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
-    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
     let cases: [(&str, &[&str]); 16] = [
         ("select array_dims(array[1,2,3]), array_dims('{}'::int[]);", &["[1:3]|"]),
         (
@@ -1860,6 +1859,101 @@ fn the_array_functions_resolve_their_types_and_give_the_values_of_postgres() {
         ),
     ] {
         // An error of a kernel comes after the row description.
+        let messages = client.query(sql);
+        assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_array_operators_resolve_as_postgres_resolves_them() {
+    let dirs = Dirs::new("pgarrayops");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
+    let cases: [(&str, &[&str]); 15] = [
+        (
+            "select array[1,2] || 3, 0 || array[1,2], array[1,2] || array[3,4], array[1] || null, null || array[1];",
+            &["{1,2,3}|{0,1,2}|{1,2,3,4}|{1}|{1}"],
+        ),
+        (
+            "select array[1,2] || '{3,4}', '{0}' || array[1,2], array[1.5] || 2, 2 || array[1.5];",
+            &["{1,2,3,4}|{0,1,2}|{1.5,2}|{2,1.5}"],
+        ),
+        ("select '{1}' || 2;", &["{1}2"]),
+        (
+            "select array[]::int[] || array[1], array[1] || array[]::int[], null::int[] || null::int[];",
+            &["{1}|{1}|"],
+        ),
+        ("select pg_typeof(array[1] || 2.5), array[1] || 2.5;", &["numeric[]|{1,2.5}"]),
+        (
+            "select array[1,2,2] @> array[2,1], array[1] @> array[]::int[], array[1,null] @> array[null::int], array[]::int[] <@ array[null::int];",
+            &["t|t|f|t"],
+        ),
+        (
+            "select array[null,2] && array[2], array[null::int] && array[null::int], array[]::int[] && array[]::int[], null::int[] @> array[1];",
+            &["t|f|f|"],
+        ),
+        ("select array[1] @> '{1}', '{1,2}' <@ array[1,2,3], array['a'] && '{a}';", &["t|t|t"]),
+        ("select array_append('{1}', 2);", &["{1,2}"]),
+        (
+            "select array_append(array[1], 2), array_prepend(0, array[1]), array_cat(array[1], array[2.5]), array_append(null::int[], null), array_cat(null::int[], array[1]);",
+            &["{1,2}|{0,1}|{1,2.5}|{NULL}|{1}"],
+        ),
+        (
+            "select array_cat(array[1], null), array_cat('{}'::int[], null::int[]), array_prepend(null, null::text[]);",
+            &["{1}|{}|{NULL}"],
+        ),
+        ("select array['a','B'] @> array['b'];", &["f"]),
+        (
+            "select array[1.0] @> array[1.00], array['NaN'::float8] @> array['NaN'::float8];",
+            &["t|t"],
+        ),
+        (
+            "select array['a','b'] || array['c'], 'x' || 'y' || 1, array[true] && array[false, true];",
+            &["{a,b,c}|xy1|t"],
+        ),
+        (
+            "select pg_typeof(array[1] && array[2]), pg_typeof(0::int8 || array[1]);",
+            &["boolean|bigint[]"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        ("select array[1] || '3';", "22P02", "malformed array literal: \"3\""),
+        (
+            "select array['a'] || 'b', 'b' || array['a'], 'x' || 'y', 'x' || 1;",
+            "22P02",
+            "malformed array literal: \"b\"",
+        ),
+        (
+            "select array[1] @> array[1.5];",
+            "42883",
+            "operator does not exist: integer[] @> numeric[]",
+        ),
+        ("select array[1] @> 1;", "42883", "operator does not exist: integer[] @> integer"),
+        ("select 1 @> 2;", "42883", "operator does not exist: integer @> integer"),
+        ("select 1 @@@ 2;", "42883", "operator does not exist: integer @@@ integer"),
+        ("select '1' + '2';", "42725", "operator is not unique: unknown + unknown"),
+        ("select date '2020-01-01' + '1';", "42725", "operator is not unique: date + unknown"),
+    ] {
+        // An error of the binder comes before a row description, and an error of a kernel after it.
         let messages = client.query(sql);
         assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
         let error = &messages[messages.len() - 2];

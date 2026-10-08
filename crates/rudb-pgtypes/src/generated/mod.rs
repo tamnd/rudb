@@ -6,6 +6,8 @@
 
 pub(crate) mod casts;
 pub mod oids;
+#[rustfmt::skip]
+pub(crate) mod operators;
 // The table of functions is long and has the layout of its generator. rustfmt does not change it,
 // so that `cargo xtask pg-check` can compare it byte for byte.
 #[rustfmt::skip]

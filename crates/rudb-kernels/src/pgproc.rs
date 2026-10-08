@@ -6,7 +6,7 @@
 //! cast to its declared type. So one kernel serves every name of a function, such as `ceil` and
 //! `ceiling`, and the types of the arguments are always the declared ones.
 
-use rudb_common::{Result, Value};
+use rudb_common::{LogicalType, Result, Value};
 
 use crate::{pgarray, pgdatetime, pgmath, pgnormalize, pgstring};
 
@@ -57,7 +57,7 @@ pub fn rows_of(src: &str) -> Option<&'static str> {
 /// The value of a call of a kernel of a C function, or `None` for any other name. A null
 /// argument of a strict function gives a null. The functions that are not strict, as
 /// `proisstrict` has them, see the null.
-pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
+pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
     let Some(src) = name.strip_prefix(PREFIX) else { return Ok(None) };
     if args.iter().any(Value::is_null) && !sees_nulls(src) {
         return Ok(Some(Value::Null));
@@ -74,7 +74,7 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     if let Some(value) = pgnormalize::call(src, args)? {
         return Ok(Some(value));
     }
-    pgarray::proc_call(src, args)
+    pgarray::proc_call(src, args, returns)
 }
 
 /// The function of one `float8` of the kernel `name`, for the loop over a column.
