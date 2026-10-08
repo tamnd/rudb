@@ -86,6 +86,26 @@ pub(crate) fn vectorized<A: Fn(usize) -> usize>(
     finish(returns, Data::Float64(out.into()), validity)
 }
 
+/// A column of doubles through a function that can fail, such as a kernel of `pg_proc`.
+pub(crate) fn over_float<A: Fn(usize) -> usize>(
+    body: fn(f64) -> Result<f64>,
+    data: &Data,
+    at: A,
+    base: Validity,
+    rows: usize,
+    returns: &LogicalType,
+) -> Result<Option<Vector>> {
+    let (Data::Float64(held), LogicalType::Double) = (data, returns) else {
+        return Ok(None);
+    };
+    let mut out = vec![0.0f64; rows];
+    let validity = over_valid(rows, base, |index| {
+        out[index] = body(held[at(index)])?;
+        Ok(())
+    })?;
+    finish(returns, Data::Float64(out.into()), validity)
+}
+
 /// A column of doubles rounded to a count of digits that is the same for every row, which is how
 /// `round(x, 2)` is always written.
 pub(crate) fn rounded_column(

@@ -628,6 +628,12 @@ impl Binder<'_> {
     /// the optimizer gets to fold and prune with the values in hand.
     fn bind_parameter(&mut self, ast: &Ast, name: ast::StrRef) -> Result<ExprRef> {
         let name = ast.string(name);
+        if let Some(inlined) = &self.inlined
+            && let Some(at) = name.strip_prefix('$').and_then(|number| number.parse::<usize>().ok())
+            && let Some(&argument) = inlined.get(at.wrapping_sub(1))
+        {
+            return Ok(argument);
+        }
         if self.parameters.get(name).is_none()
             && let Some(placeholders) = self.parameters.placeholders()
             && let Some(declared) = placeholders.declared(name)
@@ -1616,6 +1622,12 @@ impl Binder<'_> {
         {
             return Ok(cast);
         }
+        if postgres
+            && let Some(call) =
+                self.pg_proc_call(ast, &written, &arguments, &bound, &untyped, scope)?
+        {
+            return Ok(call);
+        }
         if let Some(expanded) = self.list_macro(&written, &bound, &untyped)? {
             return Ok(expanded);
         }
@@ -1944,10 +1956,7 @@ impl Binder<'_> {
             let name = written.to_ascii_lowercase();
             return Err(rudb_functions::named_mismatch(&name, &spelled, false));
         }
-        let mut bound = self.variant_arguments(ast, &written, &arguments, bound)?;
-        if postgres {
-            self.postgres_rounding(&written, &mut bound);
-        }
+        let bound = self.variant_arguments(ast, &written, &arguments, bound)?;
         // PostgreSQL counts the bytes of a text with `octet_length` and of a bytea with `length`,
         // and the pin has `strlen` and `octet_length` for these.
         if postgres && let [only] = &types[..] {
@@ -1967,14 +1976,10 @@ impl Binder<'_> {
             }
         }
         let texts = self.semantics.error_texts() == ErrorTexts::Postgres;
-        let call = self.call(&written, bound).map_err(|error| match texts {
+        self.call(&written, bound).map_err(|error| match texts {
             true => undefined_function(ast, error, &written, &arguments, &types),
             false => literals_spelled(ast, error, &arguments, &types),
-        })?;
-        match postgres {
-            true => Ok(self.postgres_narrowed(&written, &types, call)),
-            false => Ok(call),
-        }
+        })
     }
 
     /// The arguments of a function over `VARIANT`, read the way the pin reads them.
@@ -5161,7 +5166,7 @@ fn literals_spelled(
 /// place of the error of the pin. The message names the types of the arguments as `format_type`
 /// does, with `unknown` for a string literal and a null. A name with no function at all gets the
 /// detail that says so, and a name with the wrong types gets another detail and a hint. Another error stays as it is.
-fn undefined_function(
+pub(crate) fn undefined_function(
     ast: &Ast,
     error: Error,
     written: &str,

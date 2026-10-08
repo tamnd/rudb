@@ -1163,6 +1163,95 @@ fn the_functions_of_postgres_have_its_result_types() {
 }
 
 #[test]
+fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
+    let dirs = Dirs::new("pgmath");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The values are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "select sign(-8.4), sign(0.0), sign('NaN'::numeric), sign('-Infinity'::numeric)",
+            "-1|0|NaN|-1",
+        ),
+        (
+            "select scale(8.4100), scale('NaN'::numeric), min_scale(8.4100), min_scale(0.00), \
+             trim_scale(8.4100), trim_scale(100.000), trim_scale(0.000)",
+            "4|null|2|0|8.41|100|0",
+        ),
+        (
+            "select div(9.5, 2), div(-9.5, 2), div(1, 'Infinity'::numeric), \
+             div('Infinity'::numeric, -2), div('NaN'::numeric, 1)",
+            "4|-4|0|-Infinity|NaN",
+        ),
+        (
+            "select factorial(0), factorial(20), factorial(25)",
+            "1|2432902008176640000|15511210043330985984000000",
+        ),
+        (
+            "select gcd(1.5, 0.25), lcm(1.5, 0.25), gcd(-12.0, 18), lcm(0, 5.5), \
+             gcd('NaN'::numeric, 1)",
+            "0.25|1.50|6.0|0.0|NaN",
+        ),
+        (
+            "select width_bucket(5.35, 0.024, 10.06, 5), width_bucket(-1.0, 0, 10, 5), \
+             width_bucket(10.0, 0, 10, 5), width_bucket(5.0, 10, 0, 5), \
+             width_bucket('NaN'::numeric, 0, 1, 3)",
+            "3|0|6|3|4",
+        ),
+        (
+            "select width_bucket(5.35::float8, 0.024, 10.06, 5), \
+             width_bucket(1e308::float8, -1e308, 1e308, 10), width_bucket(0::float8, 10, 0, 4)",
+            "3|11|5",
+        ),
+        (
+            "select sind(30), cosd(60), tand(45), cotd(45), asind(0.5), acosd(0.5), atand(1), \
+             atan2d(1, 1), sind(-90), tand(90)",
+            "0.5|0.5|1|1|30|60|45|45|-1|Infinity",
+        ),
+        (
+            "select mod(-2147483648, -1), to_bin(-1), to_oct(-8::int8), to_hex(-1::int8)",
+            "0|11111111111111111111111111111111|1777777777777777777770|ffffffffffffffff",
+        ),
+        ("select erf(0.5), erfc(0.5), gamma(5)", "0.5204998778130465|0.4795001221869535|24"),
+        (
+            "select round(-2.5), round(2.5::float8), round(3.5::float8), round(1234.5, -2)",
+            "-3|2|4|1200",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "TDCZ", "{sql}");
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        ("select div(1.0, 0)", "22012", "division by zero"),
+        ("select factorial(-1)", "22003", "factorial of a negative number is undefined"),
+        ("select width_bucket(1.0, 0, 10, 0)", "2201G", "count must be greater than zero"),
+        ("select width_bucket(1.0, 1, 1, 3)", "2201G", "lower bound cannot equal upper bound"),
+        ("select dexp(800)", "22003", "value out of range: overflow"),
+        ("select exp(-1000::float8)", "22003", "value out of range: underflow"),
+        ("select gcd(-2147483648, 0)", "22003", "integer out of range"),
+        ("select lcm(2147483647, 2147483646)", "22003", "integer out of range"),
+        ("select ln(0::float8)", "2201E", "cannot take logarithm of zero"),
+        ("select log10(-1::float8)", "2201E", "cannot take logarithm of a negative number"),
+        ("select sqrt(-1)", "2201F", "cannot take square root of a negative number"),
+        ("select acos(2)", "22003", "input is out of range"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_parameter_in_a_call_gets_the_type_of_postgres() {
     let dirs = Dirs::new("unknowns");
     let server = Server::start(dirs.config()).unwrap();
@@ -1598,6 +1687,13 @@ fn a_call_that_no_function_takes_is_the_error_of_postgres() {
             "function text(record) does not exist",
             "No function of that name accepts the given argument types.",
         ),
+        // `round` with a scale is only over `numeric`, and a `float8` does not cast to it with no
+        // cast written.
+        (
+            "select round(1.5::float8, 1)",
+            "function round(double precision, integer) does not exist",
+            "No function of that name accepts the given argument types.",
+        ),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "EZ", "{sql}");
@@ -1606,6 +1702,15 @@ fn a_call_that_no_function_takes_is_the_error_of_postgres() {
         assert_eq!(messages[0].field(b'D').as_deref(), Some(detail), "{sql}");
         assert_eq!(messages[0].field(b'P').as_deref(), Some("8"), "{sql}");
     }
+    // Two of the functions take a call of two arguments of no type, and neither wins.
+    let messages = client.query("select date_trunc('day', null)");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("42725"));
+    let message = "function date_trunc(unknown, unknown) is not unique";
+    assert_eq!(messages[0].field(b'M').as_deref(), Some(message));
+    let detail = "Could not choose a best candidate function.";
+    assert_eq!(messages[0].field(b'D').as_deref(), Some(detail));
+    assert_eq!(messages[0].field(b'P').as_deref(), Some("8"));
     server.stop().unwrap();
 }
 

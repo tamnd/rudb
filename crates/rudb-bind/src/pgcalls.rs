@@ -19,9 +19,18 @@ use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 
-use crate::advisory::no_such_function;
+use crate::advisory::{no_such_function, spelled_call};
 use crate::binder::Binder;
 use crate::scope::Scope;
+
+/// The PostgreSQL type of a value of `ty` when that type binds back as `ty`, so that the rules for
+/// a call see the type that the value has. A DECIMAL is a `numeric` with a typmod.
+fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
+    let oid = rudb_pgtypes::pg_type(ty).oid;
+    let back = rudb_pgtypes::logical_type(oid)?;
+    let exact = back == *ty || matches!(ty, LogicalType::Decimal { .. });
+    exact.then_some(oid)
+}
 
 /// The functions whose result is an `int4` in PostgreSQL and a BIGINT here.
 const INTEGER_RESULTS: &[&str] = &[
@@ -198,6 +207,120 @@ impl Binder<'_> {
         self.cast_bound(*input, &target, declared, false).map(Some)
     }
 
+    /// The call `written(arguments)` bound to the function of `pg_proc` that PostgreSQL finds for
+    /// it, or `None` when the call takes another path here.
+    ///
+    /// The function is found by the rules of `func_get_detail` over the types of the arguments,
+    /// with `unknown` for a string literal and a null. A function in C with a kernel here is
+    /// called as the kernel, with each argument cast to the declared type, and a function in SQL
+    /// has its body bound in place of the call, with `$1` and the others the arguments. No
+    /// function, or more than one, is the error of PostgreSQL. A name that is also an aggregate
+    /// or a window function, and an argument of a type that PostgreSQL does not have, take the
+    /// path of the pin.
+    pub(crate) fn pg_proc_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+        untyped: &[bool],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        use rudb_pgtypes::{Failure, Resolution, oid};
+        let procs = rudb_pgtypes::procs(written);
+        if procs.is_empty() || procs.iter().any(|proc| proc.kind != b'f') {
+            return Ok(None);
+        }
+        let mut types = Vec::with_capacity(bound.len());
+        let mut oids = Vec::with_capacity(bound.len());
+        for (&argument, &untyped) in bound.iter().zip(untyped) {
+            let ty = self.plan().expr_type(argument).clone();
+            let oid = match untyped || ty == LogicalType::Null {
+                true => oid::UNKNOWN,
+                false => match exact_oid(&ty) {
+                    Some(oid) => oid,
+                    None => return Ok(None),
+                },
+            };
+            types.push(ty);
+            oids.push(oid);
+        }
+        let candidate = match rudb_pgtypes::resolve_function(written, &oids) {
+            Resolution::Found(candidate) => candidate,
+            Resolution::NotFound(failure) => {
+                let detail = match failure {
+                    Failure::Name => "There is no function of that name.",
+                    Failure::Count => {
+                        "No function of that name accepts the given number of arguments."
+                    }
+                    Failure::Types => {
+                        let error = no_such_function(written, &types, untyped);
+                        return Err(error.with_span(self.current_span));
+                    }
+                };
+                let call = spelled_call(written, &types, untyped);
+                let message = format!("function {call} does not exist");
+                return Err(Error::binder(message.clone())
+                    .state(SqlState::UNDEFINED_FUNCTION)
+                    .pg(message)
+                    .detail(detail)
+                    .with_span(self.current_span));
+            }
+            Resolution::Ambiguous => {
+                let call = spelled_call(written, &types, untyped);
+                let message = format!("function {call} is not unique");
+                return Err(Error::binder(message.clone())
+                    .state(SqlState::AMBIGUOUS_FUNCTION)
+                    .pg(message)
+                    .detail("Could not choose a best candidate function.")
+                    .hint("You might need to add explicit type casts.")
+                    .with_span(self.current_span));
+            }
+        };
+        let proc = candidate.proc;
+        if candidate.variadic != 0 || candidate.defaults != 0 {
+            return Ok(None);
+        }
+        let Some(declared) = candidate
+            .args
+            .iter()
+            .map(|&oid| rudb_pgtypes::logical_type(oid))
+            .collect::<Option<Vec<LogicalType>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(returns) = rudb_pgtypes::logical_type(proc.result) else { return Ok(None) };
+        let kernel = matches!(proc.lang, b'i' | b'c') && rudb_kernels::pgproc::has(proc.src);
+        let body = match proc.lang {
+            b's' if proc.src != "see system_functions.sql" => {
+                let src = proc.src;
+                Some(match src.get(..7) {
+                    Some(start) if start.eq_ignore_ascii_case("select ") => &src[7..],
+                    _ => src,
+                })
+            }
+            _ => None,
+        };
+        if !kernel && body.is_none() {
+            return Ok(None);
+        }
+        let mut cast = Vec::with_capacity(bound.len());
+        for ((&argument, &input), ty) in arguments.iter().zip(bound).zip(&declared) {
+            cast.push(self.argument_as(ast, argument, input, ty)?);
+        }
+        if let Some(body) = body {
+            // A body that the parser or the binder here cannot take yet leaves the call to the
+            // path of the pin.
+            let outer = self.inlined.replace(cast);
+            let inlined = self.bind_macro_body(written, body, scope);
+            self.inlined = outer;
+            return Ok(inlined.ok().map(|call| self.cast_to(call, &returns)));
+        }
+        let name = self.plan_mut().intern(&format!("{}{}", rudb_kernels::pgproc::PREFIX, proc.src));
+        let args = self.plan_mut().add_expr_list(&cast);
+        Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
     /// The call `written(arguments)` bound as PostgreSQL binds it, or `None` when the name is not
     /// one of the functions that this module writes out.
     pub(crate) fn postgres_call(
@@ -281,19 +404,6 @@ impl Binder<'_> {
                     .map(|text| format!("CAST((({text}) {test}) AS INTEGER)"))
                     .collect();
                 format!("CAST(({}) AS INTEGER)", each.join(" + "))
-            }
-            // The bounds can be in either order. A value below the first bound is in bucket 0 and
-            // a value at or past the second bound is in the bucket after the last.
-            [value, low, high, count] if named("width_bucket") => {
-                let value = format!("CAST(({value}) AS DOUBLE)");
-                format!(
-                    "CAST(CASE WHEN (({low}) < ({high})) THEN (CASE WHEN ({value} < ({low})) THEN \
-                     (0) WHEN ({value} >= ({high})) THEN ((({count}) + 1)) ELSE ((floor(((({value} \
-                     - ({low})) * ({count})) / (({high}) - ({low})))) + 1)) END) ELSE (CASE WHEN \
-                     ({value} > ({low})) THEN (0) WHEN ({value} <= ({high})) THEN ((({count}) + \
-                     1)) ELSE ((floor((((({low}) - {value}) * ({count})) / (({low}) - ({high})))) \
-                     + 1)) END) END AS INTEGER)"
-                )
             }
             // The fill is a space when the call does not give one.
             [string, length] if named("lpad") || named("rpad") => {
@@ -792,60 +902,6 @@ impl Binder<'_> {
             return self.cast_to(call, &LogicalType::Double);
         }
         call
-    }
-
-    /// The call `written(types)` resolved to `call`, cast to the type of the overload that
-    /// PostgreSQL chooses for these types.
-    ///
-    /// `gcd` and `lcm` have overloads over `int4`, `int8` and `numeric` there and only over a
-    /// BIGINT and a HUGEINT here, so the types have to be the ones that were given and not the
-    /// ones that the call cast them to. `sign` is a TINYINT here and has overloads over `float8`
-    /// and `numeric` there, and an integer goes to `float8`.
-    pub(crate) fn postgres_narrowed(
-        &mut self,
-        written: &str,
-        types: &[LogicalType],
-        call: ExprRef,
-    ) -> ExprRef {
-        if same_name(written, "sign") && types.len() == 1 {
-            let ty = match types[0] {
-                LogicalType::Decimal { .. } | LogicalType::Numeric => LogicalType::Numeric,
-                _ => LogicalType::Double,
-            };
-            if *self.plan().expr_type(call) != ty {
-                return self.cast_to(call, &ty);
-            }
-            return call;
-        }
-        let named = ["gcd", "lcm"].iter().any(|name| same_name(written, name));
-        match named && !types.is_empty() && types.iter().all(narrow) {
-            true if *self.plan().expr_type(call) == LogicalType::BigInt => {
-                self.cast_to(call, &LogicalType::Integer)
-            }
-            _ => call,
-        }
-    }
-
-    /// Casts the value of a call of `round`, `trunc`, `ceil` or `floor` to the overload that
-    /// PostgreSQL chooses for it.
-    ///
-    /// PostgreSQL has these over `float8` and `numeric` and not over an integer. An integer goes
-    /// to `float8` when the call has one argument, and to `numeric` when it has a scale, since
-    /// only the `numeric` overload takes one. A parameter of no type with a scale is a `numeric`
-    /// for the same reason.
-    pub(crate) fn postgres_rounding(&mut self, written: &str, arguments: &mut [ExprRef]) {
-        let named = |names: &[&str]| names.iter().any(|name| same_name(written, name));
-        let ty = match arguments.len() {
-            1 if named(&["round", "trunc", "ceil", "ceiling", "floor"]) => LogicalType::Double,
-            2 if named(&["round", "trunc"]) => LogicalType::Numeric,
-            _ => return,
-        };
-        let value = arguments[0];
-        let given = self.plan().expr_type(value);
-        let placeholder = *given == LogicalType::Null && self.is_placeholder(value);
-        if given.is_integer() || (placeholder && ty == LogicalType::Numeric) {
-            arguments[0] = self.cast_to(value, &ty);
-        }
     }
 
     /// Whether `function(arguments)` is the series over `int4` of PostgreSQL, which gives an
