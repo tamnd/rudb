@@ -73,6 +73,20 @@ pub fn statements(script: &str) -> Result<Vec<Statement<'_>>> {
     Ok(found)
 }
 
+/// [`statements`] of a script that a PostgreSQL session sent. The PostgreSQL grammar reads all of
+/// the script first, so a syntax error anywhere in it is the error of the script, and each
+/// statement is where the grammar says it is.
+///
+/// # Errors
+///
+/// The error of the PostgreSQL grammar.
+pub(crate) fn postgres_statements(script: &str) -> Result<Vec<Statement<'_>>> {
+    Ok(rudb_pgparse::transform::statements(script)?
+        .into_iter()
+        .map(|range| Statement { sql: &script[range.clone()], offset: range.start })
+        .collect())
+}
+
 /// Whether a script ends on a statement boundary.
 ///
 /// This is the question a prompt asks between lines. False means the user is in the middle of

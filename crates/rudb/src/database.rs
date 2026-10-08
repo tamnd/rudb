@@ -4160,6 +4160,11 @@ impl Shared {
         *self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner) = Some(postgres);
     }
 
+    /// Whether a PostgreSQL session speaks through this connection.
+    pub(crate) fn is_postgres(&self) -> bool {
+        self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+    }
+
     /// Runs one query and returns every row it produced.
     ///
     /// `EXPLAIN` comes through here as well as through [`Shared::execute`], because it answers with

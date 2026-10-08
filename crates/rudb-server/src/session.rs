@@ -1541,7 +1541,7 @@ impl Runner {
         out: &mut OutBuf,
         mut flush: impl FnMut(&mut OutBuf) -> io::Result<()>,
     ) -> io::Result<bool> {
-        let statements = match rudb::statements(sql) {
+        let statements = match self.connection.statements(sql) {
             Ok(statements) => statements,
             Err(error) => {
                 Failure::engine(&error, 0).write(sql, out);

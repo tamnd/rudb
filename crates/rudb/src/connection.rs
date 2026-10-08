@@ -120,6 +120,21 @@ impl Connection {
         self.shared.set_postgres(postgres);
     }
 
+    /// The statements of a script in the dialect of the session. A PostgreSQL session reads the
+    /// script with the PostgreSQL grammar, so a syntax error in any statement is the error of the
+    /// script. Any other session splits it as [`crate::statements`] does.
+    ///
+    /// # Errors
+    ///
+    /// The syntax error of a PostgreSQL session, or the tokenizer error of any other session.
+    pub fn statements<'a>(&self, script: &'a str) -> Result<Vec<crate::Statement<'a>>> {
+        if self.shared.is_postgres() {
+            crate::statements::postgres_statements(script)
+        } else {
+            crate::statements(script)
+        }
+    }
+
     /// Records when the client sent the statement that runs next, in microseconds since the epoch.
     /// `statement_timestamp()` gives it, and a `BEGIN` takes it as the start of the transaction
     /// that `now()` gives. A server calls this each time it reads a statement.
