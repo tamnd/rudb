@@ -12,10 +12,10 @@
 //! removed nothing has to cost nothing downstream, and without it that reduction costs a bitmap of
 //! all ones and a test per row to learn nothing.
 //!
-//! Sparse is a sorted list of row ids, used below one member in [`SPARSE_RATIO`] rows, which is
-//! where the list is the smaller of the two. A test is a binary search, which is fine because the
-//! consumer of a set that small walks it rather than testing into it, and the one walk here that
-//! tests every row of what it reaches lays a list out as a bitmap first.
+//! Sparse is a sorted list of row ids, used below one member in [`SPARSE_RATIO`] rows. A test is a
+//! binary search, which is fine because the consumer of a set that small walks it rather than
+//! testing into it, and the one walk here that tests every row of what it reaches lays a list out
+//! as a bitmap first.
 //!
 //! Dense is one bit per row. On TPC-H SF100 `lineitem` that is 75 MB and `orders` is 18.75 MB, which
 //! fits the last level cache of nothing, and the reason it is still the right form is that a scan
@@ -41,15 +41,13 @@ use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 
 /// Below one member in this many rows, a set is held as a sorted list rather than a bitmap.
 ///
-/// A list is eight bytes a member and a bitmap is a bit a row, so the list is the smaller one up to
-/// one member in sixty four rows. Section 4.3 put the line at one in a thousand, on the side of the
-/// bitmap because a scan tests it in row order. But the scan of a reduced part asks for the members
-/// in its range and not for a test a row, which a list answers with one search, and a bitmap
-/// between the two lines was a pass over every word of the table to write it, one to count it and
-/// one in each part to find its members. On TPC-H q02 the 747 parts a filter keeps have 2,988 rows
-/// of `partsupp` out of 800,000, one in 268, and the bitmap was 100 KB written, counted and walked
-/// for those 2,988 rows.
-pub const SPARSE_RATIO: u64 = 64;
+/// Section 4.3's number. At one in a thousand the list is eight bytes a member against a bitmap's
+/// thousand bits, so the list is about a sixteenth of the size, and it stays smaller until one in
+/// sixty four, so the threshold is on the side of the bitmap. That side is the one a scan wants.
+/// Moving the line to sixty four took 2.7 million instructions off q17 at SF1 and put 2.8 million
+/// on q20 and 1.7 million on q08, whose sets between the two lines are tested a row at a time
+/// further on, so it stays here until those tests walk the list instead.
+pub const SPARSE_RATIO: u64 = 1000;
 
 /// Parents apart past which a push finds the next held parent's run with a select rather than by
 /// reading on through the link, as [`crate::adjacency`] does for the same reason.
