@@ -1829,6 +1829,146 @@ fn a_call_that_names_a_type_is_a_cast_as_postgresql_has_it() {
 }
 
 #[test]
+fn named_arguments_defaults_and_variadic_find_the_function_postgresql_finds() {
+    let dirs = Dirs::new("function-named");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let mut text = format!(
+                "{} {} at {}",
+                error.field(b'C').unwrap_or_default(),
+                error.field(b'M').unwrap_or_default(),
+                error.field(b'P').unwrap_or_default()
+            );
+            for (field, name) in [(b'D', "DETAIL"), (b'H', "HINT")] {
+                if let Some(value) = error.field(field) {
+                    text.push_str(&format!(" {name}: {value}"));
+                }
+            }
+            return text;
+        }
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(|| "NULL".into(), |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        rows.join(";")
+    };
+    let names = "No function of that name accepts the given argument names.";
+    let types = "No function of that name accepts the given argument types. \
+                 HINT: You might need to add explicit type casts.";
+    let count = "No function of that name accepts the given number of arguments.";
+    let both = "In the closest available match, an argument was specified both positionally and \
+                by name.";
+    // The answers of the PostgreSQL 19 oracle.
+    for (sql, expected) in [
+        // A named argument goes to the parameter of that name, and the others take their defaults.
+        ("select make_interval(days => 3)", "3 days".to_string()),
+        ("select make_interval(days := 2, hours => 1)", "2 days 01:00:00".into()),
+        ("select make_interval()", "00:00:00".into()),
+        ("select make_interval(1, 2, days => 3)", "1 year 2 mons 3 days".into()),
+        (
+            "select make_interval(secs => 1.5), make_interval(weeks => 1, mins => 2), \
+             pg_typeof(make_interval(secs => '1.5'))",
+            "00:00:01.5|7 days 00:02:00|interval".into(),
+        ),
+        ("select make_interval(years := 1, months := null)", "NULL".into()),
+        ("select make_interval(0, days => '2')", "2 days".into()),
+        (
+            "select x, make_interval(days => x) from (values (1), (2)) t(x)",
+            "1|1 day;2|2 days".into(),
+        ),
+        ("select make_date(year => 2024, month => 2, day => 3)", "2024-02-03".into()),
+        (
+            "select make_interval(days => 'x')",
+            "22P02 invalid input syntax for type integer: \"x\" at 30".into(),
+        ),
+        (
+            "select make_interval(nope => 1)",
+            format!(
+                "42883 function make_interval(nope => integer) does not exist at 8 DETAIL: {names}"
+            ),
+        ),
+        (
+            "select left(str => 'abc', n => 2)",
+            format!(
+                "42883 function left(str => unknown, n => integer) does not exist at 8 DETAIL: {names}"
+            ),
+        ),
+        (
+            "select make_interval(1, years => 2)",
+            format!(
+                "42883 function make_interval(integer, years => integer) does not exist at 8 DETAIL: {both}"
+            ),
+        ),
+        (
+            "select make_interval(days => 3, 1)",
+            "42601 positional argument cannot follow named argument at 33".into(),
+        ),
+        (
+            "select make_interval(days => 1, days => 2)",
+            "42601 argument name \"days\" used more than once at 33".into(),
+        ),
+        // The values of a variadic `any` that VARIADIC gives as one array.
+        ("select concat(variadic array['a', 'b'])", "ab".into()),
+        ("select concat_ws(',', variadic array['a', 'b', 'c'])", "a,b,c".into()),
+        (
+            "select concat(variadic array[1, 2]), concat(variadic array[true, null]), \
+             concat(variadic array[1.5::float8, 2.50])",
+            "12|t|1.52.5".into(),
+        ),
+        ("select concat(variadic array[[1, 2], [3, 4]])", "1234".into()),
+        ("select concat_ws('-', variadic array[1, null, 2])", "1-2".into()),
+        ("select concat(variadic null::text[])", "NULL".into()),
+        (
+            "select num_nulls(variadic null::int[]), num_nonnulls(variadic '{}'::int[]), \
+             num_nulls(variadic array[1, null, null])",
+            "NULL|0|2".into(),
+        ),
+        // `concat` writes each value by the output function of its type, which for a boolean is
+        // not the cast to text.
+        (
+            "select concat(true), true::text, concat_ws(',', true, 1.5::float8)",
+            "t|true|t,1.5".into(),
+        ),
+        ("select concat(variadic 'a')", "42804 VARIADIC argument must be an array at 24".into()),
+        ("select concat(variadic null)", "42804 VARIADIC argument must be an array at 24".into()),
+        (
+            "select concat('x', variadic array['a'])",
+            format!("42883 function concat(unknown, text[]) does not exist at 8 DETAIL: {count}"),
+        ),
+        (
+            "select abs(variadic array[1])",
+            format!("42883 function abs(integer[]) does not exist at 8 DETAIL: {types}"),
+        ),
+        (
+            "select jsonb_extract_path_text(from_json => '{\"a\":1}', path_elems => array['a'])",
+            "42883 function jsonb_extract_path_text(from_json => unknown, path_elems => text[]) \
+             does not exist at 8 HINT: This call would be correct if the variadic array were \
+             labeled VARIADIC and placed last."
+                .into(),
+        ),
+    ] {
+        assert_eq!(result(sql), expected, "{sql}");
+    }
+    let messages = client.query("select make_interval(days => 3)");
+    let bytes = messages[0].decoded();
+    let Backend::RowDescription(fields) = Backend::decode(&bytes).unwrap().unwrap().0 else {
+        panic!("{:?}", messages[0]);
+    };
+    assert_eq!(fields[0].name, b"make_interval");
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_literal_that_a_cast_cannot_read_has_its_place_and_an_overflow_has_none() {
     let dirs = Dirs::new("literal-place");
     let server = Server::start(dirs.config()).unwrap();

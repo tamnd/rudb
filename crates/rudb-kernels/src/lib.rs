@@ -92,6 +92,7 @@ mod number;
 mod path;
 mod peel;
 pub mod pgarray;
+mod pgdatetime;
 mod pgformat;
 pub mod pginput;
 pub mod pgjson;

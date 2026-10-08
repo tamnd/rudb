@@ -163,7 +163,7 @@ impl Binder<'_> {
 
 /// The error of PostgreSQL for a call of a function that no form of it takes.
 pub(crate) fn no_such_function(name: &str, types: &[LogicalType], unknown: &[bool]) -> Error {
-    let message = format!("function {} does not exist", spelled_call(name, types, unknown));
+    let message = format!("function {} does not exist", spelled_call(name, types, unknown, &[]));
     Error::new(ErrorCode::Binder, message.clone())
         .state(SqlState::UNDEFINED_FUNCTION)
         .pg(message)
@@ -172,14 +172,28 @@ pub(crate) fn no_such_function(name: &str, types: &[LogicalType], unknown: &[boo
 }
 
 /// A call as the messages of PostgreSQL name it, `name(types)`, with `unknown` for a string
-/// literal and a null.
-pub(crate) fn spelled_call(name: &str, types: &[LogicalType], unknown: &[bool]) -> String {
+/// literal and a null. The last arguments have the names `names` in front of their types, as in
+/// `make_interval(integer, days => integer)`.
+pub(crate) fn spelled_call(
+    name: &str,
+    types: &[LogicalType],
+    unknown: &[bool],
+    names: &[&str],
+) -> String {
+    let first_named = types.len().saturating_sub(names.len());
     let spelled = types
         .iter()
         .zip(unknown)
-        .map(|(ty, &unknown)| match unknown || *ty == LogicalType::Null {
-            true => "unknown".into(),
-            false => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(ty).oid),
+        .enumerate()
+        .map(|(at, (ty, &unknown))| {
+            let ty = match unknown || *ty == LogicalType::Null {
+                true => "unknown".into(),
+                false => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(ty).oid),
+            };
+            match at.checked_sub(first_named).and_then(|index| names.get(index)) {
+                Some(name) => format!("{name} => {ty}"),
+                None => ty.into_owned(),
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
