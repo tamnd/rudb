@@ -4332,6 +4332,9 @@ pub fn call_values(
     if let Some(value) = crate::pgregexp::call(name, args)? {
         return Ok(value);
     }
+    if let Some(value) = crate::pgarray::call(name, args, returns)? {
+        return Ok(value);
+    }
     // The binder folds only the calls that read no `timestamptz`, which read no zone.
     if let Some(value) =
         crate::pgformat::call_value(name, args, rudb_common::SessionTimeZone::default())?

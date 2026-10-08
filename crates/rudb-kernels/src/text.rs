@@ -280,6 +280,18 @@ pub(crate) fn chr(code: &Value) -> Result<Value> {
 /// input reads no setting, which the input function of the type reads. Its second argument is
 /// the OID of the type.
 pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
+    // Each of these is strict, which is not true of every kernel whose name starts the same way.
+    const NAMES: [&str; 6] = [
+        PG_SUBSTR,
+        "__rudb_pg_input",
+        "__rudb_pg_name",
+        "__rudb_pg_varchar",
+        "__rudb_pg_bpchar",
+        "__rudb_pg_bpchar_cut",
+    ];
+    if !NAMES.contains(&name) {
+        return Ok(None);
+    }
     let text = match args.first() {
         Some(Value::Null) => return Ok(Some(Value::Null)),
         Some(text) => text,

@@ -211,6 +211,9 @@ impl Binder<'_> {
         if let Some(call) = self.position_call(ast, written, arguments, scope)? {
             return Ok(Some(call));
         }
+        if let Some(call) = self.array_fill_call(ast, written, arguments, scope)? {
+            return Ok(Some(call));
+        }
         if let Some(call) = self.regexp_call(ast, written, arguments, scope)? {
             return Ok(Some(call));
         }
@@ -497,6 +500,64 @@ impl Binder<'_> {
         }
         let name = self.plan_mut().intern(rudb_kernels::PG_SUBSTR);
         let args = self.plan_mut().add_expr_list(&cast);
+        Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
+    /// `array_fill(value, dimensions [, lower_bounds])` of a PostgreSQL session, or `None` for any
+    /// other call. The result is an array of the type of the value, so a value of no type and a
+    /// value that is an array are errors. The dimensions and the lower bounds are `int4[]`, and a
+    /// string literal for one of them is read as an `int4[]`.
+    fn array_fill_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        if !same_name(written, "array_fill") || !(2..=3).contains(&arguments.len()) {
+            return Ok(None);
+        }
+        let unknown: Vec<bool> =
+            arguments.iter().map(|&argument| string_literal(ast, argument).is_some()).collect();
+        let mut bound = Vec::with_capacity(arguments.len());
+        for &argument in arguments {
+            bound.push(self.bind_expr(ast, argument, scope)?);
+        }
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&argument| self.plan().expr_type(argument).clone()).collect();
+        let integers = |at: usize| match &types[at] {
+            LogicalType::List(element) => {
+                matches!(**element, LogicalType::Integer | LogicalType::SmallInt)
+            }
+            ty => unknown[at] || *ty == LogicalType::Null,
+        };
+        if !(1..arguments.len()).all(integers) {
+            return Err(no_such_function(written, &types, &unknown));
+        }
+        let element = types[0].clone();
+        if unknown[0] || element == LogicalType::Null {
+            let message = "could not determine polymorphic type because input has type unknown";
+            return Err(Error::binder(message)
+                .state(SqlState::DATATYPE_MISMATCH)
+                .pg(message)
+                .unplaced());
+        }
+        if matches!(element, LogicalType::List(_) | LogicalType::Array(..)) {
+            let name = rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&element).oid);
+            let message = format!("could not find array type for data type {name}");
+            return Err(Error::binder(message.clone())
+                .state(SqlState::UNDEFINED_OBJECT)
+                .pg(message)
+                .unplaced());
+        }
+        let dimensions = LogicalType::List(Box::new(LogicalType::Integer));
+        let mut cast = vec![bound[0]];
+        for at in 1..bound.len() {
+            cast.push(self.argument_as(ast, arguments[at], bound[at], &dimensions)?);
+        }
+        let name = self.plan_mut().intern(rudb_kernels::pgarray::ARRAY_FILL);
+        let args = self.plan_mut().add_expr_list(&cast);
+        let returns = LogicalType::List(Box::new(element));
         Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
     }
 
