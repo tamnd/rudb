@@ -3356,6 +3356,8 @@ fn the_transaction_rules_of_postgres() {
     client.query("select nope");
     let messages = client.query("selec 1");
     assert_eq!(messages[0].field(b'C').as_deref(), Some("42601"));
+    let messages = client.query("copy t from stdin (format nope)");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("25P02"));
     let messages = client.query("select $$a;b$$, E'x\\';' ; select 2");
     assert_eq!(tags(&messages), "EZ");
     assert_eq!(messages[0].field(b'C').as_deref(), Some("25P02"));
