@@ -84,9 +84,13 @@ impl Mapped {
     /// the 61 MB ClickBench 28 held at its peak, for bytes nothing would read again. The page cache
     /// still has them, so a read that does come back faults them in again and sees the same bytes.
     ///
-    /// Pages are dropped whole, so a page shared with the part next to it goes as well, and the
-    /// next part pays one fault to bring it back. That is always safe, since the mapping is read
-    /// only and the file under it never changes.
+    /// Pages are dropped a whole fault window at a time, both ends of the range rounded out to it,
+    /// because a fault maps the window around the page it is for and not the page alone. Rounding
+    /// only the start left the window past the end of every part mapped, and a read at positions
+    /// skips most of the parts after it, so nothing let those go: on ClickBench q24 they were most
+    /// of the 28 MB of the file the process held at its peak. The part next to one that went pays
+    /// one fault to bring its pages back. That is always safe, since the mapping is read only and
+    /// the file under it never changes.
     pub fn release(&self, offset: u64, len: usize) {
         if self.until.as_ref().is_some_and(|last| !last.load(Ordering::Relaxed)) {
             return;
@@ -96,7 +100,7 @@ impl Mapped {
         if start >= end {
             return;
         }
-        sys::release(self.at, start, end);
+        sys::release(self.at, start, end, self.len);
     }
 
     /// How many bytes it maps.
@@ -144,7 +148,8 @@ mod sys {
     #[cfg(target_os = "linux")]
     const MADV_DONTNEED: c_int = 4;
 
-    /// The alignment a release starts on, a multiple of every page size Linux runs with here.
+    /// The alignment a release starts and ends on, a multiple of every page size Linux runs with
+    /// here and the window a fault maps around the page it is for.
     #[cfg(target_os = "linux")]
     const RELEASE_ALIGN: usize = 64 * 1024;
 
@@ -161,21 +166,23 @@ mod sys {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn release(at: *const u8, start: usize, end: usize) {
+    pub(super) fn release(at: *const u8, start: usize, end: usize, len: usize) {
         // The mapping itself starts on a page, so rounding the address down stays inside it as
-        // long as it does not go below the start.
+        // long as it does not go below the start, and rounding the end up stays inside it as long
+        // as it does not go past `len`.
         let base = at as usize;
         let from = ((base + start) & !(RELEASE_ALIGN - 1)).max(base);
-        // SAFETY: `from..base + end` lies inside the mapping, which is read only and shared, so
-        // dropping its pages changes nothing a later read sees: the next touch maps them again out
-        // of the page cache.
+        let to = (base + end).next_multiple_of(RELEASE_ALIGN).min(base + len);
+        // SAFETY: `from..to` lies inside the mapping, which is read only and shared, so dropping
+        // its pages changes nothing a later read sees: the next touch maps them again out of the
+        // page cache.
         unsafe {
-            madvise(from as *mut c_void, base + end - from, MADV_DONTNEED);
+            madvise(from as *mut c_void, to - from, MADV_DONTNEED);
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(super) fn release(_: *const u8, _: usize, _: usize) {}
+    pub(super) fn release(_: *const u8, _: usize, _: usize, _: usize) {}
 
     pub(super) fn unmap(at: *const u8, len: usize) {
         // SAFETY: `at` and `len` are what `map` returned and was asked for, and the last reference
@@ -196,7 +203,7 @@ mod sys {
 
     pub(super) fn unmap(_: *const u8, _: usize) {}
 
-    pub(super) fn release(_: *const u8, _: usize, _: usize) {}
+    pub(super) fn release(_: *const u8, _: usize, _: usize, _: usize) {}
 }
 
 #[cfg(all(test, unix))]
@@ -218,6 +225,24 @@ mod tests {
         assert_eq!(mapped.get(19_999, 1).unwrap(), &bytes[19_999..]);
         assert!(mapped.get(19_999, 2).is_none());
         assert!(mapped.get(u64::MAX, 1).is_none());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_released_range_reads_the_same_bytes_again() {
+        let path = std::env::temp_dir().join(format!("rudb-map-release-{}", std::process::id()));
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::File::create(&path).unwrap().write_all(&bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapped = Mapped::open(&file, bytes.len() as u64).unwrap();
+        assert_eq!(mapped.get(0, bytes.len()).unwrap(), &bytes[..]);
+        // Rounded out past both ends, the first one into the next window and the last one to the
+        // end of the mapping, which is not a whole window.
+        mapped.release(70_000, 5_000);
+        mapped.release(190_001, 9_999);
+        mapped.release(0, bytes.len());
+        assert_eq!(mapped.get(65_536, 70_000).unwrap(), &bytes[65_536..135_536]);
+        assert_eq!(mapped.get(0, bytes.len()).unwrap(), &bytes[..]);
         std::fs::remove_file(&path).unwrap();
     }
 
