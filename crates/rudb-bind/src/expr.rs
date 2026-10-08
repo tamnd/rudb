@@ -889,13 +889,34 @@ impl Binder<'_> {
     /// The explicit cast of a string to the PostgreSQL type `declared` in a session where the input
     /// function of the type reads it, as `__rudb_pg_input` over the string and the OID. `None`
     /// when the session casts with the engine, when `expr` is not a string, or when the input of
-    /// the type reads a setting or the catalog.
+    /// the type reads a setting or the catalog. An array of strings is read element by element,
+    /// so `'{a}'::text[]::int[]` is the error of the input of `integer`.
     fn read_string(
         &mut self,
         expr: ExprRef,
         declared: DeclaredType,
         target: &LogicalType,
     ) -> Option<ExprRef> {
+        if let (LogicalType::List(from), LogicalType::List(to)) =
+            (self.plan().expr_type(expr).clone(), target)
+            && self.semantics.cast_input() == CastInput::Postgres
+        {
+            let info = rudb_pgtypes::TypeInfo::get(declared.oid)?;
+            let element = DeclaredType { oid: info.elem, typmod: declared.typmod };
+            if info.elem == 0 || !rudb_pgtypes::has_plain_input(element.oid) {
+                return None;
+            }
+            let table = self.fresh_index();
+            let name = self.plan_mut().intern("x");
+            let params = self.plan_mut().add_name_list(&[name]);
+            let value =
+                self.add_expr(Expr::LambdaParam(rudb_plan::ColumnBinding::new(table, 0)), *from);
+            let body = self.read_string(value, element, to)?;
+            let lambda = self.add_expr(Expr::Lambda { table, params, body }, (**to).clone());
+            let args = self.plan_mut().add_expr_list(&[expr, lambda]);
+            let transform = self.plan_mut().intern(crate::lambda::TRANSFORM);
+            return Some(self.add_expr(Expr::Function { name: transform, args }, target.clone()));
+        }
         if self.semantics.cast_input() != CastInput::Postgres
             || *self.plan().expr_type(expr) != LogicalType::Varchar
             || rudb_pgtypes::logical_type(declared.oid).as_ref() != Some(target)
@@ -1362,16 +1383,18 @@ impl Binder<'_> {
         Ok(())
     }
 
-    /// Casts an operand of no known type on one side of an arithmetic operator to the type that
-    /// PostgreSQL picks for it. That is a parameter and a string literal, which are both of type
-    /// `unknown` in PostgreSQL.
+    /// Casts an operand of no known type on one side of an operator to the type that PostgreSQL
+    /// picks for it. That is a parameter and a string literal, which are both of type `unknown` in
+    /// PostgreSQL.
     ///
+    /// The type is the declared type of the operator of `pg_operator` that PostgreSQL finds.
     /// PostgreSQL first tries the operator with the unknown operand as the type of the other side,
-    /// so `1 + '5'` adds two `integer` values and `now() - $1` subtracts two `timestamptz` values.
-    /// When there is no such operator, it takes the one operator that is left, so `now() + $1`
-    /// adds an `interval` and `interval '1 day' * '2'` multiplies by a `float8`. The function
-    /// resolution of rudb finds no overload for these, so the cast comes first. The operators that
-    /// PostgreSQL finds ambiguous, such as `date + $1`, are left as they are.
+    /// so `1 + '5'` adds two `integer` values, `now() - $1` subtracts two `timestamptz` values and
+    /// `array[1] = '{1}'` compares two `integer[]` values. When there is no such operator, it
+    /// takes the best candidate, so `now() + $1` adds an `interval` and `interval '1 day' * '2'`
+    /// multiplies by a `float8`. The function resolution of rudb finds no overload for some of
+    /// these, so the cast comes first. The operators that PostgreSQL finds ambiguous, such as
+    /// `date + $1`, are left as they are.
     ///
     /// A string literal is read by the input function of the type, as it is in a cast, so
     /// `1 + '1.5'` is the error of PostgreSQL and not 3.
@@ -1383,7 +1406,7 @@ impl Binder<'_> {
         left: &mut ExprRef,
         right: &mut ExprRef,
     ) -> Result<()> {
-        use LogicalType as L;
+        use rudb_pgtypes::{OperatorResolution, oid};
         let unknown = |binder: &Self, at: usize, side: ExprRef| {
             binder.is_placeholder(side)
                 || matches!(
@@ -1396,42 +1419,27 @@ impl Binder<'_> {
             (false, true) => (false, self.plan().expr_type(*left).clone()),
             _ => return Ok(()),
         };
-        let number = other.is_integer()
-            || matches!(other, L::Float | L::Double | L::Decimal { .. } | L::Numeric);
-        let float = matches!(other, L::Float | L::Double);
-        // A `numeric` operand takes the unknown one as a `numeric` with no precision.
-        let same = match other {
-            L::Decimal { .. } => L::Numeric,
-            _ => other.clone(),
+        let Some(known) = crate::pgcalls::exact_oid(&other) else { return Ok(()) };
+        let index = usize::from(!unknown_left);
+        let mut oids = [known; 2];
+        oids[index] = oid::UNKNOWN;
+        let OperatorResolution::Found(operator) =
+            rudb_pgtypes::resolve_operator(&operator_name(ast, op), &oids)
+        else {
+            return Ok(());
         };
-        let wanted = match (op, &other) {
-            (BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide, _)
-            | (BinaryOp::IntegerDivide, _)
-                if number =>
-            {
-                same
+        let declared = match rudb_pgtypes::is_polymorphic(operator.args[index]) {
+            true => {
+                match rudb_pgtypes::enforce_generic_types(&oids, operator.args, operator.result) {
+                    Ok(generic) => generic.args[index],
+                    Err(_) => return Ok(()),
+                }
             }
-            (BinaryOp::Modulo, _) if number && !float => same,
-            (BinaryOp::BitAnd | BinaryOp::BitOr, _) if other.is_integer() => same,
-            (BinaryOp::ShiftLeft | BinaryOp::ShiftRight, _)
-                if other.is_integer() && !unknown_left =>
-            {
-                L::Integer
-            }
-            (BinaryOp::Multiply, L::Interval) => L::Double,
-            (BinaryOp::Add, L::Timestamp | L::TimestampTz | L::Time | L::Interval) => L::Interval,
-            (
-                BinaryOp::Subtract,
-                L::Date | L::Timestamp | L::TimestampTz | L::Time | L::Interval,
-            ) => other.clone(),
-            (BinaryOp::Subtract, L::TimeTz) if !unknown_left => L::Interval,
-            (BinaryOp::Divide | BinaryOp::IntegerDivide, L::Interval) if !unknown_left => L::Double,
-            (BinaryOp::Concat, L::Blob) => L::Blob,
-            _ => return Ok(()),
+            false => operator.args[index],
         };
+        let Some(wanted) = rudb_pgtypes::logical_type(declared) else { return Ok(()) };
         let (side, at) = if unknown_left { (left, written[0]) } else { (right, written[1]) };
-        let oid = rudb_pgtypes::pg_type(&wanted).oid;
-        *side = match self.read_literal(ast, at, oid) {
+        *side = match self.read_literal(ast, at, declared) {
             Some(value) => self.cast_to(value?, &wanted),
             None => self.cast_to(*side, &wanted),
         };
@@ -1656,6 +1664,9 @@ impl Binder<'_> {
                 matches!(ast.expr(arg), ast::Expr::Literal { kind: LiteralKind::String, .. })
             })
             .collect();
+        if let Some(subscript) = self.pg_subscript(ast, &written, &arguments, &bound)? {
+            return Ok(subscript);
+        }
         if postgres
             && let Some(cast) =
                 self.function_style_cast(ast, &written, &arguments, &bound, scope)?
@@ -1673,6 +1684,9 @@ impl Binder<'_> {
                 scope,
             )?
         {
+            return Ok(call);
+        }
+        if postgres && let Some(call) = self.array_shape_call(ast, &written, &arguments, scope)? {
             return Ok(call);
         }
         if let Some(expanded) = self.list_macro(&written, &bound, &untyped)? {
@@ -5342,8 +5356,12 @@ fn undefined_operator(
 }
 
 /// The name of a binary operator in `pg_operator`, which spells `LIKE` and its forms as `~~`.
+/// `IS DISTINCT FROM` compares with `=`, and `/` of two integers, which binds as an integer
+/// division here, is `/`.
 fn operator_name(ast: &Ast, op: BinaryOp) -> String {
     match op {
+        BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => "=".to_string(),
+        BinaryOp::IntegerDivide => "/".to_string(),
         BinaryOp::Like => "~~".to_string(),
         BinaryOp::NotLike => "!~~".to_string(),
         BinaryOp::ILike => "~~*".to_string(),

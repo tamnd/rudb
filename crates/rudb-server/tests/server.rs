@@ -1964,6 +1964,100 @@ fn the_array_operators_resolve_as_postgres_resolves_them() {
 }
 
 #[test]
+fn a_subscript_of_an_array_is_coerced_and_bounded_as_postgres_does_it() {
+    let dirs = Dirs::new("pgsubscripts");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
+    let cases: [(&str, &[&str]); 17] = [
+        ("select (array[1,2,3])[null];", &[""]),
+        ("select (array[1,2,3])[1:null];", &[""]),
+        ("select (array['a','b'])[1.6];", &["b"]),
+        ("select ('{1,2,3}'::int[])[-1:1];", &["{1}"]),
+        (
+            "select (array[1,2,3])[-1], (array[1,2,3])[-2:-1], (array[1,2,3])[-5:2], (array[1,2,3])[2:10], (array[1,2,3])[4:5];",
+            &["|{}|{1,2}|{2,3}|{}"],
+        ),
+        (
+            "select (array[1,2,3])['2'], (array[1,2,3])[2::int8], (array[1,2,3])[2.5::float8];",
+            &["2|2|2"],
+        ),
+        (
+            "select (array[1,2,3])[1:2.5], (array[1,2,3])[null:2], (array[1,2,3])[:null];",
+            &["{1,2,3}||"],
+        ),
+        (
+            "select pg_typeof((array[1,2,3])[1]), pg_typeof((array[1,2,3])[1:2]);",
+            &["integer|integer[]"],
+        ),
+        ("select ('{a,b}'::text[])[2], (string_to_array('a,b', ','))[2];", &["b|b"]),
+        ("select (null::int[])[1], (null::int[])[1:2];", &["|"]),
+        (
+            "select string_to_array('1 2', ' ')::int[], pg_typeof(string_to_array('1 2', ' ')::int8[]);",
+            &["{1,2}|bigint[]"],
+        ),
+        ("select array['1.5', null]::float8[], array['t','f']::bool[];", &["{1.5,NULL}|{t,f}"]),
+        ("select array[' 7 ']::int2[];", &["{7}"]),
+        ("select (array[1,2,3])[1.5::float8];", &["2"]),
+        ("select (array[1,2,3])[2::int8];", &["2"]),
+        ("select array[1,2] = array[1,2], array[1] = '{1}', '{1,2}' <> array[1,2];", &["t|t|f"]),
+        ("select (string_to_array('1,2,3', ','))[2:], (array[1,2,3])[:];", &["{2,3}|{1,2,3}"]),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        ("select (array[1,2,3])['x'];", "22P02", "invalid input syntax for type integer: \"x\""),
+        ("select (array[1,2,3])[true];", "42804", "array subscript must have type integer"),
+        ("select (array[1,2,3])[3000000000];", "22003", "integer out of range"),
+        (
+            "select string_to_array('a b', ' ')::int[];",
+            "22P02",
+            "invalid input syntax for type integer: \"a\"",
+        ),
+        (
+            "select (array[1,2,3])['1.5'];",
+            "22P02",
+            "invalid input syntax for type integer: \"1.5\"",
+        ),
+        (
+            "select array_length('{1,2}', 1);",
+            "42804",
+            "could not determine polymorphic type because input has type unknown",
+        ),
+        (
+            "select array_lower('{5}', 1);",
+            "42804",
+            "could not determine polymorphic type because input has type unknown",
+        ),
+        (
+            "select cardinality('{1,2,3}');",
+            "42804",
+            "could not determine polymorphic type because input has type unknown",
+        ),
+    ] {
+        // An error of the binder comes before a row description, and an error of a kernel after it.
+        let messages = client.query(sql);
+        assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_parameter_in_a_call_gets_the_type_of_postgres() {
     let dirs = Dirs::new("unknowns");
     let server = Server::start(dirs.config()).unwrap();

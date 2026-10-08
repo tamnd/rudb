@@ -186,6 +186,12 @@ impl Transform<'_> {
         self.push(Expr::Literal { kind: LiteralKind::Number, text }, location)
     }
 
+    /// The omitted bound of a slice.
+    fn omitted(&mut self) -> ExprRef {
+        let items = self.ast.expr_slice(Vec::new());
+        self.push(Expr::List { items }, -1)
+    }
+
     fn string(&mut self, text: &str, location: i32) -> ExprRef {
         let text = self.intern(text);
         self.push(Expr::Literal { kind: LiteralKind::String, text }, location)
@@ -474,14 +480,17 @@ impl Transform<'_> {
                     };
                     ("array_extract", vec![target, self.expr(index)?])
                 }
+                // An omitted bound is an empty list, as the omitted step of DuckDB is. A written
+                // bound is a number, and `a[1:-1]` of PostgreSQL is an empty slice and not the
+                // whole array, so the binder must see which bound is omitted.
                 Node::A_Indices(indices) => {
                     let first = match &indices.lidx {
                         Some(node) => self.expr(node)?,
-                        None => self.number("1", -1),
+                        None => self.omitted(),
                     };
                     let last = match &indices.uidx {
                         Some(node) => self.expr(node)?,
-                        None => self.number("-1", -1),
+                        None => self.omitted(),
                     };
                     ("array_slice", vec![target, first, last])
                 }

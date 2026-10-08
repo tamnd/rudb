@@ -64,8 +64,8 @@ pub use session::{
     FloatRange, FromFunctions, FunctionRules, IdentifierCase, IdentifierCompare, InsertColumns,
     JoinColumns, NumberCasts, NumberLiterals, OperatorRules, PlanErrors, PreparedStatement,
     QueryColumns, RegexRules, RowFields, RowNulls, Semantics, SequenceOwners, Session,
-    SessionTimeZone, SetFunctions, ShowBehavior, TableNames, TypeNames, UnknownTypes, ValuesNames,
-    Variable,
+    SessionTimeZone, SetFunctions, ShowBehavior, Subscripts, TableNames, TypeNames, UnknownTypes,
+    ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

@@ -16,8 +16,21 @@ use crate::compare::order;
 /// `dimensions`. The value can be null, and the two arrays cannot.
 pub const ARRAY_FILL: &str = "__rudb_pg_array_fill";
 
+/// `array[index]`, the element at the `integer` index from 1, or a null for an index outside the
+/// array.
+pub const ARRAY_SUBSCRIPT: &str = "__rudb_pg_array_subscript";
+
+/// `array[lower:upper]`, the elements between the two `integer` bounds, both included. The part of
+/// the bounds outside the array is left out, so the slice can be empty.
+pub const ARRAY_SLICE: &str = "__rudb_pg_array_slice";
+
 /// The value of a call of a kernel of this module, or `None` for any other name.
 pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
+    match (name, args) {
+        (ARRAY_SUBSCRIPT, [array, index]) => return subscript(array, index).map(Some),
+        (ARRAY_SLICE, [array, lower, upper]) => return slice(array, lower, upper).map(Some),
+        _ => {}
+    }
     if name != ARRAY_FILL {
         return Ok(None);
     }
@@ -30,6 +43,38 @@ pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         return Err(Error::internal(format!("{name} that gives a {returns}")));
     };
     fill(value, lengths, lowers, element).map(Some)
+}
+
+/// `array_get_element` of an array of one dimension. A null array or index is a null.
+fn subscript(array: &Value, index: &Value) -> Result<Value> {
+    let (Some((_, values)), Some(index)) = (elements(array), bound(index)?) else {
+        return Ok(Value::Null);
+    };
+    let found = usize::try_from(index).ok().and_then(|index| index.checked_sub(1));
+    Ok(found.and_then(|at| values.get(at)).cloned().unwrap_or(Value::Null))
+}
+
+/// `array_get_slice` of an array of one dimension. A null array or bound is a null, and a lower
+/// bound past the upper bound once both are inside the array is the empty array.
+fn slice(array: &Value, lower: &Value, upper: &Value) -> Result<Value> {
+    let (Some((element, values)), Some(lower), Some(upper)) =
+        (elements(array), bound(lower)?, bound(upper)?)
+    else {
+        return Ok(Value::Null);
+    };
+    let first = usize::try_from(lower.max(1) - 1).unwrap_or(0);
+    let last = usize::try_from(upper).unwrap_or(0).min(values.len());
+    let values = values.get(first..last).unwrap_or_default().to_vec();
+    Ok(Value::List { element: element.clone(), values })
+}
+
+/// A subscript, which the binder casts to `integer`, or `None` for a null.
+fn bound(value: &Value) -> Result<Option<i32>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Integer(value) => Ok(Some(*value)),
+        other => Err(Error::internal(format!("a subscript of type {}", other.logical_type()))),
+    }
 }
 
 /// `array_fill_internal`, which checks the arguments in this order.
@@ -688,5 +733,30 @@ mod tests {
         };
         assert_eq!(run(null, &[rows, comma.clone(), text(Some("x"))]), text(Some("1,2,3,x")));
         assert_eq!(run("array_to_text", &[texts(&[None, Some("b")]), comma]), text(Some("b")));
+    }
+
+    #[test]
+    fn a_subscript_and_a_slice_leave_out_what_is_outside_the_array_as_postgresql_does() {
+        let returns = LogicalType::List(Box::new(LogicalType::Integer));
+        let array = ints(&[Some(1), Some(2), Some(3)]);
+        let at = |index: Value| call(ARRAY_SUBSCRIPT, &[array.clone(), index], &returns).unwrap();
+        assert_eq!(at(Value::Integer(2)), Some(Value::Integer(2)));
+        for index in [Value::Integer(0), Value::Integer(-1), Value::Integer(4), Value::Null] {
+            assert_eq!(at(index), Some(Value::Null));
+        }
+        let part = |lower: Option<i32>, upper: Option<i32>| {
+            let bounds = [lower, upper].map(|bound| bound.map_or(Value::Null, Value::Integer));
+            let [lower, upper] = bounds;
+            call(ARRAY_SLICE, &[array.clone(), lower, upper], &returns).unwrap().unwrap()
+        };
+        assert_eq!(part(Some(2), Some(3)), ints(&[Some(2), Some(3)]));
+        assert_eq!(part(Some(-5), Some(2)), ints(&[Some(1), Some(2)]));
+        assert_eq!(part(Some(-1), Some(1)), ints(&[Some(1)]));
+        assert_eq!(part(Some(2), Some(i32::MAX)), ints(&[Some(2), Some(3)]));
+        assert_eq!(part(Some(-2), Some(-1)), ints(&[]));
+        assert_eq!(part(Some(3), Some(2)), ints(&[]));
+        assert_eq!(part(Some(5), Some(9)), ints(&[]));
+        assert_eq!(part(None, Some(2)), Value::Null);
+        assert_eq!(part(Some(1), None), Value::Null);
     }
 }
