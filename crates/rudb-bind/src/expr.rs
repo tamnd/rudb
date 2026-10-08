@@ -13,8 +13,9 @@
 use rudb_common::{
     CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, CountTypes, DeclaredType,
     Error, ErrorTexts, Field, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts,
-    NumberLiterals, OperatorRules, RegexRules, Result, Semantics, Session, SetFunctions, SqlState,
-    StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
+    NumberLiterals, OperatorRules, RegexRules, Result, RowNulls, Semantics, Session, SetFunctions,
+    SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule,
+    rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_kernels::pgjson::JsonSet;
@@ -731,6 +732,11 @@ impl Binder<'_> {
             if let Some(field) = self.struct_path(parts, scope)? {
                 return Ok(field);
             }
+            if let ([word], Some(_)) = (parts, ast)
+                && let Some(row) = self.whole_row(word, scope)?
+            {
+                return Ok(row);
+            }
             // The pin reads `read_csv(data)` as `read_csv('data')`, dots and all, and warns that
             // it will stop doing so. It is the deprecated behaviour, but it is still the answer.
             if self.identifiers_as_strings {
@@ -784,6 +790,17 @@ impl Binder<'_> {
                 _ => error,
             });
         };
+        self.outer_column(at, binding, ty)
+    }
+
+    /// A column of the scope at `at` in [`Self::outer_scopes`], which the subquery being bound is
+    /// correlated on.
+    pub(crate) fn outer_column(
+        &mut self,
+        at: usize,
+        binding: rudb_plan::ColumnBinding,
+        ty: LogicalType,
+    ) -> Result<ExprRef> {
         // A LATERAL entry may not aggregate over what its left neighbour gave it. There is one row
         // of the left per evaluation of the entry, so `sum(o.k)` would be a sum of one value and
         // whoever wrote it meant something else. The pinned build refuses it in these words and a
@@ -976,8 +993,8 @@ impl Binder<'_> {
             }
             UnaryOp::Negate => self.call("-", vec![bound]),
             UnaryOp::Plus => self.call("+", vec![bound]),
-            UnaryOp::IsNull => self.against_null(CompareOp::NotDistinctFrom, bound),
-            UnaryOp::IsNotNull => self.against_null(CompareOp::DistinctFrom, bound),
+            UnaryOp::IsNull => self.row_against_null(CompareOp::NotDistinctFrom, bound),
+            UnaryOp::IsNotNull => self.row_against_null(CompareOp::DistinctFrom, bound),
             UnaryOp::IsTrue => {
                 self.against_boolean(ast, operand, CompareOp::NotDistinctFrom, bound, true)
             }
@@ -3945,6 +3962,27 @@ impl Binder<'_> {
     fn against_null(&mut self, op: CompareOp, expr: ExprRef) -> Result<ExprRef> {
         let null = self.add_constant(Value::Null);
         self.compare(op, expr, null)
+    }
+
+    /// `IS NULL` or `IS NOT NULL`, which tests each field of a row value when the session says so.
+    ///
+    /// A null row has a null in each field, so testing the fields alone also gives the answer for
+    /// a row that is null itself.
+    fn row_against_null(&mut self, op: CompareOp, expr: ExprRef) -> Result<ExprRef> {
+        let LogicalType::Struct(fields) = self.plan().expr_type(expr).clone() else {
+            return self.against_null(op, expr);
+        };
+        if self.semantics.row_nulls() != RowNulls::Postgres || fields.is_empty() {
+            return self.against_null(op, expr);
+        }
+        let mut tests = Vec::with_capacity(fields.len());
+        for (field, _) in self.struct_fields(expr, &fields) {
+            tests.push(self.against_null(op, field)?);
+        }
+        Ok(match tests.len() {
+            1 => tests[0],
+            _ => self.conjunction(ConjunctionOp::And, tests),
+        })
     }
 
     fn against_boolean(
