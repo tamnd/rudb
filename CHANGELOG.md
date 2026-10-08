@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.9.3
+
+#2853 vendors `pg_operator.dat` and resolves an operator in a PostgreSQL session by the rules of `binary_oper_exact` and `oper_select_candidate`. An operator of a polymorphic type with a kernel binds as the kernel, so the array operators `||`, `@>`, `<@` and `&&` give the types and the null rules of PostgreSQL. `operator is not unique` and `operator does not exist` come from the same lookup.
+
+#2854 gives array subscripts and slices the bounds and the null rules of PostgreSQL, and coerces each subscript to `integer` with the PostgreSQL errors. A cast of a text array to another array type reads each element with the input function of the element type, and an unknown literal next to an operator takes its type from the `pg_operator` lookup.
+
+#2852 answers only the table groups that can pass a HAVING on a total.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.9.2
 
 #2848 ports the string functions of `varlena.c`, `oracle_compat.c`, `encode.c` and the other string files of PostgreSQL as kernels, with the values and the errors of PostgreSQL. #2849 adds `string_to_table` as the unnest of the array of its kernel, and `normalize` and `IS NORMALIZED` as a port of `unicode_norm.c` over the vendored Unicode tables of the PostgreSQL pin.
