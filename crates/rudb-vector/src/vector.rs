@@ -5922,8 +5922,11 @@ fn run_holding(ends: &[u32], row: usize) -> Option<usize> {
 ///
 /// A gather after a filter asks for rows that rise, and a search a row over a part held as runs of
 /// four rows cost more than reading the row would have flat. So the walk goes on from the run the
-/// last row was in, a few runs at a time, and searches only the rest of the ends when the next row
-/// is further on than that or goes back.
+/// last row was in, a few runs at a time, and when the next row is further on than that it gallops,
+/// doubling the step until it passes the row and searching only the last step. A search over the
+/// rest of the ends was about a hundred and forty instructions a row on a gather that keeps one
+/// `partsupp` row in twenty five, where the row is a few runs on. A row that goes back starts again
+/// from the first run.
 fn runs_holding(ends: &[u32], at: &mut [usize]) {
     const STEPS: usize = 4;
     let mut run = 0;
@@ -5938,7 +5941,16 @@ fn runs_holding(ends: &[u32], at: &mut [usize]) {
         let near = ends.len().min(run + STEPS);
         match ends[run..near].iter().position(|&end| end > row) {
             Some(step) => run += step,
-            None => run = near + ends[near..].partition_point(|&end| end <= row),
+            None => {
+                // Every end before `near` is at or before the row, so the run is past `low`.
+                let (mut low, mut width) = (near, STEPS);
+                while low + width < ends.len() && ends[low + width] <= row {
+                    low += width;
+                    width *= 2;
+                }
+                let high = ends.len().min(low + width + 1);
+                run = low + ends[low..high].partition_point(|&end| end <= row);
+            }
         }
         *slot = if run < ends.len() { run } else { NOWHERE };
     }
@@ -7608,6 +7620,18 @@ mod tests {
         assert!(read.is_null_at(rows.len()));
         assert_eq!(read.gather(&wanted).unwrap(), flat.gather(&wanted).unwrap());
         assert_eq!(cut.data(), integers(&rows[2..22]).data());
+        // Rows far apart over many runs, which the walk gallops to, then one that goes back. Fewer
+        // rows than runs, so the gather walks rather than laying the runs out.
+        let (mut ends, mut rows) = (Vec::new(), Vec::new());
+        for run in 0..3000_i32 {
+            rows.extend(std::iter::repeat_n(run, 1 + (run % 5) as usize));
+            ends.push(rows.len() as u32);
+        }
+        let runs = Vector::runs(ends, integers(&(0..3000).collect::<Vec<_>>())).unwrap();
+        let mut wanted: Vec<u32> = (0..rows.len() as u32).step_by(37).collect();
+        wanted.extend([5, 8999, rows.len() as u32 - 1, 0, 4000]);
+        let flat = integers(&rows);
+        assert_eq!(runs.gather(&wanted).unwrap(), flat.gather(&wanted).unwrap());
         // Runs over values with nulls are not laid out, and say so by having no data.
         let holes =
             Vector::from_values(LogicalType::Integer, &[Value::Integer(1), Value::Null]).unwrap();
