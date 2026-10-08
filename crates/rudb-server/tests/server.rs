@@ -3550,6 +3550,38 @@ fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
             "substring,substring,substring,substring",
             "cde|d||bcd",
         ),
+        (
+            "select 'abc' similar to 'a%', 'a|c' similar to 'a|c', 'ab' similar to '(a|b)*', \
+             'a%' similar to 'a#%' escape '#', 'abc' not similar to 'a_c', \
+             'abc' similar to 'a%' escape null",
+            "?column?,?column?,?column?,?column?,?column?,?column?",
+            "t|f|t|t|f|",
+        ),
+        (
+            "select similar_to_escape('a%b_c'), similar_to_escape('[^]a]'), \
+             similar_to_escape('a#\"b#\"c', '#'), similar_to_escape('a\\%', '')",
+            "similar_to_escape,similar_to_escape,similar_to_escape,similar_to_escape",
+            "^(?:a.*b.c)$|^(?:[^]a])$|^(?:a){1,1}?(b){1,1}(?:c)$|^(?:a\\\\.*)$",
+        ),
+        (
+            "select substring('foobar' similar '%#\"o_b#\"%' escape '#'), \
+             substring('foobar' from '%#\"o%' for '#'), \
+             substring('foobar' similar '#\"o_b#\"%' escape '#')",
+            "substring,substring,substring",
+            "oob|oobar|",
+        ),
+        (
+            "select x from (values ('abc'), ('xbc'), (null)) t(x) where x similar to '_b%'",
+            "x",
+            "abc;xbc",
+        ),
+        ("select 'abc' similar to 'a%' escape 'xy'", "22025 invalid escape string", ""),
+        (
+            "select similar_to_escape('a#\"b#\"c#\"d', '#')",
+            "2200C SQL regular expression may not contain more than two escape-double-quote \
+             separators",
+            "",
+        ),
     ] {
         assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
     }

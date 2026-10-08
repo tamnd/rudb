@@ -34,7 +34,7 @@ const SAME: &[&str] = &[
     "with q as (select 1 as a) select * from (with q as (select 2 as a) select * from q) as s, q",
     "select case when a then 1 when b then 2 else 3 end, case a when 1 then 'x' end from t",
     "select a between 1 and 2, a not between 1 and 2, a is null, a is not null, a is true, a is not unknown from t",
-    "select a like 'x', a not ilike 'y', a similar to 'z', a not similar to 'z', a like 'x' escape '!', a not like 'x' escape '!', a ~ 'r', a !~* 's' from t",
+    "select a like 'x', a not ilike 'y', a like 'x' escape '!', a not like 'x' escape '!', a ~ 'r', a !~* 's' from t",
     "select exists (select 1), not exists (select 1), (select 1), a in (select 1), a not in (select 1), a = any (select 1), a < all (select 1), array(select 1) from t",
     "select a = any (array[1, 2]), array[1, 2], array[[1], [2]], row(1, 2), (1, 2) from t",
     "select a::pg_catalog.int4, cast(a as pg_catalog.varchar(10)), a::pg_catalog.numeric(10,2)[], a::\"MyType\", a::s.t from t",
@@ -107,6 +107,17 @@ fn both_transforms_build_the_same_tree() {
         }
     }
     assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
+/// `SIMILAR TO` is `~` over what `similar_to_escape` makes of the pattern, as in PostgreSQL, where
+/// the DuckDB transform keeps the operator.
+#[test]
+fn similar_to_is_a_regular_expression_match() {
+    let tree = |sql| transform(sql).map(|ast| shape::script(&ast)).unwrap();
+    let similar = tree("select a similar to 'z', a not similar to 'z' escape '#' from t");
+    let written =
+        tree("select a ~ similar_to_escape('z'), a !~ similar_to_escape('z', '#') from t");
+    assert_eq!(similar, written);
 }
 
 #[test]

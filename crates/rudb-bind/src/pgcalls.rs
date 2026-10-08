@@ -14,7 +14,7 @@ use rudb_common::{
     Error, FunctionRules, LogicalType, RegexRules, Result, SetFunctions, SqlState, Value,
 };
 use rudb_kernels::pgjson::JsonSet;
-use rudb_kernels::pgregexp::Function;
+use rudb_kernels::pgregexp::{self, Function};
 use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
@@ -211,6 +211,9 @@ impl Binder<'_> {
         if let Some(call) = self.regexp_call(ast, written, arguments, scope)? {
             return Ok(Some(call));
         }
+        if let Some(call) = self.similar_call(ast, written, arguments, scope)? {
+            return Ok(Some(call));
+        }
         let texts: Vec<String> =
             arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
         let text = match texts.as_slice() {
@@ -370,6 +373,8 @@ impl Binder<'_> {
         let least = named.parameters().iter().filter(|parameter| parameter.is_required()).count();
         let most = match named {
             Function::Replace => Function::ReplaceAt.parameters().len(),
+            // The third argument is the escape of a `SIMILAR` pattern.
+            Function::Substring => 3,
             _ => named.parameters().len(),
         };
         if self.semantics.regex_rules() != RegexRules::Postgres
@@ -388,19 +393,29 @@ impl Binder<'_> {
         let integer = |at: usize| {
             !unknown[at] && matches!(types[at], LogicalType::Integer | LogicalType::SmallInt)
         };
+        let text = |at: usize| {
+            unknown[at] || matches!(types[at], LogicalType::Varchar | LogicalType::Null)
+        };
         let function = match named {
             // A string or a null as the fourth argument is the flags, and an integer is the start.
             Function::Replace if arguments.len() > 4 || (arguments.len() == 4 && integer(3)) => {
                 Function::ReplaceAt
             }
             // `substring` from a position is not a regular expression.
-            Function::Substring
-                if !unknown[1] && !matches!(types[1], LogicalType::Varchar | LogicalType::Null) =>
-            {
+            Function::Substring if !(1..arguments.len()).all(text) => {
                 return self.call("substring", bound).map(Some);
             }
             other => other,
         };
+        // `substring(text similar pattern escape escape)`, which is `substring` from what
+        // `similar_to_escape` makes of the pattern.
+        if function == Function::Substring && arguments.len() == 3 {
+            if !text(0) {
+                return Err(no_such_function("substring", &types, &unknown));
+            }
+            let pattern = self.similar_escape(bound[1], bound[2]);
+            return Ok(Some(self.regexp_kernel(function, vec![bound[0], pattern])));
+        }
         let parameters = function.parameters();
         let fits = |(at, ty): (usize, &LogicalType)| match parameters[at].is_text() {
             true => matches!(ty, LogicalType::Varchar | LogicalType::Null),
@@ -422,6 +437,47 @@ impl Binder<'_> {
             bound.push(self.add_constant(parameter.default_value()));
         }
         Ok(Some(self.regexp_kernel(function, bound)))
+    }
+
+    /// `similar_to_escape(pattern [, escape])` of a PostgreSQL session, which the transform also
+    /// writes for `SIMILAR TO`. The escape is a backslash where the call gives none.
+    fn similar_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        if self.semantics.regex_rules() != RegexRules::Postgres
+            || !same_name(written, "similar_to_escape")
+            || !(1..=2).contains(&arguments.len())
+        {
+            return Ok(None);
+        }
+        let mut bound = Vec::with_capacity(2);
+        for &argument in arguments {
+            bound.push(self.bind_expr(ast, argument, scope)?);
+        }
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&argument| self.plan().expr_type(argument).clone()).collect();
+        if !types.iter().all(|ty| matches!(ty, LogicalType::Varchar | LogicalType::Null)) {
+            let unknown: Vec<bool> =
+                arguments.iter().map(|&argument| string_literal(ast, argument).is_some()).collect();
+            return Err(no_such_function("similar_to_escape", &types, &unknown));
+        }
+        if bound.len() == 1 {
+            bound.push(self.add_constant(Value::Varchar("\\".to_owned())));
+        }
+        Ok(Some(self.similar_escape(bound[0], bound[1])))
+    }
+
+    /// The call of the kernel of `similar_to_escape`.
+    fn similar_escape(&mut self, pattern: ExprRef, escape: ExprRef) -> ExprRef {
+        let arguments =
+            [pattern, escape].map(|argument| self.cast_to(argument, &LogicalType::Varchar));
+        let name = self.plan_mut().intern(pgregexp::SIMILAR_ESCAPE);
+        let args = self.plan_mut().add_expr_list(&arguments);
+        self.add_expr(Expr::Function { name, args }, LogicalType::Varchar)
     }
 
     /// The call of one of the kernels of `pgregexp`, with an argument for each parameter.

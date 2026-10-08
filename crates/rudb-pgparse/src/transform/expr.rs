@@ -308,16 +308,19 @@ impl Transform<'_> {
                 let (Some(left), Some(right)) = (left, right) else {
                     return clause("A_Expr");
                 };
-                let Some([pattern]) = escape_call(right, "similar_to_escape") else {
+                // As in PostgreSQL, the pattern is a regular expression that `similar_to_escape`
+                // makes, and the operator is `~` or `!~`.
+                let Node::FuncCall(call) = right else {
                     return clause("SimilarEscape");
                 };
-                let op = if symbol.starts_with('!') {
-                    BinaryOp::NotSimilarTo
-                } else {
-                    BinaryOp::SimilarTo
-                };
+                if escape_call::<1>(right, "similar_to_escape").is_none()
+                    && escape_call::<2>(right, "similar_to_escape").is_none()
+                {
+                    return clause("SimilarEscape");
+                }
+                let op = self.operator(symbol);
                 let left = self.expr(left)?;
-                let right = self.expr(pattern)?;
+                let right = self.call("similar_to_escape", &call.args, location)?;
                 Ok(self.binary(op, left, right, location))
             }
             A_Expr_Kind::AEXPR_BETWEEN | A_Expr_Kind::AEXPR_NOT_BETWEEN => {
@@ -575,9 +578,6 @@ impl Transform<'_> {
             _ => return clause("FuncCall"),
         };
         match (name, &call.args[..]) {
-            ("substring", _) if self.written_in_call(location, token::SIMILAR) => {
-                clause("SubstringSimilar")
-            }
             ("substring" | "position" | "overlay" | "ltrim" | "rtrim", _) => {
                 self.call(name, &call.args, location)
             }
@@ -607,32 +607,6 @@ impl Transform<'_> {
             }
             _ => clause("FuncCall"),
         }
-    }
-
-    /// Whether a token of a kind is written at the top level of the parentheses of the call at a
-    /// location.
-    fn written_in_call(&self, location: i32, kind: u16) -> bool {
-        let Ok(location) = u32::try_from(location) else {
-            return false;
-        };
-        let (open, close) = (crate::character(b'('), crate::character(b')'));
-        let tokens = self.tokens();
-        let start = tokens.partition_point(|&(start, _, _)| start < location);
-        let mut depth = 0_i32;
-        for &(_, _, found) in &tokens[start..] {
-            match Some(found) {
-                written if written == open => depth += 1,
-                written if written == close => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return false;
-                    }
-                }
-                _ if found == kind && depth == 1 => return true,
-                _ => {}
-            }
-        }
-        false
     }
 }
 

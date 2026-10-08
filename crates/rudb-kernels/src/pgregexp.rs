@@ -7,6 +7,9 @@
 //! `regexp_split_to_table` give the list of their rows, and the unnest that the binder puts around
 //! them gives the rows one at a time, in a select list and in `FROM`.
 //!
+//! `SIMILAR TO` is `~` over what `similar_to_escape` makes of the pattern, as in PostgreSQL, and
+//! `substring(text similar pattern escape escape)` is `substring` from a pattern over it.
+//!
 //! The pattern and the flags are compiled once for a query where they are literals, and once for
 //! each run of rows that have the same ones where they are not. A pattern that does not compile
 //! gives its error from the first row that reaches it, as in PostgreSQL, and not when the query is
@@ -183,6 +186,109 @@ impl Parameter {
             EndOption | Subexpr => Value::Integer(0),
         }
     }
+}
+
+/// The kernel of `similar_to_escape(pattern, escape)`. The binder gives a backslash as the escape
+/// where the call gives none.
+pub const SIMILAR_ESCAPE: &str = "__rudb_pg_similar_to_escape";
+
+/// The regular expression that `SIMILAR TO` matches with, as `similar_escape_internal` in
+/// `regexp.c` writes it. The pattern must match the whole text, `%` and `_` are `.*` and `.`, and
+/// a group does not capture. The escape followed by a double quote splits the pattern into the
+/// three parts of `substring`, and the middle part is the one group. Within brackets the text is
+/// kept as it is, and the brackets end at the first `]` that is not the first member of the class.
+pub fn similar_escape(pattern: &str, escape: &str) -> Result<String> {
+    let mut letters = escape.chars();
+    let escape = match (letters.next(), letters.next()) {
+        (None, _) => None,
+        (Some(escape), None) => Some(escape),
+        _ => {
+            let error = Error::invalid_input("invalid escape string")
+                .state(SqlState::INVALID_ESCAPE_SEQUENCE)
+                .hint("Escape string must be empty or one character.");
+            return Err(error.unplaced());
+        }
+    };
+    // PostgreSQL reads the pattern a byte at a time unless both the escape and the character are
+    // more than one byte. The two ways give the same text, except that a character of more than
+    // one byte in brackets ends the start of the class only the first way.
+    let wide = escape.is_some_and(|escape| escape.len_utf8() > 1);
+    let mut out = String::with_capacity(pattern.len() * 3 + 23);
+    out.push_str("^(?:");
+    let mut escaped = false;
+    let mut quotes = 0;
+    let mut depth = 0;
+    // 1 right after the `[`, 2 after a `^` there, and 3 once a member has been read.
+    let mut class_at = 0;
+    for letter in pattern.chars() {
+        if wide && letter.len_utf8() > 1 {
+            if escaped {
+                out.push('\\');
+                out.push(letter);
+                escaped = false;
+            } else if Some(letter) == escape {
+                escaped = true;
+            } else {
+                out.push(letter);
+            }
+            continue;
+        }
+        if escaped {
+            if letter == '"' && depth < 1 {
+                match quotes {
+                    0 => out.push_str("){1,1}?("),
+                    1 => out.push_str("){1,1}(?:"),
+                    _ => {
+                        let message = "SQL regular expression may not contain more than two \
+                                       escape-double-quote separators";
+                        let error = Error::invalid_input(message)
+                            .state(SqlState::INVALID_USE_OF_ESCAPE_CHARACTER);
+                        return Err(error.unplaced());
+                    }
+                }
+                quotes += 1;
+            } else {
+                out.push('\\');
+                out.push(letter);
+                class_at = 3;
+            }
+            escaped = false;
+        } else if Some(letter) == escape {
+            escaped = true;
+        } else if depth > 0 {
+            if letter == '\\' {
+                out.push('\\');
+            }
+            out.push(letter);
+            match letter {
+                ']' if class_at > 2 => depth -= 1,
+                '[' => {
+                    depth += 1;
+                    class_at = 3;
+                }
+                '^' => class_at += 1,
+                _ => class_at = 3,
+            }
+        } else {
+            match letter {
+                '[' => {
+                    depth = 1;
+                    class_at = 1;
+                    out.push('[');
+                }
+                '%' => out.push_str(".*"),
+                '_' => out.push('.'),
+                '(' => out.push_str("(?:"),
+                '\\' | '.' | '^' | '$' => {
+                    out.push('\\');
+                    out.push(letter);
+                }
+                _ => out.push(letter),
+            }
+        }
+    }
+    out.push_str(")$");
+    Ok(out)
 }
 
 /// Whether `name` is one of the calls of this module.
@@ -528,6 +634,15 @@ pub(crate) fn hoist(name: &str, literals: &[Option<Value>]) -> Option<Call> {
 /// The answer of a call over one row of values, or `None` when `name` is not one of the calls of
 /// this module.
 pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
+    if name == SIMILAR_ESCAPE {
+        return match args {
+            [Value::Varchar(pattern), Value::Varchar(escape)] => {
+                Ok(Some(Value::Varchar(similar_escape(pattern, escape)?)))
+            }
+            [_, _] => Ok(Some(Value::Null)),
+            _ => Err(Error::internal(format!("{name} takes 2 arguments"))),
+        };
+    }
     let Some(function) = Function::of_kernel(name) else {
         return Ok(None);
     };
@@ -716,5 +831,25 @@ mod tests {
         assert_eq!(split("abc", "x*"), vec![text("a"), text("b"), text("c")]);
         assert_eq!(split(",a,", ","), vec![text(""), text("a"), text("")]);
         assert_eq!(split("", ","), vec![text("")]);
+    }
+
+    /// The translations of the PostgreSQL 19 oracle. The brackets end at the first `]` that is not
+    /// the first member of the class.
+    #[test]
+    fn similar_to_escape_writes_what_postgresql_writes() {
+        let escape = |pattern, escape| similar_escape(pattern, escape).unwrap();
+        assert_eq!(escape("a%b_c", "\\"), "^(?:a.*b.c)$");
+        assert_eq!(escape("(ab)*c", "\\"), "^(?:(?:ab)*c)$");
+        assert_eq!(escape("a.b^c$d\\e", "\\"), "^(?:a\\.b\\^c\\$d\\e)$");
+        assert_eq!(escape("[^]a]x", "\\"), "^(?:[^]a]x)$");
+        assert_eq!(escape("[%_]%", "\\"), "^(?:[%_].*)$");
+        assert_eq!(escape("[\\\"]\"", "\\"), "^(?:[\\\"]\")$");
+        assert_eq!(escape("a#\"b#\"c", "#"), "^(?:a){1,1}?(b){1,1}(?:c)$");
+        assert_eq!(escape("a\\%", ""), "^(?:a\\\\.*)$");
+        assert_eq!(escape("aé%", "é"), "^(?:a\\%)$");
+        let error = similar_escape("a", "ab").unwrap_err();
+        assert_eq!(error.sqlstate(), Some(SqlState::INVALID_ESCAPE_SEQUENCE));
+        let error = similar_escape("a#\"b#\"c#\"", "#").unwrap_err();
+        assert_eq!(error.sqlstate(), Some(SqlState::INVALID_USE_OF_ESCAPE_CHARACTER));
     }
 }
