@@ -943,7 +943,7 @@ impl Binder<'_> {
         text: ExprRef,
         pattern: ExprRef,
         insensitive: bool,
-    ) -> ExprRef {
+    ) -> Result<ExprRef> {
         let letters = if insensitive { "i" } else { "" };
         let letters = self.add_constant(Value::Varchar(letters.to_owned()));
         self.regexp_kernel(Function::Match, vec![text, pattern, letters])
@@ -1001,7 +1001,7 @@ impl Binder<'_> {
                 return Err(no_such_function("substring", &types, &unknown));
             }
             let pattern = self.similar_escape(bound[1], bound[2]);
-            return Ok(Some(self.regexp_kernel(function, vec![bound[0], pattern])));
+            return self.regexp_kernel(function, vec![bound[0], pattern]).map(Some);
         }
         let parameters = function.parameters();
         let fits = |(at, ty): (usize, &LogicalType)| match parameters[at].is_text() {
@@ -1029,7 +1029,7 @@ impl Binder<'_> {
         for parameter in &parameters[bound.len()..] {
             bound.push(self.add_constant(parameter.default_value()));
         }
-        Ok(Some(self.regexp_kernel(function, bound)))
+        self.regexp_kernel(function, bound).map(Some)
     }
 
     /// `substring(value from start [for length])` and `substr` of a PostgreSQL session, which keep
@@ -1228,10 +1228,13 @@ impl Binder<'_> {
         self.add_expr(Expr::Function { name, args }, LogicalType::Varchar)
     }
 
-    /// The call of one of the kernels of `pgregexp`, with an argument for each parameter.
-    fn regexp_kernel(&mut self, function: Function, arguments: Vec<ExprRef>) -> ExprRef {
+    /// The call of one of the kernels of `pgregexp`, with an argument for each parameter and the
+    /// OID of the collation of the call after them.
+    fn regexp_kernel(&mut self, function: Function, arguments: Vec<ExprRef>) -> Result<ExprRef> {
+        let collation = self.call_collation(&arguments)?;
+        let collation = self.add_constant(Value::BigInt(i64::from(collation)));
         let parameters = function.parameters();
-        let arguments: Vec<ExprRef> = arguments
+        let mut arguments: Vec<ExprRef> = arguments
             .into_iter()
             .zip(parameters)
             .map(|(argument, parameter)| {
@@ -1240,9 +1243,10 @@ impl Binder<'_> {
                 self.cast_to(argument, &ty)
             })
             .collect();
+        arguments.push(collation);
         let name = self.plan_mut().intern(function.kernel());
         let args = self.plan_mut().add_expr_list(&arguments);
-        self.add_expr(Expr::Function { name, args }, function.returns())
+        Ok(self.add_expr(Expr::Function { name, args }, function.returns()))
     }
 
     /// The error of PostgreSQL for a set-returning function in a place that cannot give rows.

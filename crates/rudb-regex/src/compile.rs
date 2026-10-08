@@ -11,9 +11,11 @@
 //! a limit on how long the program may get. Both are checks with a message rather than an allocation
 //! nobody sees coming.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Result};
 
-use crate::parse::{Assertion, Ast, Class, Named};
+use crate::parse::{Assertion, Ast, Class};
 
 /// The most instructions a pattern may compile to.
 ///
@@ -56,9 +58,6 @@ pub(crate) struct Set {
     ascii: u128,
     /// The ranges the class names, sorted and merged, before the negation.
     ranges: Vec<(char, char)>,
-    /// The named classes of PostgreSQL past ASCII, each with whether the set holds it or its
-    /// complement, before the negation.
-    named: Vec<(Named, bool)>,
     negated: bool,
 }
 
@@ -91,7 +90,7 @@ impl Set {
         if class.negated {
             ascii = !ascii;
         }
-        Self { ascii, ranges: merged, named: class.named.clone(), negated: class.negated }
+        Self { ascii, ranges: merged, negated: class.negated }
     }
 
     /// Folds every byte a character in this set may begin with into a table.
@@ -104,10 +103,7 @@ impl Set {
         // Above the ASCII line a character begins with a lead byte, and which lead byte depends on
         // how many bytes it takes. Working that out range by range is more care than a prefilter is
         // worth, so a set that reaches above the line takes every lead byte there is.
-        if self.negated
-            || !self.named.is_empty()
-            || self.ranges.iter().any(|&(_, high)| high as u32 >= 128)
-        {
+        if self.negated || self.ranges.iter().any(|&(_, high)| high as u32 >= 128) {
             for byte in 0xc2..=0xf4u8 {
                 into[byte as usize / 64] |= 1 << (byte % 64);
             }
@@ -120,7 +116,7 @@ impl Set {
         if code < 128 {
             return self.ascii >> code & 1 == 1;
         }
-        let ranged = self
+        let held = self
             .ranges
             .binary_search_by(|&(low, high)| {
                 if high < ch {
@@ -132,7 +128,6 @@ impl Set {
                 }
             })
             .is_ok();
-        let held = ranged || self.named.iter().any(|&(named, holds)| named.holds(ch) == holds);
         held != self.negated
     }
 }
@@ -254,6 +249,9 @@ pub(crate) struct Program {
     pub(crate) anchored: bool,
     /// What a match may begin with, which an unanchored search uses to skip positions.
     pub(crate) first: First,
+    /// The word characters of the word boundaries of PostgreSQL, which are `[[:alnum:]_]` of the
+    /// collation, or `None` for the ASCII ones.
+    pub(crate) word: Option<Arc<Set>>,
 }
 
 /// Compiles a tree.
@@ -262,7 +260,18 @@ pub(crate) struct Program {
 ///
 /// If the program would be longer than the budget.
 pub(crate) fn compile(ast: &Ast, groups: usize) -> Result<Program> {
-    let mut builder = Builder { insts: Vec::new(), sets: Vec::new(), looks: Vec::new() };
+    compile_with(ast, groups, None)
+}
+
+/// Compiles a tree whose word boundaries of PostgreSQL look at the characters of `word`, and the
+/// lookarounds in it the same way.
+///
+/// # Errors
+///
+/// If the program would be longer than the budget.
+pub(crate) fn compile_with(ast: &Ast, groups: usize, word: Option<&Arc<Set>>) -> Result<Program> {
+    let mut builder =
+        Builder { insts: Vec::new(), sets: Vec::new(), looks: Vec::new(), word: word.cloned() };
     builder.push(Inst::Save(0))?;
     builder.emit(ast)?;
     builder.push(Inst::Save(1))?;
@@ -275,6 +284,7 @@ pub(crate) fn compile(ast: &Ast, groups: usize) -> Result<Program> {
         groups,
         anchored: anchored(ast),
         first,
+        word: builder.word,
     })
 }
 
@@ -297,6 +307,7 @@ struct Builder {
     insts: Vec<Inst>,
     sets: Vec<Set>,
     looks: Vec<Look>,
+    word: Option<Arc<Set>>,
 }
 
 impl Builder {
@@ -347,7 +358,7 @@ impl Builder {
                 self.repeat(inner, *least, *most, *greedy)?;
             }
             Ast::Look { ahead, negated, inner } => {
-                let program = compile(inner, 0)?;
+                let program = compile_with(inner, 0, self.word.as_ref())?;
                 self.looks.push(Look { ahead: *ahead, negated: *negated, program });
                 let id = self.looks.len() - 1;
                 self.push(Inst::Look(id))?;

@@ -104,69 +104,12 @@ pub(crate) struct Class {
     pub(crate) negated: bool,
     /// The ranges, inclusive at both ends.
     pub(crate) ranges: Vec<(char, char)>,
-    /// The named classes of PostgreSQL that the set holds past ASCII, where a range list would be
-    /// the whole Unicode table, each with whether the set holds the class or its complement. Below
-    /// the ASCII line the ranges hold them too.
-    pub(crate) named: Vec<(Named, bool)>,
 }
 
 impl Class {
     pub(crate) fn of(ranges: &[(char, char)]) -> Self {
-        Self { negated: false, ranges: ranges.to_vec(), named: Vec::new() }
+        Self { negated: false, ranges: ranges.to_vec() }
     }
-}
-
-/// A named class of characters past ASCII, as PostgreSQL reads it in a UTF-8 database.
-///
-/// PostgreSQL asks the C library, and the C library builds its tables from Unicode with a few rules
-/// of its own: a digit is an ASCII digit only, so the decimal digits of the other scripts are
-/// letters, and the spaces that do not break a line are punctuation rather than space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Named {
-    Alpha,
-    /// A letter or a digit, which past ASCII is the same set as a letter.
-    Alnum,
-    Upper,
-    Lower,
-    Space,
-    Punct,
-    Graph,
-    Print,
-}
-
-/// The first code point of each run of ten decimal digits past ASCII.
-const DECIMAL_ZEROS: [u32; 75] = [
-    0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6,
-    0xe50, 0xed0, 0xf20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50,
-    0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0, 0xff10,
-    0x104a0, 0x10d30, 0x10d40, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0,
-    0x11650, 0x116c0, 0x116d0, 0x116da, 0x11730, 0x118e0, 0x11950, 0x11bf0, 0x11c50, 0x11d50,
-    0x11da0, 0x11f50, 0x16130, 0x16a60, 0x16ac0, 0x16b50, 0x16d70, 0x1ccf0, 0x1d7ce, 0x1d7d8,
-    0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e5f1, 0x1e950, 0x1fbf0,
-];
-
-impl Named {
-    /// Whether a character past ASCII is in the class.
-    pub(crate) fn holds(self, ch: char) -> bool {
-        match self {
-            Self::Alpha | Self::Alnum => ch.is_alphabetic() || decimal(ch),
-            Self::Upper => ch.is_uppercase(),
-            Self::Lower => ch.is_lowercase(),
-            Self::Space => {
-                ch.is_whitespace() && !matches!(ch, '\u{85}' | '\u{a0}' | '\u{2007}' | '\u{202f}')
-            }
-            Self::Print => !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}'),
-            Self::Graph => Self::Print.holds(ch) && !Self::Space.holds(ch),
-            Self::Punct => Self::Graph.holds(ch) && !Self::Alpha.holds(ch),
-        }
-    }
-}
-
-/// Whether a character is a decimal digit of a script other than Latin.
-fn decimal(ch: char) -> bool {
-    let code = ch as u32;
-    let index = DECIMAL_ZEROS.partition_point(|&zero| zero <= code);
-    index > 0 && code - DECIMAL_ZEROS[index - 1] < 10
 }
 
 /// Which of the flags that can be written inside a pattern are on.
@@ -601,7 +544,7 @@ impl Parser {
 
     /// The inside of a `[...]`, with the cursor just past the `[`.
     fn class(&mut self, from: usize) -> Result<Class> {
-        let mut class = Class { negated: self.eat('^'), ranges: Vec::new(), named: Vec::new() };
+        let mut class = Class { negated: self.eat('^'), ranges: Vec::new() };
         let mut first = true;
         loop {
             let Some(ch) = self.peek() else {
@@ -715,7 +658,7 @@ pub(crate) fn perl_class(ch: char) -> Class {
         's' => &[('\t', '\n'), ('\u{c}', '\r'), (' ', ' ')],
         _ => &[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
     };
-    Class { negated: ch.is_ascii_uppercase(), ranges: ranges.to_vec(), named: Vec::new() }
+    Class { negated: ch.is_ascii_uppercase(), ranges: ranges.to_vec() }
 }
 
 /// The POSIX named classes, as ASCII, which is again what RE2 does with them.

@@ -7,6 +7,10 @@
 //! `regexp_split_to_table` give the list of their rows, and the unnest that the binder puts around
 //! them gives the rows one at a time, in a select list and in `FROM`.
 //!
+//! Each kernel takes the OID of the collation of the call as one more argument, a `BIGINT` after
+//! the parameters, as `PG_GET_COLLATION` gives it to the C function. The character classes, the
+//! case folding of the flag `i` and the word boundaries are the ones of that collation.
+//!
 //! `SIMILAR TO` is `~` over what `similar_to_escape` makes of the pattern, as in PostgreSQL, and
 //! `substring(text similar pattern escape escape)` is `substring` from a pattern over it.
 //!
@@ -19,6 +23,7 @@ use rudb_common::{Error, LogicalType, Result, SqlState, Value};
 use rudb_regex::{Captures, PgFlags, Regex};
 use rudb_vector::{Data, Vector};
 
+use crate::pgunicode;
 use crate::scalar::{finish, over_valid};
 use crate::shape::nulls_of;
 
@@ -301,6 +306,7 @@ pub(crate) fn is_pg_regexp(name: &str) -> bool {
 pub(crate) struct Call {
     pattern: String,
     letters: String,
+    collation: i64,
     regex: Regex,
     global: bool,
 }
@@ -359,8 +365,9 @@ impl Numbers {
 }
 
 impl Call {
-    /// The call for `pattern` and `letters`, or the error that PostgreSQL gives for them.
-    fn new(function: Function, pattern: &str, letters: &str) -> Result<Self> {
+    /// The call for `pattern` and `letters` in the collation with the OID `collation`, or the
+    /// error that PostgreSQL gives for them.
+    fn new(function: Function, pattern: &str, letters: &str, collation: i64) -> Result<Self> {
         // A string for the fourth argument of `regexp_replace` is the flags, so a number written
         // as a string there is an error that says how to give a start.
         if function == Function::Replace
@@ -388,17 +395,20 @@ impl Call {
             };
             return Err(error.unplaced());
         }
-        let regex = Regex::postgres(pattern, flags).map_err(Error::unplaced)?;
+        // `pg_regcomp` takes the locale of the collation before it reads the pattern.
+        let ctype = pgunicode::ctype(collation)?;
+        let regex = Regex::postgres(pattern, flags, ctype).map_err(Error::unplaced)?;
         Ok(Self {
             pattern: pattern.to_owned(),
             letters: letters.to_owned(),
+            collation,
             regex,
             global: flags.is_global(),
         })
     }
 
-    fn holds(&self, pattern: &str, letters: &str) -> bool {
-        self.pattern == pattern && self.letters == letters
+    fn holds(&self, pattern: &str, letters: &str, collation: i64) -> bool {
+        self.pattern == pattern && self.letters == letters && self.collation == collation
     }
 
     /// The answer for one row of arguments, none of which is null.
@@ -609,9 +619,14 @@ fn byte_at(text: &str, chars: usize) -> Option<usize> {
     }
 }
 
-/// The pattern and the flags of a row, with no flags for a function that takes none.
-fn pattern_of(function: Function, row: &[Option<&Value>]) -> Option<(String, String)> {
+/// The pattern, the flags and the collation of a row, with no flags for a function that takes
+/// none.
+fn pattern_of(function: Function, row: &[Option<&Value>]) -> Option<(String, String, i64)> {
     let Some(Value::Varchar(pattern)) = row.get(1).copied().flatten() else { return None };
+    let Some(&Value::BigInt(collation)) = row.get(function.parameters().len()).copied().flatten()
+    else {
+        return None;
+    };
     let letters = match function.at(Flags) {
         Some(at) => match row.get(at).copied().flatten() {
             Some(Value::Varchar(letters)) => letters.clone(),
@@ -619,7 +634,7 @@ fn pattern_of(function: Function, row: &[Option<&Value>]) -> Option<(String, Str
         },
         None => String::new(),
     };
-    Some((pattern.clone(), letters))
+    Some((pattern.clone(), letters, collation))
 }
 
 /// What a recipe can lift out of a call, given the arguments that were literals. A pattern that
@@ -627,8 +642,8 @@ fn pattern_of(function: Function, row: &[Option<&Value>]) -> Option<(String, Str
 pub(crate) fn hoist(name: &str, literals: &[Option<Value>]) -> Option<Call> {
     let function = Function::of_kernel(name)?;
     let literals: Vec<Option<&Value>> = literals.iter().map(Option::as_ref).collect();
-    let (pattern, letters) = pattern_of(function, &literals)?;
-    Call::new(function, &pattern, &letters).ok()
+    let (pattern, letters, collation) = pattern_of(function, &literals)?;
+    Call::new(function, &pattern, &letters, collation).ok()
 }
 
 /// The answer of a call over one row of values, or `None` when `name` is not one of the calls of
@@ -646,7 +661,7 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let Some(function) = Function::of_kernel(name) else {
         return Ok(None);
     };
-    if args.len() != function.parameters().len() {
+    if args.len() != function.parameters().len() + 1 {
         return Err(Error::internal(format!("{name} takes {} arguments", args.len())));
     }
     // The functions are strict.
@@ -655,10 +670,10 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     }
     let numbers = Numbers::read(function, args)?;
     let row: Vec<Option<&Value>> = args.iter().map(Some).collect();
-    let Some((pattern, letters)) = pattern_of(function, &row) else {
+    let Some((pattern, letters, collation)) = pattern_of(function, &row) else {
         return Err(Error::internal(format!("{name} of something that is not a string")));
     };
-    Call::new(function, &pattern, &letters)?.one(function, args, &numbers).map(Some)
+    Call::new(function, &pattern, &letters, collation)?.one(function, args, &numbers).map(Some)
 }
 
 /// The answers of a call over vectors, with the pattern compiled again only where it changes.
@@ -671,7 +686,7 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
 ) -> Result<Option<Vector>> {
     let Some(function) = Function::of_kernel(name) else { return Ok(None) };
     let args: Vec<&Vector> = args.iter().map(AsRef::as_ref).collect();
-    if args.len() != function.parameters().len() {
+    if args.len() != function.parameters().len() + 1 {
         return Ok(None);
     }
     let text = args[0];
@@ -681,9 +696,9 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     let constants: Vec<Option<&Value>> = args.iter().map(|arg| arg.constant_value()).collect();
     let mut held: Option<Call> = None;
     if prepared.is_none()
-        && let Some((pattern, letters)) = pattern_of(function, &constants)
+        && let Some((pattern, letters, collation)) = pattern_of(function, &constants)
     {
-        held = Some(Call::new(function, &pattern, &letters)?);
+        held = Some(Call::new(function, &pattern, &letters, collation)?);
     }
     // The operator over one pattern for every row is the loop that a `WHERE` runs, so it writes
     // the answers in place.
@@ -715,13 +730,13 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
             Some(call) => call,
             None => {
                 let given: Vec<Option<&Value>> = row.iter().map(Some).collect();
-                let Some((pattern, letters)) = pattern_of(function, &given) else {
+                let Some((pattern, letters, collation)) = pattern_of(function, &given) else {
                     return Err(Error::internal(format!(
                         "{name} of something that is not a string"
                     )));
                 };
-                if !held.as_ref().is_some_and(|call| call.holds(&pattern, &letters)) {
-                    held = Some(Call::new(function, &pattern, &letters)?);
+                if !held.as_ref().is_some_and(|call| call.holds(&pattern, &letters, collation)) {
+                    held = Some(Call::new(function, &pattern, &letters, collation)?);
                 }
                 held.as_ref().ok_or_else(|| Error::internal("no pattern"))?
             }
@@ -739,11 +754,16 @@ mod tests {
         Value::Varchar(value.to_owned())
     }
 
-    /// The answer of `function` over the arguments, with the defaults for the ones left out.
+    /// The OID of the collation `C`.
+    const C: Value = Value::BigInt(950);
+
+    /// The answer of `function` over the arguments in the collation `C`, with the defaults for
+    /// the ones left out.
     fn answer(function: Function, given: &[Value]) -> Result<Value> {
         let parameters = function.parameters();
         let mut args = given.to_vec();
         args.extend(parameters[given.len()..].iter().map(|parameter| parameter.default_value()));
+        args.push(C);
         Ok(call(function.kernel(), &args)?.expect("one of these"))
     }
 
@@ -777,7 +797,7 @@ mod tests {
         assert_eq!(first("abc", "x", "").unwrap(), Value::Null);
         let error = first("abc", "b", "g").unwrap_err();
         assert_eq!(error.sqlstate(), Some(SqlState::INVALID_PARAMETER_VALUE));
-        let args = [Value::Null, text("b"), text("")];
+        let args = [Value::Null, text("b"), text(""), C];
         assert_eq!(call(Function::First.kernel(), &args).unwrap(), Some(Value::Null));
     }
 

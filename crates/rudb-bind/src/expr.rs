@@ -1519,7 +1519,7 @@ impl Binder<'_> {
             && text(self.plan().expr_type(left))
             && text(self.plan().expr_type(right))
         {
-            let matched = self.pg_regex_match(left, right, insensitive);
+            let matched = self.pg_regex_match(left, right, insensitive)?;
             return if negated { self.call("not", vec![matched]) } else { Ok(matched) };
         }
         let full = always_full || self.semantics.regex_match_full();

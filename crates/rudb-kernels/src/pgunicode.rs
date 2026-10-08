@@ -8,14 +8,17 @@
 //! only the ASCII letters. `pg_c_utf8` maps each code point by the simple mappings of Unicode, and
 //! `pg_unicode_fast` by the full mappings, with the special mappings and the condition
 //! `Final_Sigma`. The properties of a code point here are the ones of `unicode_category.c` that the
-//! case mapping reads.
+//! case mapping reads. A regular expression takes its character classes and its case folding from
+//! the same collation, through [`ctype`].
 
+mod ctype;
 mod table;
 
 use std::cmp::Ordering;
 
 use rudb_common::{Error, Result, SqlState, Value};
 
+pub(crate) use ctype::ctype;
 use table::{
     ALPHABETIC, CASE_IGNORABLE, CASES, CATEGORIES, Category, FINAL_SIGMA, LOWERCASE, SPECIALS,
     UPPERCASE,

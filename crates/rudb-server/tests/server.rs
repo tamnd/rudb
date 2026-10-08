@@ -2120,7 +2120,7 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
     };
     // The rows are the ones that PostgreSQL 19 gives. The default collation of a database of
     // rudb is `C`, so a call with no collation maps only the ASCII letters, as `C` does.
-    let cases: [(&str, &[&str]); 19] = [
+    let cases: [(&str, &[&str]); 28] = [
         (
             "select upper('abc é ß'), lower('ABC É'), initcap('hELLO éa'), casefold('ABC ẞ');",
             &["ABC é ß|abc É|Hello éA|abc ẞ"],
@@ -2189,6 +2189,44 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
             "select x from (values ('école'), ('ÉCOLE'), ('ecole')) t(x) where x ilike 'É%' collate pg_c_utf8;",
             &["école", "ÉCOLE"],
         ),
+        // A regular expression takes its character classes, its case folding and its word
+        // boundaries from the collation of the call.
+        (
+            "select 'é' ~* 'É', 'é' collate pg_c_utf8 ~* 'É', 'ǅ' collate pg_c_utf8 ~* 'ǅ', 'ǆ' collate pg_c_utf8 ~* '[ǅ]', 'ss' ~* 'ß' collate pg_unicode_fast;",
+            &["f|t|f|t|f"],
+        ),
+        (
+            "select substring('1abé α2' from '[[:alpha:]]+'), substring('1abé α2' collate pg_c_utf8 from '[[:alpha:]]+');",
+            &["ab|abé"],
+        ),
+        (
+            "select substring('a٣12' collate pg_c_utf8 from '[[:digit:]]+'), substring('a٣12' collate pg_unicode_fast from '[[:digit:]]+');",
+            &["12|٣12"],
+        ),
+        (
+            "select substring('a$+!b' collate pg_c_utf8 from '[[:punct:]]+'), substring('a$+!b' collate pg_unicode_fast from '[[:punct:]]+');",
+            &["$+!|!"],
+        ),
+        (
+            "select regexp_replace('a b c' collate pg_c_utf8, '\\s', '_', 'g'), regexp_replace('a b', '\\s', '_', 'g');",
+            &["a_b_c|a_b"],
+        ),
+        (
+            "select regexp_match(',a_é,', '\\w+'), regexp_match(',a_é,' collate pg_c_utf8, '\\w+'), regexp_match('.a٣.' collate pg_unicode_fast, '\\w+');",
+            &["{a_}|{a_é}|{a٣}"],
+        ),
+        (
+            "select regexp_count('éb éb', '\\mb'), regexp_count('éb éb' collate pg_c_utf8, '\\mb'), regexp_count('éb éb', '\\yb\\y');",
+            &["2|0|2"],
+        ),
+        (
+            "select regexp_like('ÀÉ' collate pg_c_utf8, '^[à-é]+$', 'i'), regexp_like('ÀÉ', '^[à-é]+$', 'i'), regexp_split_to_array('aébÉc' collate pg_c_utf8, 'é', 'i');",
+            &["t|f|{a,b,c}"],
+        ),
+        (
+            "select x from (values ('é'), ('É'), ('e')) t(x) where x collate pg_c_utf8 ~ '^[[:lower:]]$';",
+            &["é", "e"],
+        ),
     ];
     for (sql, expected) in cases {
         let messages = client.query(sql);
@@ -2219,6 +2257,8 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
             "ICU is not supported in this build",
             None,
         ),
+        ("select 'a' collate \"C\" ~ 'a' collate pg_c_utf8;", "42P21", mismatch, Some("30")),
+        ("select 'a' ~ 'A' collate unicode;", "0A000", "ICU is not supported in this build", None),
     ] {
         let messages = client.query(sql);
         let error = &messages[0];
