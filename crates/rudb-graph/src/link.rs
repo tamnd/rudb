@@ -393,16 +393,17 @@ impl Link {
     /// monotone form again. A child there is a `select1` and a `rank0`, about three hundred
     /// instructions between them, and on q09 those were a tenth of the query for 319,404 children.
     /// The children a scan hands up are ascending, so the search for each starts at the word the
-    /// last one was found in and gallops out over the count of ones before each word, which finds
-    /// a near child in a load or two and a far one in a few halvings. The parent is then the zeros
+    /// last one was found in and gallops out over the count of ones before each word, which finds a
+    /// near child in a load or two and a far one in a few halvings. The parent is then the zeros
     /// before the child's bit, which is the bit less the ones before it, and the ones before the
     /// `n`th one are `n`. A child a few past the last one answered is a few one bits after the last
     /// one's, and when those are in the same word it takes no search at all, and the next child of
-    /// the same parent is just the next bit set. On a link of 200,000 parents of four children each with one parent in
-    /// 268 held, which is the shape of the `partsupp` rows q02 keeps through `part`, this came to 96
-    /// instructions a child where a walk of up to a thousand children a word at a time and a
-    /// `select1` past that was 142. A child before the last starts the search from the first word
-    /// again, so the answer is the same in any order and only the cost depends on it.
+    /// the same parent is just the next bit set. On a link of 200,000 parents of four children each
+    /// with one parent in 268 held, which is the shape of the `partsupp` rows q02 keeps through
+    /// `part`, this came to 103 instructions a child where a walk of up to a thousand children a
+    /// word at a time and a `select1` past that was 142. A child before the last starts the search
+    /// from the first word again, so the answer is the same in any order and only the cost depends
+    /// on it.
     pub fn forward_each(&self, children: &[Rid], out: &mut Vec<Rid>) {
         out.clear();
         out.reserve(children.len());
