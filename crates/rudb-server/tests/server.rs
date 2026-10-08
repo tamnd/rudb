@@ -3748,6 +3748,77 @@ fn array_fill_gives_the_array_and_the_errors_of_postgresql() {
 }
 
 #[test]
+fn a_table_name_is_the_whole_row_as_postgresql_has_it() {
+    let dirs = Dirs::new("pg-whole-row");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            return format!("{code} {text}");
+        }
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(|| "NULL".into(), |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        rows.join(";")
+    };
+    result("create table t(a int, b text)");
+    result("insert into t values (1, 'x'), (2, null)");
+    // The answers of the PostgreSQL 19 oracle. A row is null when each field is null and not null
+    // when no field is, and `t.*` in a row constructor or a call is the row of `t`.
+    for (sql, expected) in [
+        ("select t from t order by a", "(1,x);(2,)"),
+        ("select (t).*, (t).a from t order by a", "1|x|1;2|NULL|2"),
+        ("select s from t s order by a", "(1,x);(2,)"),
+        ("select t from t as x", "42703 column \"t\" does not exist"),
+        ("select x from (select 1 as p, 'q' as r) x", "(1,q)"),
+        ("select x from (values (1, 2)) x(c, d)", "(1,2)"),
+        (
+            "select t::text, row_to_json(t), to_json(t) from t where a = 1",
+            "(1,x)|{\"a\":1,\"b\":\"x\"}|{\"a\":1,\"b\":\"x\"}",
+        ),
+        ("select t = t, count(t) over () from t order by a", "t|2;t|2"),
+        ("select array_agg(t order by a) from t", "{\"(1,x)\",\"(2,)\"}"),
+        ("select (select t from (values (9)) v(z)) from t order by a", "(1,x);(2,)"),
+        ("select t from t, (values (1)) u(t) order by a", "1;1"),
+        ("select u from t, (values (1)) u(t) order by a", "(1);(1)"),
+        (
+            "select t is null, t is not null, t isnull, t notnull from t order by a",
+            "f|t|f|t;f|f|f|f",
+        ),
+        ("select t from t where t is not null", "(1,x)"),
+        (
+            "select row(1, null) is null, row(1, null) is not null, row(null, null) is null, \
+             row(null, null) is not null, row(1, 2) is not null",
+            "f|f|t|f|t",
+        ),
+        ("select row(row(null)) is null, row(row(null)) is not null", "f|t"),
+        ("select row(t.*), row(t.*, 3), (1, t.*) from t where a = 1", "(1,x)|(1,x,3)|(1,1,x)"),
+        (
+            "select row_to_json(t.*), count(t.*) over () from t where a = 2",
+            "{\"a\":2,\"b\":null}|1",
+        ),
+        (
+            "select b is null, b is not null from (values (1)) a(x) left join (values (2)) b(y) on false",
+            "t|f",
+        ),
+    ] {
+        assert_eq!(result(sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();

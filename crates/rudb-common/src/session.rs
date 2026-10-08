@@ -216,6 +216,7 @@ pub struct Semantics {
     regex_match_full: bool,
     regex_rules: RegexRules,
     row_fields: RowFields,
+    row_nulls: RowNulls,
     scalar_subquery_error_on_multiple_rows: bool,
     sequence_owners: SequenceOwners,
     set_functions: SetFunctions,
@@ -243,6 +244,7 @@ impl Default for Semantics {
             conflict_arbiter: ConflictArbiter::Pin,
             from_functions: FromFunctions::Pin,
             row_fields: RowFields::Pin,
+            row_nulls: RowNulls::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -418,6 +420,11 @@ impl Semantics {
     #[must_use]
     pub fn row_fields(self) -> RowFields {
         self.row_fields
+    }
+    /// When a row value `IS NULL` and when it `IS NOT NULL`.
+    #[must_use]
+    pub fn row_nulls(self) -> RowNulls {
+        self.row_nulls
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -823,6 +830,18 @@ pub enum RowFields {
     Pin,
     /// As in PostgreSQL: the fields of `row(...)` are `f1`, `f2` and so on, a name must be the
     /// same, and a name that no field has is `42703`.
+    Postgres,
+}
+
+/// When a row value `IS NULL` and when it `IS NOT NULL`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowNulls {
+    /// As in DuckDB: the test is about the row itself, so `row(1, null) IS NOT NULL` is true.
+    #[default]
+    Pin,
+    /// As in PostgreSQL and the SQL standard: a row `IS NULL` when each of its fields is null and
+    /// `IS NOT NULL` when none of them is, so `row(1, null)` is neither. The test does not look
+    /// inside a field that is a row itself.
     Postgres,
 }
 
@@ -1396,6 +1415,7 @@ impl Session {
             self.semantics.conflict_arbiter = ConflictArbiter::Postgres;
             self.semantics.from_functions = FromFunctions::Postgres;
             self.semantics.row_fields = RowFields::Postgres;
+            self.semantics.row_nulls = RowNulls::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;

@@ -51,8 +51,13 @@ impl Binder<'_> {
                 )));
             }
         }
+        Ok(self.pack_row(names, values))
+    }
+
+    /// A struct of bound values with these field names, which can repeat.
+    fn pack_row(&mut self, names: &[String], values: &[ExprRef]) -> ExprRef {
         if values.is_empty() {
-            return Ok(self.add_constant(Value::Struct(Vec::new())));
+            return self.add_constant(Value::Struct(Vec::new()));
         }
         let fields = names
             .iter()
@@ -61,7 +66,47 @@ impl Binder<'_> {
             .collect();
         let args = self.plan_mut().add_expr_list(values);
         let recorded = self.plan_mut().intern(STRUCT_PACK);
-        Ok(self.add_expr(Expr::Function { name: recorded, args }, LogicalType::Struct(fields)))
+        self.add_expr(Expr::Function { name: recorded, args }, LogicalType::Struct(fields))
+    }
+
+    /// A table name written where a value goes, which is the whole row of the table as a struct
+    /// with a field for each column, or `None` when no table in scope has the name.
+    ///
+    /// Both DuckDB and PostgreSQL read `SELECT t FROM t` this way. A column or a field of a struct
+    /// with the name comes first, so the binder only asks here when the name resolves to nothing
+    /// else. The name is the one the table is reachable through, so after `FROM t AS x` only `x`
+    /// is the row. The scope of this block comes first and then the scopes around it from the
+    /// nearest out, the same order a column name is looked for in.
+    pub(crate) fn whole_row(&mut self, word: &str, scope: &Scope) -> Result<Option<ExprRef>> {
+        let compare = self.semantics.identifier_compare();
+        let columns = |scope: &Scope| -> Vec<(String, rudb_plan::ColumnBinding, LogicalType)> {
+            let held = scope.columns.iter().filter(|held| compare.same(&held.table, word));
+            held.map(|held| (held.name.clone(), held.binding, held.ty.clone())).collect()
+        };
+        let mut found = columns(scope);
+        let mut outer = None;
+        if found.is_empty() {
+            for (at, scope) in self.outer_scopes.iter().enumerate().rev() {
+                found = columns(scope);
+                if !found.is_empty() {
+                    outer = Some(at);
+                    break;
+                }
+            }
+        }
+        if found.is_empty() {
+            return Ok(None);
+        }
+        let mut names = Vec::with_capacity(found.len());
+        let mut values = Vec::with_capacity(found.len());
+        for (name, binding, ty) in found {
+            values.push(match outer {
+                Some(at) => self.outer_column(at, binding, ty)?,
+                None => self.add_expr(Expr::Column(binding), ty),
+            });
+            names.push(name);
+        }
+        Ok(Some(self.pack_row(&names, &values)))
     }
 
     /// `(r).*`: each field of a composite value as a value of its own, with the name of its

@@ -63,8 +63,8 @@ pub use session::{
     ConditionTypes, ConflictArbiter, CountTypes, DefaultNullOrder, DistinctOrder, ErrorTexts,
     FromFunctions, FunctionRules, IdentifierCase, IdentifierCompare, InsertColumns, JoinColumns,
     NumberCasts, NumberLiterals, OperatorRules, PlanErrors, PreparedStatement, QueryColumns,
-    RegexRules, RowFields, Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions,
-    ShowBehavior, TableNames, TypeNames, UnknownTypes, ValuesNames, Variable,
+    RegexRules, RowFields, RowNulls, Semantics, SequenceOwners, Session, SessionTimeZone,
+    SetFunctions, ShowBehavior, TableNames, TypeNames, UnknownTypes, ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

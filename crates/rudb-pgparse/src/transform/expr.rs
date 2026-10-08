@@ -81,7 +81,7 @@ impl Transform<'_> {
                 Ok(list)
             }
             Node::RowExpr(row) => {
-                let items = self.expr_list(&row.args)?;
+                let items = self.row_items(&row.args, true)?;
                 Ok(self.push(Expr::Row { items }, row.location))
             }
             Node::TypeCast(cast) => {
@@ -123,6 +123,33 @@ impl Transform<'_> {
         let mut items = Vec::with_capacity(list.len());
         for node in list.iter().flatten() {
             items.push(self.expr(node)?);
+        }
+        Ok(self.ast.expr_slice(items))
+    }
+
+    /// The items of a row constructor or the arguments of a call, where `t.*` is not a star.
+    ///
+    /// PostgreSQL reads `t.*` there as the whole row of `t`. A row constructor takes the row apart
+    /// into its fields, as `(t).*` does, so `row(t.*, 3)` has a field for each column of `t` and
+    /// then the `3`. A call takes it as one value, so `row_to_json(t.*)` is `row_to_json(t)`.
+    fn row_items(&mut self, list: &[Option<Node>], expand: bool) -> Made<Slice> {
+        let mut items = Vec::with_capacity(list.len());
+        for node in list.iter().flatten() {
+            let Node::ColumnRef(column) = node else {
+                items.push(self.expr(node)?);
+                continue;
+            };
+            let fields = &column.fields;
+            let (Some(Some(Node::A_Star(_))), 2..) = (fields.last(), fields.len()) else {
+                items.push(self.expr(node)?);
+                continue;
+            };
+            let name = self.names(&fields[..fields.len() - 1])?;
+            let mut item = self.push(Expr::Column { name }, column.location);
+            if expand {
+                item = self.push(Expr::Fields { record: item }, column.location);
+            }
+            items.push(item);
         }
         Ok(self.ast.expr_slice(items))
     }
@@ -544,7 +571,7 @@ impl Transform<'_> {
             let star = self.push(star, location);
             self.ast.expr_slice([star])
         } else {
-            self.expr_list(&call.args)?
+            self.row_items(&call.args, false)?
         };
         let mut items: Vec<OrderItem> = Vec::with_capacity(call.agg_order.len());
         for node in call.agg_order.iter().flatten() {
