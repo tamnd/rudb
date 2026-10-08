@@ -1697,7 +1697,11 @@ impl Vector {
                 values.len()
             )));
         }
-        if ends.windows(2).any(|pair| pair[0] >= pair[1]) || ends.first() == Some(&0) {
+        // Every pair is looked at with no early way out, which the compiler turns into a few pairs
+        // an instruction. Stopping at the first bad pair was a branch a run, and every part read as
+        // runs comes through here.
+        let falls = ends.windows(2).fold(false, |falls, pair| falls | (pair[0] >= pair[1]));
+        if falls || ends.first() == Some(&0) {
             return Err(Error::internal("run ends that do not increase"));
         }
         let len = ends.last().copied().unwrap_or(0) as usize;
@@ -1707,6 +1711,28 @@ impl Vector {
             validity: Validity::AllValid,
             body: Body::Runs { ends, values: Arc::new(values), laid: Laid::default() },
         })
+    }
+
+    /// Runs with their rows already written out flat beside them, for a reader that decodes both
+    /// at once rather than have [`Vector::laid_out`] write the rows from the runs a second time.
+    ///
+    /// # Errors
+    ///
+    /// As [`Vector::runs`], and when `rows` is not a flat vector of the same type and length with
+    /// no nulls.
+    pub fn runs_laid_out(ends: Vec<u32>, values: Vector, rows: Vector) -> Result<Self> {
+        let mut runs = Self::runs(ends, values)?;
+        if rows.len != runs.len
+            || rows.ty != runs.ty
+            || !matches!(rows.body, Body::Flat(_))
+            || !matches!(rows.validity, Validity::AllValid)
+        {
+            return Err(Error::internal("rows laid out beside runs they do not stand for"));
+        }
+        if let Body::Runs { laid, .. } = &mut runs.body {
+            *laid = Laid::of(rows);
+        }
+        Ok(runs)
     }
 
     /// The same values as runs, when there are few enough runs for that to be smaller.
@@ -4580,12 +4606,19 @@ impl Vector {
     /// carrying a validity mask alongside the positions it is already walking.
     fn resolve(&self, mut at: Vec<usize>) -> (Vec<usize>, &Self) {
         let mut source = self;
+        // The length the positions were last checked against, when nothing they pointed at could
+        // have moved them. Runs laid out hand over rows of the same length as the runs, so the
+        // positions need no second look unless the rows have nulls.
+        let mut checked = None;
         loop {
-            for slot in &mut at {
-                if *slot >= source.len || !source.validity.is_valid(*slot) {
-                    *slot = NOWHERE;
+            if checked != Some(source.len) || !matches!(source.validity, Validity::AllValid) {
+                for slot in &mut at {
+                    if *slot >= source.len || !source.validity.is_valid(*slot) {
+                        *slot = NOWHERE;
+                    }
                 }
             }
+            checked = None;
             source = match &source.body {
                 Body::Dictionary { codes, values, .. } => {
                     for slot in &mut at {
@@ -4609,7 +4642,10 @@ impl Vector {
                 Body::Runs { ends, values, laid } => match laid.flat().or_else(|| {
                     laid.walked(at.len(), ends.len()).then(|| source.laid_runs()).flatten()
                 }) {
-                    Some(flat) => flat,
+                    Some(flat) => {
+                        checked = Some(source.len);
+                        flat
+                    }
                     None => {
                         runs_holding(ends, &mut at);
                         values.as_ref()
@@ -7677,6 +7713,15 @@ mod tests {
         // A cut of runs laid out is laid out already, and the runs held off a page start that way.
         assert!(format!("{:?}", read.slice(2, 20).unwrap()).contains("Laid(out)"));
         assert!(format!("{:?}", runs.clone().laid_out()).contains("Laid(out)"));
+        // Handed its rows by the reader, the runs read the same and are laid out from the start.
+        let (ends, values) = runs.run_parts().unwrap();
+        let handed = Vector::runs_laid_out(ends.to_vec(), values.clone(), flat.clone()).unwrap();
+        assert!(format!("{handed:?}").contains("Laid(out)"));
+        assert_eq!(handed.gather(&wanted).unwrap(), flat.gather(&wanted).unwrap());
+        assert!(
+            Vector::runs_laid_out(ends.to_vec(), values.clone(), flat.slice(0, 5).unwrap())
+                .is_err()
+        );
         // Rows far apart over many runs, which the walk gallops to, then one that goes back. Fewer
         // rows than runs, so the gather walks rather than laying the runs out.
         let (mut ends, mut rows) = (Vec::new(), Vec::new());

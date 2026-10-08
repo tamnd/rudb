@@ -14192,32 +14192,40 @@ const HELD_RUN: usize = 3;
 /// `l_orderkey` is stored as runs of about four rows, one run an order. Held flat it was written
 /// out a row at a time, and then a grouping by it compared every row with the one before it to find
 /// the same runs again, which on TPC-H q18 was a quarter of the query. Held as runs, the ends are
-/// where the groups are. It is laid out flat beside its runs as well (see [`Vector::laid_out`]),
+/// where the groups are. It is laid out flat beside its runs as well (see [`Vector::runs_laid_out`]),
 /// since a join or a filter reads it a row at a time and a row of runs is a search. The flat form
 /// is the copy the part cost before, and the runs are a run's value and end on top of it.
 fn cascade_runs(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Option<Vector>> {
-    fn held<T: integer::Lane>(bytes: &[u8], rows: usize) -> Result<Option<(Vec<T>, Vec<u32>)>> {
-        let runs = integer::decode_runs_as::<T>(bytes)
-            .map_err(|error| invalid(&format!("page value is not of its type: {error}")))?;
-        Ok(runs.filter(|(_, ends)| ends.len().saturating_mul(HELD_RUN) <= rows))
+    fn held<T: integer::Lane>(
+        bytes: &[u8],
+        rows: usize,
+    ) -> Result<Option<(Vec<T>, Vec<u32>, Vec<T>)>> {
+        integer::decode_runs_laid_as::<T>(bytes, rows / HELD_RUN)
+            .map_err(|error| invalid(&format!("page value is not of its type: {error}")))
     }
     if !integer::run_length(bytes) {
         return Ok(None);
     }
     let data = match ty {
         LogicalType::Integer | LogicalType::Date => {
-            held::<i32>(bytes, rows)?.map(|(values, ends)| (Data::Int32(values.into()), ends))
+            held::<i32>(bytes, rows)?.map(|(values, ends, flat)| {
+                (Data::Int32(values.into()), ends, Data::Int32(flat.into()))
+            })
         }
-        LogicalType::BigInt => {
-            held::<i64>(bytes, rows)?.map(|(values, ends)| (Data::Int64(values.into()), ends))
-        }
+        LogicalType::BigInt => held::<i64>(bytes, rows)?.map(|(values, ends, flat)| {
+            (Data::Int64(values.into()), ends, Data::Int64(flat.into()))
+        }),
         _ => None,
     };
-    let Some((values, ends)) = data else { return Ok(None) };
+    let Some((values, ends, flat)) = data else { return Ok(None) };
     if ends.last().map_or(0, |&end| end as usize) != rows {
         return Err(invalid("cascade page holds the wrong number of rows"));
     }
-    Ok(Some(Vector::runs(ends, Vector::flat(ty.clone(), values)?)?.laid_out()))
+    Ok(Some(Vector::runs_laid_out(
+        ends,
+        Vector::flat(ty.clone(), values)?,
+        Vector::flat(ty.clone(), flat)?,
+    )?))
 }
 
 /// How many bytes a part of this type costs written out plainly, which is what the cascade has to

@@ -465,6 +465,36 @@ pub fn run_length(bytes: &[u8]) -> bool {
 ///
 /// As [`decode_as`].
 pub fn decode_runs_as<T: Lane>(bytes: &[u8]) -> Result<Option<(Vec<T>, Vec<u32>)>> {
+    let Some((count, run_values, run_lengths)) = read_runs(bytes)? else { return Ok(None) };
+    runs_ending(run_values, &run_lengths, count).map(Some)
+}
+
+/// As [`decode_runs_as`] with the rows written out as well, for a reader that keeps both, or `None`
+/// when the chunk has more than `most_runs` runs and the reader would not keep them.
+///
+/// The rows are written from the run values and lengths the chunk was read into once, the way
+/// [`decode_as`] writes them. Writing them out from the runs afterwards a run at a time took twice
+/// as long on `l_orderkey`, whose runs are four rows each.
+///
+/// # Errors
+///
+/// As [`decode_as`].
+#[allow(clippy::type_complexity)]
+pub fn decode_runs_laid_as<T: Lane>(
+    bytes: &[u8],
+    most_runs: usize,
+) -> Result<Option<(Vec<T>, Vec<u32>, Vec<T>)>> {
+    let Some((count, run_values, run_lengths)) = read_runs(bytes)? else { return Ok(None) };
+    if run_values.len() > most_runs {
+        return Ok(None);
+    }
+    let rows = expanded::<T>(&run_values, &run_lengths, count as usize)?;
+    let (values, ends) = runs_ending(run_values, &run_lengths, count)?;
+    Ok(Some((values, ends, rows)))
+}
+
+/// The row count, run values and run lengths of a run length chunk, or `None` for any other kind.
+fn read_runs(bytes: &[u8]) -> Result<Option<(u32, Vec<i64>, Vec<i64>)>> {
     if !run_length(bytes) {
         return Ok(None);
     }
@@ -482,6 +512,15 @@ pub fn decode_runs_as<T: Lane>(bytes: &[u8]) -> Result<Option<(Vec<T>, Vec<u32>)
     if run_values.len() != run_lengths.len() {
         return Err(Error::internal("an RLE chunk has more runs than run lengths"));
     }
+    Ok(Some((count, run_values, run_lengths)))
+}
+
+/// The run values of a run length chunk and where each run ends, leaving out runs of no rows.
+fn runs_ending<T: Lane>(
+    run_values: Vec<i64>,
+    run_lengths: &[i64],
+    count: u32,
+) -> Result<(Vec<T>, Vec<u32>)> {
     // Every run at least a row and at most the chunk, which is every chunk the writer makes, is
     // checked in one pass with no branch a run, and then the ends are a running total. No end can
     // pass the chunk's count without the last one doing so, and the total of fewer than 2^32 runs
@@ -501,12 +540,12 @@ pub fn decode_runs_as<T: Lane>(bytes: &[u8]) -> Result<Option<(Vec<T>, Vec<u32>)
             .collect();
         check_count(end as usize, count as usize)?;
         let values = run_values.into_iter().map(lane::<T>).collect::<Result<Vec<T>>>()?;
-        return Ok(Some((values, ends)));
+        return Ok((values, ends));
     }
     let mut values = Vec::with_capacity(run_values.len());
     let mut ends = Vec::with_capacity(run_values.len());
     let mut end = 0_u64;
-    for (&value, &length) in run_values.iter().zip(&run_lengths) {
+    for (&value, &length) in run_values.iter().zip(run_lengths) {
         let length =
             u64::try_from(length).map_err(|_| Error::internal("a negative RLE run length"))?;
         if length == 0 {
@@ -520,7 +559,7 @@ pub fn decode_runs_as<T: Lane>(bytes: &[u8]) -> Result<Option<(Vec<T>, Vec<u32>)
         ends.push(end as u32);
     }
     check_count(end as usize, count as usize)?;
-    Ok(Some((values, ends)))
+    Ok((values, ends))
 }
 
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
@@ -2132,6 +2171,13 @@ mod tests {
         }
         let packed = round_trip(&(0..5000).collect::<Vec<i64>>());
         assert!(decode_runs_as::<i64>(&packed).unwrap().is_none(), "not a run length chunk");
+        // Laid out as well, the rows are what a plain decode gives and the runs are the same.
+        let (laid_runs, laid_ends, rows) =
+            decode_runs_laid_as::<i32>(&bytes, 1000).unwrap().expect("a run length chunk");
+        assert_eq!((laid_runs, laid_ends), (runs, ends));
+        assert_eq!(rows, decode_as::<i32>(&bytes).unwrap());
+        assert!(decode_runs_laid_as::<i32>(&bytes, 999).unwrap().is_none(), "more runs than kept");
+        assert!(decode_runs_laid_as::<i64>(&packed, 5000).unwrap().is_none());
     }
 
     #[test]
