@@ -28,11 +28,9 @@ pub(crate) const SOURCES: &[&str] = &[
     "bytealtrim",
     "byteartrim",
     "byteatrim",
-    "casefold",
     "chr",
     "crc32_bytea",
     "crc32c_bytea",
-    "initcap",
     "lpad",
     "ltrim",
     "ltrim1",
@@ -116,11 +114,9 @@ pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
         ("bytealtrim", [Blob(bytes), Blob(set)]) => Blob(trim_bytes(bytes, set, true, false)),
         ("byteartrim", [Blob(bytes), Blob(set)]) => Blob(trim_bytes(bytes, set, false, true)),
         ("byteatrim", [Blob(bytes), Blob(set)]) => Blob(trim_bytes(bytes, set, true, true)),
-        ("casefold", [Varchar(text)]) => Varchar(text.chars().map(lower).collect()),
         ("chr", [Integer(code)]) => Varchar(chr(*code)?),
         ("crc32_bytea", [Blob(bytes)]) => BigInt(i64::from(hashing::crc32(bytes, CRC32))),
         ("crc32c_bytea", [Blob(bytes)]) => BigInt(i64::from(hashing::crc32(bytes, CRC32C))),
-        ("initcap", [Varchar(text)]) => Varchar(initcap(text)),
         ("lpad", [Varchar(text), Integer(len), Varchar(fill)]) => {
             Varchar(pad(text, *len, fill, true)?)
         }
@@ -217,34 +213,6 @@ fn unsupported(message: impl Into<String>) -> Error {
 /// A text array of one dimension.
 fn text_array(values: Vec<Value>) -> Value {
     Value::List { element: LogicalType::Varchar, values }
-}
-
-/// The lower case of a character, by the simple mapping of one character to one character.
-fn lower(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
-/// The upper case of a character, or the character when its upper case is more than one
-/// character, as the simple mapping has it.
-fn upper(c: char) -> char {
-    let mut upper = c.to_uppercase();
-    match (upper.next(), upper.next()) {
-        (Some(upper), None) => upper,
-        _ => c,
-    }
-}
-
-/// `initcap`: each letter after a letter or a digit in lower case, and each other one in upper
-/// case.
-fn initcap(text: &str) -> String {
-    let mut after_alnum = false;
-    text.chars()
-        .map(|c| {
-            let mapped = if after_alnum { lower(c) } else { upper(c) };
-            after_alnum = c.is_alphanumeric();
-            mapped
-        })
-        .collect()
 }
 
 /// `chr`: the character with the code point `code`.
@@ -1283,8 +1251,6 @@ mod tests {
     #[test]
     fn the_strings_functions_give_the_answers_of_postgresql() {
         let one = |src: &str, arg: &str| text(src, &[varchar(arg)]).unwrap();
-        assert_eq!(one("initcap", "hello wORLD foo_bar 1abc ǆa"), "Hello World Foo_Bar 1abc Ǆa");
-        assert_eq!(one("casefold", "ẞ ABC"), "ß abc");
         assert_eq!(one("text_reverse", "aé"), "éa");
         assert_eq!(one("unistr", "d\\0061t\\+000061 \\d83d\\de00 \\110000"), "data 😀 ᄀ00");
         assert_eq!(

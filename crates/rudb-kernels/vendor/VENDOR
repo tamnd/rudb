@@ -9,4 +9,7 @@ version: 19beta4
 
 # sha256 of every vendored file, relative to this directory.
 ce015eeb87829e5b3603c4ab22c1e96bbea5a8f5b0c71e9c1f7c5bf7811a43fc  unicode_norm_table.h
+02019063eaff62e51bc29dad6df44912dc0c54eed4d303f084f9a7ba5c1c04ea  unicode_case_table.h
+84e68a66816eb8919249ab8fc52c12129db95dcda7f0d7b8176d0ecd3a5bb7b6  unicode_category_table.h
+5dda1cb9ed585bbb8af8418841f1de0e405854c1485ea8942481b72fc828d1ea  unicode_category.h
 3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd  LICENSE.postgres

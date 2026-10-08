@@ -8,17 +8,18 @@
 
 use rudb_common::{LogicalType, Result, Value};
 
-use crate::{pgarray, pgdatetime, pgmath, pgnormalize, pgstring};
+use crate::{pgarray, pgdatetime, pgmath, pgnormalize, pgstring, pgunicode};
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// The C functions of each module of kernels, sorted.
-const SOURCES: [&[&str]; 5] = [
+const SOURCES: [&[&str]; 6] = [
     pgmath::SOURCES,
     pgdatetime::SOURCES,
     pgstring::SOURCES,
     pgnormalize::SOURCES,
+    pgunicode::SOURCES,
     pgarray::SOURCES,
 ];
 
@@ -29,6 +30,12 @@ const NULLS: [&[&str]; 2] = [pgstring::NULLS, pgarray::NULLS];
 /// array, which it then takes with each element as text by the output function of its type.
 pub fn outputs(src: &str) -> bool {
     pgarray::OUTPUTS.contains(&src)
+}
+
+/// Whether the kernel of the C function `src` takes the OID of the collation of the call as one
+/// more argument, a `BIGINT`, after the declared ones.
+pub fn collated(src: &str) -> bool {
+    pgunicode::COLLATED.contains(&src)
 }
 
 /// Whether the C function `src` has a kernel.
@@ -72,6 +79,9 @@ pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         return Ok(Some(value));
     }
     if let Some(value) = pgnormalize::call(src, args)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = pgunicode::call(src, args)? {
         return Ok(Some(value));
     }
     pgarray::proc_call(src, args, returns)

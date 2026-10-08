@@ -117,13 +117,13 @@ fn array<'a>(text: &'a str, name: &str) -> Result<&'a str, String> {
     Ok(&text[open + 1..close])
 }
 
-fn number(text: &str) -> Result<u32, String> {
+pub(super) fn number(text: &str) -> Result<u32, String> {
     let text = text.trim();
     let parsed = match text.strip_prefix("0x") {
         Some(hex) => u32::from_str_radix(hex, 16),
         None => text.parse(),
     };
-    parsed.map_err(|_| format!("unicode_norm_table.h: not a number: {text}"))
+    parsed.map_err(|_| format!("not a number: {text}"))
 }
 
 /// The entries of `UnicodeDecompMain`, one on each line as `{code, class, size | FLAGS, index}`.
@@ -166,7 +166,7 @@ fn codepoints(body: &str) -> Result<Vec<u32>, String> {
 }
 
 /// The items, as many on a line as fit in 100 columns.
-fn rows(out: &mut String, items: impl Iterator<Item = String>) {
+pub(super) fn rows(out: &mut String, items: impl Iterator<Item = String>) {
     let mut line = String::from("   ");
     for item in items {
         if line.len() + 1 + item.len() > 100 {
