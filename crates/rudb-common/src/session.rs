@@ -223,6 +223,7 @@ pub struct Semantics {
     set_functions: SetFunctions,
     show_behavior: ShowBehavior,
     subscripts: Subscripts,
+    collations: Collations,
     single_arrow_lambdas: bool,
     type_names: TypeNames,
     unknown_types: UnknownTypes,
@@ -275,6 +276,7 @@ impl Default for Semantics {
             set_functions: SetFunctions::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
+            collations: Collations::Pin,
             single_arrow_lambdas: false,
             type_names: TypeNames::Pin,
             unknown_types: UnknownTypes::Pin,
@@ -449,6 +451,11 @@ impl Semantics {
     #[must_use]
     pub fn subscripts(self) -> Subscripts {
         self.subscripts
+    }
+    /// What `COLLATE` names and how the collation of an expression comes from its inputs.
+    #[must_use]
+    pub fn collations(self) -> Collations {
+        self.collations
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -936,6 +943,18 @@ pub enum Subscripts {
     Pin,
     /// As in PostgreSQL: the subscript is coerced to `integer`, and an index outside the array gives
     /// a null, or for a slice, only the part of the array that is inside the bounds.
+    Postgres,
+}
+
+/// What `COLLATE` names and how the collation of an expression comes from its inputs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Collations {
+    /// As in DuckDB.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: `COLLATE` names a collation of `pg_collation` and is refused on a type
+    /// that has no collation, and two different collations written with `COLLATE` cannot meet in
+    /// one operator or function.
     Postgres,
 }
 
@@ -1458,6 +1477,7 @@ impl Session {
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
+            self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
         }
         self.postgres = Postgreses(postgres);

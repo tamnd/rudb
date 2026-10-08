@@ -365,6 +365,8 @@ pub(crate) struct Binder<'a> {
     /// The span every expression is placed at while a built-in macro's body is bound, which is the
     /// span of the call. See `crate::macros`.
     pub(crate) pinned_span: Option<Span>,
+    /// The collations the statement wrote with `COLLATE`. See `crate::collate`.
+    pub(crate) collated: crate::collate::Collated,
     /// The arguments of a function in SQL of `pg_proc` while its body is bound in place of the
     /// call, which `$1` and the others name there. See `crate::pgcalls`.
     pub(crate) inlined: Option<Vec<ExprRef>>,
@@ -533,6 +535,7 @@ impl<'a> Binder<'a> {
             next_index: 0,
             current_span: Span::new(0, 0),
             pinned_span: None,
+            collated: crate::collate::Collated::default(),
             inlined: None,
             aggregation: None,
             want_ascending: false,
@@ -2363,6 +2366,18 @@ impl<'a> Binder<'a> {
                 // A cast keeps the type it wrote, with the typmod, and is no table column.
                 ast::Expr::Cast { ty, .. } => {
                     rudb_pgtypes::declared_type(ast.string(ty)).map(Origin::typed)
+                }
+                // A `COLLATE` keeps the type of what it is written on and is no table column.
+                ast::Expr::Binary { op: ast::BinaryOp::Collate, .. } => {
+                    match ast.expr(crate::expr::uncollated(ast, target.expr)) {
+                        ast::Expr::Cast { ty, .. } => {
+                            rudb_pgtypes::declared_type(ast.string(ty)).map(Origin::typed)
+                        }
+                        ast::Expr::Column { .. } => {
+                            origin.and_then(|origin| origin.ty).map(Origin::typed)
+                        }
+                        _ => None,
+                    }
                 }
                 _ => None,
             });
@@ -5349,16 +5364,17 @@ impl<'a> Binder<'a> {
         {
             let summed = resolve("sum", &types)?;
             let argument = self.checked_cast_to(argument, &summed.arguments[0], false)?;
-            let total = self.aggregate_call("sum", &[argument], distinct, filter, summed.returns);
+            let total =
+                self.aggregate_call("sum", &[argument], distinct, filter, summed.returns)?;
             let count =
-                self.aggregate_call("count", &[argument], distinct, filter, LogicalType::BigInt);
+                self.aggregate_call("count", &[argument], distinct, filter, LogicalType::BigInt)?;
             let total = self.cast_to(total, &LogicalType::Numeric);
             // A group with no values has a null sum and a count of zero, and its mean is null.
             let count = self.cast_to(count, &LogicalType::Numeric);
             let count = self.zero_to_null(count);
             return self.call("/", vec![total, count]);
         }
-        let column = self.aggregate_call(&name, &cast, distinct, filter, ty);
+        let column = self.aggregate_call(&name, &cast, distinct, filter, ty)?;
         // PostgreSQL sums an `int2` or an `int4` into an `int8` and a `float4` into a `float4`,
         // where the pin sums them into a HUGEINT and a DOUBLE.
         if postgres && !exporting && resolved.name == "sum" {
@@ -5383,7 +5399,7 @@ impl<'a> Binder<'a> {
         distinct: bool,
         filter: Option<ExprRef>,
         ty: LogicalType,
-    ) -> ExprRef {
+    ) -> Result<ExprRef> {
         let args = self.plan.add_expr_list(args);
         let name = self.plan.intern(name);
         let call = self.plan.add_expr(Expr::Aggregate { name, args, distinct, filter }, ty.clone());
@@ -5399,7 +5415,9 @@ impl<'a> Binder<'a> {
         };
         let aggregation = self.aggregation.as_ref().expect("checked by the caller");
         let (index, groups) = (aggregation.index, aggregation.groups.len());
-        self.column(index, groups + at, ty)
+        let column = self.column(index, groups + at, ty);
+        self.carry_collation(call, column)?;
+        Ok(column)
     }
 
     /// The fraction of a quantile call, checked the way the pin checks it and counted from the top
@@ -5830,7 +5848,9 @@ impl<'a> Binder<'a> {
 
         let at = self.window_run(parts.partition, parts.order, parts.frame, call);
         let index = self.windows.last().expect("the run was just filed").index;
-        Ok(self.column(index, at, ty))
+        let column = self.column(index, at, ty);
+        self.carry_collation(call, column)?;
+        Ok(column)
     }
 
     /// Files a call under the run that matches it, or opens a new run, and says which column it is.

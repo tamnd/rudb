@@ -5,6 +5,8 @@
 //! gate if the two disagree.
 
 pub(crate) mod casts;
+#[rustfmt::skip]
+pub(crate) mod collations;
 pub mod oids;
 #[rustfmt::skip]
 pub(crate) mod operators;

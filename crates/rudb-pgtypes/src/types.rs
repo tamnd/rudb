@@ -51,6 +51,8 @@ pub struct TypeInfo {
     pub array: Oid,
     /// `typdelim`: the character between the elements of an array in the text format.
     pub delim: u8,
+    /// `typcollation`: the collation of a type that can have one, or 0 for a type that cannot.
+    pub collation: Oid,
 }
 
 /// The row constructor of the generated table, short so that each row fits on one line.
@@ -64,8 +66,9 @@ pub(crate) const fn t(
     elem: Oid,
     array: Oid,
     delim: u8,
+    collation: Oid,
 ) -> TypeInfo {
-    TypeInfo { oid, name, kind, category, len, elem, array, delim }
+    TypeInfo { oid, name, kind, category, len, elem, array, delim, collation }
 }
 
 impl TypeInfo {
