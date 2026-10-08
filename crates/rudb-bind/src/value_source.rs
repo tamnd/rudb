@@ -7,6 +7,7 @@
 
 use rudb_common::{Error, Field, FromFunctions, LogicalType, Result, SqlState, Value};
 use rudb_functions::TableFunction;
+use rudb_kernels::pgjson::JsonSet;
 use rudb_parse::{Ast, NONE, ast};
 use rudb_plan::{ColumnBinding, Expr, Node, NodeRef};
 
@@ -32,10 +33,9 @@ impl Binder<'_> {
         let table = ["query", "query_table", "test_all_types", "test_vector_types"]
             .iter()
             .any(|held| called.eq_ignore_ascii_case(held));
-        if table
-            || TableFunction::lookup(called).is_some()
-            || self.catalog().resolve_macro(&parts, Some(true)).is_some()
-        {
+        // The JSON set functions of PostgreSQL have the names of table functions of DuckDB.
+        let duckdb = TableFunction::lookup(called).is_some() && JsonSet::of(called).is_none();
+        if table || duckdb || self.catalog().resolve_macro(&parts, Some(true)).is_some() {
             return None;
         }
         Some(call)
@@ -155,6 +155,10 @@ impl Binder<'_> {
             match ty {
                 LogicalType::Struct(fields) => exprs.extend(self.struct_fields(read, fields)),
                 // One call that gives a value names its column for the alias of the source.
+                // A JSON set function names its column, and the alias does not rename it.
+                _ if let Some(column) = JsonSet::of(name).and_then(JsonSet::column) => {
+                    exprs.push((read, column.to_owned()));
+                }
                 _ if calls.len() == 1 && alias != NONE => exprs.push((read, label.clone())),
                 _ => exprs.push((read, name.clone())),
             }
