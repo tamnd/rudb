@@ -1,5 +1,4 @@
-//! The session time zone of the engine as a [`TimeZone`], and the zones of the time zone database
-//! as a [`ZoneLookup`].
+//! The zones of the engine as a [`TimeZone`], and the zones of PostgreSQL as a [`ZoneLookup`].
 //!
 //! The kernels that run in a PostgreSQL session have the zone of the `TimeZone` setting as a
 //! [`SessionTimeZone`]. These impls let the input and the formatting functions of this crate read
@@ -8,42 +7,53 @@
 use std::sync::Arc;
 
 use rudb_common::SessionTimeZone;
+use rudb_common::tzdb::Zone;
 
 use super::decode::ZoneLookup;
-use super::{AbbrevMeaning, TimeZone, USECS_PER_SEC};
+use super::{AbbrevMeaning, TimeZone};
+
+impl TimeZone for Zone {
+    fn at(&self, unix_seconds: i64) -> (i32, &str) {
+        let period = self.state().at(unix_seconds);
+        (period.offset, period.abbrev)
+    }
+
+    fn next_change(&self, unix_seconds: i64) -> (i32, Option<(i64, i32)>) {
+        self.state().next_change(unix_seconds)
+    }
+
+    fn abbrev_meaning(&self, abbrev: &str) -> Option<AbbrevMeaning> {
+        Some(match self.state().abbrev_is_known(abbrev)? {
+            Some((offset, dst)) => AbbrevMeaning::Fixed { offset, dst },
+            None => AbbrevMeaning::Varies,
+        })
+    }
+
+    fn abbrev_at(&self, abbrev: &str, unix_seconds: i64) -> Option<(i32, bool)> {
+        self.state().interpret_abbrev(abbrev, unix_seconds)
+    }
+
+    fn fixed_offset(&self) -> Option<i32> {
+        self.state().fixed_offset()
+    }
+}
 
 impl TimeZone for SessionTimeZone {
     fn at(&self, unix_seconds: i64) -> (i32, &str) {
-        let micros = unix_seconds.saturating_mul(USECS_PER_SEC);
-        (self.offset_seconds_at(micros), self.abbreviation_at(micros))
+        let period = self.zone().state().at(unix_seconds);
+        (period.offset, period.abbrev)
     }
 
-    fn offset_at(&self, unix_seconds: i64) -> i32 {
-        self.offset_seconds_at(unix_seconds.saturating_mul(USECS_PER_SEC))
+    fn next_change(&self, unix_seconds: i64) -> (i32, Option<(i64, i32)>) {
+        self.zone().next_change(unix_seconds)
     }
 
-    fn local_offset(&self, local_seconds: i64) -> i32 {
-        let local = local_seconds.saturating_mul(USECS_PER_SEC);
-        match self.instant_of_local(local) {
-            Some(instant) => ((local - instant) / USECS_PER_SEC) as i32,
-            None => self.offset_seconds_at(local),
-        }
-    }
-
-    // A zone of the database gives no meaning to an abbreviation here, so the abbreviation is
-    // read from `timezone_abbreviations`, as the server's own zone does.
     fn abbrev_meaning(&self, abbrev: &str) -> Option<AbbrevMeaning> {
-        let offset = self.fixed_offset()?;
-        let known = self.abbreviation_at(0);
-        (!known.is_empty() && abbrev == known)
-            .then_some(AbbrevMeaning::Fixed { offset, dst: false })
+        self.zone().abbrev_meaning(abbrev)
     }
 
-    fn abbrev_at(&self, abbrev: &str, _: i64) -> Option<(i32, bool)> {
-        match self.abbrev_meaning(abbrev)? {
-            AbbrevMeaning::Fixed { offset, dst } => Some((offset, dst)),
-            AbbrevMeaning::Varies => None,
-        }
+    fn abbrev_at(&self, abbrev: &str, unix_seconds: i64) -> Option<(i32, bool)> {
+        self.zone().abbrev_at(abbrev, unix_seconds)
     }
 
     fn fixed_offset(&self) -> Option<i32> {
@@ -51,13 +61,14 @@ impl TimeZone for SessionTimeZone {
     }
 }
 
-/// The zones of the time zone database that the engine bundles, by name.
+/// The zones that `pg_tzset` finds by name, which a dynamic abbreviation of
+/// `timezone_abbreviations` names.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionZones;
 
 impl ZoneLookup for SessionZones {
     fn zone(&self, name: &str) -> Option<Arc<dyn TimeZone + Send + Sync>> {
-        SessionTimeZone::named(name).map(|zone| Arc::new(zone) as Arc<dyn TimeZone + Send + Sync>)
+        Zone::postgres(name).map(|zone| Arc::new(zone) as Arc<dyn TimeZone + Send + Sync>)
     }
 }
 
@@ -79,6 +90,22 @@ mod tests {
             fixed.abbrev_meaning("XYZ"),
             Some(AbbrevMeaning::Fixed { offset: -10800, dst: false })
         );
+        let new_york = SessionTimeZone::of_postgres("America/New_York").unwrap();
+        assert_eq!(
+            new_york.abbrev_meaning("EST"),
+            Some(AbbrevMeaning::Fixed { offset: -18000, dst: false })
+        );
+        assert_eq!(
+            new_york.abbrev_meaning("LMT"),
+            Some(AbbrevMeaning::Fixed { offset: -17762, dst: false })
+        );
+        assert_eq!(new_york.abbrev_meaning("CET"), None);
+        // EWT and EPT of the Second World War.
+        assert_eq!(new_york.abbrev_at("EWT", 0), Some((-14400, true)));
+        let moscow = SessionTimeZone::of_postgres("Europe/Moscow").unwrap();
+        assert_eq!(moscow.abbrev_meaning("MSK"), Some(AbbrevMeaning::Varies));
+        // 2012-07-01 12:00 UTC, when Moscow time was +04.
+        assert_eq!(moscow.abbrev_at("MSK", 1_341_144_000), Some((14400, false)));
         assert!(SessionZones.zone("Europe/Moscow").is_some());
         assert!(SessionZones.zone("Mars/Olympus").is_none());
     }

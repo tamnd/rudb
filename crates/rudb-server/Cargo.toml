@@ -35,7 +35,6 @@ tls-ring = ["rustls/ring", "dep:ring"]
 [dependencies]
 aws-lc-rs = { workspace = true, optional = true }
 chrono.workspace = true
-chrono-tz.workspace = true
 libc.workspace = true
 memchr.workspace = true
 ring = { workspace = true, optional = true }

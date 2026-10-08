@@ -48,6 +48,7 @@ pub mod stage;
 pub mod stat;
 pub mod time_tz;
 pub mod types;
+pub mod tzdb;
 pub mod utf8;
 pub mod uuid;
 pub mod value;

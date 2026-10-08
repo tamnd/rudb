@@ -15,11 +15,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{LocalResult, Offset, TimeDelta, TimeZone as _, Utc};
-use chrono_tz::{OffsetName, Tz};
-
 use crate::Rules;
 use crate::types::LogicalType;
+use crate::tzdb::{Release, Zone};
 use crate::value::Value;
 
 /// The settings a session has, by name.
@@ -1007,192 +1005,76 @@ pub enum DefaultNullOrder {
 }
 
 /// A parsed session time zone, cheap enough to carry beside a prepared expression.
+///
+/// A zone of a DuckDB session is a zone of the IANA release of DuckDB's ICU, and a zone of a
+/// PostgreSQL session is what the `TimeZone` setting of PostgreSQL names, from the release of the
+/// pin of PostgreSQL. Both read the same way, as `localtime.c` of the pin reads a zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionTimeZone(Clock);
-
-/// The rule of a session time zone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Clock {
-    /// A zone of the time zone database.
-    Named(Tz),
-    /// One offset at all instants, in seconds east of UTC, the name of the zone, and its
-    /// abbreviation. Only the `TimeZone` of PostgreSQL makes one, from a number of hours, an
-    /// interval, or a POSIX zone without daylight saving time.
-    Fixed(i32, &'static str, &'static str),
-}
+pub struct SessionTimeZone(Zone);
 
 impl Default for SessionTimeZone {
     fn default() -> Self {
-        Self(Clock::Named(chrono_tz::UTC))
+        Self(Zone::utc(Release::Icu))
     }
-}
-
-/// The name or the abbreviation of a zone as a string that lives as long as the program. There
-/// are a few hundred different ones, and each one is kept once.
-fn kept(name: &str) -> &'static str {
-    static ALL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
-        std::sync::OnceLock::new();
-    let mut all = ALL.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(kept) = all.get(name) {
-        return kept;
-    }
-    let kept: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    all.insert(kept);
-    kept
-}
-
-/// The abbreviation that PostgreSQL makes for an offset east of UTC that has no name, such as
-/// `-03` or `+0530`.
-fn numbered(offset: i32) -> String {
-    let sign = if offset < 0 { '-' } else { '+' };
-    let abs = offset.unsigned_abs();
-    let (hours, minutes) = (abs / 3600, abs % 3600 / 60);
-    if minutes == 0 { format!("{sign}{hours:02}") } else { format!("{sign}{hours:02}{minutes:02}") }
-}
-
-/// Seconds in 400 Gregorian years, after which the calendar and every rule written in it repeat.
-const CYCLE_SECONDS: i64 = 146_097 * 86_400;
-
-/// Seconds either side of 1970 that chrono can turn into a date, which stops near the year 262143.
-const HELD_SECONDS: i64 = 8_000_000_000_000;
-
-/// The same moment of the 400 year cycle moved inside what chrono holds.
-///
-/// A timestamp reaches the year 294247 and chrono does not, but a zone's offset only depends on
-/// where in the cycle a moment is, so the offset of the moved moment is the offset of the real one.
-fn held(seconds: i64) -> i64 {
-    if seconds.abs() <= HELD_SECONDS {
-        return seconds;
-    }
-    let cycles = (seconds.abs() - HELD_SECONDS) / CYCLE_SECONDS + 1;
-    seconds - seconds.signum() * cycles * CYCLE_SECONDS
-}
-
-/// The first second of 2038, where the bundled zone tables stop listing transitions.
-const TABLE_END: i64 = 2_145_916_800;
-
-/// The years a moment after [`TABLE_END`] is moved into, which are recent enough to follow the
-/// rules a zone has now and long enough to hold every layout a year can have.
-const RULE_YEARS: std::ops::RangeInclusive<i32> = 2010..=2037;
-
-fn leap(year: i32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 impl SessionTimeZone {
-    /// The offset chrono holds for a moment it can turn into a date.
-    fn listed_offset(self, seconds: i64) -> i32 {
-        let zone = match self.0 {
-            Clock::Named(zone) => zone,
-            Clock::Fixed(offset, ..) => return offset,
-        };
-        let Some(utc) = Utc.timestamp_opt(seconds, 0).single() else { return 0 };
-        zone.offset_from_utc_datetime(&utc.naive_utc()).fix().local_minus_utc()
-    }
-
-    /// The same moment of a year that the zone tables list, which has the offset the real moment
-    /// has under the zone's current rules.
-    ///
-    /// The tables stop in 2037, and after that chrono answers the last offset it listed forever,
-    /// which is winter time in New York for the rest of the calendar. ICU carries the zone's last
-    /// rule on instead, so a zone still changing its clocks in 2037 gets the moment moved to one of
-    /// [`RULE_YEARS`] that starts on the same weekday and is a leap year exactly when the real year
-    /// is, where every rule written as a weekday of a month lands on the same dates.
-    fn listed(self, seconds: i64) -> i64 {
-        let seconds = held(seconds);
-        if seconds < TABLE_END
-            || self.listed_offset(TABLE_END - 183 * 86_400) == self.listed_offset(TABLE_END - 1)
-        {
-            return seconds;
-        }
-        let Ok(days) = i32::try_from(seconds.div_euclid(86_400)) else { return seconds };
-        let (year, _, _) = crate::civil_from_days(days);
-        let start = i64::from(crate::days_from_civil(year, 1, 1));
-        RULE_YEARS
-            .rev()
-            .map(|candidate| (candidate, i64::from(crate::days_from_civil(candidate, 1, 1))))
-            .find(|(candidate, first)| {
-                leap(*candidate) == leap(year) && (start - first).rem_euclid(7) == 0
-            })
-            .map_or(seconds, |(_, first)| seconds - (start - first) * 86_400)
-    }
-
-    /// The zone a name spells, with case ignored the way the pin's ICU lookup ignores it, or `None`
-    /// for a name the bundled time zone database does not know.
+    /// The zone a name spells in the release of DuckDB's ICU, with case ignored the way the pin's
+    /// ICU lookup ignores it, or `None` for a name that the release does not know.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
-        if let Ok(zone) = name.parse::<Tz>() {
-            return Some(Self(Clock::Named(zone)));
-        }
-        chrono_tz::TZ_VARIANTS
-            .iter()
-            .find(|zone| zone.name().eq_ignore_ascii_case(name))
-            .map(|zone| Self(Clock::Named(*zone)))
+        Zone::file(Release::Icu, name).map(Self)
     }
 
     /// The zone of a value of the `TimeZone` parameter of PostgreSQL, which a cast between a
     /// `timestamptz` and a type without a zone reads in a PostgreSQL session in place of the zone
     /// of the database.
     ///
-    /// A fixed offset, such as `-3` or `INTERVAL '+05:30'`, is that offset at all instants, with
-    /// the canonical name that PostgreSQL gives it. `None` for a value that is not a zone, which
-    /// the check of the parameter does not let through.
+    /// A fixed offset, such as `-3` or `INTERVAL '+05:30'`, is the POSIX zone that PostgreSQL
+    /// makes of it. `None` for a value that is not a zone, which the check of the parameter does
+    /// not let through.
     #[must_use]
     pub fn of_postgres(value: &str) -> Option<Self> {
-        match crate::guc::zone(value).ok()? {
-            (crate::guc::Zone::Named(zone), _) => Some(Self(Clock::Named(zone))),
-            (crate::guc::Zone::Fixed { offset, abbrev }, name) => {
-                Some(Self(Clock::Fixed(offset, kept(&name), kept(&abbrev))))
-            }
-        }
+        crate::guc::zone(value).ok().map(Self)
     }
 
-    /// Whether the zone is UTC, where every wall clock is its instant and nothing needs moving.
+    /// The zone and its rules.
+    #[must_use]
+    pub fn zone(self) -> Zone {
+        self.0
+    }
+
+    /// Whether the zone is UTC at all instants, where every wall clock is its instant and nothing
+    /// needs moving.
     #[must_use]
     pub fn is_utc(self) -> bool {
-        matches!(self.0, Clock::Named(chrono_tz::UTC | chrono_tz::Etc::UTC) | Clock::Fixed(0, ..))
+        self.fixed_offset() == Some(0)
     }
 
-    /// The canonical IANA name of the zone.
+    /// The canonical name of the zone: the IANA name, or the POSIX string in upper case.
     #[must_use]
     pub fn name(self) -> &'static str {
-        match self.0 {
-            Clock::Named(zone) => zone.name(),
-            Clock::Fixed(_, name, _) => name,
-        }
+        self.0.name()
     }
 
-    /// The offset in seconds east of UTC of a zone with one offset at all instants.
+    /// The offset in seconds east of UTC of a zone with one offset at all instants, as
+    /// `pg_get_timezone_offset` finds it.
     #[must_use]
     pub fn fixed_offset(self) -> Option<i32> {
-        match self.0 {
-            Clock::Named(_) => None,
-            Clock::Fixed(offset, ..) => Some(offset),
-        }
+        self.0.state().fixed_offset()
     }
 
-    /// The abbreviation of the zone at an instant expressed as Unix microseconds, such as `CEST`.
-    /// A zone that has no abbreviation at that instant gets its offset as PostgreSQL writes it,
-    /// such as `-03` or `+0530`.
+    /// The abbreviation of the zone at an instant expressed as Unix microseconds, such as `CEST`,
+    /// or the offset as the data writes it for a zone that has no abbreviation, such as `-03`.
     #[must_use]
     pub fn abbreviation_at(self, micros: i64) -> &'static str {
-        let zone = match self.0 {
-            Clock::Named(zone) => zone,
-            Clock::Fixed(.., abbrev) => return abbrev,
-        };
-        let seconds = self.listed(micros.div_euclid(1_000_000));
-        let Some(utc) = Utc.timestamp_opt(seconds, 0).single() else { return "UTC" };
-        let offset = zone.offset_from_utc_datetime(&utc.naive_utc());
-        match offset.abbreviation() {
-            Some(abbrev) => kept(abbrev),
-            None => kept(&numbered(offset.fix().local_minus_utc())),
-        }
+        self.0.state().at(micros.div_euclid(1_000_000)).abbrev
     }
 
     /// The UTC offset in seconds at an instant expressed as Unix microseconds.
     #[must_use]
     pub fn offset_seconds_at(self, micros: i64) -> i32 {
-        self.listed_offset(self.listed(micros.div_euclid(1_000_000)))
+        self.0.state().at(micros.div_euclid(1_000_000)).offset
     }
 
     /// The UTC offset in seconds right now, which is the offset the pin puts on a time of day that
@@ -1214,24 +1096,15 @@ impl SessionTimeZone {
 
     /// The instant a wall clock reading in this zone names, both as Unix microseconds.
     ///
-    /// This is what an ICU calendar answers when its fields are set, which settles the two readings
-    /// that do not name exactly one instant the way ICU's defaults do. A reading the clocks skipped
-    /// over is read with the offset from before the jump, so 02:30 on the morning New York moves to
-    /// summer time is 03:30 summer time. A reading the clocks passed twice is the second of the two.
-    /// `None` when the instant is past the end of the `i64`.
+    /// A reading the clocks skipped over is read with the offset from before the jump, so 02:30 on
+    /// the morning New York moves to summer time is 03:30 summer time. A reading the clocks passed
+    /// twice is the second of the two. That is `DetermineTimeZoneOffset` of PostgreSQL, and it is
+    /// also what an ICU calendar answers with its defaults when its fields are set. `None` when
+    /// the instant is past the end of the `i64`.
     #[must_use]
     pub fn instant_of_local(self, micros: i64) -> Option<i64> {
-        let zone = match self.0 {
-            Clock::Named(zone) => zone,
-            Clock::Fixed(offset, ..) => return micros.checked_sub(i64::from(offset) * 1_000_000),
-        };
-        let seconds = self.listed(micros.div_euclid(1_000_000));
-        let local = Utc.timestamp_opt(seconds, 0).single()?.naive_utc();
-        let offset = match zone.offset_from_local_datetime(&local) {
-            LocalResult::Single(offset) | LocalResult::Ambiguous(_, offset) => offset.fix(),
-            LocalResult::None => zone.offset_from_utc_datetime(&(local - TimeDelta::days(1))).fix(),
-        };
-        micros.checked_sub(i64::from(offset.local_minus_utc()) * 1_000_000)
+        let offset = self.0.state().local_offset(micros.div_euclid(1_000_000));
+        micros.checked_sub(i64::from(offset) * 1_000_000)
     }
 }
 

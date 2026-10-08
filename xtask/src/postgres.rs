@@ -55,6 +55,7 @@ const VENDORS: [Vendor; 6] = [
             ("src/backend/utils/errcodes.txt", "errcodes.txt"),
             ("src/backend/utils/misc/guc_parameters.dat", "guc_parameters.dat"),
             ("src/backend/utils/misc/guc_tables.c", "guc_tables.c"),
+            ("src/timezone/data/tzdata.zi", "tzdata.zi"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
