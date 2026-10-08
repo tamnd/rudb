@@ -986,7 +986,76 @@ struct Built {
     ///
     /// False for every other kind, which never reads it, and false for a mark join written with
     /// `IS NOT DISTINCT FROM`, where nulls are values in the table and a miss is an honest false.
+    /// False as well for a mark join on more than one equality, which asks [`Built::refine`].
     undecided: bool,
+    /// The gathered keys a mark join on more than one equality settles a miss with.
+    ///
+    /// `d1 = g1 AND d2 = g2` is false when either half is false, so a null on one side does not
+    /// make every miss null the way it does for one equality. A miss is null only where some
+    /// gathered row agrees with the driving row on every column the two of them both have a
+    /// value in, and that is a question about rows. See [`Refine::unknown`].
+    refine: Option<Refine>,
+}
+
+/// Every gathered row's key, for the misses of a mark join on more than one equality.
+#[derive(Debug)]
+struct Refine {
+    /// Each gathered chunk's row count and key columns, in the order the chunks were gathered.
+    keys: Vec<(usize, Vec<Vector>)>,
+    /// The chunk and the row of every gathered row with a null in some key column.
+    nullish: Vec<(usize, usize)>,
+}
+
+impl Refine {
+    /// The gathered keys of these chunks, evaluated by the same expressions the table is built on.
+    fn new(keying: Keying<'_>, chunks: &[Chunk], cancel: &Cancel) -> Result<Self> {
+        let Keying { plan, exprs, schema, time_zone, .. } = keying;
+        let mut keys = Vec::with_capacity(chunks.len());
+        let mut nullish = Vec::new();
+        for (at, chunk) in chunks.iter().enumerate() {
+            cancel.check()?;
+            let columns = evaluate_all_in_time_zone(plan, exprs, schema, chunk, time_zone)?;
+            if columns.iter().any(|column| column.validity().has_nulls(chunk.len())) {
+                for row in 0..chunk.len() {
+                    if columns.iter().any(|column| column.is_null_at(row)) {
+                        nullish.push((at, row));
+                    }
+                }
+            }
+            keys.push((chunk.len(), columns));
+        }
+        Ok(Self { keys, nullish })
+    }
+
+    /// How many bytes the keys hold.
+    fn footprint(&self) -> u64 {
+        let columns: usize =
+            self.keys.iter().flat_map(|(_, columns)| columns).map(Vector::footprint).sum();
+        u64::try_from(columns + self.nullish.len() * 16).unwrap_or(u64::MAX)
+    }
+
+    /// Whether a driving row the table missed has a pair that came out null rather than false.
+    ///
+    /// That is a gathered row where every column is null on one side or the other or equal on
+    /// both, since such a row makes each `d = g` true or null and the conjunction null. A driving
+    /// row with no null key missed every gathered row with none, which differ from it somewhere,
+    /// so only the rows with a null key can be such a row. One with a null key can pair that way
+    /// with any gathered row and all of them are asked. Nested values compare as values, with a
+    /// null inside a list equal to a null, which is what the table matches on too.
+    fn unknown(&self, driving: &[Vector], row: usize) -> bool {
+        let agrees = |keys: &[Vector], at: usize| {
+            driving.iter().zip(keys).all(|(left, right)| {
+                left.is_null_at(row)
+                    || right.is_null_at(at)
+                    || left.value_at(row) == right.value_at(at)
+            })
+        };
+        if driving.iter().any(|key| key.is_null_at(row)) {
+            self.keys.iter().any(|(rows, keys)| (0..*rows).any(|at| agrees(keys, at)))
+        } else {
+            self.nullish.iter().any(|&(chunk, at)| agrees(&self.keys[chunk].1, at))
+        }
+    }
 }
 
 /// How many pairs a residual is evaluated over in one go, at most.
@@ -1174,9 +1243,10 @@ pub(crate) struct Probing {
 /// `MARK` is on the list for the second half of that first sentence. Its answer is null where a
 /// miss cannot be told apart from an unknown, and what decides that is whether the gathered side
 /// holds a null key, which is one pass over a side the pipeline before this one already finished.
-/// See [`Built::undecided`]. What a lookup still cannot answer is a mark join with more than one
-/// equality or with a residual, for the reason [`Join::marks`] gives, and [`Probe::new`] hands
-/// those back rather than deciding them wrongly.
+/// See [`Built::undecided`]. A mark join on more than one equality reads the gathered keys of a
+/// miss as well, which is [`Built::refine`]. What a lookup still cannot answer is a mark join with
+/// a residual, for the reason [`Join::marks`] gives, and [`Probe::new`] hands those back rather
+/// than deciding them wrongly.
 pub(crate) fn streamed(kind: JoinKind) -> bool {
     matches!(
         kind,
@@ -1210,11 +1280,16 @@ impl<'a> Probe<'a> {
         let swapped = right.swapped;
         let right_schema = right.schema;
         let equalities = equalities(plan, plan.expr_list(conditions), left, right_schema)?;
-        // The narrower rule a mark join is answered by. One equality and nothing left over, which
-        // is what makes a miss decidable from the side alone. [`Join::marks`] is the argument and
-        // it is the same argument, so the two places agree by saying the same thing.
+        // The narrower rule a mark join is answered by. Nothing left over, which is what makes a
+        // miss decidable from the side alone. [`Join::marks`] is the argument for one equality,
+        // and more than one is answered with [`Built::refine`] when they all treat a null the
+        // same way.
         let marker = if kind == JoinKind::Mark {
-            if equalities.left.len() != 1 || !equalities.residual.is_empty() {
+            let nulls = &equalities.null_is_a_value;
+            if equalities.left.is_empty()
+                || !equalities.residual.is_empty()
+                || nulls.iter().any(|&null| null != nulls[0])
+            {
                 return None;
             }
             Some(right.marker.or_else(|| right_schema.bindings().len().checked_sub(1))?)
@@ -1573,12 +1648,19 @@ impl<'a> Probe<'a> {
         let driving = driving.filter(|key| crate::lookup::has_nulls(key, rows));
         let mut marks = vec![false; rows];
         let mut known = vec![true; rows];
-        // No check in here. It is one slot read and one validity read per row over a driving chunk
-        // of at most [`VECTOR_SIZE`] rows, and the wrapper checks between chunks.
+        // No check in here for one equality. It is one slot read and one validity read per row
+        // over a driving chunk of at most [`VECTOR_SIZE`] rows, and the wrapper checks between
+        // chunks. A miss of more than one equality can read the whole gathered side, so that one
+        // checks a row at a time.
         for (row, (mark, decided)) in marks.iter_mut().zip(known.iter_mut()).enumerate() {
             if local.slots.get(row).copied().unwrap_or(MISS) != MISS {
                 *mark = true;
-            } else if !empty {
+            } else if empty {
+                // No gathered rows, so no pairs, and false is already the answer.
+            } else if let Some(refine) = &built.refine {
+                self.cancel.check()?;
+                *decided = !refine.unknown(&local.keys, row);
+            } else {
                 *decided = !built.undecided && !driving.is_some_and(|key| key.is_null_at(row));
             }
         }
@@ -1653,8 +1735,18 @@ impl<'a> Probe<'a> {
         // Before the table rather than after it, because it is one pass over the same
         // chunks and reading them while they are warm costs less than reading them twice.
         // Only a mark join asks, and only one written with `=`. See [`Built::undecided`].
+        let nulls = !self.equalities.null_is_a_value.first().copied().unwrap_or(false);
+        let refine = match self.kind == JoinKind::Mark && nulls && self.equalities.left.len() > 1 {
+            true => {
+                let refine = Refine::new(keying, &chunks, &self.cancel)?;
+                charged.grow(refine.footprint())?;
+                Some(refine)
+            }
+            false => None,
+        };
         let undecided = self.kind == JoinKind::Mark
-            && !self.equalities.null_is_a_value.first().copied().unwrap_or(false)
+            && nulls
+            && refine.is_none()
             && any_null_key(keying, &chunks, &self.cancel)?;
         // The chunks laid end to end, which is a copy of the side and is charged as one.
         // The chunks themselves are not charged again here: `kept` is what the keep that
@@ -1688,7 +1780,7 @@ impl<'a> Probe<'a> {
                 declined: vec![Declined::new(Algorithm::Loop, KEYED)],
             });
         }
-        Ok(Arc::new(Built { rows, index, undecided }))
+        Ok(Arc::new(Built { rows, index, undecided, refine }))
     }
 }
 
@@ -1781,7 +1873,10 @@ impl Stream for Probe<'_> {
                 // Once per driving chunk rather than once per driving row, which is what keeps the
                 // evaluator on its batch interface here as well. Nothing at all against an empty
                 // table, for the reason [`Probing::keys`] gives.
-                local.keys = if built.index.is_empty() {
+                // A mark join on more than one equality reads the keys of a miss as well, and every
+                // row misses a table its null keys left empty. See [`Refine::unknown`].
+                let refined = built.refine.is_some() && built.rows.rows() > 0;
+                local.keys = if built.index.is_empty() && !refined {
                     Vec::new()
                 } else {
                     evaluate_all_in_time_zone(
@@ -1796,7 +1891,7 @@ impl Stream for Probe<'_> {
                 // column and the probe a batch of rows at a time. Doing it here rather than in the
                 // row loop below is what keeps the driving side on its batch interface.
                 local.slots.clear();
-                if !local.keys.is_empty() {
+                if !local.keys.is_empty() && !built.index.is_empty() {
                     built.index.slots(
                         &local.keys,
                         left.len(),
@@ -2798,6 +2893,15 @@ fn side_of(plan: &Plan, expr: ExprRef, driving: &Schema, gathered: &Schema) -> O
     if mixed { None } else { side }
 }
 
+/// Whether `expr` is a constant, or casts of one, which reads no row and calls nothing.
+fn constant(plan: &Plan, expr: ExprRef) -> bool {
+    match *plan.expr(expr) {
+        Expr::Constant(_) => true,
+        Expr::Cast { input, .. } => constant(plan, input),
+        _ => false,
+    }
+}
+
 /// Calls `found` for every column `expr` reads.
 ///
 /// The same walk `rudb_opt`'s `walk::columns` does, written again here because that one is private
@@ -2911,6 +3015,17 @@ fn equalities(
                 found.right.push(right);
             }
             (Some(Side::Gathered), Some(Side::Driving)) => {
+                found.left.push(right);
+                found.right.push(left);
+            }
+            // A constant against the gathered side, which `(1, x) IN (SELECT a, b ...)` writes
+            // for the first column. It is the same key for every driving row, and keeping it in
+            // the table is what lets a mark join on the other column still be a lookup.
+            (None, Some(Side::Gathered)) if constant(plan, left) => {
+                found.left.push(left);
+                found.right.push(right);
+            }
+            (Some(Side::Gathered), None) if constant(plan, right) => {
                 found.left.push(right);
                 found.right.push(left);
             }
@@ -3332,10 +3447,10 @@ mod tests {
         assert_eq!(markers(&[None, None], &[Some(2), None]), [Value::Null, Value::Null]);
     }
 
-    /// Two equalities are not the rule a lookup answers, for the reason [`Join::marks`] gives, so
-    /// the probe hands the join back and the row major operator decides it.
+    /// Two equalities are not the rule [`Join::marks`] answers, and the probe answers them with
+    /// [`Built::refine`] instead of handing the join back to the row major operator.
     #[test]
-    fn a_mark_join_on_two_equalities_is_not_streamed() {
+    fn a_mark_join_on_two_equalities_is_streamed() {
         let mut plan = Plan::new();
         let (left, right) = (pair_schema(0), pair_schema(1));
         let conditions = {
@@ -3360,7 +3475,7 @@ mod tests {
                 &Cancel::new(),
                 &memory,
             )
-            .is_none()
+            .is_some()
         );
     }
 

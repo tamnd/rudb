@@ -31,6 +31,8 @@
 //! careful about: the marker is genuinely needed as a value there, because what the row means
 //! depends on the other half of the disjunction.
 //!
+//! A condition that reads nothing of the driving side, for the reason `one_sided` gives.
+//!
 //! A plan where anything else reads a column of the mark join's gathered side. A mark join produces
 //! its driving side, the gathered side's columns and the marker, while a semi join produces the
 //! driving side alone, so a projection above that still reads one of those columns would be reading
@@ -96,11 +98,30 @@ pub fn convert(plan: &mut Plan) {
         let Some((marker, _)) = outputs.last() else {
             continue;
         };
-        if tested != *marker || read_above(plan, right, node, input) {
+        if tested != *marker
+            || read_above(plan, right, node, input)
+            || one_sided(plan, left, conditions)
+        {
             continue;
         }
         *plan.node_mut(node) = Node::Join { left, right, kind: JoinKind::Semi, conditions, build };
     }
+}
+
+/// Whether some condition of the join reads nothing of the driving side, such as the `1 = a` that
+/// `WHERE (1, x) IN (SELECT a, b ...)` binds to.
+///
+/// Filter pushdown moves such a condition into the gathered side of a semi join, where it is a
+/// filter, and leaves it on a mark join, where a gathered row it would filter out can still make a
+/// miss null. Since pushdown runs before this pass, a semi join made here would only get that move
+/// on a second run of the passes, so a plan with one is left a mark join and settles in one run.
+fn one_sided(plan: &Plan, left: NodeRef, conditions: Slice) -> bool {
+    let driving = produced(plan, left);
+    plan.expr_list(conditions).iter().any(|&condition| {
+        let mut reads = false;
+        walk::columns(plan, condition, &mut |binding| reads |= driving.contains(binding.table));
+        !reads
+    })
 }
 
 /// Rewrites an inner join under a duplicate eliminating aggregate into a semi join.

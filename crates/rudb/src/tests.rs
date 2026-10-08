@@ -15065,3 +15065,67 @@ fn a_count_of_a_qualified_star_leaves_out_the_rows_an_outer_join_made_up() {
         ]
     );
 }
+
+#[test]
+fn a_row_against_a_query_of_as_many_columns_is_compared_a_column_at_a_time() {
+    let db = Database::new();
+    for sql in [
+        "CREATE TABLE rhs AS SELECT i::INT AS a, i::INT AS b FROM range(3000) t(i)",
+        "INSERT INTO rhs VALUES (NULL, 7)",
+    ] {
+        db.execute(sql).unwrap();
+    }
+    let t = Value::Boolean(true);
+    let f = Value::Boolean(false);
+    let cases = [
+        ("SELECT (1, 2) IN (SELECT 1, 2), (1, 2) IN (SELECT 1, 3)", vec![t.clone(), f.clone()]),
+        // A miss is null only where some row agrees on every column both sides have a value in.
+        (
+            "SELECT (3, 9) IN (SELECT * FROM (VALUES (2, 6), (3, NULL::INT)) v(x, y)), \
+             (1, 5) IN (SELECT * FROM (VALUES (2, 6), (3, NULL::INT)) v(x, y)), \
+             (NULL::INT, 8) IN (SELECT * FROM (VALUES (2, 6), (3, 7)) v(x, y))",
+            vec![Value::Null, f.clone(), f.clone()],
+        ),
+        ("SELECT (1, 2) NOT IN (SELECT 1, 2 WHERE false)", vec![t.clone()]),
+        (
+            "SELECT (4000, 7) IN (SELECT a, b FROM rhs), \
+             (NULL::INT, 4001) IN (SELECT a, b FROM rhs)",
+            vec![Value::Null, f.clone()],
+        ),
+        ("SELECT (1, 2) <> ANY (SELECT * FROM (VALUES (1, NULL::INT)) v(x, y))", vec![Value::Null]),
+        ("SELECT (NULL::INT, 3) <> ANY (SELECT 1, 2)", vec![t.clone()]),
+        // The ordered comparisons compare rows, with a null after every value.
+        (
+            "SELECT (0, 0) < ANY (SELECT 1, 0), (1, NULL) < ANY (SELECT 1, 2)",
+            vec![t.clone(), f.clone()],
+        ),
+        ("SELECT (1, 0) < ALL (SELECT * FROM (VALUES (0, 0), (2, 0)) v(x, y))", vec![f.clone()]),
+        ("SELECT (1, 2) = ALL (SELECT 1, NULL)", vec![Value::Null]),
+        ("SELECT row([1, NULL::INT], 0) IN (SELECT [1, NULL::INT], 0)", vec![t.clone()]),
+        ("SELECT (1, 2) IN (SELECT row(1, 2))", vec![t.clone()]),
+        ("SELECT row(1) IN (SELECT 1)", vec![t.clone()]),
+        // A constant against the gathered side is still a key, and the plan settles.
+        ("SELECT 1 WHERE (1, 2) IN (SELECT 1, 2)", vec![Value::Integer(1)]),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(rows(&db, sql), vec![expected], "{sql}");
+    }
+    let refused = [
+        ("SELECT (1, 2) IN (SELECT 1, 2, 3)", "Subquery returns 3 columns - expected 2"),
+        ("SELECT (1, 2) IN (SELECT 1)", "Subquery returns 1 columns - expected 2"),
+        (
+            "SELECT (1, 2) IN (SELECT (1, 2, 3))",
+            "Cannot compare values of type TUPLE(INTEGER, INTEGER) and TUPLE(INTEGER, INTEGER, \
+             INTEGER) in IN/ANY/ALL clause",
+        ),
+        (
+            "SELECT (a, b) IN (SELECT x, y FROM (VALUES (1, 1)) v(x, y) WHERE x = a) \
+             FROM (VALUES (1, 1)) l(a, b)",
+            "Correlated IN/ANY/ALL with multiple columns not yet supported",
+        ),
+    ];
+    for (sql, message) in refused {
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+}
