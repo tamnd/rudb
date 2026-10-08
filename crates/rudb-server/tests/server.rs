@@ -1964,6 +1964,140 @@ fn the_array_operators_resolve_as_postgres_resolves_them() {
 }
 
 #[test]
+fn a_collation_is_named_and_checked_as_postgres_does_it() {
+    let dirs = Dirs::new("pgcollate");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives, with a null as an empty string.
+    let cases: [(&str, &[&str]); 17] = [
+        ("select 'a' collate \"C\";", &["a"]),
+        ("select lower('A' collate \"C\"), pg_typeof('a' collate \"C\");", &["a|unknown"]),
+        ("select array_sort(array['b','A','a'] collate \"C\");", &["{A,a,b}"]),
+        ("select 'a' < 'B' collate \"C\", 'a' collate \"C\" < 'B';", &["f|f"]),
+        ("select upper('a' collate \"POSIX\"), 'a' collate \"default\";", &["A|a"]),
+        ("select max(x collate \"C\") from (values ('b'),('A')) t(x);", &["b"]),
+        (
+            "select x from (values ('b'),('A'),('a')) t(x) order by x collate \"C\";",
+            &["A", "a", "b"],
+        ),
+        ("select 'a' collate pg_catalog.\"C\";", &["a"]),
+        (
+            "select 'a'::varchar collate \"C\", 'a'::char(2) collate \"C\", 'a'::name collate \"C\", array['a'] collate \"C\";",
+            &["a|a |a|{a}"],
+        ),
+        (
+            "select pg_typeof('a'::varchar collate \"C\"), pg_typeof(array['a'] collate \"C\");",
+            &["character varying|text[]"],
+        ),
+        (
+            "select pg_typeof('a'::char(2) collate \"C\"), pg_typeof('a'::name collate \"C\");",
+            &["character|name"],
+        ),
+        ("select 'a' collate \"C\" collate \"POSIX\";", &["a"]),
+        ("select null collate \"C\";", &[""]),
+        ("select x collate \"ucs_basic\" from (values ('b'),('A')) t(x) order by 1;", &["A", "b"]),
+        ("select length('a' collate \"C\") = length('b' collate \"POSIX\");", &["t"]),
+        (
+            "select (select 'a' collate \"C\") = 'b' collate \"POSIX\", 'a' collate \"C\" collate \"POSIX\" = 'b' collate \"POSIX\";",
+            &["f|f"],
+        ),
+        (
+            "select 'a' collate pg_catalog.default, 'a' collate \"ucs_basic\", 'a' collate unicode, 'a' collate pg_unicode_fast;",
+            &["a|a|a|a"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    let mismatch = "collation mismatch between explicit collations \"C\" and \"POSIX\"";
+    for (sql, state, message, position) in [
+        ("select 1 collate \"C\";", "42804", "collations are not supported by type integer", "10"),
+        (
+            "select true collate \"C\";",
+            "42804",
+            "collations are not supported by type boolean",
+            "13",
+        ),
+        (
+            "select 1::numeric collate \"C\";",
+            "42804",
+            "collations are not supported by type numeric",
+            "19",
+        ),
+        (
+            "select '{1}'::int[] collate \"C\";",
+            "42804",
+            "collations are not supported by type integer[]",
+            "21",
+        ),
+        (
+            "select 'a' collate \"nosuch\";",
+            "42704",
+            "collation \"nosuch\" for encoding \"UTF8\" does not exist",
+            "12",
+        ),
+        (
+            "select 'a' collate C;",
+            "42704",
+            "collation \"c\" for encoding \"UTF8\" does not exist",
+            "12",
+        ),
+        ("select 'a' collate nosuch.\"C\";", "3F000", "schema \"nosuch\" does not exist", "12"),
+        (
+            "select 'a' collate x.y.z;",
+            "0A000",
+            "cross-database references are not implemented: x.y.z",
+            "12",
+        ),
+        (
+            "select 'a' collate a.b.c.d;",
+            "42601",
+            "improper qualified name (too many dotted names): a.b.c.d",
+            "12",
+        ),
+        ("select 'a' collate \"C\" = 'b' collate \"POSIX\";", "42P21", mismatch, "30"),
+        ("select 'a' collate \"C\" || 'b' collate \"POSIX\";", "42P21", mismatch, "31"),
+        (
+            "select case when true then 'a' collate \"C\" else 'b' collate \"POSIX\" end;",
+            "42P21",
+            mismatch,
+            "53",
+        ),
+        ("select concat('a' collate \"C\", 'b' collate \"POSIX\");", "42P21", mismatch, "36"),
+        ("select ('a' collate \"C\")::text || 'b' collate \"POSIX\";", "42P21", mismatch, "39"),
+        ("select 'a' collate \"C\" in ('a' collate \"POSIX\");", "42P21", mismatch, "32"),
+        (
+            "select max(x collate \"C\") = 'b' collate \"POSIX\" from (values ('b')) t(x);",
+            "42P21",
+            mismatch,
+            "33",
+        ),
+        ("select array['a' collate \"C\", 'b' collate \"POSIX\"];", "42P21", mismatch, "35"),
+        ("select coalesce('a' collate \"C\", 'b' collate \"POSIX\");", "42P21", mismatch, "38"),
+        ("select 'a' collate \"C\" like 'a' collate \"POSIX\";", "42P21", mismatch, "33"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_subscript_of_an_array_is_coerced_and_bounded_as_postgres_does_it() {
     let dirs = Dirs::new("pgsubscripts");
     let server = Server::start(dirs.config()).unwrap();

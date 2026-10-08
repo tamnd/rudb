@@ -21,6 +21,7 @@
 mod advisory;
 mod all_types;
 mod binder;
+mod collate;
 mod columns;
 mod context;
 mod expr;

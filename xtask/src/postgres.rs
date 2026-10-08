@@ -69,6 +69,7 @@ const VENDORS: [Vendor; 6] = [
             ("src/include/catalog/pg_cast.dat", "pg_cast.dat"),
             ("src/include/catalog/pg_proc.dat", "pg_proc.dat"),
             ("src/include/catalog/pg_operator.dat", "pg_operator.dat"),
+            ("src/include/catalog/pg_collation.dat", "pg_collation.dat"),
             ("src/backend/catalog/system_functions.sql", "system_functions.sql"),
             ("src/timezone/tznames/Default", "tznames-Default"),
             ("COPYRIGHT", "LICENSE.postgres"),
@@ -126,7 +127,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 14] = [
+const GENERATED: [Generated; 15] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -147,8 +148,11 @@ const GENERATED: [Generated; 14] = [
     },
     Generated {
         output: "crates/rudb-pgtypes/src/generated/oids.rs",
-        inputs: &["crates/rudb-pgtypes/vendor/pg_type.dat"],
-        generate: |texts| pgtype(&texts[0]),
+        inputs: &[
+            "crates/rudb-pgtypes/vendor/pg_type.dat",
+            "crates/rudb-pgtypes/vendor/pg_collation.dat",
+        ],
+        generate: |texts| pgtype(&texts[0], &texts[1]),
     },
     Generated {
         output: "crates/rudb-pgtypes/src/generated/casts.rs",
@@ -175,6 +179,11 @@ const GENERATED: [Generated; 14] = [
             "crates/rudb-pgtypes/vendor/pg_proc.dat",
         ],
         generate: |texts| pgoperator(&texts[0], &texts[1], &texts[2]),
+    },
+    Generated {
+        output: "crates/rudb-pgtypes/src/generated/collations.rs",
+        inputs: &["crates/rudb-pgtypes/vendor/pg_collation.dat"],
+        generate: |texts| pgcollation(&texts[0]),
     },
     Generated {
         output: "crates/rudb-kernels/src/pgnormalize/table.rs",
@@ -619,6 +628,8 @@ struct TypeRow {
     elem: String,
     array: String,
     delim: char,
+    /// The `collname` of `typcollation`, or empty for a type that has no collation.
+    collation: String,
 }
 
 /// Reads the entries of a catalog `.dat` file. The file is a Perl array of hashes: each entry is
@@ -692,8 +703,18 @@ fn dat_entries(file: &str, text: &str) -> Result<Vec<BTreeMap<String, String>>, 
 /// with `_` in front, `typtype` `b`, `typcategory` `A`, `typlen` -1, the entry as `typelem` and
 /// the `typdelim` of the entry. An entry can also name its array type with `typarray`, as
 /// `record` does. The constant of a type is its name in upper case, and the constant
-/// of an array is the name of its element with `_ARRAY` after it.
-fn pgtype(text: &str) -> Result<String, String> {
+/// of an array is the name of its element with `_ARRAY` after it. An array has the collation of
+/// its element, and `typcollation` names an entry of `pg_collation.dat`.
+fn pgtype(text: &str, collations: &str) -> Result<String, String> {
+    let mut collation_oids = BTreeMap::new();
+    for entry in dat_entries("pg_collation.dat", collations)? {
+        let name = entry.get("collname").ok_or("pg_collation.dat: an entry with no collname")?;
+        let oid: u32 = entry
+            .get("oid")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| format!("pg_collation.dat: {name} has a bad oid"))?;
+        collation_oids.insert(name.clone(), oid);
+    }
     let mut rows = Vec::new();
     for entry in dat_entries("pg_type.dat", text)? {
         let field = |key: &str| entry.get(key).map(String::as_str);
@@ -722,6 +743,7 @@ fn pgtype(text: &str) -> Result<String, String> {
             elem: field("typelem").unwrap_or("").to_string(),
             array: field("typarray").unwrap_or("").to_string(),
             delim: char_of("typdelim", ',')?,
+            collation: field("typcollation").unwrap_or("").to_string(),
         };
         if row.category == ' ' {
             return Err(bad("typcategory"));
@@ -741,6 +763,7 @@ fn pgtype(text: &str) -> Result<String, String> {
                 elem: name.to_string(),
                 array: String::new(),
                 delim: row.delim,
+                collation: row.collation.clone(),
             });
             rows.push(TypeRow { array: format!("_{name}"), ..row });
         } else {
@@ -758,7 +781,13 @@ fn pgtype(text: &str) -> Result<String, String> {
     };
     let mut links = Vec::new();
     for row in &rows {
-        links.push((resolve(&row.elem)?, resolve(&row.array)?));
+        let collation = match row.collation.as_str() {
+            "" => 0,
+            name => *collation_oids
+                .get(name)
+                .ok_or_else(|| format!("pg_type.dat: no collation {name}"))?,
+        };
+        links.push((resolve(&row.elem)?, resolve(&row.array)?, collation));
     }
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by_key(|&i| rows[i].oid);
@@ -803,7 +832,7 @@ fn pgtype(text: &str) -> Result<String, String> {
     let _ = writeln!(
         out,
         "\n/// Every type in the order of the OIDs: the OID, `typname`, `typtype`, `typcategory`,\n\
-         /// `typlen`, `typelem`, `typarray` and `typdelim`.\n\
+         /// `typlen`, `typelem`, `typarray`, `typdelim` and `typcollation`.\n\
          pub(crate) static TYPES: [TypeInfo; {}] = [",
         rows.len()
     );
@@ -811,8 +840,16 @@ fn pgtype(text: &str) -> Result<String, String> {
         let row = &rows[i];
         let _ = writeln!(
             out,
-            "    t({}, \"{}\", b'{}', b'{}', {}, {}, {}, b'{}'),",
-            row.oid, row.name, row.kind, row.category, row.len, links[i].0, links[i].1, row.delim
+            "    t({}, \"{}\", b'{}', b'{}', {}, {}, {}, b'{}', {}),",
+            row.oid,
+            row.name,
+            row.kind,
+            row.category,
+            row.len,
+            links[i].0,
+            links[i].1,
+            row.delim,
+            links[i].2
         );
     }
     out.push_str("];\n");
@@ -1036,6 +1073,60 @@ fn pgproc(types: &str, procs: &str, system_functions: &str) -> Result<String, St
             "    p({oid}, {name:?}, &{args:?}, {result}, {variadic}, b'{kind}', {strict}, {retset}, b'{volatility}', {}, {}, b'{lang}', {src:?}),",
             strings(names),
             strings(defaults)
+        );
+    }
+    out.push_str("];\n");
+    Ok(out)
+}
+
+/// Renders the collations of `pg_collation.dat` in the order of the name. The locale is
+/// `colllocale` for the builtin and the ICU providers and `collcollate` for the C library, which
+/// keeps `collcollate` and `collctype` the same for each of its built-in collations.
+fn pgcollation(collations: &str) -> Result<String, String> {
+    let mut rows = Vec::new();
+    for entry in dat_entries("pg_collation.dat", collations)? {
+        let field = |key: &str| entry.get(key).map(String::as_str);
+        let name = field("collname").ok_or("pg_collation.dat: an entry with no collname")?;
+        let bad = |what: &str| format!("pg_collation.dat: {name} has a bad {what}");
+        let oid: u32 = field("oid").and_then(|v| v.parse().ok()).ok_or_else(|| bad("oid"))?;
+        let provider = match field("collprovider") {
+            Some(provider @ ("d" | "c" | "b" | "i")) => provider,
+            _ => return Err(bad("collprovider")),
+        };
+        let encoding: i32 = field("collencoding")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| bad("collencoding"))?;
+        if field("collcollate") != field("collctype") {
+            return Err(bad("collctype"));
+        }
+        let locale = field("colllocale").or(field("collcollate")).unwrap_or_default();
+        rows.push((name.to_string(), oid, provider.to_string(), encoding, locale.to_string()));
+    }
+    rows.sort();
+    if rows.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err("pg_collation.dat: two collations have the same name".to_string());
+    }
+    let mut out = String::from(
+        "//! The built-in collations of PostgreSQL, one for each entry of `pg_collation.dat`.\n\
+         //!\n\
+         //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgtypes/vendor/pg_collation.dat`.\n\
+         //! Do not edit. `cargo xtask pg-check` runs in the gate and fails if this file and the\n\
+         //! vendored file disagree.\n\
+         \n\
+         use crate::collations::Collation;\n\
+         \n",
+    );
+    let _ = writeln!(
+        out,
+        "/// Every collation in the order of the name: the OID, `collname`, `collprovider`,\n\
+         /// `collencoding` and the locale.\n\
+         pub(crate) static COLLATIONS: [Collation; {}] = [",
+        rows.len()
+    );
+    for (name, oid, provider, encoding, locale) in &rows {
+        let _ = writeln!(
+            out,
+            "    Collation {{ oid: {oid}, name: {name:?}, provider: b'{provider}', encoding: {encoding}, locale: {locale:?} }},"
         );
     }
     out.push_str("];\n");
@@ -1340,20 +1431,21 @@ Section: Class 3D - Invalid Catalog Name
         let text = "# a comment\n[\n\
                     { oid => '16', array_type_oid => '1000',\n  descr => 'boolean, format \\'t\\'/\\'f\\'',\n  \
                     typname => 'bool', typlen => '1', typcategory => 'B' },\n\
-                    { oid => '19', typname => 'name', typlen => 'NAMEDATALEN',\n  typcategory => 'S', typelem => 'char' },\n\
+                    { oid => '19', typname => 'name', typlen => 'NAMEDATALEN',\n  typcategory => 'S', typelem => 'char',\n  typcollation => 'C' },\n\
                     { oid => '18', typname => 'char', typlen => '1', typcategory => 'Z' },\n\
                     { oid => '603', array_type_oid => '1020', typname => 'box', typlen => '32',\n  \
                     typcategory => 'G', typdelim => ';' },\n\
                     ]\n";
-        let out = pgtype(text).expect("the sample parses");
+        let collations = "{ oid => '950', collname => 'C' },";
+        let out = pgtype(text, collations).expect("the sample parses");
         assert!(out.contains("/// `bool`, boolean, format 't'/'f'.\npub const BOOL: Oid = 16;\n"));
         assert!(
             out.contains("/// `_bool`, the array of `bool`.\npub const BOOL_ARRAY: Oid = 1000;\n")
         );
         assert!(out.contains("TYPES: [TypeInfo; 6]"));
-        assert!(out.contains("    t(16, \"bool\", b'b', b'B', 1, 0, 1000, b','),\n"));
-        assert!(out.contains("    t(19, \"name\", b'b', b'S', 64, 18, 0, b','),\n"));
-        assert!(out.contains("    t(1020, \"_box\", b'b', b'A', -1, 603, 0, b';'),\n"));
+        assert!(out.contains("    t(16, \"bool\", b'b', b'B', 1, 0, 1000, b',', 0),\n"));
+        assert!(out.contains("    t(19, \"name\", b'b', b'S', 64, 18, 0, b',', 950),\n"));
+        assert!(out.contains("    t(1020, \"_box\", b'b', b'A', -1, 603, 0, b';', 0),\n"));
         // The rows are in the order of the OIDs.
         assert!(out.find("t(18,") < out.find("t(19,"));
     }
@@ -1386,10 +1478,13 @@ Section: Class 3D - Invalid Catalog Name
     fn a_type_with_an_unknown_element_or_a_second_oid_is_refused() {
         let elem =
             "{ oid => '1', typname => 'a', typlen => '1', typcategory => 'A', typelem => 'b' }";
-        assert!(pgtype(elem).is_err());
+        assert!(pgtype(elem, "").is_err());
         let twice = "{ oid => '1', typname => 'a', typlen => '1', typcategory => 'A' },\n\
                      { oid => '1', typname => 'b', typlen => '1', typcategory => 'A' }";
-        assert!(pgtype(twice).is_err());
-        assert!(pgtype("{ oid => '1', typname => 'a', typlen => '1' }").is_err());
+        assert!(pgtype(twice, "").is_err());
+        assert!(pgtype("{ oid => '1', typname => 'a', typlen => '1' }", "").is_err());
+        let collated = "{ oid => '1', typname => 'a', typlen => '1', typcategory => 'S',\n  \
+                        typcollation => 'x' }";
+        assert!(pgtype(collated, "").is_err());
     }
 }

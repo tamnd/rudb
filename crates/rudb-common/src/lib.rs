@@ -59,7 +59,7 @@ pub use error::{Error, ErrorCode, Fields, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
-    AggregateTypes, CastInput, CastOutput, CharacterTypes, ColumnNames, CommonTypes,
+    AggregateTypes, CastInput, CastOutput, CharacterTypes, Collations, ColumnNames, CommonTypes,
     ConditionTypes, ConflictArbiter, CountTypes, DefaultNullOrder, DistinctOrder, ErrorTexts,
     FloatRange, FromFunctions, FunctionRules, IdentifierCase, IdentifierCompare, InsertColumns,
     JoinColumns, NumberCasts, NumberLiterals, OperatorRules, PlanErrors, PreparedStatement,

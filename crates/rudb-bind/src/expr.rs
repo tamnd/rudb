@@ -11,11 +11,11 @@
 //! and `IS NULL` becomes a null safe comparison against a null.
 
 use rudb_common::{
-    CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, CountTypes, DeclaredType,
-    Error, ErrorTexts, Field, FloatRange, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH,
-    NumberCasts, NumberLiterals, OperatorRules, RegexRules, Result, RowNulls, Semantics, Session,
-    SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting,
-    looks_like_rule, rule_names,
+    CastInput, CastOutput, CharacterTypes, Collations, CommonTypes, ConditionTypes, CountTypes,
+    DeclaredType, Error, ErrorTexts, Field, FloatRange, FunctionRules, LogicalType,
+    MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, RegexRules, Result, RowNulls,
+    Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value,
+    is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_kernels::pgjson::JsonSet;
@@ -94,8 +94,10 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         let span = self.pinned_span.unwrap_or_else(|| ast.expr_span(expr));
         let outer = std::mem::replace(&mut self.current_span, span);
-        let result =
-            self.bind_expr_inner(ast, expr, scope).map_err(|error| error.with_fallback_span(span));
+        let result = self
+            .bind_expr_inner(ast, expr, scope)
+            .and_then(|bound| self.check_collations(bound).map(|()| bound))
+            .map_err(|error| error.with_fallback_span(span));
         self.current_span = outer;
         result
     }
@@ -1098,6 +1100,9 @@ impl Binder<'_> {
         right: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
+        if op == BinaryOp::Collate && self.semantics.collations() == Collations::Postgres {
+            return self.bind_collate(ast, left, right, scope);
+        }
         let symbol = op;
         let op = if op == BinaryOp::Divide && self.semantics.integer_division() {
             BinaryOp::IntegerDivide
@@ -1349,6 +1354,7 @@ impl Binder<'_> {
             _ => None,
         };
         let sides = [(written[0], *left), (written[1], *right)].map(|(written, expr)| {
+            let written = uncollated(ast, written);
             let ty = declared(self, written, expr);
             let column = matches!(ast.expr(written), ast::Expr::Column { .. })
                 && ty.is_some_and(|ty| ty.oid == BPCHAR && ty.typmod >= 4);
@@ -1600,10 +1606,14 @@ impl Binder<'_> {
             }
             let ty = self.plan().expr_type(bound).clone();
             let untyped = ty == LogicalType::Null
-                || matches!(ast.expr(only), ast::Expr::Literal { kind: LiteralKind::String, .. });
+                || matches!(
+                    ast.expr(uncollated(ast, only)),
+                    ast::Expr::Literal { kind: LiteralKind::String, .. }
+                );
+            let oid = written_oid(ast, only, &ty).unwrap_or(rudb_pgtypes::pg_type(&ty).oid);
             let name = match untyped {
                 true => "unknown".to_string(),
-                false => rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&ty).oid).into_owned(),
+                false => rudb_pgtypes::format_type(oid).into_owned(),
             };
             return Ok(self.add_constant(Value::Varchar(name)));
         }
@@ -5544,13 +5554,22 @@ fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) ->
 /// `varchar` and `text`.
 pub(crate) fn written_oid(ast: &Ast, written: ast::ExprRef, ty: &LogicalType) -> Option<u32> {
     let oid = postgres_oid(ty)?;
-    if let ast::Expr::Cast { ty: name, .. } = ast.expr(written)
+    if let ast::Expr::Cast { ty: name, .. } = ast.expr(uncollated(ast, written))
         && let Some(declared) = rudb_pgtypes::declared_type(ast.string(name))
         && rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(ty)
     {
         return Some(declared.oid);
     }
     Some(oid)
+}
+
+/// What a `COLLATE` was written on, through any number of them, since a `COLLATE` keeps the type
+/// and the value of what it is written on.
+pub(crate) fn uncollated(ast: &Ast, mut written: ast::ExprRef) -> ast::ExprRef {
+    while let ast::Expr::Binary { op: BinaryOp::Collate, left, .. } = ast.expr(written) {
+        written = left;
+    }
+    written
 }
 
 /// The PostgreSQL type of a rudb type that has one of its own, or `None` for a type such as a

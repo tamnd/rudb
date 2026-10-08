@@ -105,6 +105,7 @@
 mod array;
 mod binary;
 mod coerce;
+mod collations;
 mod datetime;
 mod declared;
 mod error;
@@ -134,6 +135,7 @@ pub use array::{
     oidvector_in, oidvector_out, oidvector_recv, oidvector_send,
 };
 pub use binary::{Recv, name_recv, verify_utf8};
+pub use collations::{Collation, collation, collation_by_oid};
 pub use coerce::{
     Cast, CoercionContext, CoercionPath, Mismatch, can_coerce_assigned, can_coerce_implicitly,
     common_type, find_cast, find_coercion_pathway, is_preferred,
