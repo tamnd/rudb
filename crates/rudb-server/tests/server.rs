@@ -1253,6 +1253,11 @@ fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
              power(0.5, 'Infinity'::numeric), power(-2, 'Infinity'::numeric)",
             "1|-Infinity|0|Infinity",
         ),
+        (
+            "select 'NaN'::float8 / 0, 'Infinity'::float8 * 2, 0::float8 * 'Infinity', \
+             1::float8 / 'Infinity', 1.5::float4 * 2::float4, pg_typeof(1.5::float4 * 2::float4)",
+            "NaN|Infinity|NaN|0|3|real",
+        ),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "TDCZ", "{sql}");
@@ -1282,11 +1287,32 @@ fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
             "a negative number raised to a non-integer power yields a complex result",
         ),
         ("select power(0.0, -1.0)", "2201F", "zero raised to a negative power is undefined"),
+        ("select 2147483647 + 1", "22003", "integer out of range"),
+        ("select 9223372036854775807 + 1", "22003", "bigint out of range"),
+        ("select 32767::int2 * 2::int2", "22003", "smallint out of range"),
+        ("select -(-2147483647 - 1)", "22003", "integer out of range"),
+        ("select abs(-2147483647 - 1)", "22003", "integer out of range"),
+        ("select 1e308::float8 * 10", "22003", "value out of range: overflow"),
+        ("select -1e308::float8 - 1e308::float8", "22003", "value out of range: overflow"),
+        ("select 1e-308::float8 * 1e-308::float8", "22003", "value out of range: underflow"),
+        ("select 1e-308::float8 / 1e308::float8", "22003", "value out of range: underflow"),
+        ("select 1.5::float8 / 0", "22012", "division by zero"),
+        ("select 3e38::float4 * 10::float4", "22003", "value out of range: overflow"),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "EZ", "{sql}");
         assert_eq!(messages[0].field(b'C').as_deref(), Some(state), "{sql}");
         assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    // The first row is sent, and the second is past the range.
+    for (sql, message) in [
+        ("select x * 10 from (values (1.0::float8), (1e308)) t(x)", "value out of range: overflow"),
+        ("select x + 1 from (values (1), (2147483647)) t(x)", "integer out of range"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "TDEZ", "{sql}");
+        assert_eq!(messages[2].field(b'C').as_deref(), Some("22003"), "{sql}");
+        assert_eq!(messages[2].field(b'M').as_deref(), Some(message), "{sql}");
     }
     server.stop().unwrap();
 }

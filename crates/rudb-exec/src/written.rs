@@ -135,6 +135,10 @@ fn call<W: Write>(
     let name = match name {
         "__rudb_checked_slash" => "/",
         "__rudb_checked_remainder" => "%",
+        "__rudb_pg_float_add" => "+",
+        "__rudb_pg_float_subtract" => "-",
+        "__rudb_pg_float_multiply" => "*",
+        "__rudb_pg_float_divide" => "/",
         "__rudb_divide" => "divide",
         "__rudb_mod" => "mod",
         other => other,
