@@ -556,6 +556,143 @@ impl Numeric {
         )
     }
 
+    /// `numeric_sqrt`: the scale gives at least 16 significant digits and is not below the scale
+    /// of the argument.
+    pub fn sqrt(&self) -> Result<Numeric, TypeError> {
+        match self.sign {
+            NumericSign::NegativeInfinity => {
+                return Err(power_error("cannot take square root of a negative number"));
+            }
+            NumericSign::NaN | NumericSign::Infinity => return Ok(self.clone()),
+            _ => {}
+        }
+        let arg = Var::from(self);
+        let sweight = arg.weight * DEC_DIGITS / 2 + 1;
+        arg.sqrt(display_scale((MIN_SIG_DIGITS - sweight).max(arg.dscale)))?.make()
+    }
+
+    /// `numeric_exp`: e to the power of the value.
+    pub fn exp(&self) -> Result<Numeric, TypeError> {
+        match self.sign {
+            NumericSign::NegativeInfinity => return Ok(Numeric::from_integer(0)),
+            NumericSign::NaN | NumericSign::Infinity => return Ok(self.clone()),
+            _ => {}
+        }
+        let arg = Var::from(self);
+        let limit = f64::from(NUMERIC_MAX_RESULT_SCALE);
+        let val = (arg.to_f64() * LOG10_E).clamp(-limit, limit);
+        arg.exp(display_scale((MIN_SIG_DIGITS - val as i64).max(arg.dscale)))?.make()
+    }
+
+    /// `numeric_ln`: the natural logarithm.
+    pub fn ln(&self) -> Result<Numeric, TypeError> {
+        match self.sign {
+            NumericSign::NegativeInfinity => {
+                return Err(log_error("cannot take logarithm of a negative number"));
+            }
+            NumericSign::NaN | NumericSign::Infinity => return Ok(self.clone()),
+            _ => {}
+        }
+        let arg = Var::from(self);
+        arg.ln(display_scale((MIN_SIG_DIGITS - arg.ln_dweight()).max(arg.dscale)))?.make()
+    }
+
+    /// `numeric_log`: the logarithm of `num` to the base `base`.
+    pub fn log(base: &Numeric, num: &Numeric) -> Result<Numeric, TypeError> {
+        if !base.sign.is_finite() || !num.sign.is_finite() {
+            if base.sign == NumericSign::NaN || num.sign == NumericSign::NaN {
+                return Ok(Numeric::NAN);
+            }
+            let (sign1, sign2) = (base.sign_internal(), num.sign_internal());
+            if sign1 < 0 || sign2 < 0 {
+                return Err(log_error("cannot take logarithm of a negative number"));
+            }
+            if sign1 == 0 || sign2 == 0 {
+                return Err(log_error("cannot take logarithm of zero"));
+            }
+            return Ok(match (base.sign, num.sign) {
+                // log(Infinity, Infinity) is Infinity over Infinity.
+                (NumericSign::Infinity, NumericSign::Infinity) => Numeric::NAN,
+                (NumericSign::Infinity, _) => Numeric::from_integer(0),
+                _ => Numeric::INFINITY,
+            });
+        }
+        Var::log(&Var::from(base), &Var::from(num))?.make()
+    }
+
+    /// `numeric_power`: `self` to the power `exp`. The values that are not finite follow the
+    /// rules of POSIX for `pow`.
+    pub fn power(&self, exp: &Numeric) -> Result<Numeric, TypeError> {
+        let one = || Numeric::from_integer(1);
+        let zero = || Numeric::from_integer(0);
+        let (sign1, sign2) = (self.sign_internal(), exp.sign_internal());
+        if !self.sign.is_finite() || !exp.sign.is_finite() {
+            if self.sign == NumericSign::NaN {
+                // NaN ^ 0 is 1.
+                let to_zero = exp.sign.is_finite() && exp.digits.is_empty();
+                return Ok(if to_zero { one() } else { Numeric::NAN });
+            }
+            if exp.sign == NumericSign::NaN {
+                // 1 ^ NaN is 1.
+                let of_one = self.sign.is_finite() && self.compare(&one()).is_eq();
+                return Ok(if of_one { one() } else { Numeric::NAN });
+            }
+            if sign1 == 0 && sign2 < 0 {
+                return Err(power_error("zero raised to a negative power is undefined"));
+            }
+            let integral = !exp.sign.is_finite() || {
+                let var = Var::from(exp);
+                var.digits.len() as i64 <= var.weight + 1
+            };
+            if sign1 < 0 && !integral {
+                return Err(power_error(
+                    "a negative number raised to a non-integer power yields a complex result",
+                ));
+            }
+            if self.sign.is_finite() && self.compare(&one()).is_eq() {
+                return Ok(one());
+            }
+            if sign2 == 0 {
+                return Ok(one());
+            }
+            if sign1 == 0 && sign2 > 0 {
+                return Ok(zero());
+            }
+            if !exp.sign.is_finite() {
+                let abs_above_one = match self.sign.is_finite() {
+                    false => true,
+                    true if self.compare(&Numeric::from_integer(-1)).is_eq() => return Ok(one()),
+                    true => self.abs().compare(&one()).is_gt(),
+                };
+                return Ok(if abs_above_one == (sign2 > 0) { Numeric::INFINITY } else { zero() });
+            }
+            if self.sign == NumericSign::Infinity {
+                return Ok(if sign2 > 0 { Numeric::INFINITY } else { zero() });
+            }
+            // The base is -Infinity and the power is finite.
+            if sign2 < 0 {
+                return Ok(zero());
+            }
+            let var = Var::from(exp);
+            let odd = var.digits.len() as i64 == var.weight + 1
+                && var.digits.last().is_some_and(|&d| d & 1 == 1);
+            return Ok(if odd { Numeric::NEGATIVE_INFINITY } else { Numeric::INFINITY });
+        }
+        if sign1 == 0 && sign2 < 0 {
+            return Err(power_error("zero raised to a negative power is undefined"));
+        }
+        Var::power(&Var::from(self), &Var::from(exp))?.make()
+    }
+
+    /// `numeric_sign_internal`: -1, 0 or 1, with the infinities. The value is not `NaN`.
+    fn sign_internal(&self) -> i32 {
+        match self.sign {
+            NumericSign::Negative | NumericSign::NegativeInfinity => -1,
+            _ if self.sign.is_finite() && self.digits.is_empty() => 0,
+            _ => 1,
+        }
+    }
+
     /// `cmp_numerics`: `NaN` is equal to itself and above every other value, and the display scale
     /// does not count.
     pub fn compare(&self, other: &Numeric) -> std::cmp::Ordering {
@@ -971,6 +1108,538 @@ impl Var {
             var.sign = NumericSign::Positive;
         }
         var
+    }
+}
+
+/// `MUL_GUARD_DIGITS`: the digits of 10000 that `mul_var` keeps below the scale it rounds to.
+const MUL_GUARD_DIGITS: i64 = 2;
+/// `DIV_GUARD_DIGITS`: the digits of 10000 that `div_var` keeps below the scale it rounds to.
+const DIV_GUARD_DIGITS: i64 = 4;
+/// `NBASE_SQR`: `mul_var` and `div_var` work on pairs of digits of 10000.
+const NBASE_SQR: i64 = 100_000_000;
+/// `NUMERIC_WEIGHT_MAX`.
+const WEIGHT_MAX: i64 = i16::MAX as i64;
+/// `log10(e)` as `numeric.c` writes it. The double is not the nearest one to the true value, and
+/// the scales of the results come from it.
+#[expect(clippy::approx_constant, reason = "the server uses this double and not the nearest one")]
+const LOG10_E: f64 = 0.434294481903252;
+/// `log10(2)` as `numeric.c` writes it.
+#[expect(clippy::approx_constant, reason = "the server uses this double and not the nearest one")]
+const LOG10_2: f64 = 0.301029995663981;
+
+/// `2201F` with `message`.
+fn power_error(message: &str) -> TypeError {
+    TypeError::new(SqlState::INVALID_ARGUMENT_FOR_POWER_FUNCTION, message.to_string())
+}
+
+/// `2201E` with `message`.
+fn log_error(message: &str) -> TypeError {
+    TypeError::new(SqlState::INVALID_ARGUMENT_FOR_LOG, message.to_string())
+}
+
+/// The scale of a result as `numeric.c` limits it: not below 0 and not above 1000.
+fn display_scale(rscale: i64) -> i64 {
+    rscale.clamp(0, NUMERIC_MAX_DISPLAY_SCALE)
+}
+
+impl Var {
+    /// A zero with the display scale `dscale`.
+    fn zero(dscale: i64) -> Var {
+        Var { sign: NumericSign::Positive, weight: 0, dscale, digits: Vec::new() }
+    }
+
+    /// The value of an integer, with a display scale of 0.
+    fn integer(value: i64) -> Var {
+        Var::from(&Numeric::from_integer(i128::from(value)))
+    }
+
+    /// `0.9` and `1.1`, the bounds that `ln_var` brings its argument between.
+    fn near_one() -> (Var, Var) {
+        (Var::from_decimal_digits(&[9], -1, 1), Var::from_decimal_digits(&[1, 1], 0, 1))
+    }
+
+    /// `numericvar_to_double_no_overflow`: the double nearest to the text of the value, which has
+    /// the digits up to the display scale.
+    fn to_f64(&self) -> f64 {
+        let mut out = Vec::new();
+        if self.sign == NumericSign::Negative {
+            out.push(b'-');
+        }
+        digits_out(
+            self.weight,
+            self.dscale.max(0) as usize,
+            |d| self.digit(self.weight - d),
+            &mut out,
+        );
+        std::str::from_utf8(&out).ok().and_then(|text| text.parse().ok()).unwrap_or(f64::NAN)
+    }
+
+    /// `numericvar_to_int64` for a value with no digits after the point, when it fits an `i32`.
+    fn to_i32(&self) -> Option<i32> {
+        if self.weight > 8 {
+            return None;
+        }
+        let mut value: i128 = 0;
+        for weight in (0..=self.weight).rev() {
+            value = value * i128::from(NBASE) + i128::from(self.digit(weight));
+        }
+        if self.sign == NumericSign::Negative {
+            value = -value;
+        }
+        i32::try_from(value).ok()
+    }
+
+    /// The pair of digits of 10000 at `index` as `mul_var` and `div_var` read them: the digit
+    /// after the last one is a zero.
+    fn pair(&self, index: i64) -> i64 {
+        let at = 2 * index as usize;
+        i64::from(self.digits[at]) * i64::from(NBASE)
+            + i64::from(self.digits.get(at + 1).copied().unwrap_or(0))
+    }
+
+    /// `mul_var`: the product rounded to `rscale` digits after the point. When the exact product
+    /// has more digits than that, the server leaves out the products of the input digits below
+    /// two guard digits, and so does this, which gives the last digit that the server gives.
+    fn mul_scaled(&self, other: &Var, rscale: i64) -> Var {
+        let (var1, var2) =
+            if self.digits.len() > other.digits.len() { (other, self) } else { (self, other) };
+        let (n1, n2) = (var1.digits.len() as i64, var2.digits.len() as i64);
+        if n1 == 0 {
+            return Var::zero(rscale);
+        }
+        if n1 <= 6 && rscale == var1.dscale + var2.dscale {
+            // `mul_var_short`, which gives the exact product.
+            return var1.mul(var2);
+        }
+        let sign =
+            if var1.sign == var2.sign { NumericSign::Positive } else { NumericSign::Negative };
+        let res_ndigits = n1 + n2;
+        let mut res_pairs = res_ndigits / 2 + 1;
+        let pair_offset = res_pairs - (n1 + 1) / 2 - (n2 + 1) / 2 + 1;
+        let res_weight =
+            var1.weight + var2.weight + 1 + 2 * res_pairs - res_ndigits - (n1 & 1) - (n2 & 1);
+        let maxdigits = res_weight + 1 + (rscale + DEC_DIGITS - 1) / DEC_DIGITS + MUL_GUARD_DIGITS;
+        res_pairs = res_pairs.min(maxdigits / 2 + 1);
+        if res_pairs <= pair_offset {
+            return Var::zero(rscale);
+        }
+        let pairs1 = ((n1 + 1) / 2).min(res_pairs - pair_offset);
+        let pairs2 = ((n2 + 1) / 2).min(res_pairs - pair_offset);
+        let right: Vec<u128> = (0..pairs2).map(|i| var2.pair(i) as u128).collect();
+        // The server adds the products in 64 bits and carries when they could overflow. The sums
+        // are the same in 128 bits with no carries.
+        let mut dig = vec![0u128; res_pairs as usize];
+        for i1 in 0..pairs1 {
+            let left = var1.pair(i1) as u128;
+            for i2 in 0..pairs2.min(res_pairs - i1 - pair_offset) {
+                dig[(i1 + i2 + pair_offset) as usize] += left * right[i2 as usize];
+            }
+        }
+        let mut digits = vec![0; 2 * res_pairs as usize];
+        let mut carry = 0;
+        for (at, &sum) in dig.iter().enumerate().rev() {
+            let total = sum + carry;
+            carry = total / NBASE_SQR as u128;
+            let pair = (total % NBASE_SQR as u128) as i32;
+            digits[2 * at] = pair / NBASE;
+            digits[2 * at + 1] = pair % NBASE;
+        }
+        debug_assert_eq!(carry, 0);
+        let mut result = Var { sign, weight: res_weight, dscale: rscale, digits };
+        result.round(rscale);
+        result.strip();
+        result
+    }
+
+    /// `div_var`. A divisor of up to 12 digits of 10000, or `exact` set, gives the exact quotient
+    /// rounded or cut to `rscale` digits after the point. A longer divisor with `exact` not set
+    /// takes the server's quotient from estimates in doubles with four guard digits, so the last
+    /// digit is the one the server gives. The divisor is not zero.
+    fn div_scaled(&self, other: &Var, rscale: i64, round: bool, exact: bool) -> Var {
+        let (n1, n2) = (self.digits.len() as i64, other.digits.len() as i64);
+        if exact || n1 == 0 || n2 <= 2 * (DIV_GUARD_DIGITS + 2) {
+            return self.div(other, rscale, round);
+        }
+        let sign =
+            if self.sign == other.sign { NumericSign::Positive } else { NumericSign::Negative };
+        let res_weight = self.weight - other.weight + 1;
+        let mut res_ndigits = (res_weight + 1 + (rscale + DEC_DIGITS - 1) / DEC_DIGITS).max(1);
+        if round {
+            res_ndigits += 1;
+        }
+        res_ndigits += DIV_GUARD_DIGITS;
+        let res_pairs = (res_ndigits + 1) / 2;
+        let pairs1 = ((n1 + 1) / 2).min(res_pairs);
+        let pairs2 = ((n2 + 1) / 2).min(res_pairs);
+        let mut dividend = vec![0i64; res_pairs as usize + 1];
+        for i in 0..pairs1 {
+            dividend[i as usize] = self.pair(i);
+        }
+        let divisor: Vec<i64> = (0..pairs2).map(|i| other.pair(i)).collect();
+        let mut fdivisor = divisor[0] as f64 * NBASE_SQR as f64;
+        if pairs2 > 1 {
+            fdivisor += divisor[1] as f64;
+        }
+        let inverse = 1.0 / fdivisor;
+        // The digit of the quotient that the first two pairs of the dividend give, cut toward
+        // minus infinity.
+        let estimate = |dividend: &[i64], qi: usize| {
+            let quotient =
+                (dividend[qi] as f64 * NBASE_SQR as f64 + dividend[qi + 1] as f64) * inverse;
+            let digit = i64::from(quotient as i32);
+            if quotient >= 0.0 { digit } else { digit - 1 }
+        };
+        let limit = (i64::MAX - i64::MAX / NBASE_SQR - 1) / (NBASE_SQR - 1);
+        let mut maxdiv = 1;
+        for qi in 0..res_pairs as usize {
+            let mut qdigit = estimate(&dividend, qi);
+            if qdigit != 0 {
+                maxdiv += qdigit.abs();
+                if maxdiv > limit {
+                    // Carry through the dividend before a sum can overflow.
+                    let mut carry = 0;
+                    let top = (qi as i64 + pairs2 - 2).min(res_pairs - 1);
+                    for i in (qi + 1..=top.max(qi as i64) as usize).rev() {
+                        let total = dividend[i] + carry;
+                        carry = total.div_euclid(NBASE_SQR);
+                        dividend[i] = total.rem_euclid(NBASE_SQR);
+                    }
+                    dividend[qi] += carry;
+                    qdigit = estimate(&dividend, qi);
+                    maxdiv = 1 + qdigit.abs();
+                }
+                if qdigit != 0 {
+                    let stop = pairs2.min(res_pairs - qi as i64) as usize;
+                    for (i, &d) in divisor.iter().enumerate().take(stop) {
+                        dividend[qi + i] -= qdigit * d;
+                    }
+                }
+            }
+            // The server lets this product overflow, and the sum overflows back.
+            dividend[qi + 1] = dividend[qi + 1].wrapping_add(dividend[qi].wrapping_mul(NBASE_SQR));
+            dividend[qi] = qdigit;
+        }
+        let mut digits = vec![0; 2 * res_pairs as usize];
+        let mut carry = 0;
+        for at in (0..res_pairs as usize).rev() {
+            let total = dividend[at] + carry;
+            carry = total.div_euclid(NBASE_SQR);
+            let pair = total.rem_euclid(NBASE_SQR) as i32;
+            digits[2 * at] = pair / NBASE;
+            digits[2 * at + 1] = pair % NBASE;
+        }
+        debug_assert_eq!(carry, 0);
+        let mut result = Var { sign, weight: res_weight, dscale: rscale, digits };
+        if round {
+            result.round(rscale);
+        } else {
+            result.trunc(rscale);
+        }
+        result.strip();
+        result
+    }
+
+    /// The integer square root of an integer that is not negative, by the method of Newton from
+    /// a power of 10000 above the root.
+    fn isqrt(&self) -> Var {
+        if self.digits.is_empty() {
+            return Var::zero(0);
+        }
+        let two = Var::integer(2);
+        let mut root = Var {
+            sign: NumericSign::Positive,
+            weight: self.weight / 2 + 1,
+            dscale: 0,
+            digits: vec![1],
+        };
+        loop {
+            let next = root.add(&self.div(&root, 0, false)).div(&two, 0, false);
+            if next.cmp_abs(&root).is_ge() {
+                return root;
+            }
+            root = next;
+        }
+    }
+
+    /// `sqrt_var`: the square root rounded to `rscale` digits after the point, which can be
+    /// negative. The server takes the integer square root of the digits that the scale needs,
+    /// with the Karatsuba method, and the root of the same integer by any method is the same.
+    fn sqrt(&self, rscale: i64) -> Result<Var, TypeError> {
+        if self.digits.is_empty() {
+            return Ok(Var::zero(rscale));
+        }
+        if self.sign == NumericSign::Negative {
+            return Err(power_error("cannot take square root of a negative number"));
+        }
+        let res_weight = self.weight.div_euclid(2);
+        let res_ndigits = match rscale + 1 >= 0 {
+            true => res_weight + 1 + (rscale + DEC_DIGITS) / DEC_DIGITS,
+            false => res_weight + 1 - (-rscale - 1) / DEC_DIGITS,
+        }
+        .max(1);
+        // The digits after the point of the root, which make twice as many of the argument.
+        let after = res_ndigits - res_weight - 1;
+        let src_ndigits = (self.weight + 1 + after * 2).max(1);
+        let digits = (0..src_ndigits).map(|i| self.digit(self.weight - i)).collect();
+        let mut source =
+            Var { sign: NumericSign::Positive, weight: src_ndigits - 1, dscale: 0, digits };
+        source.strip();
+        let mut root = source.isqrt();
+        root.weight -= after;
+        root.round(rscale);
+        root.strip();
+        Ok(root)
+    }
+
+    /// `exp_var`: e to the power of the value, rounded to `rscale` digits after the point.
+    fn exp(&self, rscale: i64) -> Result<Var, TypeError> {
+        let mut x = self.clone();
+        let mut val = x.to_f64();
+        if val.abs() >= f64::from(NUMERIC_MAX_RESULT_SCALE * 3) {
+            if val > 0.0 {
+                return Err(overflow());
+            }
+            return Ok(Var::zero(rscale));
+        }
+        let dweight = (val * LOG10_E) as i64;
+        // Halve the argument until it is near zero, and square the result as many times.
+        let mut ndiv2 = 0;
+        if val.abs() > 0.01 {
+            ndiv2 = 1;
+            val /= 2.0;
+            while val.abs() > 0.01 {
+                ndiv2 += 1;
+                val /= 2.0;
+            }
+            x = x.div(&Var::integer(1 << ndiv2), x.dscale + ndiv2, true);
+        }
+        let sig_digits = (1 + dweight + rscale + (ndiv2 as f64 * LOG10_2) as i64).max(0) + 8;
+        let local_rscale = sig_digits - 1;
+        // The Taylor series 1 + x + x^2/2! + x^3/3! + ... up to a term of zero.
+        let mut result = Var::integer(1).add(&x);
+        let mut ni = 2;
+        let mut elem = x.mul_scaled(&x, local_rscale).div(&Var::integer(ni), local_rscale, true);
+        while !elem.digits.is_empty() {
+            result = result.add(&elem);
+            ni += 1;
+            elem = elem.mul_scaled(&x, local_rscale).div(&Var::integer(ni), local_rscale, true);
+        }
+        for _ in 0..ndiv2 {
+            let local_rscale = (sig_digits - result.weight * 2 * DEC_DIGITS).max(0);
+            result = result.mul_scaled(&result, local_rscale);
+        }
+        result.round(rscale);
+        Ok(result)
+    }
+
+    /// `estimate_ln_dweight`: the power of ten of the first digit of the natural logarithm, or 0
+    /// for a value that has no logarithm.
+    fn ln_dweight(&self) -> i64 {
+        if self.sign != NumericSign::Positive {
+            return 0;
+        }
+        let (low, high) = Var::near_one();
+        if self.cmp_abs(&low).is_ge() && self.cmp_abs(&high).is_le() {
+            // ln(1 + x) is near x.
+            let x = self.add(&Var::integer(-1));
+            return match x.digits.first() {
+                Some(&first) => x.weight * DEC_DIGITS + f64::from(first).log10() as i64,
+                None => 0,
+            };
+        }
+        let Some(&first) = self.digits.first() else { return 0 };
+        let mut digits = first;
+        let mut dweight = self.weight * DEC_DIGITS;
+        if let Some(&second) = self.digits.get(1) {
+            digits = digits * NBASE + second;
+            dweight -= DEC_DIGITS;
+        }
+        let ln = f64::from(digits).ln() + dweight as f64 * std::f64::consts::LN_10;
+        ln.abs().log10() as i64
+    }
+
+    /// `ln_var`: the natural logarithm rounded to `rscale` digits after the point.
+    fn ln(&self, rscale: i64) -> Result<Var, TypeError> {
+        if self.digits.is_empty() {
+            return Err(log_error("cannot take logarithm of zero"));
+        }
+        if self.sign == NumericSign::Negative {
+            return Err(log_error("cannot take logarithm of a negative number"));
+        }
+        // Take square roots until the value is between 0.9 and 1.1, and double the factor of the
+        // series each time.
+        let (low, high) = Var::near_one();
+        let two = Var::integer(2);
+        let mut x = self.clone();
+        let mut fact = two.clone();
+        let mut nsqrt = 0;
+        while x.cmp_abs(&low).is_le() || x.cmp_abs(&high).is_ge() {
+            x = x.sqrt(rscale - x.weight * DEC_DIGITS / 2 + 8)?;
+            fact = fact.mul_scaled(&two, 0);
+            nsqrt += 1;
+        }
+        // The series z + z^3/3 + z^5/5 + ... of 0.5 * ln((1 + z) / (1 - z)), for z = (x-1)/(x+1).
+        let local_rscale = rscale + ((nsqrt + 1) as f64 * LOG10_2) as i64 + 8;
+        let one = Var::integer(1);
+        let minus_one = Var::integer(-1);
+        let mut result = x.add(&minus_one).div_scaled(&x.add(&one), local_rscale, true, false);
+        let mut xx = result.clone();
+        let square = result.mul_scaled(&result, local_rscale);
+        let mut ni = 1;
+        loop {
+            ni += 2;
+            xx = xx.mul_scaled(&square, local_rscale);
+            let elem = xx.div(&Var::integer(ni), local_rscale, true);
+            if elem.digits.is_empty() {
+                break;
+            }
+            result = result.add(&elem);
+            if elem.weight < result.weight - local_rscale * 2 / DEC_DIGITS {
+                break;
+            }
+        }
+        Ok(result.mul_scaled(&fact, rscale))
+    }
+
+    /// `log_var`: the logarithm of `num` to the base `base`, with the scale that it picks.
+    fn log(base: &Var, num: &Var) -> Result<Var, TypeError> {
+        let ln_base_dweight = base.ln_dweight();
+        let ln_num_dweight = num.ln_dweight();
+        let result_dweight = ln_num_dweight - ln_base_dweight;
+        let rscale =
+            display_scale((MIN_SIG_DIGITS - result_dweight).max(base.dscale).max(num.dscale));
+        let ln_base = base.ln((rscale + result_dweight - ln_base_dweight + 8).max(0))?;
+        let ln_num = num.ln((rscale + result_dweight - ln_num_dweight + 8).max(0))?;
+        if ln_base.digits.is_empty() {
+            return Err(division_by_zero());
+        }
+        Ok(ln_num.div_scaled(&ln_base, rscale, true, false))
+    }
+
+    /// `power_var`: `base` to the power `exp`, with the scale that it picks.
+    fn power(base: &Var, exp: &Var) -> Result<Var, TypeError> {
+        let integral = exp.digits.len() as i64 <= exp.weight + 1;
+        if let Some(exponent) = exp.to_i32().filter(|_| integral) {
+            return Var::power_int(base, exponent, exp.dscale);
+        }
+        if base.digits.is_empty() {
+            return Ok(Var::zero(MIN_SIG_DIGITS));
+        }
+        let mut base = base.clone();
+        let mut negative = false;
+        if base.sign == NumericSign::Negative {
+            if !integral {
+                return Err(power_error(
+                    "a negative number raised to a non-integer power yields a complex result",
+                ));
+            }
+            negative = exp.digits.len() as i64 == exp.weight + 1
+                && exp.digits.last().is_some_and(|&d| d & 1 == 1);
+            base.sign = NumericSign::Positive;
+        }
+        // A first estimate of exp * ln(base) with about 8 digits gives the scale of the result
+        // and catches an overflow.
+        let ln_dweight = base.ln_dweight();
+        let local_rscale = (8 - ln_dweight).max(0);
+        let ln_num = base.ln(local_rscale)?.mul_scaled(exp, local_rscale);
+        let mut val = ln_num.to_f64();
+        if val.abs() > f64::from(NUMERIC_MAX_RESULT_SCALE) * 3.01 {
+            if val > 0.0 {
+                return Err(overflow());
+            }
+            return Ok(Var::zero(NUMERIC_MAX_DISPLAY_SCALE));
+        }
+        val *= LOG10_E;
+        let rscale = display_scale((MIN_SIG_DIGITS - val as i64).max(base.dscale).max(exp.dscale));
+        let sig_digits = (rscale + val as i64).max(0);
+        let local_rscale = (sig_digits - ln_dweight + 8).max(0);
+        let ln_num = base.ln(local_rscale)?.mul_scaled(exp, local_rscale);
+        let mut result = ln_num.exp(rscale)?;
+        if negative && !result.digits.is_empty() {
+            result.sign = NumericSign::Negative;
+        }
+        Ok(result)
+    }
+
+    /// `power_var_int`: `base` to an integer power, with the scale that it picks. The products
+    /// keep the digits that the result needs and no more, as on the server.
+    fn power_int(base: &Var, exp: i32, exp_dscale: i64) -> Result<Var, TypeError> {
+        // The power of ten of the result, from base = f * 10^p.
+        let f = match base.digits.first() {
+            Some(&first) => {
+                let mut f = f64::from(first);
+                let mut p = base.weight * DEC_DIGITS;
+                for &digit in base.digits.iter().skip(1).take(3) {
+                    f = f * f64::from(NBASE) + f64::from(digit);
+                    p -= DEC_DIGITS;
+                }
+                f64::from(exp) * (f.log10() + p as f64)
+            }
+            None => 0.0,
+        };
+        if f > ((WEIGHT_MAX + 1) * DEC_DIGITS) as f64 {
+            return Err(overflow());
+        }
+        if f + 1.0 < -(NUMERIC_MAX_DISPLAY_SCALE as f64) {
+            return Ok(Var::zero(NUMERIC_MAX_DISPLAY_SCALE));
+        }
+        let rscale = display_scale((MIN_SIG_DIGITS - f as i64).max(base.dscale).max(exp_dscale));
+        let one = Var::integer(1);
+        match exp {
+            0 => return Ok(Var { dscale: rscale, ..one }),
+            1 => {
+                let mut result = base.clone();
+                result.round(rscale);
+                return Ok(result);
+            }
+            -1 if base.digits.is_empty() => return Err(division_by_zero()),
+            -1 => return Ok(one.div(base, rscale, true)),
+            2 => return Ok(base.mul_scaled(base, rscale)),
+            _ => {}
+        }
+        if base.digits.is_empty() {
+            if exp < 0 {
+                return Err(division_by_zero());
+            }
+            return Ok(Var::zero(rscale));
+        }
+        let sig_digits = 1 + rscale + f as i64 + f64::from(exp).abs().ln() as i64 + 8;
+        let mut negative = exp < 0;
+        let mut mask = exp.unsigned_abs();
+        let mut base_prod = base.clone();
+        let mut result = if mask & 1 == 1 { base.clone() } else { one.clone() };
+        loop {
+            mask >>= 1;
+            if mask == 0 {
+                break;
+            }
+            let local_rscale =
+                (sig_digits - 2 * base_prod.weight * DEC_DIGITS).min(2 * base_prod.dscale).max(0);
+            base_prod = base_prod.mul_scaled(&base_prod, local_rscale);
+            if mask & 1 == 1 {
+                let local_rscale = (sig_digits - (base_prod.weight + result.weight) * DEC_DIGITS)
+                    .min(base_prod.dscale + result.dscale)
+                    .max(0);
+                result = base_prod.mul_scaled(&result, local_rscale);
+            }
+            if base_prod.weight > WEIGHT_MAX || result.weight > WEIGHT_MAX {
+                // The result overflows, or it is a zero for a negative power.
+                if !negative {
+                    return Err(overflow());
+                }
+                result = Var::zero(0);
+                negative = false;
+                break;
+            }
+        }
+        if negative {
+            if result.digits.is_empty() {
+                return Err(division_by_zero());
+            }
+            return Ok(one.div_scaled(&result, rscale, true, false));
+        }
+        result.round(rscale);
+        Ok(result)
     }
 }
 
@@ -1574,6 +2243,121 @@ mod tests {
         assert_eq!(bucket("NaN", "0", "1", 3), Ok(4));
         assert_eq!(bucket("1.0", "0", "10", 0), Err("count must be greater than zero".into()));
         assert_eq!(bucket("1.0", "1", "1", 3), Err("lower bound cannot equal upper bound".into()));
+    }
+
+    #[test]
+    fn the_roots_logarithms_and_powers_give_the_digits_of_postgres() {
+        // The texts are the ones PostgreSQL 19 prints. The long arguments take the products and
+        // the quotients that the server cuts short, so the last digits test those paths.
+        let shown = |v: Result<Numeric, TypeError>| v.map_or_else(|e| e.message, |v| text(&v));
+        let long = "12345678901234567890123456789012345678901234567890.123456789012345678901234567890123456789";
+        for (arg, sqrt, exp, ln) in [
+            ("2.0", "1.414213562373095", "7.3890560989306502", "0.6931471805599453"),
+            (
+                "1e-20",
+                "0.0000000001000000000000000",
+                "1.00000000000000000001",
+                "-46.05170185988091368036",
+            ),
+            ("0.0", "0.000000000000000", "1.0000000000000000", "cannot take logarithm of zero"),
+            (
+                "-1",
+                "cannot take square root of a negative number",
+                "0.3678794411714423",
+                "cannot take logarithm of a negative number",
+            ),
+            (
+                "-Infinity",
+                "cannot take square root of a negative number",
+                "0",
+                "cannot take logarithm of a negative number",
+            ),
+            ("Infinity", "Infinity", "Infinity", "Infinity"),
+            ("NaN", "NaN", "NaN", "NaN"),
+            (
+                "-100",
+                "cannot take square root of a negative number",
+                "0.00000000000000000000000000000000000000000003720075976020836",
+                "cannot take logarithm of a negative number",
+            ),
+            (
+                long,
+                "3513641828820144253111222.381699882939174840877239400336816548007",
+                "value overflows numeric format",
+                "113.037390579023891077936582990022470054692",
+            ),
+        ] {
+            assert_eq!(shown(value(arg).sqrt()), sqrt, "sqrt({arg})");
+            assert_eq!(shown(value(arg).exp()), exp, "exp({arg})");
+            assert_eq!(shown(value(arg).ln()), ln, "ln({arg})");
+        }
+        assert_eq!(
+            shown(value("12.345678901234567890123456789012345678901234567890123456789").exp()),
+            "229964.194852988545212647771928873384711403685728528650561024237"
+        );
+        assert_eq!(shown(value("1e-100").ln()).len(), 105);
+        for (base, num, log) in [
+            ("10", "100.0", "2.0000000000000000"),
+            ("3.0", "7.5", "1.8340437671464697"),
+            ("2.0", "1e100", "332.19280948873623"),
+            ("1.0", "10.0", "division by zero"),
+            ("0.0", "10.0", "cannot take logarithm of zero"),
+            ("-2.0", "10.0", "cannot take logarithm of a negative number"),
+            ("Infinity", "Infinity", "NaN"),
+            ("Infinity", "2", "0"),
+            ("2", "Infinity", "Infinity"),
+            (
+                "1.234567890123456789012345678901234567890123456789012345678901234567890",
+                "98765.43210987654321098765432109876543210987654321",
+                "54.576913203547526642155671447884789685261815909112130614344562317420184",
+            ),
+        ] {
+            assert_eq!(shown(Numeric::log(&value(base), &value(num))), log, "log({base}, {num})");
+        }
+        for (base, exp, power) in [
+            ("2.0", "10.0", "1024.0000000000000"),
+            ("2.0", "0.5", "1.4142135623730950"),
+            ("-8.0", "3.0", "-512.00000000000000"),
+            ("10.0", "-2.0", "0.010000000000000000"),
+            ("1.5", "100", "406561177535215237.4"),
+            ("0.0", "0.0", "1.0000000000000000"),
+            ("2", "-1", "0.5000000000000000"),
+            ("1.000001", "1000000", "2.7182804693193769"),
+            ("2", "0.333333333333333333333333", "1.259921049894873164767210"),
+            (
+                "-8.0",
+                "0.5",
+                "a negative number raised to a non-integer power yields a complex result",
+            ),
+            ("0.0", "-1.0", "zero raised to a negative power is undefined"),
+            ("10", "200000", "value overflows numeric format"),
+            ("NaN", "0", "1"),
+            ("1", "NaN", "1"),
+            ("-Infinity", "3", "-Infinity"),
+            ("-Infinity", "-3", "0"),
+            ("0.5", "Infinity", "0"),
+            ("-1", "Infinity", "1"),
+            ("2", "-Infinity", "0"),
+            (
+                "-Infinity",
+                "2.5",
+                "a negative number raised to a non-integer power yields a complex result",
+            ),
+            (
+                "1.234567890123456789012345678901234567890123456789012345678901234567890",
+                "98.765432109876543210987654321098765432109876543210",
+                "1092738561.079291543802031692297704103794304249293246982499215960791437980625045",
+            ),
+            (
+                "3.14159265358979323846264338327950288419716939937510",
+                "-17",
+                "0.00000000353551076718524752149179810911565188879362",
+            ),
+        ] {
+            assert_eq!(shown(value(base).power(&value(exp))), power, "power({base}, {exp})");
+        }
+        assert!(shown(value("9.99").power(&value("123.456"))).ends_with("333005754963211.184"));
+        assert!(shown(value("0.1").power(&value("200000"))).starts_with("0.0000"));
     }
 
     #[test]
