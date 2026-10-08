@@ -602,12 +602,7 @@ pub fn decode_leading(bytes: &[u8], count: usize) -> Result<Vec<u8>> {
             if count > held {
                 return Err(short(held));
             }
-            let mut out = Vec::new();
-            let mut at = 0;
-            for index in 0..count {
-                runs.run_into(index, &mut at, &mut out)?;
-            }
-            out
+            runs.leading(count)?
         }
         _ => {
             let mut flat = decode_chunk(&mut reader)?;
@@ -1279,6 +1274,12 @@ fn decode_chunk(reader: &mut Reader<'_>) -> Result<Flat> {
     }
 }
 
+thread_local! {
+    /// Room a compressed chunk is decompressed into before what it decompressed to is copied out,
+    /// kept by the thread so that it is made once and not zeroed afresh for every chunk.
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A compressed chunk's symbol table and its runs, left where the file put them.
 ///
 /// Reading a compressed chunk into this rather than straight into a buffer is what lets a run be
@@ -1323,9 +1324,6 @@ impl Compressed<'_> {
     ///
     /// If a run is past the end of the chunk or does not decompress.
     fn all_into(&self, flat: &mut Flat) -> Result<()> {
-        thread_local! {
-            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
         SCRATCH.with_borrow_mut(|out| -> Result<()> {
             let base = flat.bytes.len();
             let mut at = 0;
@@ -1348,6 +1346,39 @@ impl Compressed<'_> {
             flat.bytes.reserve_exact(at);
             flat.bytes.extend_from_slice(&out[..at]);
             Ok(())
+        })
+    }
+
+    /// The first `count` runs decompressed end to end.
+    ///
+    /// The runs sit end to end in the payload, so the first `count` of them are one slice and one
+    /// [`SymbolTable::decompress_at`] call over it, into room made in the thread's buffer the way
+    /// [`Compressed::all_into`] makes it. Asked for a run at a time, each symbol was a push onto a
+    /// vector growing as it went, and on a `LIKE` over `Referer` that was six percent of the query,
+    /// all of it in the partial blocks the row estimates read.
+    ///
+    /// # Errors
+    ///
+    /// If the runs are past the end of the chunk or do not decompress.
+    fn leading(&self, count: usize) -> Result<Vec<u8>> {
+        let past = || Error::internal("a compressed run is past the end of its chunk");
+        let used = self
+            .lengths
+            .get(..count)
+            .ok_or_else(past)?
+            .iter()
+            .try_fold(0usize, |total, &run| total.checked_add(run))
+            .ok_or_else(|| Error::internal("a compressed chunk longer than memory"))?;
+        let codes = self.payload.get(..used).ok_or_else(past)?;
+        let need = used
+            .checked_mul(MAX_SYMBOL_LEN)
+            .ok_or_else(|| Error::internal("a compressed chunk longer than memory"))?;
+        SCRATCH.with_borrow_mut(|out| {
+            if out.len() < need {
+                out.resize(need.max(out.len() * 2), 0);
+            }
+            let end = self.table.decompress_at(codes, out, 0)?;
+            Ok(out[..end].to_vec())
         })
     }
 
