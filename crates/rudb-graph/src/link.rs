@@ -424,20 +424,31 @@ impl Link {
             }
         };
         let words = vector.words();
-        // The last child answered and the word its bit is in, where the next search starts.
-        let (mut last, mut from) = (0, 0);
+        // The last child answered, the bit its one is at, and the word the next search starts in.
+        let (mut last, mut at, mut from) = (Rid::MAX, 0, 0);
         for &child in children {
             if child >= self.children {
                 out.push(NO_PARENT);
                 continue;
+            }
+            // The child after the last is the next one after its bit, and when that one is in the
+            // same word a trailing zero count finds it without the search or the select.
+            if last.checked_add(1) == Some(child) {
+                let rest = words[at / 64] & (!1_u64 << (at % 64));
+                if rest != 0 {
+                    (last, at) = (child, at / 64 * 64 + rest.trailing_zeros() as usize);
+                    out.push(count(at) - child);
+                    continue;
+                }
             }
             if child < last {
                 from = 0;
             }
             let parent = match vector.word_holding(child, from) {
                 Some((word, within)) => {
+                    at = word * 64 + crate::bits::nth_set(words[word], within) as usize;
                     (last, from) = (child, word);
-                    count(word * 64 + crate::bits::nth_set(words[word], within) as usize) - child
+                    count(at) - child
                 }
                 None => NO_PARENT,
             };
