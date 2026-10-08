@@ -350,7 +350,9 @@ impl Extended {
                 }
                 let query = match &cursor {
                     Cursor::Declare(declare) => {
-                        Some(Arc::new(statement(runner, sql[declare.query..].into(), types)?))
+                        let made = statement(runner, sql[declare.query..].into(), types);
+                        runner.raised(&sql, declare.query, out);
+                        Some(Arc::new(made?))
                     }
                     _ => None,
                 };
@@ -373,7 +375,11 @@ impl Extended {
                     named: None,
                 }
             }
-            (None, None) => statement(runner, sql, types)?,
+            (None, None) => {
+                let made = statement(runner, Arc::clone(&sql), types);
+                runner.raised(&sql, 0, out);
+                made?
+            }
         };
         self.statements.insert(name, Arc::new(statement))?;
         out.parse_complete();
@@ -1370,7 +1376,7 @@ impl Portal {
             };
             let (ran, ended) = match flow {
                 Some(flow) if control.is_none() && command.is_none() => {
-                    runner.streamed(sql, flow, out, execute)
+                    runner.streamed(sql, (sql, 0), flow, out, execute)
                 }
                 _ => (execute(runner, out), streamed::Ended::none()),
             };

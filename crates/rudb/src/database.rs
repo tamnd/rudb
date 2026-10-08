@@ -5606,7 +5606,7 @@ impl Shared {
     }
 
     fn remember_native_aggregate(&self, sql: &str, ast: &Ast, plan: &Plan, catalog: &Catalog) {
-        if !is_native_summary_aggregate(ast, plan, catalog) {
+        if !is_native_summary_aggregate(ast, plan, catalog) || rudb_common::notice::raised() {
             return;
         }
         *self.inner.native_aggregate_plan.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -5656,7 +5656,8 @@ impl Shared {
         catalog: &Catalog,
         session: &Session,
     ) {
-        if !simple_cacheable(ast, plan, catalog) {
+        // A hit does not parse, so a statement with notices of the parse is parsed each time.
+        if !simple_cacheable(ast, plan, catalog) || rudb_common::notice::raised() {
             return;
         }
 
@@ -5691,7 +5692,9 @@ impl Shared {
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
         let session = self.session();
-        let (ast, parse_ns) = timed(|| parse(&session, sql))?;
+        // The second pass reads the text that the first pass read, whose notices are raised.
+        let (ast, parse_ns) =
+            timed(|| if mirror { parse_statement(&session, sql) } else { parse(&session, sql) })?;
         let outlined = mirror && self.inner.settings.config().parquet_mirror();
         let (bound, bind_ns) = timed(|| {
             if outlined {
@@ -6092,7 +6095,7 @@ impl Shared {
                 return Ok(answer);
             }
             let session = self.session();
-            let (ast, parse_ns) = timed(|| parse(&session, sql))?;
+            let (ast, parse_ns) = timed(|| parse_statement(&session, sql))?;
             if let Some(answer) = self.prepared_statement(&ast, sql, cancel) {
                 return answer;
             }
@@ -6460,10 +6463,8 @@ impl Shared {
                         ))
                         .unplaced());
                     }
-                    notices.push(Notice {
-                        sqlstate: "00000",
-                        message: format!("truncate cascades to table \"{}\"", name.table),
-                    });
+                    let message = format!("truncate cascades to table \"{}\"", name.table);
+                    notices.push(Notice::new(rudb_common::notice::Level::Notice, "00000", message));
                     tables.push(name);
                 }
                 at += 1;
@@ -8741,12 +8742,27 @@ fn optimized(plan: &mut Plan, context: &rudb_opt::pass::Context) -> Result<(u64,
 /// comes through here, `08-the-dialect.md` section 8.1. A PostgreSQL session parses with the
 /// PostgreSQL grammar, which folds unquoted names itself, so the identifier case of the session
 /// is for the DuckDB grammar only.
+///
+/// The notices of the PostgreSQL grammar are dropped here. A text that the client sent is parsed
+/// by [`parse_statement`], which raises them.
 pub(crate) fn parse(session: &Session, sql: &str) -> Result<Ast> {
     if session.postgres().is_some() {
-        rudb_pgparse::transform::parse_ast(sql)
+        rudb_pgparse::transform::parse_ast(sql).map(|(ast, _)| ast)
     } else {
         rudb_parse::parse_ast_with_case(sql, session.semantics().identifier_case())
     }
+}
+
+/// [`parse`] of a text that the client sent, which raises the notices of the grammar, such as the
+/// one for an identifier that is too long. A text that the engine made or kept, such as the body
+/// of a trigger, is parsed by [`parse`], because PostgreSQL does not read it again.
+pub(crate) fn parse_statement(session: &Session, sql: &str) -> Result<Ast> {
+    if session.postgres().is_none() {
+        return parse(session, sql);
+    }
+    let (ast, notices) = rudb_pgparse::transform::parse_ast(sql)?;
+    notices.into_iter().for_each(rudb_common::notice::raise);
+    Ok(ast)
 }
 
 /// Run something and say how long it took, in wall nanoseconds.

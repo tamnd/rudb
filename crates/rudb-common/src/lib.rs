@@ -36,6 +36,7 @@ pub mod guc;
 pub mod heap;
 pub mod implicit;
 pub mod memory;
+pub mod notice;
 pub mod numeric;
 pub mod rules;
 pub mod sequence;

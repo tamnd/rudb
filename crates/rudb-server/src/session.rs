@@ -28,7 +28,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rudb::{Connection, ErrorCode, QueryResult, Transaction};
+use rudb::{Connection, ErrorCode, Notice, QueryResult, Transaction};
 use rudb_common::guc::{self, Action, Origin, Settings};
 use rudb_common::session::Postgres;
 use rudb_pgtypes::{
@@ -1018,6 +1018,14 @@ enum Severity {
 }
 
 impl Severity {
+    /// The severity of a notice of the engine.
+    fn of(level: rudb_common::notice::Level) -> Self {
+        match level {
+            rudb_common::notice::Level::Notice => Self::Notice,
+            rudb_common::notice::Level::Warning => Self::Warning,
+        }
+    }
+
     fn word(self) -> &'static [u8] {
         match self {
             Self::Notice => b"NOTICE",
@@ -1025,6 +1033,30 @@ impl Severity {
             Self::Error => b"ERROR",
         }
     }
+}
+
+/// Writes a notice of the engine as a `NoticeResponse`, if `client_min_messages` lets the client
+/// have it. The position of the notice is a byte offset in the statement at `offset` of `sql`, the
+/// text of the message.
+fn write_notice(out: &mut OutBuf, least: Severity, notice: &Notice, sql: &str, offset: usize) {
+    let severity = Severity::of(notice.level);
+    if severity < least {
+        return;
+    }
+    let position = notice.position.map(|at| position(sql, offset + at as usize));
+    let mut fields: Vec<(u8, &[u8])> = vec![
+        (b'S', severity.word()),
+        (b'V', severity.word()),
+        (b'C', notice.sqlstate.as_bytes()),
+        (b'M', notice.message.as_bytes()),
+    ];
+    let optional = [(b'D', notice.detail.as_ref()), (b'H', notice.hint.as_ref())];
+    for (code, value) in optional.into_iter().chain([(b'P', position.as_ref())]) {
+        if let Some(value) = value {
+            fields.push((code, value.as_bytes()));
+        }
+    }
+    out.notice_response(&fields);
 }
 
 /// The error for a statement in a failed transaction block.
@@ -1114,6 +1146,14 @@ fn position(sql: &str, at: usize) -> String {
 }
 
 impl Runner {
+    /// Writes the notices that the last call of the engine raised, such as those of the parse, for
+    /// the statement at `offset` of `sql`.
+    fn raised(&self, sql: &str, offset: usize, out: &mut OutBuf) {
+        for notice in self.connection.notices() {
+            write_notice(out, self.least, &notice, sql, offset);
+        }
+    }
+
     /// The settings of the text output.
     fn output(&self) -> OutputSettings<'_> {
         output(&self.format, &self.zone)
@@ -1434,9 +1474,12 @@ impl Runner {
         }
         // Rows that an earlier statement left behind are not the rows of this one.
         drop(self.connection.rows_before_error());
-        let result = run(&self.connection).map_err(|e| Failure::engine(&e, offset))?;
+        let ran = run(&self.connection);
+        // The notices of the parse come before the rows and before the error, as in PostgreSQL.
+        self.raised(sql, offset, out);
+        let result = ran.map_err(|e| Failure::engine(&e, offset))?;
         for notice in result.notices() {
-            self.notice(out, Severity::Notice, notice.sqlstate, &notice.message);
+            write_notice(out, self.least, notice, sql, offset);
         }
         Ok(Outcome::Result(result))
     }
@@ -1511,6 +1554,8 @@ impl Runner {
         }
         // A query of more than one statement runs in one transaction, as in PostgreSQL.
         let implicit = statements.len() > 1;
+        // The text for the position of a notice of a streamed statement, made once.
+        let mut text: Option<Arc<str>> = None;
         for (index, statement) in statements.into_iter().enumerate().skip(from) {
             if let Some(parsed) = copy::parse(statement.sql()) {
                 let offset = statement.offset();
@@ -1609,7 +1654,9 @@ impl Runner {
             let (ran, ended) = match started {
                 Err(failure) => (Err(failure), streamed::Ended::none()),
                 Ok(()) if control.is_none() && command.is_none() && streamed::streamable(one) => {
-                    self.streamed(one, streamed::Flow::Simple, out, |runner, out| {
+                    let text = text.get_or_insert_with(|| sql.into());
+                    let place = (&*text, offset);
+                    self.streamed(one, place, streamed::Flow::Simple, out, |runner, out| {
                         runner.run(None, None, sql, offset, out, |c| c.execute(one))
                     })
                 }

@@ -14044,6 +14044,43 @@ fn a_postgres_session_hints_the_nearest_column_names() {
 }
 
 #[test]
+fn a_postgres_session_gives_the_notices_of_the_parse_once() {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+    let db = Database::new();
+    let connection = db.connect();
+    let long = "a".repeat(64);
+    let sql = format!("SELECT 1 AS {long}");
+    // A DuckDB session does not truncate an identifier, so it has no notice.
+    connection.query(&sql).expect("duckdb");
+    assert!(connection.notices().is_empty());
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    for _ in 0..2 {
+        connection.query(&sql).expect("postgres");
+        let notices = connection.notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].sqlstate, "42622");
+        assert!(connection.notices().is_empty());
+    }
+    // A failed statement keeps its notices, and the next statement starts with none.
+    assert!(connection.query(&format!("SELECT {long} FROM nope")).is_err());
+    assert_eq!(connection.notices().len(), 1);
+    assert!(connection.query(&format!("SELECT {long} FROM nope")).is_err());
+    connection.query("SELECT 1").expect("one");
+    assert!(connection.notices().is_empty());
+    let prepared = connection.prepare(&sql).expect("prepare");
+    assert_eq!(connection.notices().len(), 1);
+    prepared.execute(&[]).expect("execute");
+    assert!(connection.notices().is_empty());
+}
+
+#[test]
 fn a_postgres_session_words_binder_errors_as_postgres() {
     use rudb_common::guc::Settings;
     use rudb_common::session::Postgres;

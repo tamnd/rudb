@@ -976,7 +976,7 @@ impl Prepared {
     /// Parses `sql` and reads the parameters out of it.
     pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
         let session = shared.session();
-        let ast = crate::database::parse(&session, sql)?;
+        let ast = crate::database::parse_statement(&session, sql)?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
         let short = Short::of(&ast, session.semantics().identifier_compare());
         let numbered = numbered_one_to_n(&names);
@@ -1118,6 +1118,7 @@ impl Prepared {
     /// If a parameter was given no value, if a value was given for a parameter the statement does
     /// not use, or anything binding and running the statement reports.
     pub fn execute(&self, values: &[Value]) -> Result<QueryResult> {
+        drop(rudb_common::notice::take());
         let result = self.shared.in_transaction(&self.sql, || {
             // The short ways, which have the values they want and nothing else, read them where
             // they are rather than copying them into parameters to look them up by name again.
@@ -1142,6 +1143,7 @@ impl Prepared {
     ///
     /// The same as [`Prepared::execute`].
     pub fn execute_named(&self, values: &[(&str, Value)]) -> Result<QueryResult> {
+        drop(rudb_common::notice::take());
         let mut parameters = Parameters::new();
         for (name, value) in values {
             parameters.set(*name, value.clone());

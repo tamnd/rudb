@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rudb::{Chunk, RowSink};
 use rudb_common::{LogicalType, Origin};
@@ -24,6 +25,7 @@ use rudb_pgwire::{Field, OutBuf};
 use super::zone::Zone;
 use super::{
     FLUSH_AT, Failure, Format, Runner, Severity, column_type, field, leading_words, output,
+    write_notice,
 };
 use crate::stream::Stream;
 
@@ -49,6 +51,10 @@ pub(super) struct Streamed {
     zone_name: String,
     least: Severity,
     pid: i32,
+    /// The text of the message and the offset of the statement in it, for the position of a
+    /// notice.
+    text: Arc<str>,
+    offset: usize,
     encoder: RowEncoder,
     /// The rows that went out.
     rows: u64,
@@ -96,10 +102,11 @@ impl Runner {
     /// Runs `run` with a sink for the rows of the statement `sql`, when the session has a socket
     /// that a second handle can write: TLS keeps its state in one handle. The output of the
     /// session moves into the sink while `run` runs, and `out` holds all the output in order when
-    /// this returns.
+    /// this returns. The statement is at `offset` of `text`, the text of the message.
     pub(super) fn streamed<R>(
         &mut self,
         sql: &str,
+        (text, offset): (&Arc<str>, usize),
         flow: Flow,
         out: &mut OutBuf,
         run: impl FnOnce(&mut Runner, &mut OutBuf) -> R,
@@ -116,6 +123,8 @@ impl Runner {
             zone_name: self.zone_name.clone(),
             least: self.least,
             pid: self.pid,
+            text: Arc::clone(text),
+            offset,
             encoder: RowEncoder::default(),
             rows: 0,
             started: false,
@@ -158,6 +167,14 @@ impl Streamed {
         Err(rudb::Error::interrupt(message))
     }
 
+    /// Writes the notices that the statement raised before its rows, such as those of the parse.
+    fn raised(&mut self) {
+        // The sink runs on the session thread, which ran the parse.
+        for notice in rudb_common::notice::take() {
+            write_notice(&mut self.out, self.least, &notice, &self.text, self.offset);
+        }
+    }
+
     /// Writes the warnings of the advisory lock functions that the rows so far raised.
     fn warnings(&mut self) {
         if Severity::Warning < self.least {
@@ -184,6 +201,8 @@ impl RowSink for Sink {
     ) -> rudb::Result<()> {
         let mut state = self.0.borrow_mut();
         state.started = true;
+        // PostgreSQL parses the statement before it describes the rows.
+        state.raised();
         let origin = |at: usize| origins.get(at).copied().flatten();
         let mut columns = Vec::with_capacity(types.len());
         let mut typmods = Vec::with_capacity(types.len());

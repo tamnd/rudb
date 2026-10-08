@@ -21,13 +21,14 @@ mod write;
 
 use std::cell::OnceCell;
 
+use rudb_common::notice::{Level, Notice};
 use rudb_common::session::IdentifierCase;
 use rudb_common::{Error, Span};
 use rudb_parse::Ast;
 use rudb_parse::ast::{Expr, ExprRef, QueryRef, Slice, SourceRef, Statement, StrRef, WindowRef};
 use rudb_parse::build::Interner;
 
-use crate::nodes::{CTEMaterialize, Node, RawStmt};
+use crate::nodes::{CTEMaterialize, List, Node, RawStmt};
 
 /// Why [`transform`] did not give a tree.
 #[derive(Debug)]
@@ -55,6 +56,11 @@ impl From<Error> for Refused {
 /// a node that the transform does not build yet.
 pub fn transform(text: &str) -> Result<Ast, Refused> {
     let (list, _) = crate::parse(text).map_err(Refused::Syntax)?;
+    transform_list(text, &list)
+}
+
+/// The [`Ast`] of the statements `list` that the grammar read from `text`.
+fn transform_list(text: &str, list: &List) -> Result<Ast, Refused> {
     let mut transform = Transform::new(text);
     for node in list.iter().flatten() {
         let Node::RawStmt(raw) = node else {
@@ -76,12 +82,28 @@ pub fn transform(text: &str) -> Result<Ast, Refused> {
 ///
 /// The error of the grammar or of the transform, with the SQLSTATE and the position that
 /// PostgreSQL gives.
-pub fn parse_ast(text: &str) -> Result<Ast, Error> {
-    match transform(text) {
-        Ok(ast) => Ok(ast),
-        Err(Refused::NotYet(_)) => rudb_parse::parse_ast_postgres(text, IdentifierCase::Lower),
-        Err(Refused::Syntax(error)) => Err(error.into()),
-        Err(Refused::Error(error)) => Err(error),
+pub fn parse_ast(text: &str) -> Result<(Ast, Vec<Notice>), Error> {
+    let (list, notices) = crate::parse(text).map_err(Error::from)?;
+    let notices = notices.into_iter().map(noted).collect();
+    let ast = match transform_list(text, &list) {
+        Ok(ast) => ast,
+        Err(Refused::NotYet(_)) => rudb_parse::parse_ast_postgres(text, IdentifierCase::Lower)?,
+        Err(Refused::Syntax(error)) => return Err(error.into()),
+        Err(Refused::Error(error)) => return Err(error),
+    };
+    Ok((ast, notices))
+}
+
+/// A notice of the lexer or the grammar, as the engine raises it.
+fn noted(notice: crate::Notice) -> Notice {
+    let level = match notice.severity {
+        crate::Severity::Notice => Level::Notice,
+        crate::Severity::Warning => Level::Warning,
+    };
+    let made = Notice::new(level, notice.code, notice.message);
+    match notice.location.and_then(|location| u32::try_from(location).ok()) {
+        Some(location) => made.at(location),
+        None => made,
     }
 }
 
