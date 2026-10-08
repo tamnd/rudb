@@ -3589,6 +3589,83 @@ fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
 }
 
 #[test]
+fn substring_from_a_position_keeps_the_part_that_postgresql_keeps() {
+    let dirs = Dirs::new("pg-substring");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            return format!("{code} {text}");
+        }
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(|| "NULL".into(), |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        rows.join(";")
+    };
+    // The values and the errors of the PostgreSQL 19 oracle. The part starts at the start and
+    // ends one before the start plus the length, and a start before the first character does not
+    // count back from the end.
+    for (sql, expected) in [
+        ("select substring('abcdef', -1, 3)", "a"),
+        ("select substring('abcdef', -1)", "abcdef"),
+        ("select substring('abcdef', 0, 2)", "a"),
+        ("select substring('abcdef', -5, 3)", ""),
+        ("select substring('abcdef', 3, 100)", "cdef"),
+        ("select substring('abcdef', 10)", ""),
+        ("select substring('abcdef', -2147483647, 2147483647)", ""),
+        ("select substring('abcdef', 1, 2147483647)", "abcdef"),
+        ("select substring('héllo', 2, 2)", "él"),
+        ("select substring('abcdef', 2, -1)", "22011 negative substring length not allowed"),
+        ("select substr('abcdef', -1, 3)", "a"),
+        ("select substring('abc' from 2 for '1')", "b"),
+        ("select substring('abc' from '2' for 1)", "b"),
+        ("select substring('abc' from '2')", "NULL"),
+        ("select substr('abc', ' 2 ')", "bc"),
+        ("select substr('abc', 'x')", "22P02 invalid input syntax for type integer: \"x\""),
+        ("select regexp_instr('abc', 'b', '2')", "2"),
+        ("select substring('abc' from 1::smallint)", "abc"),
+        ("select substring('abc', null)", "NULL"),
+        ("select substring('abc', 1, null)", "NULL"),
+        (
+            "select substr('abc', 1::bigint)",
+            "42883 function substr(unknown, bigint) does not exist",
+        ),
+        (
+            "select substring('abc', 1.5)",
+            "42883 function substring(unknown, numeric) does not exist",
+        ),
+        ("select substring(123, 1)", "42883 function substring(integer, integer) does not exist"),
+        ("select substring('\\x010203'::bytea, 2, 1)", "\\x02"),
+        ("select substring('\\x010203'::bytea, -1, 3)", "\\x01"),
+        ("select substring('\\x010203'::bytea from 2)", "\\x0203"),
+        (
+            "select substring(x, -1, 3), substring(x, 0), substr(x, 2, 0) \
+             from (values ('abcdef'), ('héllo'), (null)) t(x)",
+            "a|abcdef|;h|héllo|;NULL|NULL|NULL",
+        ),
+        (
+            "select substring(x, y, z) from (values ('abcdef', -1, 3), ('abcdef', 2, 2)) t(x, y, z)",
+            "a;bc",
+        ),
+        ("select substring(x, 2, -1) from (values (null::text)) t(x)", "NULL"),
+    ] {
+        assert_eq!(result(sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();

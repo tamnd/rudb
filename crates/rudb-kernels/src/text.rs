@@ -35,8 +35,58 @@
 //! q22 calls it over every customer's phone number, so it has a loop in [`crate::scalar`] that calls
 //! [`cut`] for each row. Any other call over a column counts itself in [`crate::fallback`] so the
 //! report says how often it happened.
+//!
+//! The `substring` of a PostgreSQL session is [`PG_SUBSTR`], which has the rule of the SQL
+//! standard and none of the rules above. It keeps the characters from `start` up to one before
+//! `start + length` that are in the value. A start before the first character does not count back
+//! from the end, so `substring('abcdef', -1, 3)` is `a`, and a negative length is an error.
+//! [`pg_span`] turns that rule into a start of one or more for [`cut`].
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, Result, SqlState, Value};
+
+/// `substring(value from start [for length])` and `substr` of a PostgreSQL session by position, over
+/// a `text` or a `bytea` value and one or two integers.
+pub const PG_SUBSTR: &str = "__rudb_pg_substr";
+
+/// The start and the length that [`cut`] takes for the part of a value that PostgreSQL keeps from
+/// `start` for `length`. The start is one or more, so [`cut`] counts no part of it from the end.
+pub(crate) fn pg_span(start: i128, length: Option<i128>) -> Result<(i128, Option<i128>)> {
+    let from = start.max(1);
+    match length {
+        None => Ok((from, None)),
+        Some(length) if length < 0 => {
+            Err(Error::invalid_input("negative substring length not allowed")
+                .state(SqlState::SUBSTRING_ERROR)
+                .unplaced())
+        }
+        Some(length) => Ok((from, Some((start + length - from).max(0)))),
+    }
+}
+
+/// [`PG_SUBSTR`] on one row. A null argument gives a null before the length is looked at.
+fn pg_substring(args: &[Value]) -> Result<Value> {
+    let (held, start, length) = match args {
+        [held, start] => (held, start, None),
+        [held, start, length] => (held, start, Some(length)),
+        _ => return Err(Error::internal(format!("{PG_SUBSTR} with {} arguments", args.len()))),
+    };
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let length = match length {
+        Some(length) => Some(whole(length)?),
+        None => None,
+    };
+    let (start, length) = pg_span(whole(start)?, length)?;
+    match held {
+        Value::Blob(bytes) => {
+            let kept = span(bytes.len() as i128, start, length)
+                .map_or(&[][..], |(from, to)| &bytes[from..to]);
+            Ok(Value::Blob(kept.to_vec()))
+        }
+        held => Ok(Value::Varchar(cut(string(held)?, start, length).to_owned())),
+    }
+}
 
 /// `substring(text, start)` and `substring(text, start, length)` on one row.
 pub(crate) fn substring(text: &Value, start: &Value, length: Option<&Value>) -> Result<Value> {
@@ -236,6 +286,7 @@ pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
         None => return Ok(None),
     };
     let kept = match (name, args) {
+        (PG_SUBSTR, _) => return pg_substring(args).map(Some),
         ("__rudb_pg_input", [_, oid]) => {
             let oid = u32::try_from(whole(oid)?).unwrap_or_default();
             return match rudb_pgtypes::plain_text_value(oid, string(text)?) {
@@ -284,6 +335,28 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Varchar(value.to_string())
+    }
+
+    #[test]
+    fn the_postgresql_substring_keeps_from_the_start_to_one_before_its_end() {
+        let pg = |value: &str, start: i64, length: Option<i64>| {
+            let mut args = vec![text(value), Value::BigInt(start)];
+            args.extend(length.map(Value::BigInt));
+            pg_substring(&args)
+        };
+        for (start, length, kept) in [
+            (-1, Some(3), "a"),
+            (0, Some(2), "a"),
+            (-5, Some(3), ""),
+            (2, Some(0), ""),
+            (3, None, "cdef"),
+        ] {
+            assert_eq!(pg("abcdef", start, length).unwrap(), text(kept), "{start} {length:?}");
+        }
+        assert!(pg("abcdef", 2, Some(-1)).is_err());
+        let bytes =
+            pg_substring(&[Value::Blob(vec![1, 2, 3]), Value::BigInt(-1), Value::BigInt(3)]);
+        assert_eq!(bytes.unwrap(), Value::Blob(vec![1]));
     }
 
     #[test]
