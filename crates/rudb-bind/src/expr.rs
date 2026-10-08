@@ -17,6 +17,7 @@ use rudb_common::{
     TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
+use rudb_kernels::pgjson::JsonSet;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, NONE};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan};
@@ -39,6 +40,11 @@ const LIST_MACROS: &[(&str, &str, usize, bool)] = &[
     ("array_prepend", "el, arr", 0, true),
     ("array_push_front", "arr, e", 1, true),
 ];
+
+/// A function of PostgreSQL that gives a set of rows, which a select list and `FROM` unnest.
+fn set_function(name: &str) -> bool {
+    rudb_catalog::same_name(name, "generate_series") || JsonSet::of(name).is_some()
+}
 
 impl Binder<'_> {
     /// Binds the value of a `SET`, which is an expression over nothing.
@@ -151,13 +157,13 @@ impl Binder<'_> {
                     && !self.in_window
                     && !self.in_lambda()
                     && self.semantics.set_functions() == SetFunctions::Postgres
-                    && rudb_catalog::same_name(
-                        ast.name(name).last().unwrap_or_default(),
-                        "generate_series",
-                    ) =>
+                    && set_function(ast.name(name).last().unwrap_or_default()) =>
             {
                 let args = ast.expr_list(args).to_vec();
-                self.bind_series(ast, expr, &args, scope)
+                match JsonSet::of(ast.name(name).last().unwrap_or_default()) {
+                    Some(_) => self.bind_unnest(ast, expr, &[expr], scope),
+                    None => self.bind_series(ast, expr, &args, scope),
+                }
             }
             ast::Expr::Function { name, args, distinct, filter }
                 if name.len == 1

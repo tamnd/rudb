@@ -10,11 +10,13 @@
 //! that reads the type from the RowDescription gets the type it expects.
 
 use rudb_catalog::{Catalog, same_name};
-use rudb_common::{Error, FunctionRules, LogicalType, Result, SqlState, Value};
+use rudb_common::{Error, FunctionRules, LogicalType, Result, SetFunctions, SqlState, Value};
+use rudb_kernels::pgjson::JsonSet;
 use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 
+use crate::advisory::no_such_function;
 use crate::binder::Binder;
 use crate::scope::Scope;
 
@@ -152,6 +154,18 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<Option<ExprRef>> {
         let named = |name: &str| same_name(written, name);
+        if let [document] = arguments
+            && let Some(set) = JsonSet::of(written)
+        {
+            return self.json_set(ast, set, *document, scope).map(Some);
+        }
+        // A select list and `FROM` unnest the series, so a series anywhere else has no rows to give.
+        if named("generate_series")
+            && !self.in_unnest
+            && self.semantics.set_functions() == SetFunctions::Postgres
+        {
+            return Err(self.misplaced_set_function());
+        }
         if arguments.is_empty() && named("pg_backend_pid") {
             let backend = self.session.postgres().map_or(0, |postgres| postgres.backend);
             return Ok(Some(self.add_constant(Value::Integer(backend))));
@@ -306,6 +320,50 @@ impl Binder<'_> {
         let name = self.plan_mut().intern(kernel);
         let args = self.plan_mut().add_expr_list(&[text, type_name, date_style, interval_style]);
         Ok(self.add_expr(Expr::Function { name, args }, returns))
+    }
+
+    /// A JSON set function, such as `json_each`, as the list of its rows. The unnest around the
+    /// call gives the rows one at a time.
+    fn json_set(
+        &mut self,
+        ast: &Ast,
+        set: JsonSet,
+        document: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let bound = self.bind_expr(ast, document, scope)?;
+        let ty = self.plan().expr_type(bound).clone();
+        let unknown = string_literal(ast, document).is_some();
+        if !unknown && ty != LogicalType::Null && ty != set.document() {
+            return Err(no_such_function(set.name(), &[ty], &[false]));
+        }
+        if !self.in_unnest {
+            return Err(self.misplaced_set_function());
+        }
+        let document = self.cast_to(bound, &set.document());
+        let called = self.add_constant(Value::Varchar(set.name().to_owned()));
+        let name = self.plan_mut().intern(rudb_kernels::pgjson::KERNEL);
+        let args = self.plan_mut().add_expr_list(&[document, called]);
+        Ok(self.add_expr(Expr::Function { name, args }, LogicalType::List(Box::new(set.element()))))
+    }
+
+    /// The error of PostgreSQL for a set-returning function in a place that cannot give rows.
+    fn misplaced_set_function(&self) -> Error {
+        if self.in_aggregate {
+            let message = "aggregate function calls cannot contain set-returning function calls";
+            return Error::binder(message).state(SqlState::FEATURE_NOT_SUPPORTED).hint(
+                "You might be able to move the set-returning function into a LATERAL FROM item.",
+            );
+        }
+        let place = match self.clause {
+            "WHERE clause" => "WHERE",
+            "HAVING clause" => "HAVING",
+            "LIMIT clause" => "LIMIT",
+            "JOIN condition" => "JOIN conditions",
+            other => other,
+        };
+        Error::binder(format!("set-returning functions are not allowed in {place}"))
+            .state(SqlState::FEATURE_NOT_SUPPORTED)
     }
 
     /// `to_char` of a date and a time, `to_timestamp(text, text)` and `to_date(text, text)`, as

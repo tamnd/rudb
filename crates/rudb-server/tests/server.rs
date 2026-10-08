@@ -3263,6 +3263,130 @@ fn a_star_after_a_record_is_a_column_for_each_field() {
 }
 
 #[test]
+fn the_json_set_functions_give_the_rows_and_columns_of_postgresql() {
+    let dirs = Dirs::new("json-sets");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            return (format!("{code} {text}"), String::new());
+        }
+        let shape = messages.iter().find(|m| m.tag == b'T').unwrap();
+        let names: Vec<String> = row_shape(shape).into_iter().map(|(name, ..)| name).collect();
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(String::new, |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        (names.join(","), rows.join(";"))
+    };
+    // The values and the names of the columns of the PostgreSQL 19 oracle. `json` keeps the text
+    // and the duplicate keys of the document, and `jsonb` sorts the keys and keeps the last value.
+    for (sql, names, rows) in [
+        (
+            r#"select * from json_each('{"a":1,"b":"x","c":null,"d":[1]}')"#,
+            "key,value",
+            r#"a|1;b|"x";c|null;d|[1]"#,
+        ),
+        (
+            r#"select * from json_each_text('{"a":1,"b":"x","c":null,"d":[1]}')"#,
+            "key,value",
+            "a|1;b|x;c|;d|[1]",
+        ),
+        (
+            r#"select * from json_each('{"a":{"x" :  1},"a":2}')"#,
+            "key,value",
+            r#"a|{"x" :  1};a|2"#,
+        ),
+        (
+            r#"select * from jsonb_each('{"b":1,"a":{"x" :  1}, "b":3}')"#,
+            "key,value",
+            r#"a|{"x": 1};b|3"#,
+        ),
+        (r#"select * from json_each_text('{"a":"é\n"}')"#, "key,value", "a|\u{e9}\n"),
+        (r#"select * from json_each('{"a":1}') as t(k, v)"#, "k,v", "a|1"),
+        (r#"select * from json_each('{"a":1}') with ordinality"#, "key,value,ordinality", "a|1|1"),
+        ("select * from json_each(null)", "key,value", ""),
+        (r#"select * from json_array_elements('[1,"a",null]') e"#, "value", r#"1;"a";null"#),
+        (r#"select * from json_array_elements_text('[1,"a\"b",null]')"#, "value", r#"1;a"b;"#),
+        ("select * from json_array_elements('[1]') as e(x)", "x", "1"),
+        (
+            r#"select * from jsonb_array_elements('[{"b":1,"a":2}]')"#,
+            "value",
+            r#"{"a": 2, "b": 1}"#,
+        ),
+        (r#"select * from json_object_keys('{"a":1,"b":2}')"#, "json_object_keys", "a;b"),
+        (r#"select * from json_object_keys('{"a":1}') k"#, "k", "a"),
+        (r#"select * from jsonb_object_keys('{"b":1,"a":2}')"#, "jsonb_object_keys", "a;b"),
+        (r#"select pg_typeof(value) from jsonb_each('{"a":1}')"#, "pg_typeof", "jsonb"),
+        (r#"select pg_typeof(value) from json_each_text('{"a":1}')"#, "pg_typeof", "text"),
+        (r#"select json_each('{"a":1,"b":[2]}')"#, "json_each", "(a,1);(b,[2])"),
+        (r#"select (json_each('{"a":1}')).key"#, "key", "a"),
+        (r#"select json_object_keys('{"a":1}') || 'x'"#, "?column?", "ax"),
+        (
+            "select generate_series(1, 2), json_array_elements_text('[1,2,3]')",
+            "generate_series,json_array_elements_text",
+            "1|1;2|2;|3",
+        ),
+        (
+            r#"select * from (values ('{"a":1}'::json), ('{"b":2,"c":3}')) v(j), json_each(v.j)"#,
+            "j,key,value",
+            r#"{"a":1}|a|1;{"b":2,"c":3}|b|2;{"b":2,"c":3}|c|3"#,
+        ),
+        ("select * from json_each('[1]')", "22023 cannot deconstruct an array as an object", ""),
+        ("select * from json_each('1')", "22023 cannot deconstruct a scalar", ""),
+        (
+            r#"select * from json_array_elements('{"a":1}')"#,
+            "22023 cannot call json_array_elements on a non-array",
+            "",
+        ),
+        (
+            "select * from json_object_keys('[1]')",
+            "22023 cannot call json_object_keys on an array",
+            "",
+        ),
+        (
+            r#"select * from json_each('{"a":1}'::jsonb)"#,
+            "42883 function json_each(jsonb) does not exist",
+            "",
+        ),
+        ("select json_each(1)", "42883 function json_each(integer) does not exist", ""),
+        (
+            r#"select 1 where json_object_keys('{"a":1}') = 'a'"#,
+            "0A000 set-returning functions are not allowed in WHERE",
+            "",
+        ),
+        (
+            "select 1 where generate_series(1, 2) = 1",
+            "0A000 set-returning functions are not allowed in WHERE",
+            "",
+        ),
+        (
+            r#"select count(json_each('{"a":1}'))"#,
+            "0A000 aggregate function calls cannot contain set-returning function calls",
+            "",
+        ),
+        (
+            "select 1 limit json_array_length(json_array_elements('[1]'))",
+            "0A000 set-returning functions are not allowed in LIMIT",
+            "",
+        ),
+    ] {
+        assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();

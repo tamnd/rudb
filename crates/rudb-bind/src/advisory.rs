@@ -161,8 +161,8 @@ impl Binder<'_> {
     }
 }
 
-/// The error of PostgreSQL for a call of an advisory lock function that no form of it takes.
-fn no_such_function(name: &str, types: &[LogicalType], unknown: &[bool]) -> Error {
+/// The error of PostgreSQL for a call of a function that no form of it takes.
+pub(crate) fn no_such_function(name: &str, types: &[LogicalType], unknown: &[bool]) -> Error {
     let spelled = types
         .iter()
         .zip(unknown)
