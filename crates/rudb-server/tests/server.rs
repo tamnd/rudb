@@ -2270,6 +2270,116 @@ fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
 }
 
 #[test]
+fn a_column_carries_its_collation_as_an_implicit_one_as_postgres_does_it() {
+    let dirs = Dirs::new("pgimplicit");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives. A column of a subquery, a `WITH` query, a
+    // `VALUES` list or a set operation keeps the collation of the expression that makes it.
+    let cases: [(&str, &[&str]); 10] = [
+        ("select lower(t), upper(t) from (select 'ÀB' collate pg_c_utf8 as t) s;", &["àb|ÀB"]),
+        ("with w as (select 'ÀB' collate pg_c_utf8 as t) select lower(t) from w;", &["àb"]),
+        (
+            "with recursive r(t) as (select 'ÀB' collate pg_c_utf8 union all select t from r where false) select lower(t) from r;",
+            &["àb"],
+        ),
+        (
+            "select lower(x) from (values ('À' collate pg_c_utf8), ('É')) v(x) order by 1;",
+            &["à", "é"],
+        ),
+        (
+            "select lower(t) from (select t from (select 'ÀB' collate pg_c_utf8 as t) s0 group by t) s;",
+            &["àb"],
+        ),
+        // An explicit collation beats an implicit one.
+        (
+            "select lower(t) from (select 'ÀB' collate pg_c_utf8 as t) s where t = 'ÀB' collate \"C\";",
+            &["àb"],
+        ),
+        (
+            "select lower(x) from (select 'À' collate pg_c_utf8 union select 'É') s(x) order by 1;",
+            &["à", "é"],
+        ),
+        // The column of a set operation is implicit to the set operation that holds it.
+        (
+            "select x from (select 'a' collate \"C\" union select 'b' union select 'c' collate pg_c_utf8) s(x) order by 1;",
+            &["a", "b", "c"],
+        ),
+        (
+            "select a || b collate \"C\" from (select 'À' collate pg_c_utf8 as a, 'É' collate \"C\" as b) s order by 1;",
+            &["ÀÉ"],
+        ),
+        // A column that the set operation could not give a collation takes none, so the constant
+        // gives the default collation, which is `C` in rudb.
+        (
+            "select lower(x || 'a') from (select a from (select 'À' collate pg_c_utf8 as a) s1 union all select b from (select 'É' collate \"C\" as b) s2) s(x) order by 1;",
+            &["Àa", "Éa"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    let explicit = "collation mismatch between explicit collations \"pg_c_utf8\" and \"C\"";
+    let implicit = "collation mismatch between implicit collations \"pg_c_utf8\" and \"C\"";
+    let pair = "(select 'À' collate pg_c_utf8 as a, 'É' collate \"C\" as b) s";
+    let choose =
+        "You can choose the collation by applying the COLLATE clause to one or both expressions.";
+    let set = "Use the COLLATE clause to set the collation explicitly.";
+    let undetermined =
+        |what: &str| format!("could not determine which collation to use for {what}");
+    for (sql, state, message, hint, position) in [
+        (
+            "select lower(x) from (select 'À' collate pg_c_utf8 union all select 'É' collate \"C\") s(x);".to_owned(),
+            "42P21",
+            explicit.to_owned(),
+            None,
+            Some("73"),
+        ),
+        (
+            "select lower(x) from (select a from (select 'À' collate pg_c_utf8 as a) s1 union select b from (select 'É' collate \"C\" as b) s2) s(x);".to_owned(),
+            "42P21",
+            implicit.to_owned(),
+            Some(choose),
+            Some("89"),
+        ),
+        (format!("select a from {pair} order by a || b;"), "42P21", implicit.to_owned(), Some(choose), Some("89")),
+        (format!("select a || b from {pair} group by 1;"), "42P21", implicit.to_owned(), Some(choose), Some("13")),
+        (format!("select distinct a || b from {pair};"), "42P21", implicit.to_owned(), Some(choose), Some("22")),
+        (format!("select lower(a || b) from {pair};"), "42P22", undetermined("lower() function"), Some(set), None),
+        (format!("select a < b from {pair};"), "42P22", undetermined("string comparison"), Some(set), None),
+        (format!("select a || b like 'a' from {pair};"), "42P22", undetermined("LIKE"), Some(set), None),
+        (format!("select a || b ilike 'a' from {pair};"), "42P22", undetermined("ILIKE"), Some(set), None),
+        (format!("select a || b ~ 'a' from {pair};"), "42P22", undetermined("regular expression"), Some(set), None),
+        (
+            "select lower(x) from (select a from (select 'À' collate pg_c_utf8 as a) s1 union all select b from (select 'É' collate \"C\" as b) s2) s(x);".to_owned(),
+            "42P22",
+            undetermined("lower() function"),
+            Some(set),
+            None,
+        ),
+    ] {
+        let messages = client.query(&sql);
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message.as_str()), "{sql}");
+        assert_eq!(error.field(b'H').as_deref(), hint, "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_subscript_of_an_array_is_coerced_and_bounded_as_postgres_does_it() {
     let dirs = Dirs::new("pgsubscripts");
     let server = Server::start(dirs.config()).unwrap();
