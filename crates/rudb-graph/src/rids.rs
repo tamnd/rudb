@@ -12,9 +12,10 @@
 //! removed nothing has to cost nothing downstream, and without it that reduction costs a bitmap of
 //! all ones and a test per row to learn nothing.
 //!
-//! Sparse is a sorted list of row ids, used below one member in [`SPARSE_RATIO`] rows. A test is a
-//! binary search, which is fine because the consumer of a set that small walks it rather than
-//! testing into it.
+//! Sparse is a sorted list of row ids, used below one member in [`SPARSE_RATIO`] rows, which is
+//! where the list is the smaller of the two. A test is a binary search, which is fine because the
+//! consumer of a set that small walks it rather than testing into it, and the one walk here that
+//! tests every row of what it reaches lays a list out as a bitmap first.
 //!
 //! Dense is one bit per row. On TPC-H SF100 `lineitem` that is 75 MB and `orders` is 18.75 MB, which
 //! fits the last level cache of nothing, and the reason it is still the right form is that a scan
@@ -38,10 +39,23 @@ use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 
 /// Below one member in this many rows, a set is held as a sorted list rather than a bitmap.
 ///
-/// Section 4.3's number. At one in a thousand the list is eight bytes a member against a bitmap's
-/// thousand bits, so the list is about a sixteenth of the size, and it stays smaller until one in
-/// sixty four, so the threshold is on the side of the bitmap. That side is the one a scan wants.
-pub const SPARSE_RATIO: u64 = 1000;
+/// A list is eight bytes a member and a bitmap is a bit a row, so the list is the smaller one up to
+/// one member in sixty four rows. Section 4.3 put the line at one in a thousand, on the side of the
+/// bitmap because a scan tests it in row order. But the scan of a reduced part asks for the members
+/// in its range and not for a test a row, which a list answers with one search, and a bitmap
+/// between the two lines was a pass over every word of the table to write it, one to count it and
+/// one in each part to find its members. On TPC-H q02 the 747 parts a filter keeps have 2,988 rows
+/// of `partsupp` out of 800,000, one in 268, and the bitmap was 100 KB written, counted and walked
+/// for those 2,988 rows.
+pub const SPARSE_RATIO: u64 = 64;
+
+/// Parents apart past which a push finds the next held parent's run with a select rather than by
+/// reading on through the link, as [`crate::adjacency`] does for the same reason.
+///
+/// Reading on costs a word for every sixty four bits passed, which is a parent and its children,
+/// and a select is a few hundred instructions. A thousand parents of four children each is about
+/// eighty words.
+const FAR: u64 = 1024;
 
 /// A push that stops early decides at the first part past one in this many child rows.
 ///
@@ -407,15 +421,16 @@ impl Rids {
         if self.is_full() && link.linked() == children {
             return Ok(Pushed { rids: Self::full(children), parts, skipped: 0, stopped: false });
         }
-        if let (Body::Sparse(members), Some(_)) = (&self.body, link.runs()) {
-            return Self::push_members(members, link, children, parts);
-        }
         if let Some(runs) = link.runs() {
             return Ok(self.push_runs(runs, children, parts, stopping));
         }
         let mut words = vec![0_u64; index(children.div_ceil(64))];
         let mut parents = vec![NO_PARENT; PART_ROWS];
         let mut skipped = 0_u64;
+        // Every child of a part the walk reaches is tested, so a set held as a list is laid out as a
+        // bitmap of the parent first, a load a test rather than a search.
+        let laid = matches!(self.body, Body::Sparse(_)).then(|| self.words());
+        let held = |parent: Rid| laid.as_ref().map_or_else(|| self.contains(parent), |words| bit(words, parent));
         // Asked once, at the first part boundary past the mark, because a push that has removed a
         // row by then has shown the set is worth finishing and asking again later would only give up
         // work already paid for.
@@ -446,7 +461,7 @@ impl Rids {
             let run = index((children - first).min(count(PART_ROWS)));
             link.forward_run(first, &mut parents[..run])?;
             for (at, &parent) in parents[..run].iter().enumerate() {
-                if parent != NO_PARENT && self.contains(parent) {
+                if parent != NO_PARENT && held(parent) {
                     let child = first + count(at);
                     words[index(child / 64)] |= 1 << (child % 64);
                     kept += 1;
@@ -464,14 +479,30 @@ impl Rids {
     /// each run it lands on, so a parent the set does not hold costs its share of a word and not a
     /// step of its own. Stepping every parent and testing the set for each cost about fifty seven
     /// instructions a parent, which on TPC-H q21 was 85 million a push to keep a tenth of `orders`,
-    /// see spec/perf/52-a-push-a-parent-at-a-time.md for where the step a parent came from.
+    /// see spec/perf/52-a-push-a-parent-at-a-time.md for where the step a parent came from. A held
+    /// parent more than [`FAR`] parents on is found with a select instead, which is what a set of
+    /// few parents wants: on q18 the set is the 57 orders over 300 in quantity, and reading on
+    /// stepped over all 1.5 million orders to find their 399 lines.
+    ///
+    /// The children kept are written as a list when the set's share of the parent, spread over the
+    /// children, would be a list, and as a bitmap otherwise, so a push that keeps few children
+    /// never writes a bit for each of them. The form is settled from the count at the end either
+    /// way, so a guess that was wrong costs a conversion and not a different answer.
     ///
     /// A part is counted as skipped when none of its rows is kept, which for a link in parent order
     /// is the part the zone map would have ruled out. The early stop is asked at the first run
     /// that starts past the mark rather than at a part boundary, which is the same question asked a
     /// few rows later at most.
     fn push_runs(&self, runs: &BitVector, children: u64, parts: u64, stopping: bool) -> Pushed {
-        let mut words = vec![0_u64; index(children.div_ceil(64))];
+        let expected = u128::from(self.len()) * u128::from(children) / u128::from(self.rows.max(1));
+        let listed = expected * u128::from(SPARSE_RATIO) < u128::from(children);
+        let mut list: Vec<Rid> = Vec::new();
+        let mut words = Vec::new();
+        if listed {
+            list.reserve(index(u64::try_from(expected).unwrap_or(0)));
+        } else {
+            words = vec![0_u64; index(children.div_ceil(64))];
+        }
         let bits = runs.words();
         let len = runs.len();
         let mark = children.div_ceil(STOP_AFTER);
@@ -481,7 +512,13 @@ impl Rids {
         let (mut parent, mut at, mut kept) = (0_u64, 0_usize, 0_u64);
         for held in self.iter() {
             if held > parent {
-                let Some(next) = past_zeros(bits, at, held - parent) else { break };
+                // The run of `held` starts just past the zero that ends the run before it.
+                let next = if held - parent > FAR {
+                    runs.select0(held - 1).map(|zero| zero + 1)
+                } else {
+                    past_zeros(bits, at, held - parent)
+                };
+                let Some(next) = next else { break };
                 at = next;
                 parent = held;
             }
@@ -502,42 +539,31 @@ impl Rids {
                         };
                     }
                 }
-                set_range(&mut words, child, child + run);
+                if listed {
+                    list.extend(child..child + run);
+                } else {
+                    set_range(&mut words, child, child + run);
+                }
                 kept += run;
             }
             // The zero after the run, which moves on to the next parent.
             at += index(run) + 1;
             parent += 1;
         }
+        if listed {
+            let part = count(PART_ROWS);
+            let reached = count(list.chunk_by(|a, b| a / part == b / part).count());
+            return Pushed {
+                rids: Self::settle_sparse(children, list),
+                parts,
+                skipped: parts.saturating_sub(reached),
+                stopped: false,
+            };
+        }
         let per_part = PART_ROWS / 64;
         let skipped =
             count(words.chunks(per_part).filter(|part| part.iter().all(|&word| word == 0)).count());
         Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
-    }
-
-    /// The push of a sparse set over a monotone link, a member at a time.
-    ///
-    /// A member's children are one run that [`Link::backward`] finds with two selects, so this costs
-    /// what the set holds and not what the parent holds. On TPC-H q18 the set is the 57 orders over
-    /// 300 in quantity, and [`Self::push_runs`] stepped over all 1.5 million orders to find their
-    /// 399 lines. The early stop is not asked, since a sparse set holds at most one parent in
-    /// [`SPARSE_RATIO`] and the answer is exact either way.
-    fn push_members(members: &[Rid], link: &Link, children: u64, parts: u64) -> Result<Pushed> {
-        let mut kept = Vec::new();
-        for &member in members {
-            let children = link.backward(member).ok_or_else(|| {
-                Error::internal(format!("parent {member} has no run in a monotone link"))
-            })?;
-            kept.extend(children);
-        }
-        let part = count(PART_ROWS);
-        let reached = count(kept.chunk_by(|a, b| a / part == b / part).count());
-        Ok(Pushed {
-            rids: Self::settle_sparse(children, kept),
-            parts,
-            skipped: parts.saturating_sub(reached),
-            stopped: false,
-        })
     }
 
     /// The members from `first` for `len` rows, as offsets from `first`, in order.
@@ -658,6 +684,16 @@ impl Rids {
             )));
         }
         let mut words = vec![0_u64; index(link.parents().div_ceil(64))];
+        // A list is pushed back a member at a time, since testing every child of each part a
+        // member is in is a search a child.
+        if let Body::Sparse(members) = &self.body {
+            let mut parents = Vec::with_capacity(members.len());
+            link.forward_each(members, &mut parents);
+            for parent in parents.into_iter().filter(|&parent| parent != NO_PARENT) {
+                words[index(parent / 64)] |= 1 << (parent % 64);
+            }
+            return Ok(Self::settle_dense(link.parents(), words));
+        }
         let mut parents = vec![NO_PARENT; PART_ROWS];
         let children = link.children();
         for part in 0..children.div_ceil(count(PART_ROWS)) {
