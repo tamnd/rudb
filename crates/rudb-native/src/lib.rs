@@ -5464,6 +5464,20 @@ struct HeldPage {
     left: AtomicUsize,
 }
 
+/// A range of the mapped file that bytes are read out of in place. See [`Reader::held_payload`].
+struct MappedRange {
+    map: Arc<Mapped>,
+    offset: u64,
+    len: usize,
+}
+
+impl AsRef<[u8]> for MappedRange {
+    fn as_ref(&self) -> &[u8] {
+        // The range was inside the mapping when it was made, and a mapping never shrinks.
+        self.map.get(self.offset, self.len).unwrap_or_default()
+    }
+}
+
 /// Where a held page's bytes are: read into memory of its own, or a range of the mapped file.
 #[derive(Debug)]
 enum PageBytes {
@@ -9477,6 +9491,59 @@ impl Reader {
             return Err(invalid("a section's header is longer than its payload"));
         }
         Ok(bytes)
+    }
+
+    /// A whole section's payload, as [`Self::payload`] reads it, left where the mapped file holds
+    /// it when it can be.
+    ///
+    /// A graph section is read whole and kept for as long as the reader is, and reading it into a
+    /// buffer of its own is a fresh page zeroed and filled for every four kilobytes of it. On the
+    /// first run of JOB 20c the `cast_info` adjacency was 117 MB of that, about a quarter of the
+    /// query's time, every one of it in the kernel. A section whose extents lie one after another
+    /// in the file is checked where the mapping has it and handed out as that range, so its pages
+    /// are the page cache's own and a fault maps sixteen of them at once. Anything else is read the
+    /// way [`Self::payload`] reads it.
+    ///
+    /// The pages stay mapped for as long as the bytes are held, which is what a buffer of their own
+    /// did too. A release of a neighbouring range can let some of them go, and the next read of
+    /// them faults them back in from the page cache, the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// If the extent table or any extent fails its check.
+    pub fn held_payload(&self, of: &Section) -> Result<rudb_graph::Held> {
+        let read = || -> Result<rudb_graph::Held> { Ok(Arc::new(self.payload(of)?)) };
+        let Some(map) = self.map.as_ref() else { return read() };
+        let extents = self.extents(of)?;
+        let Some(start) = extents.first().map(|first| first.offset) else { return read() };
+        let mut end = start;
+        for one in &extents {
+            if one.offset != end || one.first != end - start {
+                return read();
+            }
+            end = end
+                .checked_add(u64::from(one.length))
+                .ok_or_else(|| invalid("an extent overflows the file"))?;
+        }
+        if start < HEADER || end > self.size {
+            return Err(invalid("an extent is outside the file"));
+        }
+        let Ok(len) = usize::try_from(end - start) else { return read() };
+        let Some(bytes) = map.get(start, len) else { return read() };
+        map.will_need(start, len);
+        for one in &extents {
+            let at = usize::try_from(one.offset - start)
+                .map_err(|_| invalid("an extent overflows the file"))?;
+            let extent = &bytes[at..at + one.length as usize];
+            let sum = if one.wide { part_checksum(extent) } else { checksum(extent) };
+            if sum != one.hash {
+                return Err(invalid("an extent does not checksum"));
+            }
+        }
+        if len > 0 && of.header_bytes as usize > len {
+            return Err(invalid("a section's header is longer than its payload"));
+        }
+        Ok(Arc::new(MappedRange { map: Arc::clone(map), offset: start, len }))
     }
 
     /// Reads only the named columns from one part.

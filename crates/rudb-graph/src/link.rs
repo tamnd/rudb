@@ -47,12 +47,14 @@
 //! minimum and maximum over a range are its two ends and two selects are cheaper than nine
 //! megabytes.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Result};
 use rudb_encoding::bitpack;
 
 use crate::bits::BitVector;
 use crate::rid::{NO_PARENT, PART_ROWS, Rid};
-use crate::tail::Tail;
+use crate::tail::{Held, Tail};
 
 /// The payload layout version. See the same constant in `wire.rs` for why it is belt and braces.
 const LAYOUT: u8 = 1;
@@ -343,6 +345,7 @@ impl Link {
         }
         match &self.body {
             Body::Packed { bytes, width, .. } => {
+                let bytes: &[u8] = bytes;
                 let absent = reserved(*width);
                 let start = usize::try_from(first)
                     .map_err(|_| malformed("a child past what fits in memory"))?;
@@ -412,6 +415,7 @@ impl Link {
             // The body matched once for the chunk rather than once a child, with the same answers
             // as `forward`.
             Body::Packed { bytes, width, .. } => {
+                let bytes: &[u8] = bytes;
                 let absent = reserved(*width);
                 out.extend(children.iter().map(|&child| {
                     if child >= self.children {
@@ -648,7 +652,20 @@ impl Link {
     ///
     /// As [`Link::read`], or if `at` is past the end of `payload`.
     pub fn read_from(payload: Vec<u8>, at: usize) -> Result<Self> {
-        let bytes = payload.get(at..).ok_or_else(|| malformed("a forward link header is torn"))?;
+        Self::read_held(Arc::new(payload), at)
+    }
+
+    /// [`Link::read_from`] of bytes that may not be a buffer of their own, such as a section of a
+    /// mapped file, which the packed parents are then read out of where they are.
+    ///
+    /// # Errors
+    ///
+    /// As [`Link::read_from`].
+    pub fn read_held(payload: Held, at: usize) -> Result<Self> {
+        let bytes = (*payload)
+            .as_ref()
+            .get(at..)
+            .ok_or_else(|| malformed("a forward link header is torn"))?;
         let Counts { children, parents, linked, form } = Self::counts(bytes)?;
         let width = bytes[25] as usize;
         let rest = &bytes[HEADER_BYTES..];

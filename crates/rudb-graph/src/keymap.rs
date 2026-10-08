@@ -30,11 +30,14 @@
 //! because the form is a tag in a header that a reader is already required to be able to not
 //! recognize.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Result};
 use rudb_encoding::bitpack;
 
 use crate::bits::{Rank, nth_set};
 use crate::rid::{NO_PARENT, Rid};
+use crate::tail::{Held, Tail};
 
 /// How dense a range has to be before the bitmap form beats the sorted form.
 ///
@@ -154,11 +157,11 @@ enum Body {
         /// Bits one stored key offset takes.
         key_width: usize,
         /// The key offsets in ascending order, bit packed.
-        keys: Vec<u8>,
+        keys: Tail,
         /// Bits one permutation entry takes, which is `ceil(log2(rows))`.
         rid_width: usize,
         /// Sorted position to `rid`, bit packed.
-        perm: Vec<u8>,
+        perm: Tail,
         count: u64,
     },
     Permuted {
@@ -169,7 +172,7 @@ enum Body {
         /// Bits one permutation entry takes, which is `ceil(log2(rows))`.
         rid_width: usize,
         /// Rank to `rid`, bit packed, one entry per key.
-        perm: Vec<u8>,
+        perm: Tail,
     },
 }
 
@@ -444,8 +447,13 @@ impl KeyMap {
         form: Form,
         base: i128,
         mut observed: Observed,
-        body: &[u8],
+        held: &Held,
+        at: usize,
     ) -> Result<Self> {
+        let body = (**held)
+            .as_ref()
+            .get(at..)
+            .ok_or_else(|| malformed("a key map payload is shorter than its header"))?;
         match form {
             Form::Identity => {
                 if !body.is_empty() {
@@ -507,8 +515,13 @@ impl KeyMap {
                         "a sorted key map's arrays are not the size its widths and count imply",
                     ));
                 }
-                let keys = rest[..key_bytes].to_vec();
-                let perm = rest[key_bytes..].to_vec();
+                // The arrays stay where the payload holds them. `rest` starts two bytes into the
+                // body, past the widths.
+                let from = at + 2;
+                let keys = Tail::within(Arc::clone(held), from, from + key_bytes)
+                    .ok_or_else(|| malformed("a sorted key map's keys are outside its payload"))?;
+                let perm = Tail::within(Arc::clone(held), from + key_bytes, from + rest.len())
+                    .ok_or_else(|| malformed("a sorted key map's rows are outside its payload"))?;
                 if count > 0 {
                     let largest = bitpack::tail_at(&keys, key_width, count_usize - 1)?;
                     observed.max =
@@ -551,7 +564,11 @@ impl KeyMap {
                         "a permuted key map holds more keys than this machine can",
                     ));
                 };
-                let perm = rest[bitmap + ranks + 1..].to_vec();
+                // Past the range, the bitmap, the rank index and the width byte.
+                let from = at + size_of::<u64>() + bitmap + ranks + 1;
+                let perm = Tail::of(Arc::clone(held), from).ok_or_else(|| {
+                    malformed("a permuted key map's rows are outside its payload")
+                })?;
                 if perm.len() != (count * rid_width).div_ceil(8) {
                     return Err(malformed(
                         "a permuted key map's permutation is not the size its width and count imply",
@@ -663,6 +680,7 @@ impl KeyMap {
                 if bits.len() < held.len() {
                     return Ok(None);
                 }
+                let perm: &[u8] = perm;
                 let mut before = 0_u64;
                 for (&keys, &present) in held.iter().zip(bits) {
                     if keys & !present != 0 {
@@ -773,6 +791,7 @@ impl KeyMap {
         // rank. The IMDb files list their rows in no order of their keys, so every key map of the
         // JOB load is this form, and a key at a time through `lookup` was a tenth of the links.
         if let Body::Permuted { base, range, bits, rank, rid_width, perm } = &self.body {
+            let perm: &[u8] = perm;
             for (key, out) in keys.iter().zip(out) {
                 let offset = u64::try_from(i128::from(*key) - base).ok();
                 *out = match offset.filter(|offset| offset < range) {
@@ -876,6 +895,7 @@ impl KeyMap {
                 // here, which is that the comparison drives an index rather than a branch to a
                 // different loop, and every probe is one `tail_at` rather than a decode of the
                 // block around it.
+                let keys: &[u8] = keys;
                 let mut low = 0_usize;
                 let mut high = len;
                 while low < high {
@@ -1196,7 +1216,7 @@ impl Permutation {
             bits: self.bits,
             rank: self.rank,
             rid_width: self.rid_width,
-            perm,
+            perm: perm.into(),
         })
     }
 }
@@ -1246,7 +1266,14 @@ fn sorted(keys: &[Option<i128>], base: i128, rows: u64) -> Result<(Body, bool)> 
     bitpack::pack_linear(&key_values, key_width, &mut key_bytes)?;
     bitpack::pack_linear(&rid_values, rid_width, &mut rid_bytes)?;
     Ok((
-        Body::Sorted { base, key_width, keys: key_bytes, rid_width, perm: rid_bytes, count: rows },
+        Body::Sorted {
+            base,
+            key_width,
+            keys: key_bytes.into(),
+            rid_width,
+            perm: rid_bytes.into(),
+            count: rows,
+        },
         distinct,
     ))
 }

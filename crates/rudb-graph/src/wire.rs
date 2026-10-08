@@ -19,9 +19,12 @@
 //! the count, dense from the range, sorted from its last stored key. A number stored twice is a
 //! number that can disagree with itself.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Result};
 
 use crate::keymap::{Form, KeyMap, Observed};
+use crate::tail::Held;
 
 /// Bytes of fixed header at the front of a key map payload.
 ///
@@ -92,6 +95,18 @@ pub fn encode(map: &KeyMap, type_tag: u8) -> Result<Payload> {
 /// section to drop rather than a query to fail: section 3.1 says a table with no sections answers
 /// the same, so a caller's response to an error here is to ignore this key map.
 pub fn decode(bytes: &[u8]) -> Result<(KeyMap, u8)> {
+    decode_held(Arc::new(bytes.to_vec()))
+}
+
+/// [`decode`] of bytes the map keeps rather than copies, such as a section of a mapped file. The
+/// packed rows of a sorted or permuted map are most of its payload, and they are read where `held`
+/// has them.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn decode_held(held: Held) -> Result<(KeyMap, u8)> {
+    let bytes = (*held).as_ref();
     if bytes.len() < HEADER_BYTES {
         return Err(malformed("a key map payload is shorter than its header"));
     }
@@ -115,7 +130,7 @@ pub fn decode(bytes: &[u8]) -> Result<(KeyMap, u8)> {
         // none of them stores it. `read_body` fills it in.
         max: None,
     };
-    let map = KeyMap::read_body(form, base, observed, &bytes[HEADER_BYTES..])?;
+    let map = KeyMap::read_body(form, base, observed, &held, HEADER_BYTES)?;
     Ok((map, type_tag))
 }
 

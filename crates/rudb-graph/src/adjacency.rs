@@ -20,13 +20,15 @@
 //! is not here yet: the flat form is what the budget is measured against first, and the delta form
 //! arrives when a measurement says the bytes matter more than the simplicity.
 
+use std::sync::Arc;
+
 use rudb_common::{Error, Result};
 use rudb_encoding::bitpack;
 
 use crate::bits::BitVector;
 use crate::rid::{NO_PARENT, Rid};
 use crate::rids::{Rids, ones_from, past_zeros};
-use crate::tail::Tail;
+use crate::tail::{Held, Tail};
 
 /// The payload layout version.
 const LAYOUT: u8 = 1;
@@ -301,8 +303,9 @@ impl Adjacency {
         let list = self.list(parent).ok_or_else(|| {
             malformed(format!("parent {parent} of {} is past the end", self.parents))
         })?;
+        let rows: &[u8] = &self.rows;
         for at in list {
-            out.push(bitpack::tail_at(&self.rows, self.width, at)?);
+            out.push(bitpack::tail_at(rows, self.width, at)?);
         }
         Ok(())
     }
@@ -554,9 +557,10 @@ impl Adjacency {
         let share = usize::try_from(rows / count(many.max(1))).unwrap_or(0);
         let room = if share >= ROOMY { share + share / 4 } else { 0 };
         let mut buckets: Vec<Vec<u16>> = (0..many).map(|_| Vec::with_capacity(room)).collect();
+        let rows: &[u8] = &self.rows;
         let mut deal = |list: std::ops::Range<usize>| -> Result<()> {
             for at in list {
-                let child = bitpack::tail_at(&self.rows, self.width, at)?;
+                let child = bitpack::tail_at(rows, self.width, at)?;
                 let bucket = buckets
                     .get_mut(usize::try_from(child).unwrap_or(usize::MAX) / BUCKET_ROWS)
                     .ok_or_else(|| malformed(format!("child {child} past the end")))?;
@@ -670,8 +674,20 @@ impl Adjacency {
     ///
     /// As [`Adjacency::read`], or if `at` is past the end of `payload`.
     pub fn read_from(payload: Vec<u8>, at: usize) -> Result<Self> {
-        let bytes =
-            payload.get(at..).ok_or_else(|| malformed("a payload shorter than its header"))?;
+        Self::read_held(Arc::new(payload), at)
+    }
+
+    /// [`Adjacency::read_from`] of bytes that may not be a buffer of their own, such as a section
+    /// of a mapped file, which the child rows are then read out of where they are.
+    ///
+    /// # Errors
+    ///
+    /// As [`Adjacency::read_from`].
+    pub fn read_held(payload: Held, at: usize) -> Result<Self> {
+        let bytes = (*payload)
+            .as_ref()
+            .get(at..)
+            .ok_or_else(|| malformed("a payload shorter than its header"))?;
         if bytes.len() < HEADER_BYTES {
             return Err(malformed("a payload shorter than its header"));
         }

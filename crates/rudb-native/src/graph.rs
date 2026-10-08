@@ -589,7 +589,7 @@ pub fn key_map(reader: &Reader, column: usize) -> Option<KeyMap> {
     if !held.usable(table.generation()) {
         return None;
     }
-    let (map, tag) = wire::decode(&reader.payload(held).ok()?).ok()?;
+    let (map, tag) = wire::decode_held(reader.held_payload(held).ok()?).ok()?;
     // A map built against a different type than the column now has is a map built for a table that
     // is no longer this one. It should be unreachable, since changing a column's type rewrites the
     // table and moves its generation, and it is checked rather than assumed because the cost of
@@ -1305,9 +1305,9 @@ pub fn stored_adjacency(child: &Reader, parent: &Reader, edge: &Edge) -> Option<
     if !held.usable(table.generation()) || held.refused().is_some() {
         return None;
     }
-    let bytes = child.payload(held).ok()?;
-    let binding = bound(&bytes, parent, edge)?;
-    Adjacency::read_from(bytes, binding).ok()
+    let bytes = child.held_payload(held).ok()?;
+    let binding = bound((*bytes).as_ref(), parent, edge)?;
+    Adjacency::read_held(bytes, binding).ok()
 }
 
 /// The parent table and column the backward adjacency of a child column was built against, read off
@@ -1444,9 +1444,9 @@ fn linked_parent(child: &Reader, child_column: usize, missed: u64) -> Option<(St
 #[must_use]
 pub fn stored_link(child: &Reader, parent: &Reader, edge: &Edge) -> Option<link::Link> {
     let held = link_section(child, edge)?;
-    let bytes = child.payload(held).ok()?;
-    let binding = bound(&bytes, parent, edge)?;
-    link::Link::read_from(bytes, binding).ok()
+    let bytes = child.held_payload(held).ok()?;
+    let binding = bound((*bytes).as_ref(), parent, edge)?;
+    link::Link::read_held(bytes, binding).ok()
 }
 
 /// The counts at the front of the stored link [`stored_link`] would return, read without the link.
