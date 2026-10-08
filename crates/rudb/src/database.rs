@@ -5728,7 +5728,7 @@ impl Shared {
                 let result = self.answer(sql, &plan, &catalog, cancel, under)?;
                 Ok(result.with_origins(plan.origins()))
             }
-            Bound::Explain { mut plan, analyze, statistics, codegen } => {
+            Bound::Explain { mut plan, analyze, statistics, codegen, postgres } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
                     return explained_codegen(&plan, &catalog, cancel, self.qc_options());
@@ -5742,7 +5742,7 @@ impl Shared {
                     &context,
                     seams,
                     &session,
-                    Asked { analyze, statistics },
+                    Asked { analyze, statistics, postgres },
                     sql,
                     Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
@@ -6897,7 +6897,7 @@ impl Shared {
                 };
                 Ok(result.with_origins(plan.origins()))
             }
-            Bound::Explain { mut plan, analyze, statistics, codegen } => {
+            Bound::Explain { mut plan, analyze, statistics, codegen, postgres } => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
                     return explained_codegen(&plan, &catalog, cancel, self.qc_options());
@@ -6911,7 +6911,7 @@ impl Shared {
                     &context,
                     seams,
                     &session,
-                    Asked { analyze, statistics },
+                    Asked { analyze, statistics, postgres },
                     sql,
                     Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
@@ -9323,6 +9323,10 @@ fn explaining(
     sql: &str,
     planning: Planning,
 ) -> Result<QueryResult> {
+    if let Some(options) = asked.postgres {
+        let run = Run { catalog, cancel, budget, seams: seams.settings(), session, sql };
+        return explained_postgres(plan, context, &options, run, planning);
+    }
     let facts = context.facts();
     let statistics = asked.statistics();
     if !asked.analyze {
@@ -9346,6 +9350,113 @@ fn explaining(
     let measured = result.metrics().expect("a query that ran reports what it did");
     let text = rudb_opt::explain::analyzed(plan, context, seams, measured, statistics);
     explained("analyzed_plan", &text)
+}
+
+/// What running the query of an `EXPLAIN ANALYZE` needs.
+struct Run<'a> {
+    catalog: &'a Catalog,
+    cancel: &'a Cancel,
+    budget: Budget<'a>,
+    seams: &'a rudb_seam::Settings,
+    session: &'a Session,
+    sql: &'a str,
+}
+
+/// A PostgreSQL `EXPLAIN`, in the format its options ask for (document 08 section 8.13).
+///
+/// The result is the one column `QUERY PLAN`. The text and YAML formats are one row a line, which
+/// is what `ExplainQuery` sends, and JSON and XML are one row of the type `json` or `xml`.
+fn explained_postgres(
+    plan: &Plan,
+    context: &rudb_opt::pass::Context,
+    options: &rudb_plan::explain::Options,
+    run: Run<'_>,
+    planning: Planning,
+) -> Result<QueryResult> {
+    use rudb_plan::explain::Format;
+    let measured = if options.analyze {
+        let mut profiled = run.session.clone();
+        profiled.set("enable_profiling", "query_tree");
+        let under = Under::new(run.budget, context.facts(), run.seams, &profiled, Rows::ForACaller)
+            .after(planning);
+        let started = Instant::now();
+        let result = self::run(run.sql, plan, run.catalog, run.cancel, under)?;
+        Some((result, nanos(started.elapsed())))
+    } else {
+        None
+    };
+    let columns = |catalog: &str, schema: &str, table: &str| {
+        let name = QualifiedName::new(catalog, schema, table);
+        let table = run.catalog.table(&name).ok()?;
+        Some(table.columns().iter().map(|field| field.ty.clone()).collect())
+    };
+    let zone = rudb_pgtypes::FixedZone::utc();
+    let settings = rudb_pgtypes::OutputSettings {
+        date_format: rudb_pgtypes::DateFormat::ISO_MDY,
+        interval_style: rudb_pgtypes::IntervalStyle::Postgres,
+        extra_float_digits: 1,
+        bytea_output: rudb_pgtypes::ByteaOutput::Hex,
+        time_zone: &zone,
+    };
+    let analyzed = measured.as_ref().map(|(result, execution_ns)| rudb_opt::pgexplain::Run {
+        document: result.metrics().expect("a query that ran reports what it did"),
+        execution_ns: *execution_ns,
+        output_bytes: sent_bytes(result),
+    });
+    let text = rudb_opt::pgexplain::Explain {
+        plan,
+        facts: context.facts(),
+        options,
+        settings: &settings,
+        table: &columns,
+        planning_ns: planning.parse_ns
+            + planning.bind_ns
+            + planning.rewrite_ns
+            + planning.optimize_ns,
+        run: analyzed,
+    }
+    .render();
+    let (ty, declared, values) = match options.format {
+        Format::Json => (LogicalType::Json, None, vec![Value::Varchar(text)]),
+        Format::Xml => (
+            LogicalType::Varchar,
+            Some(DeclaredType { oid: rudb_pgtypes::oid::XML, typmod: -1 }),
+            vec![Value::Varchar(text)],
+        ),
+        Format::Text | Format::Yaml => (
+            LogicalType::Varchar,
+            None,
+            text.lines().map(|line| Value::Varchar(line.to_owned())).collect(),
+        ),
+    };
+    let vector = Vector::from_values(ty.clone(), &values)?;
+    let result = QueryResult::new(
+        vec!["QUERY PLAN".to_owned()],
+        vec![ty],
+        vec![Chunk::new(vec![vector])?],
+        Memory::unlimited().reservation(),
+    );
+    Ok(match declared {
+        Some(declared) => result.with_origins(&[Some(Origin::column(0, 0, Some(declared)))]),
+        None => result,
+    })
+}
+
+/// The bytes of the data rows of a result as the wire protocol sends them in text, which is what
+/// `SERIALIZE` counts: two bytes for the count of columns, and four for the length of each value
+/// and the text of it.
+fn sent_bytes(result: &QueryResult) -> u64 {
+    let mut bytes = 0;
+    for row in 0..result.len() {
+        bytes += 2;
+        for column in 0..result.width() {
+            bytes += 4;
+            if !result.value_at(row, column).is_null() {
+                bytes += count(result.text_at(row, column).len());
+            }
+        }
+    }
+    bytes
 }
 
 /// A duration in the nanoseconds the metrics count.
@@ -9398,6 +9509,8 @@ struct Asked {
     analyze: bool,
     /// Print what the planner knew: the use and the class behind every number in the plan.
     statistics: bool,
+    /// The options of a PostgreSQL `EXPLAIN`, which prints the plan in PostgreSQL's format.
+    postgres: Option<rudb_plan::explain::Options>,
 }
 
 impl Asked {

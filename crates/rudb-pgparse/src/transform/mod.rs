@@ -25,10 +25,13 @@ use rudb_common::notice::{Level, Notice};
 use rudb_common::session::IdentifierCase;
 use rudb_common::{Error, Span};
 use rudb_parse::Ast;
-use rudb_parse::ast::{Expr, ExprRef, QueryRef, Slice, SourceRef, Statement, StrRef, WindowRef};
+use rudb_parse::ast::{
+    Expr, ExprRef, OptionArg, QueryRef, Slice, SourceRef, Statement, StrRef, UtilityOption,
+    WindowRef,
+};
 use rudb_parse::build::Interner;
 
-use crate::nodes::{CTEMaterialize, List, Node, RawStmt};
+use crate::nodes::{CTEMaterialize, ExplainStmt, List, Node, RawStmt};
 
 /// Why [`transform`] did not give a tree.
 #[derive(Debug)]
@@ -225,6 +228,7 @@ impl<'a> Transform<'a> {
             Some(Node::UpdateStmt(update)) => self.update(update)?,
             Some(Node::DeleteStmt(delete)) => self.delete(delete)?,
             Some(Node::IndexStmt(index)) => self.create_index(index)?,
+            Some(Node::ExplainStmt(explain)) => self.explain(explain)?,
             Some(Node::TruncateStmt(truncate)) => {
                 let statements = self.truncate(truncate)?;
                 self.ast.statements.extend(statements);
@@ -235,6 +239,42 @@ impl<'a> Transform<'a> {
         };
         self.ast.statements.push(statement);
         Ok(())
+    }
+
+    /// `EXPLAIN` of a query, with its option list as it was written.
+    ///
+    /// The older spellings `EXPLAIN ANALYZE VERBOSE` and `EXPLAIN VERBOSE` come from the grammar as
+    /// the options `analyze` and `verbose`, so every spelling arrives as one list. PostgreSQL reads
+    /// the options after it binds the query, in `ExplainQuery`, so they are only kept here. Only a
+    /// query is explained so far, and the other statements stay with the DuckDB transform.
+    fn explain(&mut self, explain: &ExplainStmt) -> Made<Statement> {
+        let query = match &explain.query {
+            Some(Node::SelectStmt(select)) => self.query(select)?,
+            Some(node) => return Err(not_yet(node)),
+            None => return clause("ExplainStmt"),
+        };
+        let mut options = Vec::with_capacity(explain.options.len());
+        for node in explain.options.iter().flatten() {
+            let Node::DefElem(option) = node else {
+                return Err(not_yet(node));
+            };
+            let arg = match &option.arg {
+                None => OptionArg::None,
+                Some(Node::String(text)) => OptionArg::Word(self.intern(text)),
+                Some(Node::Boolean(value)) => {
+                    OptionArg::Word(self.intern(if *value { "true" } else { "false" }))
+                }
+                Some(Node::Integer(value)) => OptionArg::Integer(i64::from(*value)),
+                Some(Node::Float(text)) => OptionArg::Number(self.intern(text)),
+                Some(node) => return Err(not_yet(node)),
+            };
+            let name = self.intern(option.defname.as_deref().unwrap_or_default());
+            options.push(UtilityOption { name, arg, span: self.at(option.location) });
+        }
+        let start = self.ast.utility_options.len() as u32;
+        self.ast.utility_options.extend(options);
+        let options = Slice { start, len: self.ast.utility_options.len() as u32 - start };
+        Ok(Statement::Explain { query, analyze: false, statistics: false, codegen: false, options })
     }
 
     /// The span of the token at a location, or the span of the statement when the location is not

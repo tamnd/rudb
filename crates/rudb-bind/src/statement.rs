@@ -17,7 +17,7 @@
 use rudb_catalog::{Catalog, Entry, QualifiedName, duplicate_check, same_name};
 use rudb_common::bounds::End;
 use rudb_common::{
-    Bound as ColumnBound, Clustering, ConflictArbiter, DeclaredType, Error, Field,
+    Bound as ColumnBound, Clustering, ConflictArbiter, DeclaredType, Error, ExplainOutput, Field,
     IdentifierCompare, InsertColumns, LogicalType, PlanErrors, QueryColumns, Result,
     SequenceOwners, Session, Span, SqlState, Stat, TypeNames, UnknownTypes, Value, Width,
 };
@@ -26,7 +26,7 @@ use rudb_parse::{NONE, deparse, parse_ast};
 use rudb_plan::{Arm, Expr, ExprRef, Node, Plan, SortKey};
 
 use crate::binder::Binder;
-use crate::parameters::Parameters;
+use crate::parameters::{Parameters, Placeholders};
 
 /// One statement, bound.
 ///
@@ -90,7 +90,17 @@ pub enum Bound {
     ///
     /// With `codegen` set the layer above hands the plan to the compiled engine and prints what it
     /// generated instead.
-    Explain { plan: Plan, analyze: bool, statistics: bool, codegen: bool },
+    ///
+    /// `postgres` is the options of a PostgreSQL `EXPLAIN`, which is set when the session reads
+    /// `EXPLAIN` as PostgreSQL does. The layer above then prints the plan in the format and with the
+    /// node names of PostgreSQL, and the three flags are not read.
+    Explain {
+        plan: Plan,
+        analyze: bool,
+        statistics: bool,
+        codegen: bool,
+        postgres: Option<rudb_plan::explain::Options>,
+    },
     /// `COPY ... TO`, a query and how to write what it answers.
     CopyTo(CopyTo),
     /// A table function called for what it does rather than for rows, which is `enable_logging`
@@ -737,10 +747,30 @@ pub(crate) fn bind_one(
             Ok(Bound::Detach { name: ast.string(name).to_string(), if_exists })
         }
         ast::Statement::Transaction(kind) => Ok(Bound::Transaction(kind)),
-        ast::Statement::Explain { query, analyze, statistics, codegen } => {
+        ast::Statement::Explain { query, analyze, statistics, codegen, options } => {
+            let postgres = session.semantics().explain_output() == ExplainOutput::Postgres;
+            let described;
+            let parameters = if postgres
+                && parameters.placeholders().is_none()
+                && crate::explain::generic(ast, options)
+            {
+                let names = ast.parameters().into_iter().map(|name| (name.to_owned(), None));
+                described = Parameters::describing(Placeholders::new(names.collect()));
+                &described
+            } else {
+                parameters
+            };
             let mut binder = Binder::with(catalog, parameters, session);
             let (root, _) = binder.bind_query(ast, query)?;
-            Ok(Bound::Explain { plan: finish(binder, root)?, analyze, statistics, codegen })
+            let plan = finish(binder, root)?;
+            // PostgreSQL reads the options after the query is bound, so a wrong column is reported
+            // before a wrong option.
+            let postgres = match session.semantics().explain_output() {
+                ExplainOutput::Pin => None,
+                ExplainOutput::Postgres => Some(crate::explain::options(ast, options, analyze)?),
+            };
+            let analyze = postgres.map_or(analyze, |options| options.analyze);
+            Ok(Bound::Explain { plan, analyze, statistics, codegen, postgres })
         }
         ast::Statement::CopyTo(index) => {
             let copy = &ast.copies[index as usize];

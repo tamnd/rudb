@@ -14848,3 +14848,140 @@ fn every_arm_of_a_case_in_a_lambda_reads_the_parameter() {
         [[texts(&[Some("t"), None])], [texts(&[Some("f"), None])]]
     );
 }
+
+/// A connection with a PostgreSQL session and the two temp tables the `EXPLAIN` tests read.
+fn postgres_explain_connection() -> crate::Connection {
+    use rudb_common::guc::Settings;
+    use rudb_common::session::Postgres;
+
+    let connection = Database::new().connect();
+    connection.set_postgres(Arc::new(Postgres {
+        settings: Settings::new(true),
+        version: String::new(),
+        input: None,
+        backend: 0,
+        database: 0,
+    }));
+    connection.execute("create temp table t (a int, b text, c numeric, d int8)").unwrap();
+    connection.execute("create temp table u (a int, e float8)").unwrap();
+    connection
+}
+
+/// The rows of an `EXPLAIN` in the PostgreSQL format, one line each.
+fn postgres_explain(connection: &crate::Connection, sql: &str) -> String {
+    let result = connection.execute(sql).unwrap();
+    assert_eq!(result.width(), 1);
+    (0..result.len()).map(|row| result.text_at(row, 0)).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn postgres_explain_text_has_the_costs_of_postgres() {
+    let connection = postgres_explain_connection();
+    assert_eq!(
+        postgres_explain(&connection, "explain select * from t"),
+        "Seq Scan on t  (cost=0.00..17.80 rows=780 width=76)"
+    );
+    // `order_qual_clauses` puts the `NullTest`, which costs nothing, first.
+    assert_eq!(
+        postgres_explain(&connection, "explain select * from t where a = 1 and b is null"),
+        "Seq Scan on t  (cost=0.00..19.75 rows=1 width=76)\n  Filter: ((b IS NULL) AND (a = 1))"
+    );
+    assert_eq!(
+        postgres_explain(
+            &connection,
+            "explain (costs off, verbose) select a, b from t where a > 1"
+        ),
+        "Seq Scan on pg_temp.t\n  Output: a, b\n  Filter: (t.a > 1)"
+    );
+    assert_eq!(
+        postgres_explain(
+            &connection,
+            "explain (costs off) select row_number() over (order by a) from t"
+        ),
+        "WindowAgg\n  Window: w1 AS (ORDER BY a ROWS UNBOUNDED PRECEDING)\n  ->  Sort\n        \
+         Sort Key: a\n        ->  Seq Scan on t"
+    );
+    assert_eq!(
+        postgres_explain(&connection, "explain (costs off, generic_plan) select $1"),
+        "Result"
+    );
+}
+
+#[test]
+fn postgres_explain_formats_have_the_keys_of_postgres() {
+    let connection = postgres_explain_connection();
+    let json = postgres_explain(&connection, "explain (format json) select * from t");
+    assert_eq!(
+        json,
+        r#"[
+  {
+    "Plan": {
+      "Node Type": "Seq Scan",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Relation Name": "t",
+      "Alias": "t",
+      "Startup Cost": 0.00,
+      "Total Cost": 17.80,
+      "Plan Rows": 780,
+      "Plan Width": 76,
+      "Disabled": false
+    }
+  }
+]"#
+    );
+    let yaml = postgres_explain(
+        &connection,
+        "explain (format yaml, costs off) select count(*) from t group by b",
+    );
+    assert!(
+        yaml.starts_with("- Plan: \n    Node Type: \"Aggregate\"\n    Strategy: \"Hashed\""),
+        "{yaml}"
+    );
+    assert!(yaml.contains("    Group Key: \n      - \"b\"\n"), "{yaml}");
+    let xml = postgres_explain(&connection, "explain (format xml, costs off) select 1");
+    assert_eq!(
+        xml,
+        "<explain xmlns=\"http://www.postgresql.org/2009/explain\">\n  <Query>\n    <Plan>\n      \
+         <Node-Type>Result</Node-Type>\n      <Parallel-Aware>false</Parallel-Aware>\n      \
+         <Async-Capable>false</Async-Capable>\n      <Disabled>false</Disabled>\n    </Plan>\n  \
+         </Query>\n</explain>"
+    );
+}
+
+#[test]
+fn postgres_explain_analyze_runs_the_query() {
+    let connection = postgres_explain_connection();
+    assert_eq!(
+        postgres_explain(
+            &connection,
+            "explain (analyze, costs off, timing off, summary off) select * from t"
+        ),
+        "Seq Scan on t (actual rows=0.00 loops=1)"
+    );
+    let summary = postgres_explain(&connection, "explain (analyze) select 1");
+    let lines: Vec<&str> = summary.lines().collect();
+    assert!(
+        lines[0].starts_with("Result  (cost=0.00..0.01 rows=1 width=4) (actual time="),
+        "{summary}"
+    );
+    assert!(lines[1].starts_with("Planning Time: "), "{summary}");
+    assert!(lines[2].starts_with("Execution Time: "), "{summary}");
+}
+
+#[test]
+fn postgres_explain_rejects_the_options_postgres_rejects() {
+    let connection = postgres_explain_connection();
+    for (sql, message) in [
+        ("explain (foo) select 1", "unrecognized EXPLAIN option \"foo\""),
+        (
+            "explain (format foo) select 1",
+            "unrecognized value for EXPLAIN option \"format\": \"foo\"",
+        ),
+        ("explain (timing) select 1", "EXPLAIN option TIMING requires ANALYZE"),
+        ("explain (wal) select 1", "EXPLAIN option WAL requires ANALYZE"),
+    ] {
+        let error = connection.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+}

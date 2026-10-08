@@ -531,6 +531,7 @@ dependencies = [
  "rudb-parquet",
  "rudb-parse",
  "rudb-pgparse",
+ "rudb-pgtypes",
  "rudb-pipeline",
  "rudb-plan",
  "rudb-qc",
@@ -781,9 +782,11 @@ dependencies = [
  "rudb-common",
  "rudb-functions",
  "rudb-metrics",
+ "rudb-pgtypes",
  "rudb-plan",
  "rudb-seam",
  "rudb-storage",
+ "rudb-vector",
 ]
 
 [[package]]

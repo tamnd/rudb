@@ -142,6 +142,41 @@ pub fn format_type(oid: Oid) -> Cow<'static, str> {
     Cow::Borrowed(name)
 }
 
+/// The name of a type as `format_type(oid, typmod)` gives it, which is [`format_type`] with the
+/// modifier written the way the type's `typmodout` writes it.
+///
+/// A modifier of -1 is no modifier, with the one exception PostgreSQL makes: `bpchar` with no
+/// length is not `character`, which means `character(1)`, so it keeps its own name. An array has
+/// the modifier of its element.
+pub fn format_type_with_typmod(oid: Oid, typmod: i32) -> String {
+    if let Some(info) = TypeInfo::get(oid).filter(|info| info.is_array()) {
+        return format!("{}[]", format_type_with_typmod(info.elem, typmod));
+    }
+    if typmod < 0 {
+        return match oid {
+            oid::BPCHAR => "bpchar".to_owned(),
+            _ => format_type(oid).into_owned(),
+        };
+    }
+    let precision = |rest: &str| format!("({typmod}){rest}");
+    match oid {
+        oid::BPCHAR => format!("character({})", typmod - 4),
+        oid::VARCHAR => format!("character varying({})", typmod - 4),
+        oid::NUMERIC => {
+            let packed = typmod - 4;
+            let scale = ((packed & 0x7ff) ^ 1024) - 1024;
+            format!("numeric({},{scale})", (packed >> 16) & 0xffff)
+        }
+        oid::BIT => format!("bit({typmod})"),
+        oid::VARBIT => format!("bit varying({typmod})"),
+        oid::TIME => format!("time{}", precision(" without time zone")),
+        oid::TIMETZ => format!("time{}", precision(" with time zone")),
+        oid::TIMESTAMP => format!("timestamp{}", precision(" without time zone")),
+        oid::TIMESTAMPTZ => format!("timestamp{}", precision(" with time zone")),
+        _ => format_type(oid).into_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +242,21 @@ mod tests {
         assert_eq!(format_type(oid::RECORD_ARRAY), "record[]");
         assert_eq!(format_type(oid::TEXT), "text");
         assert_eq!((format_type(0), format_type(9999)), ("-".into(), "???".into()));
+    }
+
+    #[test]
+    fn a_modifier_is_written_the_way_typmodout_writes_it() {
+        for (oid, typmod, name) in [
+            (oid::INT4, -1, "integer"),
+            (oid::BPCHAR, -1, "bpchar"),
+            (oid::BPCHAR, 9, "character(5)"),
+            (oid::VARCHAR, 14, "character varying(10)"),
+            (oid::NUMERIC, (10 << 16 | 2) + 4, "numeric(10,2)"),
+            (oid::NUMERIC, (3 << 16 | 0x7ff) + 4, "numeric(3,-1)"),
+            (oid::TIMESTAMPTZ, 3, "timestamp(3) with time zone"),
+            (oid::VARCHAR_ARRAY, 14, "character varying(10)[]"),
+        ] {
+            assert_eq!(format_type_with_typmod(oid, typmod), name);
+        }
     }
 }

@@ -190,6 +190,7 @@ pub struct Semantics {
     count_types: CountTypes,
     query_columns: QueryColumns,
     conflict_arbiter: ConflictArbiter,
+    explain_output: ExplainOutput,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -243,6 +244,7 @@ impl Default for Semantics {
             count_types: CountTypes::Pin,
             query_columns: QueryColumns::Pin,
             conflict_arbiter: ConflictArbiter::Pin,
+            explain_output: ExplainOutput::Pin,
             from_functions: FromFunctions::Pin,
             float_range: FloatRange::Pin,
             row_fields: RowFields::Pin,
@@ -414,6 +416,11 @@ impl Semantics {
     #[must_use]
     pub fn conflict_arbiter(self) -> ConflictArbiter {
         self.conflict_arbiter
+    }
+    /// Which options `EXPLAIN` takes and what it prints.
+    #[must_use]
+    pub fn explain_output(self) -> ExplainOutput {
+        self.explain_output
     }
     /// What a float operator gives for a result past the range of its type.
     #[must_use]
@@ -874,6 +881,18 @@ pub enum RowNulls {
     /// As in PostgreSQL and the SQL standard: a row `IS NULL` when each of its fields is null and
     /// `IS NOT NULL` when none of them is, so `row(1, null)` is neither. The test does not look
     /// inside a field that is a row itself.
+    Postgres,
+}
+
+/// Which options `EXPLAIN` takes and what it prints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExplainOutput {
+    /// As in DuckDB: the options `ANALYZE`, `LOGICAL`, `STATISTICS` and `CODEGEN`, and the two
+    /// columns `explain_key` and `explain_value`.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the options of `ExplainQuery`, checked after the query is bound, and one
+    /// column `QUERY PLAN` in the format the options ask for, with the node names of PostgreSQL.
     Postgres,
 }
 
@@ -1344,6 +1363,7 @@ impl Session {
             self.semantics.count_types = CountTypes::Postgres;
             self.semantics.query_columns = QueryColumns::Postgres;
             self.semantics.conflict_arbiter = ConflictArbiter::Postgres;
+            self.semantics.explain_output = ExplainOutput::Postgres;
             self.semantics.from_functions = FromFunctions::Postgres;
             self.semantics.float_range = FloatRange::Postgres;
             self.semantics.row_fields = RowFields::Postgres;
