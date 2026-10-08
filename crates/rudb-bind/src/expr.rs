@@ -629,7 +629,7 @@ impl Binder<'_> {
     fn bind_parameter(&mut self, ast: &Ast, name: ast::StrRef) -> Result<ExprRef> {
         let name = ast.string(name);
         if let Some(inlined) = &self.inlined
-            && let Some(at) = name.strip_prefix('$').and_then(|number| number.parse::<usize>().ok())
+            && let Ok(at) = name.trim_start_matches('$').parse::<usize>()
             && let Some(&argument) = inlined.get(at.wrapping_sub(1))
         {
             return Ok(argument);

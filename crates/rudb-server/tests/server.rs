@@ -1224,6 +1224,35 @@ fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
             "select round(-2.5), round(2.5::float8), round(3.5::float8), round(1234.5, -2)",
             "-3|2|4|1200",
         ),
+        (
+            "select sqrt(2.0), sqrt(1e-20::numeric), sqrt(123456789012345678901234567890::numeric)",
+            "1.414213562373095|0.0000000001000000000000000|351364182882014.4",
+        ),
+        (
+            "select exp(1.0), exp(-1.0), exp(10.5), exp(100::numeric)",
+            "2.7182818284590452|0.3678794411714423|36315.502674246638|\
+             26881171418161354484126255515800135873611119",
+        ),
+        (
+            "select ln(2.0), ln(10::numeric), ln(1e100::numeric), ln(1.000000000001)",
+            "0.6931471805599453|2.3025850929940457|230.25850929940457|\
+             0.0000000000009999999999995000",
+        ),
+        (
+            "select log(100.0), pg_typeof(log(100.0)), log(3.0, 7.5), log(2.0, 1e100)",
+            "2.0000000000000000|numeric|1.8340437671464697|332.19280948873623",
+        ),
+        (
+            "select power(2.0, 10.0), power(2.0, 0.5), power(-8.0, 3.0), power(10.0, -2.0), \
+             power(1.5, 100), power(1.000001, 1000000)",
+            "1024.0000000000000|1.4142135623730950|-512.00000000000000|0.010000000000000000|\
+             406561177535215237.4|2.7182804693193769",
+        ),
+        (
+            "select power('NaN'::numeric, 0), power('-Infinity'::numeric, 3), \
+             power(0.5, 'Infinity'::numeric), power(-2, 'Infinity'::numeric)",
+            "1|-Infinity|0|Infinity",
+        ),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "TDCZ", "{sql}");
@@ -1242,6 +1271,17 @@ fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
         ("select log10(-1::float8)", "2201E", "cannot take logarithm of a negative number"),
         ("select sqrt(-1)", "2201F", "cannot take square root of a negative number"),
         ("select acos(2)", "22003", "input is out of range"),
+        ("select sqrt(-1.0)", "2201F", "cannot take square root of a negative number"),
+        ("select exp(6000.0)", "22003", "value overflows numeric format"),
+        ("select ln(0.0)", "2201E", "cannot take logarithm of zero"),
+        ("select log(1.0, 10.0)", "22012", "division by zero"),
+        ("select log(-2.0, 10.0)", "2201E", "cannot take logarithm of a negative number"),
+        (
+            "select power(-8.0, 0.5)",
+            "2201F",
+            "a negative number raised to a non-integer power yields a complex result",
+        ),
+        ("select power(0.0, -1.0)", "2201F", "zero raised to a negative power is undefined"),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "EZ", "{sql}");
