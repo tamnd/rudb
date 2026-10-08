@@ -12,7 +12,7 @@ use rudb_pgtypes::{
     UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, json_in, jsonb_in, numeric_in, oid, param_value,
 };
 
-use super::zone::Zone;
+use super::zone;
 
 /// The settings that the input functions read: `DateStyle`, `TimeZone` and `IntervalStyle`.
 #[derive(Debug)]
@@ -71,7 +71,7 @@ impl Literals {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| i64::try_from(since.as_micros()).unwrap_or(0));
-        let zone = Zone::of(&self.zone);
+        let zone = zone::of(&self.zone);
         let settings = InputSettings {
             datetime: DateTimeInput {
                 order: self.order,

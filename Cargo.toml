@@ -42,7 +42,6 @@ readme = "README.md"
 cranelift-codegen = { version = "=0.125.0", default-features = false, features = ["std", "host-arch"] }
 cranelift-frontend = { version = "=0.125.0", default-features = false, features = ["std"] }
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
-chrono-tz = "0.10.4"
 iana-time-zone = "0.1.65"
 # A disassembler for the tests of the `direct` backend's encoder, which decode what it wrote and compare
 # the text. Only a dev-dependency, so nothing that ships links it.

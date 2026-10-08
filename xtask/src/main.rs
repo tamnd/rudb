@@ -25,6 +25,7 @@ mod focus;
 mod generate;
 mod grammar;
 mod graph;
+mod icutz;
 mod io;
 mod kernels;
 mod layers;
@@ -73,6 +74,8 @@ fn main() -> ExitCode {
         Some("pg-generate") => postgres::generate(),
         Some("pg-check") => postgres::check(),
         Some("pg-grammar") => postgres::grammar(),
+        Some("icu-tz-vendor") => icutz::vendor(std::env::args().nth(2).as_deref()),
+        Some("icu-tz-check") => icutz::check(),
         Some("vendor-grammar") => vendor::vendor(std::env::args().nth(2).as_deref()),
         Some("version") => version::set(&root(), std::env::args().nth(2).as_deref()),
         // With a suite name it is the whole comparison against every engine on the machine, which
@@ -193,6 +196,9 @@ fn usage() {
     println!("  pg-check the vendored PostgreSQL files match VENDOR and the generated files match");
     println!("           what their generators write today");
     println!("  pg-grammar  bison makes the same parse tables as rudb-pgparse has, entry by entry");
+    println!("  icu-tz-vendor <release>  build the time zones of an IANA release in the rearguard");
+    println!("           form, which is what DuckDB's ICU holds, from the release tarball");
+    println!("  icu-tz-check  the vendored time zones of DuckDB's ICU match VENDOR");
     println!("  gen-unicode <utf8proc_data.cpp> [--check]  regenerate the grapheme break and");
     println!("           normalization tables from the pin's copy of utf8proc, out of a duckdb");
     println!("           checkout at the pin");
@@ -378,6 +384,7 @@ fn ci(full: bool) -> Result<(), String> {
         step("grammar codegen", || codegen::generate(true))?;
     }
     step("postgres files", postgres::check)?;
+    step("icu time zones", icutz::check)?;
     step("fmt", || fmt(&focus))?;
 
     if focus.no_code() {

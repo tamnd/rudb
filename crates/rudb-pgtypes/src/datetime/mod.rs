@@ -162,29 +162,17 @@ pub trait TimeZone {
     /// that the clocks skipped over has the offset from before the change, and a wall clock that
     /// the clocks passed twice has the offset from after the change.
     fn local_offset(&self, local_seconds: i64) -> i32 {
-        let (before, change) = self.next_change(local_seconds - 86400);
-        let before_time = local_seconds - i64::from(before);
-        let Some((boundary, after)) = change else {
-            return before;
-        };
-        let after_time = local_seconds - i64::from(after);
-        if before_time < boundary && after_time < boundary {
-            return before;
-        }
-        if before_time > boundary && after_time >= boundary {
-            return after;
-        }
-        if before_time > after_time { before } else { after }
+        rudb_common::tzdb::determine_offset(local_seconds, |t| self.next_change(t))
     }
 
     /// The meaning of an abbreviation in upper case in this zone over all of its history, as
-    /// `pg_interpret_timezone_abbrev` gives it.
+    /// `pg_timezone_abbrev_is_known` gives it.
     fn abbrev_meaning(&self, _abbrev: &str) -> Option<AbbrevMeaning> {
         None
     }
 
     /// The offset east of UTC and the daylight saving flag of an abbreviation in upper case at an
-    /// instant, as `pg_timezone_abbrev_is_known` gives them.
+    /// instant, as `pg_interpret_timezone_abbrev` gives them.
     fn abbrev_at(&self, _abbrev: &str, _unix_seconds: i64) -> Option<(i32, bool)> {
         None
     }

@@ -612,7 +612,7 @@ fn serve(
         database: oid,
         login: role.oid,
         format: Format::default(),
-        zone: Zone::of("UTC"),
+        zone: zone::of("UTC"),
         zone_name: "UTC".to_owned(),
         utf8: true,
         least: Severity::Notice,
@@ -1180,7 +1180,7 @@ impl Runner {
         };
         let zone_name = text("TimeZone");
         if zone_name != self.zone_name {
-            self.zone = Zone::of(&zone_name);
+            self.zone = zone::of(&zone_name);
             self.zone_name = zone_name;
         }
         let input = literal::Literals {

@@ -135,11 +135,11 @@ pub use array::{
     oidvector_in, oidvector_out, oidvector_recv, oidvector_send,
 };
 pub use binary::{Recv, name_recv, verify_utf8};
-pub use collations::{Collation, collation, collation_by_oid};
 pub use coerce::{
     Cast, CoercionContext, CoercionPath, Mismatch, can_coerce_assigned, can_coerce_implicitly,
     common_type, find_cast, find_coercion_pathway, is_preferred,
 };
+pub use collations::{Collation, collation, collation_by_oid};
 pub use datetime::{
     Abbrev, AbbrevMeaning, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateFormat, DateOrder, DateStyle,
     DateTemplate, DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,

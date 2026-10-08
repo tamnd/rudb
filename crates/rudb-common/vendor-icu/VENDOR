@@ -1,0 +1,12 @@
+# The IANA time zone data of DuckDB's ICU, built from the release tarball with
+# `make VERSION_DEPS= DATAFORM=rearguard tzdata.zi`. `cargo xtask icu-tz-vendor` is the
+# only thing that writes here and `cargo xtask icu-tz-check` checks that nothing else did.
+#
+# License: public domain, see LICENSE.
+
+upstream: https://data.iana.org/time-zones/releases/tzdata2026c.tar.gz
+release: 2026c
+
+# sha256 of every vendored file, relative to this directory.
+074bb6e0ffb848956e5c35e9c1a8a61b58cdd9236cab2175bc2d20e353feec37  tzdata.zi
+0613408568889f5739e5ae252b722a2659c02002839ad970a63dc5e9174b27cf  LICENSE

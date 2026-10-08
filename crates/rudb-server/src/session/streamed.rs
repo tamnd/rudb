@@ -22,7 +22,7 @@ use rudb_common::{LogicalType, Origin};
 use rudb_pgtypes::{RowEncoder, TypeError};
 use rudb_pgwire::{Field, OutBuf};
 
-use super::zone::Zone;
+use super::zone::{self, Zone};
 use super::{
     FLUSH_AT, Failure, Format, Runner, Severity, column_type, field, leading_words, output,
     write_notice,
@@ -272,7 +272,7 @@ impl RowSink for Sink {
         let chunk = chunk.settled()?;
         let n = chunk.len();
         state.warnings();
-        let zone = state.zone.get_or_insert_with(|| Zone::of(&state.zone_name));
+        let zone = state.zone.get_or_insert_with(|| zone::of(&state.zone_name));
         let settings = output(&state.format, zone);
         if let Err(error) =
             state.encoder.encode(chunk.columns(), 0..n, &settings, state.out.bytes_mut())

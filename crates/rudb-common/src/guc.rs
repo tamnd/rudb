@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 mod check;
 mod settings;
 
-pub use check::{Zone, encoding, split_identifiers, zone};
+pub use check::{encoding, split_identifiers, zone};
 pub use settings::{Action, Arg, Origin, Settings, Source, flatten};
 
 use crate::error::{Error, ErrorCode};
