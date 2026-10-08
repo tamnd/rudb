@@ -3387,6 +3387,126 @@ fn the_json_set_functions_give_the_rows_and_columns_of_postgresql() {
 }
 
 #[test]
+fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
+    let dirs = Dirs::new("pg-regexp");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            return (format!("{code} {text}"), String::new());
+        }
+        let shape = messages.iter().find(|m| m.tag == b'T').unwrap();
+        let names: Vec<String> = row_shape(shape).into_iter().map(|(name, ..)| name).collect();
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(String::new, |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        (names.join(","), rows.join(";"))
+    };
+    // The values, the names and the errors of the PostgreSQL 19 oracle. The match is the longest
+    // from the leftmost start, and `regexp_matches` gives a row for each match.
+    for (sql, names, rows) in [
+        ("select regexp_match('abcd', '(a|ab)(c|bcd)(d*)')", "regexp_match", "{ab,c,d}"),
+        ("select regexp_match('abc', 'x')", "regexp_match", ""),
+        ("select (regexp_match('abc', '(b)(c)'))[2]", "regexp_match", "c"),
+        ("select pg_typeof(regexp_match('abc', 'b'))", "pg_typeof", "text[]"),
+        ("select regexp_matches('aBab', 'b', 'gi')", "regexp_matches", "{B};{b}"),
+        ("select regexp_matches('abc', 'x*', 'g')", "regexp_matches", r#"{""};{""};{""};{""}"#),
+        ("select * from regexp_matches('ab', '(b)(x)?') m", "m", "{b,NULL}"),
+        ("select * from regexp_matches('ab', 'x')", "regexp_matches", ""),
+        (
+            "select x, m from (values ('ab'), ('c')) t(x), regexp_matches(x, '.', 'g') m",
+            "x,m",
+            "ab|{a};ab|{b};c|{c}",
+        ),
+        (
+            "select * from regexp_matches('ab', '.', 'g') with ordinality",
+            "regexp_matches,ordinality",
+            "{a}|1;{b}|2",
+        ),
+        (
+            "select 'abc' ~ 'B', 'abc' ~* 'B', 'abc' !~ 'b', 'ab' ~ '\\mb'",
+            "?column?,?column?,?column?,?column?",
+            "f|t|f|f",
+        ),
+        ("select x from (values ('abc'), ('xyz'), (null)) t(x) where x ~ '^x'", "x", "xyz"),
+        (
+            "select regexp_matches('ab', 'b', 'z')",
+            "22023 invalid regular expression option: \"z\"",
+            "",
+        ),
+        (
+            "select regexp_match('abc', 'b', 'g')",
+            "22023 regexp_match() does not support the \"global\" option",
+            "",
+        ),
+        ("select 'abc' ~ '('", "2201B invalid regular expression: parentheses () not balanced", ""),
+        (
+            "select regexp_match(123, '1')",
+            "42883 function regexp_match(integer, unknown) does not exist",
+            "",
+        ),
+        ("select 1 ~ '1'", "42883 operator does not exist: integer ~ unknown", ""),
+        (
+            "select 1 where regexp_matches('ab', 'a') is not null",
+            "0A000 set-returning functions are not allowed in WHERE",
+            "",
+        ),
+        (
+            "select regexp_count('abcabc', 'b'), regexp_instr('abcabc', 'c'), \
+             regexp_like('ABC', 'b', 'i'), regexp_substr('abcabc', '(b)(c)', 1, 2, '', 2)",
+            "regexp_count,regexp_instr,regexp_like,regexp_substr",
+            "2|3|t|c",
+        ),
+        (
+            "select regexp_count('abc', '', 4), regexp_count('abc', 'b', 5), \
+             regexp_instr('héllo wörld', '[éö]', 3, 1, 1), regexp_instr('abc', 'b', '2')",
+            "regexp_count,regexp_count,regexp_instr,regexp_instr",
+            "1|0|9|2",
+        ),
+        (
+            "select regexp_instr('abc', '(x)?b', 1, 1, 0, '', 1), \
+             regexp_substr('abc', '(x)?b', 1, 1, '', 1), regexp_instr('abc', 'b', null)",
+            "regexp_instr,regexp_substr,regexp_instr",
+            "0||",
+        ),
+        (
+            "select regexp_instr('abc', '(', 0)",
+            "22023 invalid value for parameter \"start\": 0",
+            "",
+        ),
+        (
+            "select regexp_substr('abc', 'b', 1, 1, 'z', -1)",
+            "22023 invalid value for parameter \"subexpr\": -1",
+            "",
+        ),
+        (
+            "select regexp_count('abc', 'b', 1, 'g')",
+            "22023 regexp_count() does not support the \"global\" option",
+            "",
+        ),
+        (
+            "select regexp_instr('abc', 'b', 2::bigint)",
+            "42883 function regexp_instr(unknown, unknown, bigint) does not exist",
+            "",
+        ),
+    ] {
+        assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");
     let server = Server::start(dirs.config()).unwrap();

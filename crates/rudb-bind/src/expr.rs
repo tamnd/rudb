@@ -13,8 +13,8 @@
 use rudb_common::{
     CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, CountTypes, DeclaredType,
     Error, ErrorTexts, Field, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts,
-    NumberLiterals, OperatorRules, Result, Semantics, Session, SetFunctions, SqlState, StateKey,
-    TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
+    NumberLiterals, OperatorRules, RegexRules, Result, Semantics, Session, SetFunctions, SqlState,
+    StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_kernels::pgjson::JsonSet;
@@ -42,8 +42,10 @@ const LIST_MACROS: &[(&str, &str, usize, bool)] = &[
 ];
 
 /// A function of PostgreSQL that gives a set of rows, which a select list and `FROM` unnest.
-fn set_function(name: &str) -> bool {
-    rudb_catalog::same_name(name, "generate_series") || JsonSet::of(name).is_some()
+fn set_function(name: &str, semantics: Semantics) -> bool {
+    let regexp = semantics.regex_rules() == RegexRules::Postgres
+        && rudb_catalog::same_name(name, "regexp_matches");
+    rudb_catalog::same_name(name, "generate_series") || JsonSet::of(name).is_some() || regexp
 }
 
 impl Binder<'_> {
@@ -157,12 +159,13 @@ impl Binder<'_> {
                     && !self.in_window
                     && !self.in_lambda()
                     && self.semantics.set_functions() == SetFunctions::Postgres
-                    && set_function(ast.name(name).last().unwrap_or_default()) =>
+                    && set_function(ast.name(name).last().unwrap_or_default(), self.semantics) =>
             {
                 let args = ast.expr_list(args).to_vec();
-                match JsonSet::of(ast.name(name).last().unwrap_or_default()) {
-                    Some(_) => self.bind_unnest(ast, expr, &[expr], scope),
-                    None => self.bind_series(ast, expr, &args, scope),
+                let written = ast.name(name).last().unwrap_or_default();
+                match rudb_catalog::same_name(written, "generate_series") {
+                    true => self.bind_series(ast, expr, &args, scope),
+                    false => self.bind_unnest(ast, expr, &[expr], scope),
                 }
             }
             ast::Expr::Function { name, args, distinct, filter }
@@ -1393,6 +1396,15 @@ impl Binder<'_> {
         negated: bool,
         always_full: bool,
     ) -> Result<ExprRef> {
+        let text = |ty: &LogicalType| matches!(ty, LogicalType::Varchar | LogicalType::Null);
+        if !always_full
+            && self.semantics.regex_rules() == RegexRules::Postgres
+            && text(self.plan().expr_type(left))
+            && text(self.plan().expr_type(right))
+        {
+            let matched = self.pg_regex_match(left, right, insensitive);
+            return if negated { self.call("not", vec![matched]) } else { Ok(matched) };
+        }
         let full = always_full || self.semantics.regex_match_full();
         let name = if full { "regexp_full_match" } else { "regexp_matches" };
         let mut args = vec![left, right];

@@ -31,9 +31,9 @@ use rudb_common::{LogicalType, Value};
 use rudb_vector::Vector;
 
 use crate::peel::{Lookup, Peel};
-use crate::regexp;
 use crate::scalar;
 use crate::shape::single;
+use crate::{pgregexp, regexp};
 
 /// A scalar call with whatever does not change from chunk to chunk already worked out.
 ///
@@ -60,6 +60,8 @@ pub(crate) enum Hoisted {
     /// Boxed because it is several times the size of the other variants and one function node in
     /// four hundred is a regular expression.
     Regexp(Box<regexp::Call>),
+    /// A compiled regular expression of a PostgreSQL session, with its flags read.
+    PgRegexp(Box<pgregexp::Call>),
 }
 
 impl Recipe {
@@ -188,6 +190,13 @@ impl Hoisted {
     pub(crate) fn regexp(&self) -> Option<&regexp::Call> {
         match self {
             Self::Regexp(call) => Some(call),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pg_regexp(&self) -> Option<&pgregexp::Call> {
+        match self {
+            Self::PgRegexp(call) => Some(call),
             _ => None,
         }
     }

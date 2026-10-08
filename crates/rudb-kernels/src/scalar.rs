@@ -253,6 +253,9 @@ fn specialized<V: AsRef<Vector>>(
     if regexp::is_regexp(name) {
         return regexp::vectorized(name, hoisted.regexp(), args, returns, rows);
     }
+    if crate::pgregexp::is_pg_regexp(name) {
+        return crate::pgregexp::vectorized(name, hoisted.pg_regexp(), args, returns, rows);
+    }
     if matches!(name, "substring" | "substr") {
         return substring_of(args, returns, rows);
     }
@@ -295,6 +298,10 @@ fn specialized<V: AsRef<Vector>>(
 pub(crate) fn hoist(name: &str, literals: &[Option<Value>]) -> Option<Hoisted> {
     if regexp::is_regexp(name) {
         return regexp::hoist(name, literals).map(|call| Hoisted::Regexp(Box::new(call)));
+    }
+    if crate::pgregexp::is_pg_regexp(name) {
+        return crate::pgregexp::hoist(name, literals)
+            .map(|call| Hoisted::PgRegexp(Box::new(call)));
     }
     let [_, Some(Value::Varchar(spelling))] = literals else {
         return None;
@@ -4297,6 +4304,9 @@ pub fn call_values(
         return Ok(value);
     }
     if let Some(value) = crate::pgjson::call(name, args)? {
+        return Ok(value);
+    }
+    if let Some(value) = crate::pgregexp::call(name, args)? {
         return Ok(value);
     }
     // The binder folds only the calls that read no `timestamptz`, which read no zone.
