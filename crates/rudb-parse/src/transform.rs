@@ -774,6 +774,7 @@ impl<'a> Transform<'a> {
                 expr,
                 Expr::Star { .. }
                     | Expr::Columns { .. }
+                    | Expr::Fields { .. }
                     | Expr::Column { .. }
                     | Expr::Positional { .. }
                     | Expr::Subquery { .. }
@@ -4937,6 +4938,7 @@ impl<'a> Transform<'a> {
             Expr::Column { .. }
             | Expr::Star { .. }
             | Expr::Columns { .. }
+            | Expr::Fields { .. }
             | Expr::Positional { .. }
             | Expr::Window { .. }
             | Expr::Subquery { .. }
@@ -7249,6 +7251,7 @@ mod tests {
             Expr::Columns { inner, unpacked } => {
                 format!("{}COLUMNS({})", if unpacked { "*" } else { "" }, show(ast, inner))
             }
+            Expr::Fields { record } => format!("({}).*", show(ast, record)),
             Expr::Star { qualifier, replacements } => {
                 let star = if qualifier.is_empty() {
                     "*".to_string()

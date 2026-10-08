@@ -128,3 +128,11 @@ fn corpus() {
     }
     println!("same {same}, differ {differ}, not yet {not_yet:?}");
 }
+
+#[test]
+fn a_star_after_a_value_is_every_field_of_the_value() {
+    let shape = |sql: &str| transform(sql).map(|ast| shape::script(&ast)).unwrap();
+    assert!(shape("select (r).* from s").contains("[fields{column['r']} as -]"));
+    assert!(shape("select (f(x)).*, (r).a from s").contains("fields{"));
+    assert!(!shape("select r.* from s").contains("fields{"));
+}

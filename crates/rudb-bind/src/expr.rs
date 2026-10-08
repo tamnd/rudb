@@ -118,6 +118,11 @@ impl Binder<'_> {
                 Err(Error::binder("*COLUMNS() can not be used in this place"))
             }
             ast::Expr::Columns { .. } => self.bind_picked(ast, scope),
+            // A select list and a row take `(r).*` apart before they bind their items.
+            ast::Expr::Fields { .. } => {
+                Err(Error::binder("row expansion via \"*\" is not supported here")
+                    .state(SqlState::FEATURE_NOT_SUPPORTED))
+            }
             ast::Expr::Column { name } => self.bind_column(ast, name, scope),
             ast::Expr::Positional { index } => {
                 let found = scope.positional(index).map_err(|total| {
@@ -332,11 +337,17 @@ impl Binder<'_> {
                 self.bind_quantified_array(ast, operand, op, array, all, scope)
             }
             // A row is a struct whose fields have no names, which the pin calls a TUPLE.
+            // `row((r).*, 3)` has a field for each field of `r`, then the `3`.
             ast::Expr::Row { items } => {
                 let written = ast.expr_list(items).to_vec();
                 let mut bound = Vec::with_capacity(written.len());
                 for value in written {
-                    bound.push(self.bind_expr(ast, value, scope)?);
+                    match ast.expr(value) {
+                        ast::Expr::Fields { record } => bound.extend(
+                            self.bind_fields(ast, record, scope)?.into_iter().map(|(expr, _)| expr),
+                        ),
+                        _ => bound.push(self.bind_expr(ast, value, scope)?),
+                    }
                 }
                 self.pack_struct(&vec![String::new(); bound.len()], &bound)
             }
@@ -3999,6 +4010,7 @@ pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> 
         | ast::Expr::Literal { .. }
         | ast::Expr::Parameter { .. }
         | ast::Expr::Default => false,
+        ast::Expr::Fields { record } => aggregating(ast, record, user),
         ast::Expr::Unary { operand, .. } => aggregating(ast, operand, user),
         ast::Expr::Binary { left, right, .. } => {
             aggregating(ast, left, user) || aggregating(ast, right, user)
@@ -4147,7 +4159,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         // named `(a.i + 1)`. A column on its own is named by its last part, which the caller sees
         // to before it gets here.
         ast::Expr::Column { name } => ast.name(name).map(quoted).collect::<Vec<_>>().join("."),
-        ast::Expr::Columns { .. } | ast::Expr::Positional { .. } => {
+        ast::Expr::Columns { .. } | ast::Expr::Positional { .. } | ast::Expr::Fields { .. } => {
             rudb_parse::deparse::expression(ast, expr)
         }
         // The deparser is the answer for a window and not an approximation of one. Every other

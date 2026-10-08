@@ -13,7 +13,6 @@ use rudb_plan::{ColumnBinding, Expr, Node, NodeRef};
 use crate::binder::Binder;
 use crate::ordinality::ORDINALITY;
 use crate::scope::{Scope, Visible};
-use crate::structs::STRUCT_EXTRACT;
 
 impl Binder<'_> {
     /// The call of a function source that is bound as a value, or `None` when the source is a
@@ -154,15 +153,7 @@ impl Binder<'_> {
         let mut exprs = Vec::new();
         for ((&read, ty), name) in reads.iter().zip(&types).zip(&written) {
             match ty {
-                LogicalType::Struct(fields) => {
-                    for (at, field) in fields.iter().enumerate() {
-                        let key = self.add_constant(Value::BigInt(at as i64 + 1));
-                        let args = self.plan_mut().add_expr_list(&[read, key]);
-                        let name = self.plan_mut().intern(STRUCT_EXTRACT);
-                        let expr = self.add_expr(Expr::Function { name, args }, field.ty.clone());
-                        exprs.push((expr, field.name.clone()));
-                    }
-                }
+                LogicalType::Struct(fields) => exprs.extend(self.struct_fields(read, fields)),
                 // One call that gives a value names its column for the alias of the source.
                 _ if calls.len() == 1 && alias != NONE => exprs.push((read, label.clone())),
                 _ => exprs.push((read, name.clone())),

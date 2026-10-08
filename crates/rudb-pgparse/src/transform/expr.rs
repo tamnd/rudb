@@ -415,7 +415,8 @@ impl Transform<'_> {
     }
 
     /// Subscripts and field selection: `a[1]`, `a[1:2]` and `(a).b`, as the calls the DuckDB
-    /// transform makes of them.
+    /// transform makes of them. A star at the end, `(a).*`, is every field of what comes before
+    /// it, which the grammar allows only last.
     fn indirection(&mut self, indirection: &A_Indirection) -> Made<ExprRef> {
         let Some(arg) = &indirection.arg else {
             return clause("A_Indirection");
@@ -425,6 +426,10 @@ impl Transform<'_> {
         for node in indirection.indirection.iter().flatten() {
             let mut selected = NONE;
             let (name, args) = match node {
+                Node::A_Star(_) => {
+                    target = self.ast.push_expr(Expr::Fields { record: target }, span);
+                    continue;
+                }
                 Node::String(field) => {
                     selected = self.intern(field);
                     let field = self.string(field, -1);

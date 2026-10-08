@@ -1279,6 +1279,12 @@ pub enum Expr {
         /// Whether it was written with the star in front.
         unpacked: bool,
     },
+    /// `(r).*`, every field of a composite value as a column of its own. PostgreSQL writes it
+    /// this way, and only a select list or a row constructor takes it apart.
+    Fields {
+        /// The composite value.
+        record: ExprRef,
+    },
     /// A column reference, qualified or not.
     Column {
         /// The name, as a run of [`StrRef`], outermost first, so `s.t.a` is three parts.
@@ -1894,6 +1900,7 @@ impl Ast {
             | Expr::Subquery { .. }
             | Expr::Exists { .. } => Vec::new(),
             Expr::Columns { inner, .. } => vec![inner],
+            Expr::Fields { record } => vec![record],
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
             | Expr::InSubquery { operand, .. }
