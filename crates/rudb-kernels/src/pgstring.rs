@@ -67,6 +67,11 @@ pub(crate) const SOURCES: &[&str] = &[
 pub(crate) const NULLS: &[&str] =
     &["quote_nullable", "text_format", "text_format_nv", "text_to_array", "text_to_array_null"];
 
+/// The functions of this module that return a set, each with the function that gives the same
+/// values as an array. `string_to_table` is `string_to_array` with a row for each element.
+pub(crate) const ROWS: &[(&str, &str)] =
+    &[("text_to_table", "text_to_array"), ("text_to_table_null", "text_to_array_null")];
+
 /// `MaxAllocSize`, the largest value PostgreSQL makes.
 const MAX_ALLOC: usize = 0x3fff_ffff;
 

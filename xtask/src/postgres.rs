@@ -9,7 +9,8 @@
 //! The plan is `16-crate-layout.md` section 16.5 of the PostgreSQL compatibility notes. Today
 //! `errcodes.txt` gives the SQLSTATE list of `rudb-common`, `guc_parameters.dat` and
 //! `guc_tables.c` give the configuration parameters of `rudb-common`, `cmdtaglist.h` gives the
-//! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`, and the
+//! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`,
+//! `unicode_norm_table.h` gives the Unicode normalization tables of `rudb-kernels`, and the
 //! samples of `pg_hba.conf`, `pg_ident.conf` and `postgresql.conf` are the files that
 //! `rudb-server init` writes.
 //!
@@ -25,6 +26,7 @@ mod gram;
 mod guc;
 mod lalr;
 mod nodes;
+mod norm;
 mod pgparse;
 mod translate;
 
@@ -42,7 +44,7 @@ struct Vendor {
     files: &'static [(&'static str, &'static str)],
 }
 
-const VENDORS: [Vendor; 5] = [
+const VENDORS: [Vendor; 6] = [
     Vendor {
         dir: "crates/rudb-common/vendor",
         files: &[
@@ -67,6 +69,13 @@ const VENDORS: [Vendor; 5] = [
             ("src/include/catalog/pg_proc.dat", "pg_proc.dat"),
             ("src/backend/catalog/system_functions.sql", "system_functions.sql"),
             ("src/timezone/tznames/Default", "tznames-Default"),
+            ("COPYRIGHT", "LICENSE.postgres"),
+        ],
+    },
+    Vendor {
+        dir: "crates/rudb-kernels/vendor",
+        files: &[
+            ("src/include/common/unicode_norm_table.h", "unicode_norm_table.h"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
@@ -115,7 +124,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 12] = [
+const GENERATED: [Generated; 13] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -155,6 +164,11 @@ const GENERATED: [Generated; 12] = [
             "crates/rudb-pgtypes/vendor/system_functions.sql",
         ],
         generate: |texts| pgproc(&texts[0], &texts[1], &texts[2]),
+    },
+    Generated {
+        output: "crates/rudb-kernels/src/pgnormalize/table.rs",
+        inputs: &["crates/rudb-kernels/vendor/unicode_norm_table.h"],
+        generate: norm::tables,
     },
     Generated {
         output: "crates/rudb-pgparse/src/generated/gram.rules",

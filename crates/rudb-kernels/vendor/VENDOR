@@ -1,0 +1,12 @@
+# PostgreSQL files, copied from the pin without changes. `cargo xtask pg-vendor` is the
+# only thing that writes here and `cargo xtask pg-check` checks that nothing else did.
+#
+# License: the PostgreSQL License, see LICENSE.postgres.
+
+upstream: https://git.postgresql.org/git/postgresql.git
+commit: 7d3d2db7d5e533fa42a4202c7d308cbb0cbf9333
+version: 19beta4
+
+# sha256 of every vendored file, relative to this directory.
+ce015eeb87829e5b3603c4ab22c1e96bbea5a8f5b0c71e9c1f7c5bf7811a43fc  unicode_norm_table.h
+3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd  LICENSE.postgres
