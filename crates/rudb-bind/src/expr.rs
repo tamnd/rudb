@@ -1124,6 +1124,12 @@ impl Binder<'_> {
         [mut left, mut right]: [ExprRef; 2],
         scope: &Scope,
     ) -> Result<ExprRef> {
+        if self.semantics.operator_rules() == OperatorRules::Postgres
+            && let Some(done) =
+                self.pg_operator(ast, &operator_name(ast, op), &written, &[left, right])?
+        {
+            return Ok(done);
+        }
         if matches!(
             op,
             BinaryOp::Add
@@ -1289,6 +1295,11 @@ impl Binder<'_> {
                 self.call_as(name, "__rudb_checked_remainder", vec![left, right])
             }
             Some(name) => self.call(name, vec![left, right]),
+            // PostgreSQL has an operator of the name over other types, or none.
+            None if self.semantics.error_texts() == ErrorTexts::Postgres => {
+                Err(Error::binder(format!("the {} operator", spelling(ast, op)))
+                    .state(SqlState::UNDEFINED_FUNCTION))
+            }
             None => Err(Error::not_implemented(format!("the {} operator", spelling(ast, op)))),
         }
     }
@@ -5288,9 +5299,8 @@ pub(crate) fn undefined_function(
 /// PostgreSQL session sends in place of the error of the pin. It is placed at the operator, which
 /// is where the PostgreSQL transform places the expression. Another error stays as it is.
 ///
-/// PostgreSQL finds more than one operator for an arithmetic operator over two unknown operands,
-/// as in `'1' + '2'`, and for `date + unknown`, so these are not unique where the others do not
-/// exist.
+/// The operator is not unique when PostgreSQL finds more than one operator of the name for the
+/// types, as for `'1' + '2'` and for `date + unknown`, and does not exist when it finds none.
 fn undefined_operator(
     ast: &Ast,
     error: Error,
@@ -5299,35 +5309,20 @@ fn undefined_operator(
     types: &[LogicalType; 2],
 ) -> Error {
     let message = error.message();
-    if !message.starts_with("No function matches") && !message.starts_with("Cannot compare values")
+    if !message.starts_with("No function matches")
+        && !message.starts_with("Cannot compare values")
+        && error.reported_state() != SqlState::UNDEFINED_FUNCTION
     {
         return error;
     }
     let [left, right] = [0, 1].map(|at| postgres_type_name(ast, written[at], &types[at]));
-    let symbol = match op {
-        BinaryOp::Like => "~~".to_string(),
-        BinaryOp::NotLike => "!~~".to_string(),
-        BinaryOp::ILike => "~~*".to_string(),
-        BinaryOp::NotILike => "!~~*".to_string(),
-        _ => spelling(ast, op),
-    };
-    let arithmetic = matches!(
-        op,
-        BinaryOp::Add
-            | BinaryOp::Subtract
-            | BinaryOp::Multiply
-            | BinaryOp::Divide
-            | BinaryOp::Modulo
-            | BinaryOp::Caret
-            | BinaryOp::BitAnd
-            | BinaryOp::BitOr
-            | BinaryOp::ShiftLeft
-            | BinaryOp::ShiftRight
-    );
-    let unknown = [&left, &right].map(|name| name == "unknown");
-    let ambiguous = (arithmetic && unknown == [true, true])
-        || (op == BinaryOp::Add
-            && ((left == "date" && unknown[1]) || (unknown[0] && right == "date")));
+    let symbol = operator_name(ast, op);
+    let ambiguous = crate::pgcalls::operand_oids(ast, written, types).is_some_and(|oids| {
+        matches!(
+            rudb_pgtypes::resolve_operator(&symbol, &oids),
+            rudb_pgtypes::OperatorResolution::Ambiguous
+        )
+    });
     let mapped = Error::new(error.code(), message.to_string());
     let mapped = match ambiguous {
         true => mapped
@@ -5343,6 +5338,17 @@ fn undefined_operator(
     match error.span() {
         Some(span) => mapped.with_span(span),
         None => mapped,
+    }
+}
+
+/// The name of a binary operator in `pg_operator`, which spells `LIKE` and its forms as `~~`.
+fn operator_name(ast: &Ast, op: BinaryOp) -> String {
+    match op {
+        BinaryOp::Like => "~~".to_string(),
+        BinaryOp::NotLike => "!~~".to_string(),
+        BinaryOp::ILike => "~~*".to_string(),
+        BinaryOp::NotILike => "!~~*".to_string(),
+        _ => spelling(ast, op),
     }
 }
 

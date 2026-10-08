@@ -4394,7 +4394,7 @@ pub fn call_values(
     returns: &LogicalType,
     written: Written<'_>,
 ) -> Result<Value> {
-    if let Some(value) = crate::pgproc::call(name, args)? {
+    if let Some(value) = crate::pgproc::call(name, args, returns)? {
         return Ok(value);
     }
     if let Some(value) = crate::aggregate::state_call(name, args, returns)? {

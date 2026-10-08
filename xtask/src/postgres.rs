@@ -10,6 +10,7 @@
 //! `errcodes.txt` gives the SQLSTATE list of `rudb-common`, `guc_parameters.dat` and
 //! `guc_tables.c` give the configuration parameters of `rudb-common`, `cmdtaglist.h` gives the
 //! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`,
+//! `pg_proc.dat` and `pg_operator.dat` give its functions and its operators,
 //! `unicode_norm_table.h` gives the Unicode normalization tables of `rudb-kernels`, and the
 //! samples of `pg_hba.conf`, `pg_ident.conf` and `postgresql.conf` are the files that
 //! `rudb-server init` writes.
@@ -67,6 +68,7 @@ const VENDORS: [Vendor; 6] = [
             ("src/include/catalog/pg_type.dat", "pg_type.dat"),
             ("src/include/catalog/pg_cast.dat", "pg_cast.dat"),
             ("src/include/catalog/pg_proc.dat", "pg_proc.dat"),
+            ("src/include/catalog/pg_operator.dat", "pg_operator.dat"),
             ("src/backend/catalog/system_functions.sql", "system_functions.sql"),
             ("src/timezone/tznames/Default", "tznames-Default"),
             ("COPYRIGHT", "LICENSE.postgres"),
@@ -124,7 +126,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 13] = [
+const GENERATED: [Generated; 14] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -164,6 +166,15 @@ const GENERATED: [Generated; 13] = [
             "crates/rudb-pgtypes/vendor/system_functions.sql",
         ],
         generate: |texts| pgproc(&texts[0], &texts[1], &texts[2]),
+    },
+    Generated {
+        output: "crates/rudb-pgtypes/src/generated/operators.rs",
+        inputs: &[
+            "crates/rudb-pgtypes/vendor/pg_type.dat",
+            "crates/rudb-pgtypes/vendor/pg_operator.dat",
+            "crates/rudb-pgtypes/vendor/pg_proc.dat",
+        ],
+        generate: |texts| pgoperator(&texts[0], &texts[1], &texts[2]),
     },
     Generated {
         output: "crates/rudb-kernels/src/pgnormalize/table.rs",
@@ -1026,6 +1037,94 @@ fn pgproc(types: &str, procs: &str, system_functions: &str) -> Result<String, St
             strings(names),
             strings(defaults)
         );
+    }
+    out.push_str("];\n");
+    Ok(out)
+}
+
+/// Renders the operators of `pg_operator.dat` in the order of the name and the OID, which is the
+/// order in which an operator finds the candidates of its name. A prefix operator has the left
+/// type 0. `oprcode` names a function of `pg_proc.dat`, and the generator checks that one function
+/// of that name takes the types of the operator, which is the function that the operator calls.
+fn pgoperator(types: &str, operators: &str, procs: &str) -> Result<String, String> {
+    let oids = type_oids(types)?;
+    let mut functions: BTreeMap<String, Vec<Vec<u32>>> = BTreeMap::new();
+    for entry in dat_entries("pg_proc.dat", procs)? {
+        let name = entry.get("proname").ok_or("pg_proc.dat: an entry with no proname")?;
+        let args: Vec<u32> = entry
+            .get("proargtypes")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|typname| {
+                oids.get(typname).copied().ok_or_else(|| format!("pg_proc.dat: no type {typname}"))
+            })
+            .collect::<Result<_, _>>()?;
+        functions.entry(name.clone()).or_default().push(args);
+    }
+    let mut rows = Vec::new();
+    for entry in dat_entries("pg_operator.dat", operators)? {
+        let field = |key: &str| entry.get(key).map(String::as_str);
+        let name = field("oprname").ok_or("pg_operator.dat: an entry with no oprname")?;
+        let bad = |what: &str| format!("pg_operator.dat: {name} has a bad {what}");
+        let oid: u32 = field("oid").and_then(|v| v.parse().ok()).ok_or_else(|| bad("oid"))?;
+        let type_oid = |key: &str| match field(key) {
+            None | Some("0") => Ok(0),
+            Some(typname) => oids
+                .get(typname)
+                .copied()
+                .ok_or_else(|| format!("pg_operator.dat: no type {typname}")),
+        };
+        let kind = match field("oprkind") {
+            None | Some("b") => 'b',
+            Some("l") => 'l',
+            Some(_) => return Err(bad("oprkind")),
+        };
+        let (left, right, result) =
+            (type_oid("oprleft")?, type_oid("oprright")?, type_oid("oprresult")?);
+        if (kind == 'l') != (left == 0) || right == 0 || result == 0 {
+            return Err(bad("oprleft, oprright or oprresult"));
+        }
+        // A regproc of an overloaded name has its argument types after it, which are the types
+        // of the operator.
+        let code = field("oprcode").ok_or_else(|| bad("oprcode"))?;
+        let code = code.split_once('(').map_or(code, |(name, _)| name);
+        let operands: Vec<u32> = [left, right].into_iter().filter(|&oid| oid != 0).collect();
+        let takes = functions
+            .get(code)
+            .map_or(0, |all| all.iter().filter(|args| **args == operands).count());
+        if takes != 1 {
+            return Err(format!(
+                "pg_operator.dat: {name} calls {code}, which is not one function of its types"
+            ));
+        }
+        rows.push((name.to_string(), oid, kind, operands, result, code.to_string()));
+    }
+    rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    if rows.windows(2).any(|w| w[0].1 == w[1].1) {
+        return Err("pg_operator.dat: two operators have the same OID".to_string());
+    }
+    let mut out = String::from(
+        "//! The built-in operators of PostgreSQL, one for each entry of `pg_operator.dat`.\n\
+         //!\n\
+         //! @generated by `cargo xtask pg-vendor` from `crates/rudb-pgtypes/vendor/pg_type.dat`,\n\
+         //! `crates/rudb-pgtypes/vendor/pg_operator.dat` and\n\
+         //! `crates/rudb-pgtypes/vendor/pg_proc.dat`. Do not edit. `cargo xtask pg-check` runs in\n\
+         //! the gate and fails if this file and the vendored files disagree.\n\
+         \n\
+         use crate::operators::{Operator, o};\n\
+         \n",
+    );
+    let _ = writeln!(
+        out,
+        "/// Every operator in the order of the name and the OID: the OID, `oprname`, `oprkind`, the\n\
+         /// types of the operands, `oprresult` and `oprcode`.\n\
+         pub(crate) static OPERATORS: [Operator; {}] = [",
+        rows.len()
+    );
+    for (name, oid, kind, operands, result, code) in &rows {
+        let _ =
+            writeln!(out, "    o({oid}, {name:?}, b'{kind}', &{operands:?}, {result}, {code:?}),");
     }
     out.push_str("];\n");
     Ok(out)

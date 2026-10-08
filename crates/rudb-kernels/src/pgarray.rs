@@ -106,10 +106,13 @@ fn unsupported(message: &str) -> Error {
 
 /// The C functions of this module, sorted.
 pub(crate) const SOURCES: &[&str] = &[
+    "array_append",
+    "array_cat",
     "array_dims",
     "array_position",
     "array_position_start",
     "array_positions",
+    "array_prepend",
     "array_remove",
     "array_replace",
     "array_reverse",
@@ -120,15 +123,21 @@ pub(crate) const SOURCES: &[&str] = &[
     "array_sort_order_nulls_first",
     "array_to_text",
     "array_to_text_null",
+    "arraycontained",
+    "arraycontains",
+    "arrayoverlap",
     "trim_array",
     "width_bucket_array",
 ];
 
 /// The C functions of this module that are not strict: they see a null argument.
 pub(crate) const NULLS: &[&str] = &[
+    "array_append",
+    "array_cat",
     "array_position",
     "array_position_start",
     "array_positions",
+    "array_prepend",
     "array_remove",
     "array_replace",
     "array_to_text_null",
@@ -143,13 +152,21 @@ pub(crate) const OUTPUTS: &[&str] = &["array_to_text", "array_to_text_null"];
 pub(crate) const VOLATILE: &[&str] = &["array_sample", "array_shuffle"];
 
 /// The value of the C function `src` of `pg_proc` over `args`, or `None` for another function.
-pub(crate) fn proc_call(src: &str, args: &[Value]) -> Result<Option<Value>> {
+/// `returns` is the type of the value.
+pub(crate) fn proc_call(src: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
     use Value::{Boolean, Integer, Null, Varchar};
     if !SOURCES.contains(&src) {
         return Ok(None);
     }
-    if src == "width_bucket_array" {
-        return width_bucket(args);
+    match (src, args) {
+        ("width_bucket_array", _) => return width_bucket(args),
+        ("array_append", [array, value]) => return pushed(array, value, returns, false).map(Some),
+        ("array_prepend", [value, array]) => return pushed(array, value, returns, true).map(Some),
+        ("array_cat", [left, right]) => return Ok(Some(concatenated(left, right))),
+        ("arraycontains", [left, right]) => return contains(right, left, true).map(Some),
+        ("arraycontained", [left, right]) => return contains(left, right, true).map(Some),
+        ("arrayoverlap", [left, right]) => return contains(left, right, false).map(Some),
+        _ => {}
     }
     // A function that is not strict gives a null for a null array.
     let Some((element, values)) = args.first().and_then(elements) else {
@@ -233,6 +250,82 @@ pub(crate) fn proc_call(src: &str, args: &[Value]) -> Result<Option<Value>> {
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+/// `array_append` and `array_prepend`: the array with the value added at its end or at its start.
+/// A null array is an empty one.
+fn pushed(array: &Value, value: &Value, returns: &LogicalType, first: bool) -> Result<Value> {
+    let (element, values) = match array {
+        Value::List { element, values } => (element.clone(), values.as_slice()),
+        _ => match returns {
+            LogicalType::List(element) => ((**element).clone(), &[][..]),
+            _ => return Err(Error::internal(format!("array_append that gives a {returns}"))),
+        },
+    };
+    if matches!(element, LogicalType::List(_)) && !values.is_empty() {
+        return Err(Error::invalid_input("argument must be empty or one-dimensional array")
+            .state(SqlState::DATA_EXCEPTION)
+            .unplaced());
+    }
+    let mut all = Vec::with_capacity(values.len() + 1);
+    if first {
+        all.push(value.clone());
+    }
+    all.extend_from_slice(values);
+    if !first {
+        all.push(value.clone());
+    }
+    Ok(Value::List { element, values: all })
+}
+
+/// `array_cat`: the elements of the two arrays in order. A null or an empty array gives the other
+/// array.
+fn concatenated(left: &Value, right: &Value) -> Value {
+    match (elements(left), elements(right)) {
+        (None, _) => right.clone(),
+        (_, None) => left.clone(),
+        (Some((_, [])), _) => right.clone(),
+        (_, Some((_, []))) => left.clone(),
+        (Some((element, first)), Some((_, second))) => {
+            let mut all = Vec::with_capacity(first.len() + second.len());
+            all.extend_from_slice(first);
+            all.extend_from_slice(second);
+            Value::List { element: element.clone(), values: all }
+        }
+    }
+}
+
+/// `array_contain_compare`: whether each element of `inner` (`all`) or one of them (not `all`)
+/// equals an element of `outer`, over the elements of all the dimensions. A null equals nothing.
+fn contains(inner: &Value, outer: &Value, all: bool) -> Result<Value> {
+    fn flat<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
+        match value {
+            Value::List { values, .. } => values.iter().for_each(|value| flat(value, out)),
+            value => out.push(value),
+        }
+    }
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    flat(inner, &mut first);
+    flat(outer, &mut second);
+    second.retain(|value| !value.is_null());
+    for value in first {
+        let found = if value.is_null() {
+            false
+        } else {
+            let mut found = false;
+            for other in &second {
+                if order(value, other)? == Ordering::Equal {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if found != all {
+            return Ok(Value::Boolean(found));
+        }
+    }
+    Ok(Value::Boolean(all))
 }
 
 /// `array_to_text_internal`: the elements in order, the ones of an array of more dimensions too,
@@ -474,7 +567,41 @@ mod tests {
     }
 
     fn run(src: &str, args: &[Value]) -> Value {
-        proc_call(src, args).unwrap().unwrap()
+        let returns = LogicalType::List(Box::new(LogicalType::Integer));
+        proc_call(src, args, &returns).unwrap().unwrap()
+    }
+
+    #[test]
+    fn the_array_operators_add_and_compare_the_elements_as_postgresql_does() {
+        let (one, null) = (Value::Integer(1), Value::Null);
+        let array = ints(&[Some(2), None]);
+        assert_eq!(
+            run("array_append", &[array.clone(), one.clone()]),
+            ints(&[Some(2), None, Some(1)])
+        );
+        assert_eq!(
+            run("array_prepend", &[one.clone(), array.clone()]),
+            ints(&[Some(1), Some(2), None])
+        );
+        assert_eq!(run("array_append", &[null.clone(), null.clone()]), ints(&[None]));
+        assert_eq!(run("array_prepend", &[one.clone(), null.clone()]), ints(&[Some(1)]));
+        assert_eq!(
+            run("array_cat", &[array.clone(), ints(&[Some(3)])]),
+            ints(&[Some(2), None, Some(3)])
+        );
+        assert_eq!(run("array_cat", &[null.clone(), array.clone()]), array);
+        assert_eq!(run("array_cat", &[array.clone(), ints(&[])]), array);
+        assert_eq!(run("array_cat", &[null.clone(), null]), Value::Null);
+        let (yes, no) = (Value::Boolean(true), Value::Boolean(false));
+        let both = [ints(&[Some(1), Some(2), Some(2)]), ints(&[Some(2), Some(1)])];
+        assert_eq!(run("arraycontains", &both), yes);
+        assert_eq!(run("arraycontained", &both), yes);
+        assert_eq!(run("arraycontains", &[ints(&[Some(1)]), ints(&[])]), yes);
+        assert_eq!(run("arraycontains", &[ints(&[Some(1), None]), ints(&[None])]), no);
+        assert_eq!(run("arraycontained", &[ints(&[]), ints(&[None])]), yes);
+        assert_eq!(run("arrayoverlap", &[ints(&[None, Some(2)]), ints(&[Some(2)])]), yes);
+        assert_eq!(run("arrayoverlap", &[ints(&[None]), ints(&[None])]), no);
+        assert_eq!(run("arrayoverlap", &[ints(&[]), ints(&[])]), no);
     }
 
     #[test]
@@ -507,7 +634,9 @@ mod tests {
             ints(&[Some(1), None, Some(3)])
         );
         assert_eq!(run("trim_array", &[array.clone(), Value::Integer(2)]), ints(&[Some(3)]));
-        let error = proc_call("trim_array", &[array.clone(), Value::Integer(4)]).unwrap_err();
+        let returns = array.logical_type();
+        let error =
+            proc_call("trim_array", &[array.clone(), Value::Integer(4)], &returns).unwrap_err();
         assert_eq!(error.message(), "number of elements to trim must be between 0 and 3");
         assert_eq!(run("array_dims", &[array]), Value::Varchar("[1:3]".into()));
         assert_eq!(run("array_dims", &[ints(&[])]), Value::Null);
