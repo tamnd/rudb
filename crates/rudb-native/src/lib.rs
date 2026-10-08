@@ -4987,6 +4987,8 @@ fn write_section(
             run_projection::RLE_PAGE_BYTES
         } else if one.kind == *section::SORTED_PROJECTION || one.kind == *section::RUN_PROJECTION {
             1 << 19
+        } else if one.kind == *section::VALUE_ROWS {
+            postings::EXTENT_BYTES.max(one.bytes.len().div_ceil(section::MAX_EXTENTS as usize))
         } else {
             section::MAX_EXTENT as usize
         };
