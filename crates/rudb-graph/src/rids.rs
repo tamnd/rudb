@@ -588,6 +588,30 @@ impl Rids {
         Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
     }
 
+    /// The rows of `rows`, as offsets from `first` in ascending order, that the set holds.
+    ///
+    /// What a scan keeps of a part after its filter has had the whole part. A test is a search for
+    /// a sparse set, so a sparse set walks its members in the part alongside the rows instead, and
+    /// the other forms test each row, which is a load.
+    #[must_use]
+    pub fn held_of(&self, first: Rid, rows: impl Iterator<Item = usize>) -> Vec<u32> {
+        let offset = |row: usize| u32::try_from(row).ok();
+        match &self.body {
+            Body::Sparse(members) => {
+                let from = members.partition_point(|&member| member < first);
+                let mut members = members[from..].iter().map(|&member| member - first).peekable();
+                rows.filter(|&row| {
+                    let row = count(row);
+                    while members.next_if(|&member| member < row).is_some() {}
+                    members.peek() == Some(&row)
+                })
+                .filter_map(offset)
+                .collect()
+            }
+            _ => rows.filter(|&row| self.contains(first + count(row))).filter_map(offset).collect(),
+        }
+    }
+
     /// The members from `first` for `len` rows, as offsets from `first`, in order.
     ///
     /// What a scan keeps of a part the set was pushed into. A sparse set answers from the members in
@@ -765,7 +789,19 @@ impl Rids {
         let members = words.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
         match shape(rows, members) {
             Form::Full => Self::full(rows),
-            Form::Sparse => Self { rows, body: Body::Sparse(ones(&words).collect()) },
+            Form::Sparse => {
+                // A loop into a list of the right length, because collecting the members out of
+                // the iterator over each word's ones grew it a push at a time.
+                let mut list = Vec::with_capacity(index(members));
+                for (at, &word) in words.iter().enumerate() {
+                    let mut rest = word;
+                    while rest != 0 {
+                        list.push(count(at) * 64 + u64::from(rest.trailing_zeros()));
+                        rest &= rest - 1;
+                    }
+                }
+                Self { rows, body: Body::Sparse(list) }
+            }
             Form::Dense => Self { rows, body: Body::Dense { words, members } },
         }
     }
@@ -1194,9 +1230,10 @@ mod tests {
         );
     }
 
-    /// The offsets a scan keeps out of a part are the members in it, for each of the three forms.
+    /// The offsets a scan keeps out of a part are the members in it, and the rows of it held are the
+    /// ones that are members, for each of the three forms.
     #[test]
-    fn the_offsets_in_a_range_are_its_members_counted_from_its_start() {
+    fn the_offsets_in_a_range_and_the_rows_held_of_it_are_its_members() {
         let rows = 10_000;
         let sparse = Rids::from_sorted(rows, vec![3, 100, 101, 9999]).expect("sorted");
         let dense = Rids::from_sorted(rows, (0..rows).step_by(3).collect()).expect("sorted");
@@ -1211,6 +1248,9 @@ mod tests {
                     set.form()
                 );
                 assert_eq!(set.count_in(first, index(u64::from(len))), expected.len());
+                let every_other = (0..index(u64::from(len))).step_by(2);
+                let held: Vec<u32> = expected.iter().copied().filter(|at| at % 2 == 0).collect();
+                assert_eq!(set.held_of(first, every_other), held, "{:?}", set.form());
             }
         }
     }
