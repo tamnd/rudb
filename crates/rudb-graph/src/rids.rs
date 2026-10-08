@@ -1149,7 +1149,7 @@ mod tests {
     /// and a member whose run crosses a part.
     #[test]
     fn a_sparse_push_a_member_at_a_time_keeps_exactly_the_children_of_its_members() {
-        let parents: u64 = 20 * SPARSE_RATIO;
+        let parents: u64 = 20_000;
         let sizes: Vec<u64> =
             (0..parents).map(|p| if p % 1000 == 42 { 3000 } else { p % 5 }).collect();
         let of: Vec<Rid> =
@@ -1177,7 +1177,7 @@ mod tests {
     /// The offsets a scan keeps out of a part are the members in it, for each of the three forms.
     #[test]
     fn the_offsets_in_a_range_are_its_members_counted_from_its_start() {
-        let rows = 10 * SPARSE_RATIO;
+        let rows = 10_000;
         let sparse = Rids::from_sorted(rows, vec![3, 100, 101, 9999]).expect("sorted");
         let dense = Rids::from_sorted(rows, (0..rows).step_by(3).collect()).expect("sorted");
         for set in [sparse, dense, Rids::full(rows), Rids::none(rows)] {
