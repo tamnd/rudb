@@ -15129,3 +15129,104 @@ fn a_row_against_a_query_of_as_many_columns_is_compared_a_column_at_a_time() {
         assert!(error.contains(message), "{sql}: {error}");
     }
 }
+
+#[test]
+fn join_by_names_the_join_type_the_pin_plans_with() {
+    let db = Database::new();
+    for sql in [
+        "CREATE TABLE t1(a INTEGER)",
+        "INSERT INTO t1 VALUES (1), (2), (3), (NULL)",
+        "CREATE TABLE t2(b INTEGER)",
+        "INSERT INTO t2 VALUES (2), (3), (NULL)",
+    ] {
+        db.execute(sql).unwrap();
+    }
+    let t = Value::Boolean(true);
+    let f = Value::Boolean(false);
+    let int = |i| Value::Integer(i);
+    let cases = [
+        (
+            "SELECT a, __mark_join_marker FROM t1 JOIN BY (TYPE mark) t2 ON (a = b) \
+             ORDER BY a NULLS LAST",
+            vec![
+                vec![int(1), Value::Null],
+                vec![int(2), t.clone()],
+                vec![int(3), t.clone()],
+                vec![Value::Null, Value::Null],
+            ],
+        ),
+        (
+            "SELECT * FROM t1 JOIN BY (TYPE MARK_JOIN) t2 ON a < b ORDER BY a NULLS LAST",
+            vec![
+                vec![int(1), t.clone()],
+                vec![int(2), t.clone()],
+                vec![int(3), Value::Null],
+                vec![Value::Null, Value::Null],
+            ],
+        ),
+        (
+            "SELECT p.a, __mark_join_marker FROM t1 p JOIN BY (TYPE mark) t2 ON p.a = 1 \
+             ORDER BY 1 NULLS LAST",
+            vec![
+                vec![int(1), t.clone()],
+                vec![int(2), f.clone()],
+                vec![int(3), f.clone()],
+                vec![Value::Null, Value::Null],
+            ],
+        ),
+        (
+            "SELECT a FROM t1 JOIN BY (TYPE SeMi) t2 ON a = b ORDER BY a",
+            vec![vec![int(2)], vec![int(3)]],
+        ),
+        (
+            "SELECT a FROM t1 JOIN BY (TYPE anti) t2 ON a = b ORDER BY a NULLS LAST",
+            vec![vec![int(1)], vec![Value::Null]],
+        ),
+        (
+            "SELECT * FROM t1 JOIN BY (TYPE single) t2 ON a = b ORDER BY a NULLS LAST",
+            vec![
+                vec![int(1), Value::Null],
+                vec![int(2), int(2)],
+                vec![int(3), int(3)],
+                vec![Value::Null, Value::Null],
+            ],
+        ),
+        (
+            "SELECT * FROM t1 JOIN BY (TYPE right_semi) t2 ON a = b ORDER BY b",
+            vec![vec![int(2)], vec![int(3)]],
+        ),
+        ("SELECT * FROM t1 JOIN BY (TYPE right_anti) t2 ON a = b", vec![vec![Value::Null]]),
+        ("SELECT count(*) FROM t1 JOIN BY (TYPE full) t2 ON a = b", vec![vec![Value::BigInt(5)]]),
+        (
+            "SELECT count(*) FROM t1 JOIN BY (TYPE semi) (SELECT b AS a FROM t2) USING (a)",
+            vec![vec![Value::BigInt(2)]],
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(rows(&db, sql), expected, "{sql}");
+    }
+    let refused = [
+        (
+            "SELECT * FROM t1 JOIN BY (TYPE bogus) t2 ON a = b",
+            "unrecognized value \"bogus\" for enum \"JoinType\"",
+        ),
+        ("SELECT * FROM t1 JOIN BY (TYPE invalid) t2 ON a = b", "not a valid join type"),
+        ("SELECT * FROM t1 JOIN BY (TYPE mark) t2 ON TRUE", "Unsupported explicit MARK"),
+        ("SELECT * FROM t1 JOIN BY (TYPE mark) t2 ON a + b = 3", "Unsupported explicit MARK"),
+        (
+            "SELECT * FROM t1 JOIN BY (TYPE mark) t2 ON a = b AND a IS NOT DISTINCT FROM b",
+            "Unsupported explicit MARK",
+        ),
+        ("SELECT * FROM t1 JOIN BY (TYPE mark) t2 ON a = (SELECT b)", "Unsupported explicit MARK"),
+        ("SELECT t2.b FROM t1 JOIN BY (TYPE mark) t2 ON a = b", "t2"),
+    ];
+    for (sql, message) in refused {
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+    }
+    let error = db
+        .execute("SELECT * FROM t1 JOIN BY (TYPE single) (VALUES (2), (2)) r(b) ON a = b")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("More than one row returned by a subquery"), "{error}");
+}

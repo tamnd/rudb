@@ -398,10 +398,22 @@ fn source(ast: &Ast, index: SourceRef) -> String {
                 JoinKind::Anti => "ANTI",
                 JoinKind::Cross => "CROSS",
                 JoinKind::Positional => "POSITIONAL",
+                JoinKind::Mark => "MARK",
+                JoinKind::Single => "SINGLE",
+                JoinKind::RightSemi => "RIGHT_SEMI",
+                JoinKind::RightAnti => "RIGHT_ANTI",
             };
             let natural = if natural { "NATURAL " } else { "" };
-            let mut out =
-                format!("({} {natural}{word} JOIN {}", source(ast, left), source(ast, right));
+            // The kinds only `JOIN BY` can write come back out as `JOIN BY`. Measured.
+            let by = matches!(
+                kind,
+                JoinKind::Mark | JoinKind::Single | JoinKind::RightSemi | JoinKind::RightAnti
+            );
+            let mut out = if by {
+                format!("({} JOIN BY (TYPE {word}) {}", source(ast, left), source(ast, right))
+            } else {
+                format!("({} {natural}{word} JOIN {}", source(ast, left), source(ast, right))
+            };
             if on != NONE {
                 // A second pair of parentheses around a condition that has its own, so an equality
                 // comes out as `ON ((a.x = b.y))`.

@@ -1284,6 +1284,14 @@ pub enum JoinKind {
     Cross,
     /// `POSITIONAL JOIN`, which is DuckDB's own and pairs rows by ordinal.
     Positional,
+    /// `JOIN BY (TYPE MARK)`, every left row and whether it matched, as `__mark_join_marker`.
+    Mark,
+    /// `JOIN BY (TYPE SINGLE)`, a left join that fails when a left row matches twice.
+    Single,
+    /// `JOIN BY (TYPE RIGHT_SEMI)`, the right rows that match.
+    RightSemi,
+    /// `JOIN BY (TYPE RIGHT_ANTI)`, the right rows that do not match.
+    RightAnti,
 }
 
 /// One expression.
