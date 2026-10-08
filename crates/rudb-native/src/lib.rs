@@ -7081,8 +7081,16 @@ impl TextSource for NativeText {
         }
         let block = first / TEXT_PAYLOAD_VALUES;
         let last = ((block + 1) * TEXT_PAYLOAD_VALUES).min(limit);
+        // A run is searched where it lies by a caller that remembers what it made of each value,
+        // a `LIKE` deciding a group, so a run that is the whole block is the read [`Loan::Whole`]
+        // describes. Read in order instead, the third decode of a block kept it, and a block the
+        // sparse rows of a chunk had already been decoded twice for was kept after the group that
+        // needed it was decided. That held 40 MB of `Title` in ClickBench q23 that nothing read.
+        let whole = first == block * TEXT_PAYLOAD_VALUES
+            && last == ((block + 1) * TEXT_PAYLOAD_VALUES).min(self.values);
+        let loan = if whole { Loan::Whole } else { Loan::InOrder };
         let mut decoded = Vec::new();
-        let bytes = self.loaned_block(block, &mut decoded, Loan::InOrder)?;
+        let bytes = self.loaned_block(block, &mut decoded, loan)?;
         let ends = self.ends_within(first, last)?;
         if ends.len() != last - first {
             return Err(invalid("global dictionary offsets are short"));
@@ -21843,6 +21851,86 @@ mod tests {
             .map(|code| generous.try_bytes_at(code).expect("read").expect("a value").to_vec())
             .collect::<Vec<_>>();
         assert_eq!(swept, read, "a starved sweep answers what a point read answers");
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A run sweep over a whole block in the last statement keeps nothing, however many times the
+    /// block was decoded before it.
+    ///
+    /// That is a `LIKE` over a filter's sparse rows: two chunks ask about a few values of a group
+    /// and decode its block for them, the third decides the whole group, and nothing asks about the
+    /// group again. A run sweep that starts partway into a block is still a read in order.
+    #[test]
+    fn a_whole_block_run_sweep_in_the_last_statement_keeps_nothing() {
+        let path = path("dictionary-run-sweep-last");
+        let spellings = (0..2_500)
+            .map(|index| Value::Varchar(format!("value {index:08} {}", "z".repeat(index % 40))))
+            .collect::<Vec<_>>();
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::new("text", LogicalType::Varchar)])
+                .expect("new file");
+        for part in spellings.chunks(1_024) {
+            writer
+                .append(
+                    &Chunk::new(vec![
+                        Vector::from_values(LogicalType::Varchar, part).expect("strings"),
+                    ])
+                    .expect("one column"),
+                )
+                .expect("stripe written");
+        }
+        writer.finish().expect("commit");
+
+        let reader = Reader::open(&path).expect("valid directory");
+        let page = reader.table.dictionaries[0].expect("a string column has one");
+        let last = Arc::new(AtomicBool::new(true));
+        let dictionary = open_global_dictionary(
+            Arc::clone(&reader.file),
+            None,
+            page,
+            &LogicalType::Varchar,
+            TEXT_KEEP_BUDGET,
+            last,
+        )
+        .expect("a dictionary opens");
+        let resting = dictionary.footprint();
+        for indices in [[3, 70], [5, 900]] {
+            dictionary
+                .visit_text_once(&indices, &mut |_at: usize, _text: &[u8]| Ok(()))
+                .expect("a visit reads");
+        }
+        assert_eq!(dictionary.footprint(), resting, "two sparse visits keep nothing");
+
+        let read = |first: usize| {
+            let mut ran: Vec<Vec<u8>> = Vec::new();
+            let stopped = dictionary
+                .sweep_text_runs(first, dictionary.len(), &mut |_from, run, ends| {
+                    let mut start = 0;
+                    for &end in ends {
+                        ran.push(run[start..end].to_vec());
+                        start = end;
+                    }
+                    Ok(())
+                })
+                .expect("a run sweep reads")
+                .expect("a stored dictionary lays its values end to end");
+            (stopped, ran)
+        };
+        let (stopped, ran) = read(0);
+        assert_eq!(stopped, TEXT_PAYLOAD_VALUES, "the sweep is the whole first block");
+        assert_eq!(dictionary.footprint(), resting, "and keeps it on its third decode");
+        let expected = spellings[..TEXT_PAYLOAD_VALUES]
+            .iter()
+            .map(|value| match value {
+                Value::Varchar(text) => text.as_bytes().to_vec(),
+                other => panic!("a string column holds {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ran, expected, "and hands over every value of the block");
+
+        let (_, ran) = read(100);
+        assert_eq!(ran, expected[100..], "a sweep from partway answers the same");
+        assert!(dictionary.footprint() > resting, "and keeps the block on its fourth decode");
         fs::remove_file(path).expect("remove scratch file");
     }
 
