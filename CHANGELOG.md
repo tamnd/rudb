@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.9.4
+
+#2856 names the collations of `pg_collation` and checks `COLLATE` as PostgreSQL does, with the error for two different explicit collations in one call. #2858 maps the case of text by its collation in `upper`, `lower`, `initcap` and `casefold`, over the Unicode case tables of the PostgreSQL pin: `C` maps only the ASCII letters, `pg_c_utf8` maps by the simple mappings and `pg_unicode_fast` by the full mappings. #2859 matches `ILIKE` by the lower case of the collation. #2861 gives a regular expression the character classes, the case folding and the word boundaries of its collation.
+
+#2857 lets the join order search read a small relation that joins two large sides once more, ahead of the join tree. #2860 gives no free map to an aggregate that closes its groups as their runs pass.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.9.3
 
 #2853 vendors `pg_operator.dat` and resolves an operator in a PostgreSQL session by the rules of `binary_oper_exact` and `oper_select_candidate`. An operator of a polymorphic type with a kernel binds as the kernel, so the array operators `||`, `@>`, `<@` and `&&` give the types and the null rules of PostgreSQL. `operator is not unique` and `operator does not exist` come from the same lookup.
