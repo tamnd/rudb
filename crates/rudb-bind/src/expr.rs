@@ -2600,6 +2600,7 @@ impl Binder<'_> {
             .plan_mut()
             .add_expr(Expr::Column(rudb_plan::ColumnBinding::new(projected, 0)), candidate_type);
         let condition = self.compare(comparison, subject, candidate)?;
+        let condition = self.tuple_not_equal(condition);
         let marker = self.add_expr(
             Expr::Column(rudb_plan::ColumnBinding::new(projected, 1)),
             LogicalType::Boolean,
@@ -2655,7 +2656,8 @@ impl Binder<'_> {
             CompareOp::Equal | CompareOp::NotEqual => {
                 let mut tests = Vec::with_capacity(row.len());
                 for (&value, &candidate) in row.iter().zip(&candidates) {
-                    tests.push(self.compare(comparison, value, candidate)?);
+                    let test = self.compare(comparison, value, candidate)?;
+                    tests.push(self.tuple_not_equal(test));
                 }
                 if comparison == CompareOp::Equal {
                     tests

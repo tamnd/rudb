@@ -5132,6 +5132,9 @@ impl<'a> Binder<'a> {
         // right semi or anti join is the right side alone.
         if let Some(marker) = marker {
             self.mark_conditions(&conditions, &left_tables, &right_tables)?;
+            for condition in &mut conditions {
+                *condition = self.tuple_not_equal(*condition);
+            }
             scope.truncate(split);
             scope.push(marker);
         }
