@@ -3500,6 +3500,56 @@ fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
             "42883 function regexp_instr(unknown, unknown, bigint) does not exist",
             "",
         ),
+        (
+            "select regexp_replace('abcabc', 'b', 'X'), regexp_replace('abcabc', 'b', 'X', 'g'), \
+             regexp_replace('abcabcabc', 'B', 'X', 1, 2, 'gi'), regexp_replace('abc', 'x*', '-', 'g')",
+            "regexp_replace,regexp_replace,regexp_replace,regexp_replace",
+            "aXcabc|aXcaXc|abcaXcabc|-a-b-c-",
+        ),
+        (
+            "select regexp_replace('abcabc', '(b)(c)', '[\\2\\1\\&\\\\\\3\\x]', 'g'), \
+             regexp_replace('abcabcabc', 'b', 'X', 1, 0), regexp_replace('abcabc', 'b', 'X', 7)",
+            "regexp_replace,regexp_replace,regexp_replace",
+            "a[cbbc\\\\x]a[cbbc\\\\x]|aXcaXcaXc|abcabc",
+        ),
+        (
+            "select regexp_replace('abc', 'b', 'X', '2')",
+            "22023 invalid regular expression option: \"2\"",
+            "",
+        ),
+        (
+            "select regexp_replace('abc', 'b', 'X', 1, -1)",
+            "22023 invalid value for parameter \"n\": -1",
+            "",
+        ),
+        (
+            "select regexp_split_to_array('a,b,,c', ','), regexp_split_to_array('abc', 'x*'), \
+             regexp_split_to_array(',a,', ','), regexp_split_to_array('', ',')",
+            "regexp_split_to_array,regexp_split_to_array,regexp_split_to_array,\
+             regexp_split_to_array",
+            r#"{a,b,"",c}|{a,b,c}|{"",a,""}|{""}"#,
+        ),
+        (
+            "select * from regexp_split_to_table('a b', '\\s+') with ordinality",
+            "regexp_split_to_table,ordinality",
+            "a|1;b|2",
+        ),
+        (
+            "select regexp_split_to_table(x, ',') from (values ('a,b'), ('c')) t(x)",
+            "regexp_split_to_table",
+            "a;b;c",
+        ),
+        (
+            "select regexp_split_to_array('abc', 'b', 'g')",
+            "22023 regexp_split_to_array() does not support the \"global\" option",
+            "",
+        ),
+        (
+            "select substring('abcdef' from 'c.e'), substring('abcdef' from 'c(.)e'), \
+             substring('abcdef' from '(x)?c'), substring('abcdef' from 2 for 3)",
+            "substring,substring,substring,substring",
+            "cde|d||bcd",
+        ),
     ] {
         assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
     }

@@ -2,10 +2,10 @@
 //! flavour of `rudb-regex`.
 //!
 //! The binder writes `~` and `~*` as `__rudb_pg_regex_match`, with the flag `i` for `~*`, and each
-//! of `regexp_like`, `regexp_match`, `regexp_matches`, `regexp_count`, `regexp_instr` and
-//! `regexp_substr` as a kernel of its own that takes every parameter, with the default of each one
-//! the call leaves out. `regexp_matches` gives the list of its rows, and the unnest that the binder
-//! puts around it gives them one at a time, in a select list and in `FROM`.
+//! of the `regexp_*` functions and `substring(text from pattern)` as a kernel of its own that takes
+//! every parameter, with the default of each one the call leaves out. `regexp_matches` and
+//! `regexp_split_to_table` give the list of their rows, and the unnest that the binder puts around
+//! them gives the rows one at a time, in a select list and in `FROM`.
 //!
 //! The pattern and the flags are compiled once for a query where they are literals, and once for
 //! each run of rows that have the same ones where they are not. A pattern that does not compile
@@ -36,6 +36,19 @@ pub enum Function {
     Instr,
     /// `regexp_substr(text, pattern, start, n, flags, subexpr)`.
     Substr,
+    /// `regexp_replace(text, pattern, replacement, flags)`, which replaces every match with the
+    /// flag `g` and the first one without it.
+    Replace,
+    /// `regexp_replace(text, pattern, replacement, start, n, flags)`, which replaces match `n`, or
+    /// every match for an `n` of 0.
+    ReplaceAt,
+    /// `regexp_split_to_array(text, pattern, flags)`.
+    SplitArray,
+    /// `regexp_split_to_table(text, pattern, flags)`, as the list of its rows.
+    SplitTable,
+    /// `substring(text from pattern)`, which gives the first group, or the whole match for a
+    /// pattern with no groups.
+    Substring,
 }
 
 /// A parameter of one of the functions.
@@ -44,6 +57,8 @@ pub enum Parameter {
     /// The text that is searched.
     Text,
     Pattern,
+    /// What `regexp_replace` writes for a match.
+    Replacement,
     /// The flag letters, which are none by default.
     Flags,
     /// The character that the search starts at, from 1, which is the default.
@@ -56,10 +71,12 @@ pub enum Parameter {
     Subexpr,
 }
 
-use Parameter::{EndOption, Flags, N, Pattern, Start, Subexpr, Text};
+use Parameter::{EndOption, Flags, N, Pattern, Replacement, Start, Subexpr, Text};
 
-/// The kernel and the SQL name of each function. The operator has no SQL name.
-const FUNCTIONS: [(Function, &str, &str); 7] = [
+/// The kernel and the SQL name of each function. The operator has no SQL name. Of the two forms of
+/// `regexp_replace`, a name finds the first, and the binder takes the second for an integer as the
+/// fourth argument.
+const FUNCTIONS: [(Function, &str, &str); 12] = [
     (Function::Match, "__rudb_pg_regex_match", ""),
     (Function::Like, "__rudb_pg_regexp_like", "regexp_like"),
     (Function::First, "__rudb_pg_regexp_match", "regexp_match"),
@@ -67,6 +84,11 @@ const FUNCTIONS: [(Function, &str, &str); 7] = [
     (Function::Count, "__rudb_pg_regexp_count", "regexp_count"),
     (Function::Instr, "__rudb_pg_regexp_instr", "regexp_instr"),
     (Function::Substr, "__rudb_pg_regexp_substr", "regexp_substr"),
+    (Function::Replace, "__rudb_pg_regexp_replace", "regexp_replace"),
+    (Function::ReplaceAt, "__rudb_pg_regexp_replace_at", "regexp_replace"),
+    (Function::SplitArray, "__rudb_pg_regexp_split_to_array", "regexp_split_to_array"),
+    (Function::SplitTable, "__rudb_pg_regexp_split_to_table", "regexp_split_to_table"),
+    (Function::Substring, "__rudb_pg_substring", "substring"),
 ];
 
 impl Function {
@@ -79,7 +101,8 @@ impl Function {
     /// The function that SQL calls `name`, found without case.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
-        let found = FUNCTIONS.iter().find(|(.., sql)| !sql.is_empty() && sql.eq_ignore_ascii_case(name));
+        let found =
+            FUNCTIONS.iter().find(|(.., sql)| !sql.is_empty() && sql.eq_ignore_ascii_case(name));
         found.map(|&(function, ..)| function)
     }
 
@@ -100,6 +123,10 @@ impl Function {
     pub fn parameters(self) -> &'static [Parameter] {
         match self {
             Self::Match | Self::Like | Self::First | Self::Every => &[Text, Pattern, Flags],
+            Self::SplitArray | Self::SplitTable => &[Text, Pattern, Flags],
+            Self::Substring => &[Text, Pattern],
+            Self::Replace => &[Text, Pattern, Replacement, Flags],
+            Self::ReplaceAt => &[Text, Pattern, Replacement, Start, N, Flags],
             Self::Count => &[Text, Pattern, Start, Flags],
             Self::Instr => &[Text, Pattern, Start, N, EndOption, Flags, Subexpr],
             Self::Substr => &[Text, Pattern, Start, N, Flags, Subexpr],
@@ -114,9 +141,18 @@ impl Function {
             Self::Match | Self::Like => LogicalType::Boolean,
             Self::First => text(),
             Self::Every => LogicalType::List(Box::new(text())),
+            Self::SplitArray | Self::SplitTable => text(),
             Self::Count | Self::Instr => LogicalType::Integer,
-            Self::Substr => LogicalType::Varchar,
+            Self::Substr | Self::Replace | Self::ReplaceAt | Self::Substring => {
+                LogicalType::Varchar
+            }
         }
+    }
+
+    /// Whether the function gives a set of rows, which the binder unnests.
+    #[must_use]
+    pub fn is_set(self) -> bool {
+        matches!(self, Self::Every | Self::SplitTable)
     }
 
     /// Where `parameter` is among the arguments of the kernel.
@@ -129,14 +165,20 @@ impl Parameter {
     /// Whether the parameter is a string, rather than an `int4`.
     #[must_use]
     pub fn is_text(self) -> bool {
-        matches!(self, Text | Pattern | Flags)
+        matches!(self, Text | Pattern | Replacement | Flags)
+    }
+
+    /// Whether every call gives the parameter.
+    #[must_use]
+    pub fn is_required(self) -> bool {
+        matches!(self, Text | Pattern | Replacement)
     }
 
     /// The value of the parameter where the call leaves it out.
     #[must_use]
     pub fn default_value(self) -> Value {
         match self {
-            Text | Pattern | Flags => Value::Varchar(String::new()),
+            Text | Pattern | Replacement | Flags => Value::Varchar(String::new()),
             Start | N => Value::Integer(1),
             EndOption | Subexpr => Value::Integer(0),
         }
@@ -177,6 +219,8 @@ impl Numbers {
                 _ => return Ok(parameter.default_value()),
             };
             let valid = match parameter {
+                // An `n` of 0 makes `regexp_replace` replace every match.
+                N if function == Function::ReplaceAt => value >= 0,
                 Start | N => value > 0,
                 EndOption => value == 0 || value == 1,
                 _ => value >= 0,
@@ -211,10 +255,25 @@ impl Numbers {
 impl Call {
     /// The call for `pattern` and `letters`, or the error that PostgreSQL gives for them.
     fn new(function: Function, pattern: &str, letters: &str) -> Result<Self> {
+        // A string for the fourth argument of `regexp_replace` is the flags, so a number written
+        // as a string there is an error that says how to give a start.
+        if function == Function::Replace
+            && let Some(digit) = letters.chars().next().filter(char::is_ascii_digit)
+        {
+            let message = format!("invalid regular expression option: \"{digit}\"");
+            let hint = "If you meant to use regexp_replace() with a start parameter, cast the \
+                        fourth argument to integer explicitly.";
+            let error = Error::invalid_input(message).state(SqlState::INVALID_PARAMETER_VALUE);
+            return Err(error.hint(hint).unplaced());
+        }
         let flags = PgFlags::parse(letters).map_err(Error::unplaced)?;
-        // Only the operator and `regexp_matches` take the `g` flag, and the flags are read before
-        // the pattern, so this error comes first.
-        if flags.is_global() && !matches!(function, Function::Match | Function::Every) {
+        // Only the operator, `regexp_matches` and `regexp_replace` take the `g` flag, and the
+        // flags are read before the pattern, so this error comes first.
+        let global = matches!(
+            function,
+            Function::Match | Function::Every | Function::Replace | Function::ReplaceAt
+        );
+        if flags.is_global() && !global {
             let message = format!("{}() does not support the \"global\" option", function.name());
             let error = Error::invalid_input(message).state(SqlState::INVALID_PARAMETER_VALUE);
             let error = match function {
@@ -236,9 +295,18 @@ impl Call {
         self.pattern == pattern && self.letters == letters
     }
 
-    /// The answer for one text.
-    fn one(&self, function: Function, text: &str, numbers: &Numbers) -> Value {
-        match function {
+    /// The answer for one row of arguments, none of which is null.
+    fn one(&self, function: Function, row: &[Value], numbers: &Numbers) -> Result<Value> {
+        let string = |parameter: Parameter| match function.at(parameter).and_then(|at| row.get(at))
+        {
+            Some(Value::Varchar(value)) => Ok(value.as_str()),
+            _ => Err(Error::internal(format!(
+                "{} of something that is not a string",
+                function.kernel()
+            ))),
+        };
+        let text = string(Text)?;
+        Ok(match function {
             Function::Match | Function::Like => Value::Boolean(self.regex.is_match(text)),
             Function::First => match self.regex.find_at(text, 0) {
                 Some(found) => self.pieces(text, &found),
@@ -274,7 +342,69 @@ impl Call {
                 Some((from, to)) => Value::Varchar(text[from..to].to_owned()),
                 None => Value::Null,
             },
-        }
+            Function::Replace => {
+                let n = usize::from(!self.global);
+                Value::Varchar(self.replace(text, 0, n, string(Replacement)?))
+            }
+            Function::ReplaceAt => match byte_at(text, numbers.skip) {
+                Some(from) => {
+                    Value::Varchar(self.replace(text, from, numbers.n, string(Replacement)?))
+                }
+                None => Value::Varchar(text.to_owned()),
+            },
+            Function::SplitArray | Function::SplitTable => {
+                let pieces =
+                    self.split(text).into_iter().map(|piece| Value::Varchar(piece.to_owned()));
+                Value::List { element: LogicalType::Varchar, values: pieces.collect() }
+            }
+            Function::Substring => {
+                let group = usize::from(self.regex.groups() > 0);
+                let found = self.regex.find_at(text, 0);
+                match found.and_then(|found| found.group(group)) {
+                    Some((from, to)) => Value::Varchar(text[from..to].to_owned()),
+                    None => Value::Null,
+                }
+            }
+        })
+    }
+
+    /// `text` with match `n` from the byte `from` on replaced, or every match for an `n` of 0, as
+    /// `replace_text_regexp` in `regexp.c` does.
+    fn replace(&self, text: &str, from: usize, n: usize, replacement: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        let mut seen = 0;
+        self.each(text, from, |found| {
+            seen += 1;
+            if seen < n {
+                return true;
+            }
+            out.push_str(&text[copied..found.start()]);
+            expand(&mut out, replacement, text, found);
+            copied = found.end();
+            n == 0
+        });
+        out.push_str(&text[copied..]);
+        out
+    }
+
+    /// The pieces of `text` between the matches. An empty match at the start or at the end, or
+    /// right after the match before it, does not split, as in `setup_regexp_matches` with
+    /// `ignore_degenerate`.
+    fn split<'t>(&self, text: &'t str) -> Vec<&'t str> {
+        let mut pieces = Vec::new();
+        let mut from = 0;
+        let mut last_end = 0;
+        self.each(text, 0, |found| {
+            if found.start() < text.len() && found.end() > last_end {
+                pieces.push(&text[from..found.start()]);
+                from = found.end();
+            }
+            last_end = found.end();
+            true
+        });
+        pieces.push(&text[from..]);
+        pieces
     }
 
     /// Calls `keep` with each match from the byte `from` on, while it says to go on. The next
@@ -332,6 +462,35 @@ impl Call {
     }
 }
 
+/// Writes `replacement` for one match. `\1` to `\9` are the groups, and a group that the pattern
+/// does not have is empty. `\&` is the whole match and `\\` is one backslash. Any other backslash
+/// is kept as it is.
+fn expand(out: &mut String, replacement: &str, text: &str, found: &Captures) {
+    let mut rest = replacement;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        let group = match rest.bytes().next() {
+            Some(digit @ b'1'..=b'9') => usize::from(digit - b'0'),
+            Some(b'&') => 0,
+            Some(b'\\') => {
+                out.push('\\');
+                rest = &rest[1..];
+                continue;
+            }
+            _ => {
+                out.push('\\');
+                continue;
+            }
+        };
+        rest = &rest[1..];
+        if let Some((from, to)) = found.group(group) {
+            out.push_str(&text[from..to]);
+        }
+    }
+    out.push_str(rest);
+}
+
 /// The byte that character `chars` of `text` starts at, which is the length for the character
 /// after the last, or `None` past that.
 fn byte_at(text: &str, chars: usize) -> Option<usize> {
@@ -344,26 +503,26 @@ fn byte_at(text: &str, chars: usize) -> Option<usize> {
     }
 }
 
-/// The pattern and the flags of a row.
-fn pattern_of(function: Function, row: &[Value]) -> Option<(&str, &str)> {
-    let pattern = row.get(1)?;
-    let letters = function.at(Flags).and_then(|at| row.get(at))?;
-    match (pattern, letters) {
-        (Value::Varchar(pattern), Value::Varchar(letters)) => Some((pattern, letters)),
-        _ => None,
-    }
+/// The pattern and the flags of a row, with no flags for a function that takes none.
+fn pattern_of(function: Function, row: &[Option<&Value>]) -> Option<(String, String)> {
+    let Some(Value::Varchar(pattern)) = row.get(1).copied().flatten() else { return None };
+    let letters = match function.at(Flags) {
+        Some(at) => match row.get(at).copied().flatten() {
+            Some(Value::Varchar(letters)) => letters.clone(),
+            _ => return None,
+        },
+        None => String::new(),
+    };
+    Some((pattern.clone(), letters))
 }
 
 /// What a recipe can lift out of a call, given the arguments that were literals. A pattern that
 /// does not compile lifts nothing, so its error still comes from the rows.
 pub(crate) fn hoist(name: &str, literals: &[Option<Value>]) -> Option<Call> {
     let function = Function::of_kernel(name)?;
-    let pattern = literals.get(1)?.as_ref()?;
-    let letters = literals.get(function.at(Flags)?)?.as_ref()?;
-    let (Value::Varchar(pattern), Value::Varchar(letters)) = (pattern, letters) else {
-        return None;
-    };
-    Call::new(function, pattern, letters).ok()
+    let literals: Vec<Option<&Value>> = literals.iter().map(Option::as_ref).collect();
+    let (pattern, letters) = pattern_of(function, &literals)?;
+    Call::new(function, &pattern, &letters).ok()
 }
 
 /// The answer of a call over one row of values, or `None` when `name` is not one of the calls of
@@ -380,12 +539,11 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
         return Ok(Some(Value::Null));
     }
     let numbers = Numbers::read(function, args)?;
-    let (Some(Value::Varchar(text)), Some((pattern, letters))) =
-        (args.first(), pattern_of(function, args))
-    else {
+    let row: Vec<Option<&Value>> = args.iter().map(Some).collect();
+    let Some((pattern, letters)) = pattern_of(function, &row) else {
         return Err(Error::internal(format!("{name} of something that is not a string")));
     };
-    Ok(Some(Call::new(function, pattern, letters)?.one(function, text, &numbers)))
+    Call::new(function, &pattern, &letters)?.one(function, args, &numbers).map(Some)
 }
 
 /// The answers of a call over vectors, with the pattern compiled again only where it changes.
@@ -405,16 +563,12 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
     if *text.logical_type() != LogicalType::Varchar {
         return Ok(None);
     }
-    let constant = |parameter: Parameter| {
-        let at = function.at(parameter)?;
-        args[at].constant_value()
-    };
+    let constants: Vec<Option<&Value>> = args.iter().map(|arg| arg.constant_value()).collect();
     let mut held: Option<Call> = None;
     if prepared.is_none()
-        && let (Some(Value::Varchar(pattern)), Some(Value::Varchar(letters))) =
-            (args[1].constant_value(), constant(Flags))
+        && let Some((pattern, letters)) = pattern_of(function, &constants)
     {
-        held = Some(Call::new(function, pattern, letters)?);
+        held = Some(Call::new(function, &pattern, &letters)?);
     }
     // The operator over one pattern for every row is the loop that a `WHERE` runs, so it writes
     // the answers in place.
@@ -445,19 +599,19 @@ pub(crate) fn vectorized<V: AsRef<Vector>>(
         let call = match prepared {
             Some(call) => call,
             None => {
-                let Some((pattern, letters)) = pattern_of(function, &row) else {
-                    return Err(Error::internal(format!("{name} of something that is not a string")));
+                let given: Vec<Option<&Value>> = row.iter().map(Some).collect();
+                let Some((pattern, letters)) = pattern_of(function, &given) else {
+                    return Err(Error::internal(format!(
+                        "{name} of something that is not a string"
+                    )));
                 };
-                if !held.as_ref().is_some_and(|call| call.holds(pattern, letters)) {
-                    held = Some(Call::new(function, pattern, letters)?);
+                if !held.as_ref().is_some_and(|call| call.holds(&pattern, &letters)) {
+                    held = Some(Call::new(function, &pattern, &letters)?);
                 }
                 held.as_ref().ok_or_else(|| Error::internal("no pattern"))?
             }
         };
-        let Value::Varchar(text) = &row[0] else {
-            return Err(Error::internal(format!("{name} of something that is not a string")));
-        };
-        values.push(call.one(function, text, &numbers));
+        values.push(call.one(function, &row, &numbers)?);
     }
     Ok(Some(Vector::from_values(returns.clone(), &values)?))
 }
@@ -537,5 +691,30 @@ mod tests {
         assert_eq!(error.message(), "invalid value for parameter \"start\": 0");
         let error = answer(Function::Count, &[abc(), text("c"), int(1), text("g")]).unwrap_err();
         assert_eq!(error.message(), "regexp_count() does not support the \"global\" option");
+    }
+
+    /// The answers of the PostgreSQL 19 oracle.
+    #[test]
+    fn regexp_replace_and_the_splits_skip_as_postgresql_does() {
+        let int = Value::Integer;
+        let replace = |given: &[Value]| answer(Function::Replace, given).unwrap();
+        assert_eq!(replace(&[text("abc"), text("x*"), text("-"), text("g")]), text("-a-b-c-"));
+        let groups = [text("abcabc"), text("(b)(c)"), text("[\\2\\1\\&\\\\\\3\\x]"), text("g")];
+        assert_eq!(replace(&groups), text("a[cbbc\\\\x]a[cbbc\\\\x]"));
+        assert_eq!(replace(&[text("abc"), text("b"), text("X\\")]), text("aX\\c"));
+        let at = |given: &[Value]| answer(Function::ReplaceAt, given).unwrap();
+        let abc = || text("abcabcabc");
+        assert_eq!(at(&[abc(), text("b"), text("X"), int(1), int(2)]), text("abcaXcabc"));
+        assert_eq!(at(&[abc(), text("b"), text("X"), int(1), int(0)]), text("aXcaXcaXc"));
+        assert_eq!(at(&[abc(), text("b"), text("X"), int(10)]), abc());
+        let error =
+            answer(Function::Replace, &[abc(), text("b"), text("X"), text("2")]).unwrap_err();
+        assert_eq!(error.message(), "invalid regular expression option: \"2\"");
+        let split = |string, pattern| {
+            rows(answer(Function::SplitArray, &[text(string), text(pattern)]).unwrap())
+        };
+        assert_eq!(split("abc", "x*"), vec![text("a"), text("b"), text("c")]);
+        assert_eq!(split(",a,", ","), vec![text(""), text("a"), text("")]);
+        assert_eq!(split("", ","), vec![text("")]);
     }
 }

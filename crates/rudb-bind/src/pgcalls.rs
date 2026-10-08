@@ -366,14 +366,18 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         scope: &Scope,
     ) -> Result<Option<ExprRef>> {
-        let Some(function) = Function::named(written) else { return Ok(None) };
-        let parameters = function.parameters();
+        let Some(named) = Function::named(written) else { return Ok(None) };
+        let least = named.parameters().iter().filter(|parameter| parameter.is_required()).count();
+        let most = match named {
+            Function::Replace => Function::ReplaceAt.parameters().len(),
+            _ => named.parameters().len(),
+        };
         if self.semantics.regex_rules() != RegexRules::Postgres
-            || !(2..=parameters.len()).contains(&arguments.len())
+            || !(least..=most).contains(&arguments.len())
         {
             return Ok(None);
         }
-        let mut bound = Vec::with_capacity(parameters.len());
+        let mut bound = Vec::with_capacity(most);
         for &argument in arguments {
             bound.push(self.bind_expr(ast, argument, scope)?);
         }
@@ -381,6 +385,23 @@ impl Binder<'_> {
             arguments.iter().map(|&argument| string_literal(ast, argument).is_some()).collect();
         let types: Vec<LogicalType> =
             bound.iter().map(|&argument| self.plan().expr_type(argument).clone()).collect();
+        let integer = |at: usize| {
+            !unknown[at] && matches!(types[at], LogicalType::Integer | LogicalType::SmallInt)
+        };
+        let function = match named {
+            // A string or a null as the fourth argument is the flags, and an integer is the start.
+            Function::Replace if arguments.len() > 4 || (arguments.len() == 4 && integer(3)) => {
+                Function::ReplaceAt
+            }
+            // `substring` from a position is not a regular expression.
+            Function::Substring
+                if !unknown[1] && !matches!(types[1], LogicalType::Varchar | LogicalType::Null) =>
+            {
+                return self.call("substring", bound).map(Some);
+            }
+            other => other,
+        };
+        let parameters = function.parameters();
         let fits = |(at, ty): (usize, &LogicalType)| match parameters[at].is_text() {
             true => matches!(ty, LogicalType::Varchar | LogicalType::Null),
             false => {
@@ -394,7 +415,7 @@ impl Binder<'_> {
         if !types.iter().enumerate().all(fits) {
             return Err(no_such_function(function.name(), &types, &unknown));
         }
-        if function == Function::Every && !self.in_unnest {
+        if function.is_set() && !self.in_unnest {
             return Err(self.misplaced_set_function());
         }
         for parameter in &parameters[bound.len()..] {

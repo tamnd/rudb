@@ -18,6 +18,7 @@ use rudb_common::{
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_kernels::pgjson::JsonSet;
+use rudb_kernels::pgregexp::Function;
 use rudb_parse::ast::{self, BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, NONE};
 use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan};
@@ -44,7 +45,7 @@ const LIST_MACROS: &[(&str, &str, usize, bool)] = &[
 /// A function of PostgreSQL that gives a set of rows, which a select list and `FROM` unnest.
 fn set_function(name: &str, semantics: Semantics) -> bool {
     let regexp = semantics.regex_rules() == RegexRules::Postgres
-        && rudb_catalog::same_name(name, "regexp_matches");
+        && Function::named(name).is_some_and(Function::is_set);
     rudb_catalog::same_name(name, "generate_series") || JsonSet::of(name).is_some() || regexp
 }
 
