@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use rudb_arrow::{DataType, Field, RecordBatch, Schema};
+pub use rudb_common::notice::Notice;
 use rudb_common::{LogicalType, Memory, Origin, Reservation, Result, Session, Value};
 use rudb_metrics::Document;
 use rudb_vector::{Chunk, Vector};
@@ -67,31 +68,6 @@ struct Body {
     session: Session,
     /// What the statement has to tell the client that is not an error, in the order it said it.
     notices: Vec<Notice>,
-}
-
-/// A message a statement gives that is not an error, such as the one for a `DROP TABLE IF EXISTS`
-/// of a table that is not there. A PostgreSQL client gets it as a `NoticeResponse` with the
-/// severity `NOTICE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Notice {
-    /// The SQLSTATE, which is `00000` for most notices.
-    pub sqlstate: &'static str,
-    /// The text, in the words of PostgreSQL.
-    pub message: String,
-}
-
-impl Notice {
-    /// The notice for a name that a statement did not find and did not need.
-    #[must_use]
-    pub fn skipped(kind: &str, name: &str) -> Self {
-        Self { sqlstate: "00000", message: format!("{kind} \"{name}\" does not exist, skipping") }
-    }
-
-    /// The notice for a name that a statement found and did not make again.
-    #[must_use]
-    pub fn exists(sqlstate: &'static str, kind: &str, name: &str) -> Self {
-        Self { sqlstate, message: format!("{kind} \"{name}\" already exists, skipping") }
-    }
 }
 
 impl QueryResult {

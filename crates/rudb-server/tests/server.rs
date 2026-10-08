@@ -930,6 +930,59 @@ fn a_name_that_if_exists_lets_go_gives_a_notice() {
 }
 
 #[test]
+fn a_notice_of_the_parse_comes_before_the_rows_as_postgres_does_it() {
+    let dirs = Dirs::new("parse-notices");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let long = "a".repeat(70);
+    let cut = format!("identifier \"{long}\" will be truncated to \"{}\"", &long[..63]);
+    let notices = |messages: &[Message]| -> Vec<String> {
+        let notices = messages.iter().filter(|message| message.tag == b'N');
+        notices
+            .map(|message| {
+                assert_eq!(message.field(b'S').as_deref(), Some("NOTICE"));
+                assert_eq!(message.field(b'C').as_deref(), Some("42622"));
+                message.field(b'M').unwrap()
+            })
+            .collect()
+    };
+
+    // The notice comes before the rows, and again when the same statement runs again.
+    for _ in 0..2 {
+        let messages = client.query(&format!("select 1 as {long}"));
+        assert_eq!(tags(&messages), "NTDCZ");
+        assert_eq!(notices(&messages), std::slice::from_ref(&cut));
+    }
+
+    // The notices come in the order of the text, and before an error.
+    let messages = client.query(&format!("select {long} from (select 1 as b{long}) s"));
+    assert_eq!(tags(&messages), "NNEZ");
+    assert_eq!(messages[2].field(b'C').as_deref(), Some("42703"));
+    let messages = client.query(&format!("select 1 as {long}; select 2 as {long}"));
+    assert_eq!(tags(&messages), "NTDCNTDCZ");
+
+    // A statement that streams its rows and a statement that changes the catalog.
+    let messages = client.query(&format!("select count(*) as {long} from generate_series(1, 3)"));
+    assert_eq!(tags(&messages), "NTDCZ");
+    assert_eq!(tags(&client.query(&format!("create table {long} (a integer)"))), "NCZ");
+    assert_eq!(tags(&client.query(&format!("drop table {long}"))), "NCZ");
+
+    // Parse gives the notice once, before ParseComplete, and Execute does not give it again.
+    client.parse("", &format!("select 1 as {long}"), &[]);
+    client.bind("", "", &[], &[]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "N12DCZ");
+    assert_eq!(notices(&messages), std::slice::from_ref(&cut));
+
+    // client_min_messages above NOTICE keeps them from the client.
+    client.query("set client_min_messages = warning");
+    assert_eq!(tags(&client.query(&format!("select 1 as {long}"))), "TDCZ");
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_parameter_of_no_type_takes_the_type_that_postgres_gives_it() {
     let dirs = Dirs::new("inference");
     let server = Server::start(dirs.config()).unwrap();

@@ -8,7 +8,7 @@ use rudb_common::{Cancel, Error, Field, Result, Value};
 
 use crate::database::Shared;
 use crate::prepared::Prepared;
-use crate::result::QueryResult;
+use crate::result::{Notice, QueryResult};
 
 /// Where a connection is in a transaction block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +127,16 @@ impl Connection {
         self.shared.set_statement_start(micros);
     }
 
+    /// The notices that the last statement of this thread raised, once, whether it failed or not.
+    /// These are the notices of the parse, such as the one for an identifier that is too long, and
+    /// they come before the notices of [`QueryResult::notices`]. Each [`Connection::query`],
+    /// [`Connection::execute`], [`Connection::prepare`] and run of a [`Prepared`] starts with no
+    /// notices.
+    #[must_use]
+    pub fn notices(&self) -> Vec<Notice> {
+        rudb_common::notice::take()
+    }
+
     /// The rows that the last statement of this thread made before it failed, once.
     ///
     /// Only a statement of a PostgreSQL session keeps them, see [`Connection::set_postgres`],
@@ -145,6 +155,7 @@ impl Connection {
     /// A parse error, a binder error, or anything the operators raise while running, which is
     /// mostly cast failures and arithmetic that leaves the range of its type.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
+        drop(rudb_common::notice::take());
         self.shared.query(sql, &self.token()).map_err(|error| self.shared.process_error(error))
     }
 
@@ -158,6 +169,7 @@ impl Connection {
     ///
     /// A parse error, a binder error, a catalog error, or anything the operators raise.
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
+        drop(rudb_common::notice::take());
         self.shared.execute(sql, &self.token()).map_err(|error| self.shared.process_error(error))
     }
 
@@ -178,6 +190,7 @@ impl Connection {
     /// A parse error. A name that does not resolve or a type that does not work out is an error at
     /// execution rather than here, because a parameter has no type until it has a value.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
+        drop(rudb_common::notice::take());
         Prepared::new(self.shared.clone(), sql).map_err(|error| self.shared.process_error(error))
     }
 
