@@ -16,6 +16,12 @@ use crate::binder::Binder;
 use crate::expr::{postgres_oid, written_oid};
 use crate::scope::Scope;
 
+/// The OID of the collation `default`, which stands for the collation of the database.
+const DEFAULT_COLLATION: u32 = 100;
+
+/// The collation of every database of rudb, as `datcollate` and `datctype` report it.
+const DATABASE_COLLATION: &str = "C";
+
 /// A collation written with `COLLATE`, and where the `COLLATE` was written.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Explicit {
@@ -171,8 +177,17 @@ impl Binder<'_> {
                 Vec::new()
             }
         };
+        let merged = self.merge_collations(&inputs)?;
+        let result = merged.filter(|_| collatable(self.plan().expr_type(expr)));
+        self.collated.derived.insert(expr, result);
+        Ok(result)
+    }
+
+    /// The collation written with `COLLATE` that the inputs of an operator or a function take
+    /// together. Two different ones are an error at the second.
+    fn merge_collations(&mut self, inputs: &[ExprRef]) -> Result<Option<Explicit>> {
         let mut merged: Option<Explicit> = None;
-        for input in inputs {
+        for &input in inputs {
             let Some(found) = self.derive_collation(input)? else { continue };
             match merged {
                 None => merged = Some(found),
@@ -188,8 +203,22 @@ impl Binder<'_> {
                 Some(_) => {}
             }
         }
-        let result = merged.filter(|_| collatable(self.plan().expr_type(expr)));
-        self.collated.derived.insert(expr, result);
-        Ok(result)
+        Ok(merged)
+    }
+
+    /// The OID of the collation of a call over `args`, as `PG_GET_COLLATION` gives it to the
+    /// function: the collation written with `COLLATE` that the arguments take, or else the
+    /// default collation of the database, which is the collation of the database itself.
+    pub(crate) fn call_collation(&mut self, args: &[ExprRef]) -> Result<u32> {
+        let explicit = match self.collated.written.is_empty() {
+            true => None,
+            false => self.merge_collations(args)?,
+        };
+        let oid = explicit.map_or(DEFAULT_COLLATION, |explicit| explicit.oid);
+        Ok(match oid {
+            DEFAULT_COLLATION => rudb_pgtypes::collation(DATABASE_COLLATION)
+                .map_or(DEFAULT_COLLATION, |collation| collation.oid),
+            oid => oid,
+        })
     }
 }

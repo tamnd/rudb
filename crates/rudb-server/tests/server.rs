@@ -1330,7 +1330,8 @@ fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
             .collect::<Vec<_>>()
             .join("|")
     };
-    // The values are the ones that PostgreSQL 19 gives.
+    // The values are the ones that PostgreSQL 19 gives in a database whose collation is `C`, which
+    // maps the case of only the ASCII letters.
     for (sql, expected) in [
         (
             "select btrim('  a  '), btrim('xxaxx', 'x'), ltrim('  a'), rtrim('a  '), \
@@ -1344,7 +1345,7 @@ fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
         ),
         (
             "select lower('ABÉ'), upper('abé'), initcap('hello wORLD foo_bar 1abc');",
-            "abé|ABÉ|Hello World Foo_Bar 1abc",
+            "abÉ|ABé|Hello World Foo_Bar 1abc",
         ),
         (
             "select lpad('abc', 5), lpad('abc', 5, 'xy'), lpad('abc', 2), rpad('abc', 5, 'xy'), \
@@ -1516,9 +1517,17 @@ fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
         ("select chr(127), chr(128), length(chr(1114111));", "||1"),
         (
             "select initcap('ÉCOLE éCOLE'), initcap('a-b c''d'), initcap(''), initcap('ǆa');",
-            "École École|A-B C'D||Ǆa",
+            "ÉCole éCole|A-B C'D||ǆA",
         ),
-        ("select casefold('ẞ ß Σ'), lower('ẞ ß Σ');", "ß ß σ|ß ß σ"),
+        (
+            "select initcap('ÉCOLE éCOLE' collate pg_c_utf8), initcap('ǆa' collate pg_c_utf8);",
+            "École École|Ǆa",
+        ),
+        ("select casefold('ẞ ß Σ'), lower('ẞ ß Σ');", "ẞ ß Σ|ẞ ß Σ"),
+        (
+            "select casefold('ẞ ß Σ' collate pg_c_utf8), lower('ẞ ß Σ' collate pg_c_utf8);",
+            "ß ß σ|ß ß σ",
+        ),
         (
             "select bit_count('\\xff00'::bytea), crc32(''), crc32c(''), sha224('');",
             "8|0|0|\\xd14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f",
@@ -2093,6 +2102,100 @@ fn a_collation_is_named_and_checked_as_postgres_does_it() {
         assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
         assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
         assert_eq!(error.field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_case_of_text_follows_its_collation_as_postgres_does_it() {
+    let dirs = Dirs::new("pgcase");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The rows are the ones that PostgreSQL 19 gives. The default collation of a database of
+    // rudb is `C`, so a call with no collation maps only the ASCII letters, as `C` does.
+    let cases: [(&str, &[&str]); 13] = [
+        (
+            "select upper('abc é ß'), lower('ABC É'), initcap('hELLO éa'), casefold('ABC ẞ');",
+            &["ABC é ß|abc É|Hello éA|abc ẞ"],
+        ),
+        (
+            "select upper('abc é ß' collate \"C\"), lower('ABC É' collate \"POSIX\"), initcap('hELLO éa' collate ucs_basic);",
+            &["ABC é ß|abc É|Hello éA"],
+        ),
+        (
+            "select upper('abc é ß ǆ' collate pg_c_utf8), lower('ΑΣ ẞ' collate pg_c_utf8), casefold('ẞ ABC' collate pg_c_utf8);",
+            &["ABC É ß Ǆ|ασ ß|ß abc"],
+        ),
+        (
+            "select initcap('hello wORLD foo_bar 1abc ǆa' collate pg_c_utf8), initcap('١a' collate pg_c_utf8);",
+            &["Hello World Foo_Bar 1abc Ǆa|١A"],
+        ),
+        (
+            "select upper('ß ŉ' collate pg_unicode_fast), casefold('ẞ ß' collate pg_unicode_fast), lower('ΑΣ ΑΣ.Α Σ' collate pg_unicode_fast);",
+            &["SS ʼN|ss ss|ας ασ.α σ"],
+        ),
+        (
+            "select initcap('ǆa ßa' collate pg_unicode_fast), initcap('١a' collate pg_unicode_fast);",
+            &["ǅa Ssa|١a"],
+        ),
+        (
+            "select lower('ΑΣ' collate pg_c_utf8), lower('ΑΣ0' collate pg_unicode_fast), lower('ΑΣ''Α' collate pg_unicode_fast);",
+            &["ασ|ας0|ασ'α"],
+        ),
+        ("select upper(x collate pg_c_utf8) from (values ('é'), ('ß')) t(x);", &["É", "ß"]),
+        (
+            "select initcap('ǅungla x' collate pg_unicode_fast), initcap('ǅungla x' collate pg_c_utf8);",
+            &["ǅungla X|Ǆungla X"],
+        ),
+        (
+            "select upper('aé'::varchar collate pg_c_utf8), upper('aé'::char(3) collate pg_c_utf8), lower(name 'ÉA');",
+            &["AÉ|AÉ|Éa"],
+        ),
+        ("select upper(null collate pg_c_utf8), pg_typeof(casefold('a'));", &["|text"]),
+        (
+            "select casefold('ﬃ' collate pg_unicode_fast), upper('ﬃ' collate pg_c_utf8), initcap('ﬃx' collate pg_unicode_fast);",
+            &["ffi|ﬃ|Ffix"],
+        ),
+        (
+            "select initcap('o''neil d''arcy' collate pg_c_utf8), initcap('o''neil' collate \"C\");",
+            &["O'Neil D'Arcy|O'Neil"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    let mismatch = "collation mismatch between explicit collations \"C\" and \"pg_c_utf8\"";
+    for (sql, state, message, position) in [
+        (
+            "select upper(x collate \"C\") = upper(x collate pg_c_utf8) from (values ('é')) t(x);",
+            "42P21",
+            mismatch,
+            Some("39"),
+        ),
+        (
+            "select upper(x collate \"C\" || 'é' collate pg_c_utf8) from (values ('é')) t(x);",
+            "42P21",
+            mismatch,
+            Some("35"),
+        ),
+        ("select upper('a' collate unicode);", "0A000", "ICU is not supported in this build", None),
+    ] {
+        let messages = client.query(sql);
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), position, "{sql}");
     }
     server.stop().unwrap();
 }

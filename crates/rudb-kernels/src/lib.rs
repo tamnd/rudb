@@ -101,6 +101,7 @@ mod pgnormalize;
 pub mod pgproc;
 pub mod pgregexp;
 mod pgstring;
+mod pgunicode;
 pub mod prepare;
 mod printf;
 mod quantile;

@@ -508,6 +508,10 @@ impl Binder<'_> {
             let list = LogicalType::List(Box::new(returns));
             return Ok(Some(self.pgproc_kernel(array, &cast, list)));
         }
+        if rudb_kernels::pgproc::collated(proc.src) {
+            let oid = self.call_collation(&cast)?;
+            cast.push(self.add_constant(Value::BigInt(i64::from(oid))));
+        }
         Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
     }
 

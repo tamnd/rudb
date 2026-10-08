@@ -11,7 +11,9 @@
 //! `guc_tables.c` give the configuration parameters of `rudb-common`, `cmdtaglist.h` gives the
 //! command tags of `rudb-pgwire`, `pg_type.dat` gives the type OIDs of `rudb-pgtypes`,
 //! `pg_proc.dat` and `pg_operator.dat` give its functions and its operators,
-//! `unicode_norm_table.h` gives the Unicode normalization tables of `rudb-kernels`, and the
+//! `unicode_norm_table.h` gives the Unicode normalization tables of `rudb-kernels`,
+//! `unicode_case_table.h`, `unicode_category_table.h` and `unicode_category.h` give its Unicode
+//! case and category tables, and the
 //! samples of `pg_hba.conf`, `pg_ident.conf` and `postgresql.conf` are the files that
 //! `rudb-server init` writes.
 //!
@@ -30,6 +32,7 @@ mod nodes;
 mod norm;
 mod pgparse;
 mod translate;
+mod unicode;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -79,6 +82,9 @@ const VENDORS: [Vendor; 6] = [
         dir: "crates/rudb-kernels/vendor",
         files: &[
             ("src/include/common/unicode_norm_table.h", "unicode_norm_table.h"),
+            ("src/include/common/unicode_case_table.h", "unicode_case_table.h"),
+            ("src/include/common/unicode_category_table.h", "unicode_category_table.h"),
+            ("src/include/common/unicode_category.h", "unicode_category.h"),
             ("COPYRIGHT", "LICENSE.postgres"),
         ],
     },
@@ -127,7 +133,7 @@ struct Generated {
     generate: fn(&[String]) -> Result<String, String>,
 }
 
-const GENERATED: [Generated; 15] = [
+const GENERATED: [Generated; 16] = [
     Generated {
         output: "crates/rudb-common/src/generated/sqlstate.rs",
         inputs: &["crates/rudb-common/vendor/errcodes.txt"],
@@ -189,6 +195,15 @@ const GENERATED: [Generated; 15] = [
         output: "crates/rudb-kernels/src/pgnormalize/table.rs",
         inputs: &["crates/rudb-kernels/vendor/unicode_norm_table.h"],
         generate: norm::tables,
+    },
+    Generated {
+        output: "crates/rudb-kernels/src/pgunicode/table.rs",
+        inputs: &[
+            "crates/rudb-kernels/vendor/unicode_case_table.h",
+            "crates/rudb-kernels/vendor/unicode_category_table.h",
+            "crates/rudb-kernels/vendor/unicode_category.h",
+        ],
+        generate: unicode::tables,
     },
     Generated {
         output: "crates/rudb-pgparse/src/generated/gram.rules",
