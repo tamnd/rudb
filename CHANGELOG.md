@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.1
+
+#2870 writes `EXPLAIN` in a PostgreSQL session the way `explain.c` writes it, in text, JSON, YAML and XML. The options give the errors of PostgreSQL, the costs are the defaults PostgreSQL uses for a table it has not analyzed, and `ANALYZE` runs the query and writes the actual rows and times. The plan is still rudb's plan, so a node that PostgreSQL does not have keeps the closest PostgreSQL name and says its own name. #2868 compiles the time zones from the IANA release of each pin, the 2026e data of PostgreSQL 19 for the PostgreSQL dialect and the 2026c data of the ICU in DuckDB v2.0 for the DuckDB dialect, and removes chrono-tz.
+
+#2867 writes the value rows section of a native file in extents of 256 KB and reads only the extents that hold the rows of a value. #2869 finds the next child of a link in the same word when a reduced scan asks for the parents of the rows it kept.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.0
 
 This release closes J7 (#1851), the JOB claim. On server2, on one fresh load of the IMDb snapshot, rudb answers all 113 JOB queries as DuckDB does in 5,780 ms of hot time against DuckDB's 80,336, which is 13.9 times faster, with no query slower than DuckDB and the highest per-query ratio 0.284, on 13d. All eight conditions of the gate hold in the same run, at six threads and again at one thread, where rudb is 15.7 times faster, and the load took 57.5 s against 97.2 s. The report is `reports/2026-10-08/job-gate.md` in rudb-bench (tamnd/rudb-bench#274), and it also has the cold totals and the run with the consistent reduction turned off. The minor version counts closed milestones, and J7 is one, so the PG series goes on from here at 0.10.y.
