@@ -147,6 +147,57 @@ fn depth(ty: &LogicalType) -> usize {
 }
 
 impl Binder<'_> {
+    /// A call with one argument that names a type, such as `int4('5')` or `text(5)`, bound as the
+    /// cast to the type, or `None` when it is a call of a function. This is the rule of
+    /// `func_get_detail` of PostgreSQL. A function of `pg_proc` that takes exactly the type of
+    /// the argument is called, and a function with the name of a type that gives the type is the
+    /// function of the cast, so it binds as the cast. With no such function, a literal string or
+    /// null is always cast, and another value is cast when the cast leaves the value as it is or
+    /// goes through text, but not a row to a string type.
+    pub(crate) fn function_style_cast(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        use rudb_pgtypes::{CoercionContext, CoercionPath, TypeInfo, oid};
+        let ([argument], [input]) = (arguments, bound) else { return Ok(None) };
+        let Some(target) = rudb_pgtypes::func_name_as_type(written) else { return Ok(None) };
+        let ty = self.plan().expr_type(*input).clone();
+        let spelled = rudb_pgtypes::format_type(target);
+        if ty == LogicalType::Null
+            || matches!(ast.expr(*argument), ast::Expr::Literal { kind: LiteralKind::String, .. })
+        {
+            return self.bind_cast(ast, *argument, &spelled, false, scope).map(Some);
+        }
+        let source = rudb_pgtypes::pg_type(&ty).oid;
+        let exact = rudb_pgtypes::procs(written).iter().find(|proc| proc.args == [source]);
+        let cast = match exact {
+            Some(proc) => proc.result == target,
+            None => {
+                match rudb_pgtypes::find_coercion_pathway(source, target, CoercionContext::Explicit)
+                {
+                    CoercionPath::Relabel => true,
+                    CoercionPath::ViaIo => {
+                        let row = source == oid::RECORD
+                            || TypeInfo::get(source).is_some_and(|info| info.kind == b'c');
+                        let string =
+                            TypeInfo::get(target).is_some_and(|info| info.category == b'S');
+                        !(row && string)
+                    }
+                    _ => false,
+                }
+            }
+        };
+        if !cast {
+            return Ok(None);
+        }
+        let (target, declared) = self.cast_target(&spelled)?;
+        self.cast_bound(*input, &target, declared, false).map(Some)
+    }
+
     /// The call `written(arguments)` bound as PostgreSQL binds it, or `None` when the name is not
     /// one of the functions that this module writes out.
     pub(crate) fn postgres_call(

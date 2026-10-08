@@ -10,5 +10,6 @@ version: 19beta4
 # sha256 of every vendored file, relative to this directory.
 c3990901e82b6702b2270591bac7038e04b3c87988f4ef181a2c5a4304d14ea9  pg_type.dat
 3dcac01c9cfee6ed7f9e6b3fbeb9e9fddade883deb96bf6fe5f167274829165b  pg_cast.dat
+1bf16f4276fb6a6f9de50f6a5c2fabf7ead8e104f3ec8040cb41025e40092de5  pg_proc.dat
 0dadd689b1998cc2d3acec42f66913194661f8d4835623776593b7bcdd075cb1  tznames-Default
 3d6af92ff8a4c2cdf69afb1cf44edea727922f5cd0cf8b5f72b11cdecac8fdfd  LICENSE.postgres

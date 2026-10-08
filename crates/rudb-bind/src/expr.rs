@@ -301,33 +301,7 @@ impl Binder<'_> {
                 }
             }
             ast::Expr::Cast { operand, ty, try_cast } => {
-                let session = self.session;
-                let written = ast.string(ty);
-                let target = crate::statement::session_type(self.catalog(), session, written)?;
-                let declared = match session.semantics().type_names() {
-                    TypeNames::Postgres => rudb_pgtypes::declared_type(written),
-                    TypeNames::Pin => None,
-                };
-                if !try_cast
-                    && let Some(declared) = declared
-                    && let Some(value) = self.read_literal(ast, operand, declared.oid)
-                {
-                    let cast = self.checked_cast_to(value?, &target, false)?;
-                    return self.pg_length(cast, declared, true);
-                }
-                let input = self.bind_expr(ast, operand, scope)?;
-                let cast = match declared {
-                    Some(declared) if !try_cast => self.read_string(input, declared, &target),
-                    _ => None,
-                };
-                let cast = match cast {
-                    Some(cast) => cast,
-                    None => self.checked_cast_to(input, &target, try_cast)?,
-                };
-                match declared {
-                    Some(declared) => self.pg_length(cast, declared, true),
-                    None => Ok(cast),
-                }
+                self.bind_cast(ast, operand, ast.string(ty), try_cast, scope)
             }
             ast::Expr::Case { operand, arms, otherwise } => {
                 self.bind_case(ast, operand, arms, otherwise, scope)
@@ -392,6 +366,62 @@ impl Binder<'_> {
             ast::Expr::Exists { query, negated } => {
                 self.bind_exists_subquery(ast, query, negated, scope)
             }
+        }
+    }
+
+    /// `operand::written`, or `TRY_CAST(operand AS written)` when `try_cast` is set. A literal is
+    /// read as the type in a PostgreSQL session.
+    pub(crate) fn bind_cast(
+        &mut self,
+        ast: &Ast,
+        operand: ast::ExprRef,
+        written: &str,
+        try_cast: bool,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let (target, declared) = self.cast_target(written)?;
+        if !try_cast
+            && let Some(declared) = declared
+            && let Some(value) = self.read_literal(ast, operand, declared.oid)
+        {
+            let cast = self.checked_cast_to(value?, &target, false)?;
+            return self.pg_length(cast, declared, true);
+        }
+        let input = self.bind_expr(ast, operand, scope)?;
+        self.cast_bound(input, &target, declared, try_cast)
+    }
+
+    /// The type a cast to the type written as `written` gives, and the PostgreSQL type of it in a
+    /// PostgreSQL session.
+    pub(crate) fn cast_target(&self, written: &str) -> Result<(LogicalType, Option<DeclaredType>)> {
+        let session = self.session;
+        let target = crate::statement::session_type(self.catalog(), session, written)?;
+        let declared = match session.semantics().type_names() {
+            TypeNames::Postgres => rudb_pgtypes::declared_type(written),
+            TypeNames::Pin => None,
+        };
+        Ok((target, declared))
+    }
+
+    /// The cast of an expression that is bound already to the type `cast_target` gave.
+    pub(crate) fn cast_bound(
+        &mut self,
+        input: ExprRef,
+        target: &LogicalType,
+        declared: Option<DeclaredType>,
+        try_cast: bool,
+    ) -> Result<ExprRef> {
+        let cast = match declared {
+            Some(declared) if !try_cast => self.read_string(input, declared, target),
+            _ => None,
+        };
+        let cast = match cast {
+            Some(cast) => cast,
+            None => self.checked_cast_to(input, target, try_cast)?,
+        };
+        match declared {
+            Some(declared) => self.pg_length(cast, declared, true),
+            None => Ok(cast),
         }
     }
 
@@ -1580,6 +1610,12 @@ impl Binder<'_> {
                 matches!(ast.expr(arg), ast::Expr::Literal { kind: LiteralKind::String, .. })
             })
             .collect();
+        if postgres
+            && let Some(cast) =
+                self.function_style_cast(ast, &written, &arguments, &bound, scope)?
+        {
+            return Ok(cast);
+        }
         if let Some(expanded) = self.list_macro(&written, &bound, &untyped)? {
             return Ok(expanded);
         }
@@ -5146,11 +5182,17 @@ fn undefined_function(
     let mut mapped = Error::new(error.code(), error.message().to_string())
         .state(SqlState::UNDEFINED_FUNCTION)
         .pg(message);
-    mapped = match unknown {
-        true => mapped.detail("There is no function of that name."),
-        false => mapped
+    // The detail is the first of the reasons of `func_lookup_failure_details` that holds for
+    // the functions of `pg_proc` with the name.
+    let procs = rudb_pgtypes::procs(written);
+    mapped = if unknown && procs.is_empty() {
+        mapped.detail("There is no function of that name.")
+    } else if !procs.is_empty() && !procs.iter().any(|proc| proc.takes(arguments.len())) {
+        mapped.detail("No function of that name accepts the given number of arguments.")
+    } else {
+        mapped
             .detail("No function of that name accepts the given argument types.")
-            .hint("You might need to add explicit type casts."),
+            .hint("You might need to add explicit type casts.")
     };
     match error.span() {
         Some(span) => mapped.with_span(span),

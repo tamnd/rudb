@@ -1563,6 +1563,41 @@ fn a_call_that_no_function_takes_is_the_error_of_postgres() {
             "function upper(integer) does not exist",
             "No function of that name accepts the given argument types.",
         ),
+        (
+            "select abs(1, 2)",
+            "function abs(integer, integer) does not exist",
+            "No function of that name accepts the given number of arguments.",
+        ),
+        (
+            "select upper('a', 'b')",
+            "function upper(unknown, unknown) does not exist",
+            "No function of that name accepts the given number of arguments.",
+        ),
+        // `concat` is variadic, and a variadic function takes at least the arguments it declares.
+        (
+            "select concat()",
+            "function concat() does not exist",
+            "No function of that name accepts the given number of arguments.",
+        ),
+        // `make_interval` has defaults for all seven, so only an eighth is too many.
+        (
+            "select make_interval(1, 2, 3, 4, 5, 6, 7.0, 8)",
+            "function make_interval(integer, integer, integer, integer, integer, integer, \
+             numeric, integer) does not exist",
+            "No function of that name accepts the given number of arguments.",
+        ),
+        // A call that names a type is a cast only when the cast keeps the value or goes through
+        // text, and not for a row to a string type.
+        (
+            "select int4(now())",
+            "function int4(timestamp with time zone) does not exist",
+            "No function of that name accepts the given argument types.",
+        ),
+        (
+            "select text(row(1, 2))",
+            "function text(record) does not exist",
+            "No function of that name accepts the given argument types.",
+        ),
     ] {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), "EZ", "{sql}");
@@ -1570,6 +1605,54 @@ fn a_call_that_no_function_takes_is_the_error_of_postgres() {
         assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
         assert_eq!(messages[0].field(b'D').as_deref(), Some(detail), "{sql}");
         assert_eq!(messages[0].field(b'P').as_deref(), Some("8"), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_call_that_names_a_type_is_a_cast_as_postgresql_has_it() {
+    let dirs = Dirs::new("function-cast");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            let text = error.field(b'M').unwrap_or_default();
+            let place = error.field(b'P').unwrap_or_default();
+            return format!("{code} {text} at {place}");
+        }
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(|| "NULL".into(), |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        rows.join(";")
+    };
+    // The answers of the PostgreSQL 19 oracle.
+    for (sql, expected) in [
+        (
+            "select int4('5'), text(5), float8('1.5'), bool('t'), date('2024-01-02')",
+            "5|5|1.5|t|2024-01-02",
+        ),
+        ("select int8(5.6), int2(7), pg_typeof(int8(5.6)), pg_typeof(text(5))", "6|7|bigint|text"),
+        ("select int4(null), pg_typeof(int4(null)), name('ab')", "NULL|integer|ab"),
+        (
+            "select text(true), int4(2.5::float8), int4(5::int8), float4(1), pg_typeof(float4(1))",
+            "true|2|5|1|real",
+        ),
+        ("select int4(true), text(array[1, 2]), bpchar(5)", "1|{1,2}|5"),
+        ("select date(timestamp '2024-01-02 03:04')", "2024-01-02"),
+        ("select int8(x) + 1, text(x) from (values (1), (2)) t(x)", "2|1;3|2"),
+        ("select int4('x')", "22P02 invalid input syntax for type integer: \"x\" at 13"),
+    ] {
+        assert_eq!(result(sql), expected, "{sql}");
     }
     server.stop().unwrap();
 }

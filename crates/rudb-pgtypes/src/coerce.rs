@@ -1,22 +1,107 @@
 //! The type that PostgreSQL gives to a list of values that must have one type, as the arms of a
 //! `CASE` or the values of a `COALESCE`, an `ARRAY` or a column of `VALUES`.
 
-use crate::generated::casts::{ASSIGNMENT, IMPLICIT, PREFERRED};
+use crate::generated::casts::{CASTS, PREFERRED};
+use crate::oid;
 use crate::types::{Oid, TypeInfo};
+
+/// A row of `pg_cast`: a cast from `source` to `target`, the place it is allowed in and the way
+/// it is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cast {
+    pub source: Oid,
+    pub target: Oid,
+    /// `castcontext`: the weakest place the cast is allowed in.
+    pub context: CoercionContext,
+    /// `castmethod`: `f` for a function, `i` for the output and then the input function, and `b`
+    /// for no change to the value.
+    pub method: u8,
+}
+
+/// The row constructor of the generated table, short so that each row fits on one line.
+pub(crate) const fn c(source: Oid, target: Oid, context: u8, method: u8) -> Cast {
+    let context = match context {
+        b'i' => CoercionContext::Implicit,
+        b'a' => CoercionContext::Assignment,
+        _ => CoercionContext::Explicit,
+    };
+    Cast { source, target, context, method }
+}
+
+/// Where a value changes its type, from the place that allows the fewest casts to the place that
+/// allows all of them: with no cast written, where the type of the place it goes to decides, as
+/// in `INSERT`, and in a cast that is written. This is `CoercionContext` of PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CoercionContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// How a value of one type becomes a value of another, as `find_coercion_pathway` of PostgreSQL
+/// finds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoercionPath {
+    /// No way that the context allows.
+    None,
+    /// The value stays as it is, as from `oid` to `int4` or from a type to itself.
+    Relabel,
+    /// The function of the cast.
+    Function,
+    /// Each element of an array becomes an element of the other array type.
+    ArrayCoerce,
+    /// The output function of the source and then the input function of the target.
+    ViaIo,
+}
+
+/// The cast of `pg_cast` from `source` to `target`, if there is one.
+pub fn find_cast(source: Oid, target: Oid) -> Option<&'static Cast> {
+    let at = CASTS.binary_search_by_key(&(source, target), |cast| (cast.source, cast.target));
+    at.ok().map(|at| &CASTS[at])
+}
+
+/// How a value of type `source` becomes a value of type `target` in `context`, for two built-in
+/// types. This is `find_coercion_pathway` of PostgreSQL: a type to itself is a relabel, then the
+/// cast of `pg_cast` decides when there is one. With no cast, an array becomes another array type
+/// when its elements do, and the output and input functions turn any type into a string type
+/// where a cast is not written, and a string type into any type where one is.
+pub fn find_coercion_pathway(source: Oid, target: Oid, context: CoercionContext) -> CoercionPath {
+    if source == target {
+        return CoercionPath::Relabel;
+    }
+    if let Some(cast) = find_cast(source, target) {
+        if context < cast.context {
+            return CoercionPath::None;
+        }
+        return match cast.method {
+            b'f' => CoercionPath::Function,
+            b'i' => CoercionPath::ViaIo,
+            _ => CoercionPath::Relabel,
+        };
+    }
+    let (from, to) = (TypeInfo::get(source), TypeInfo::get(target));
+    let element =
+        |info: Option<&TypeInfo>| info.filter(|info| info.is_array()).map(|info| info.elem);
+    if !matches!(target, oid::OIDVECTOR | oid::INT2VECTOR)
+        && let (Some(to), Some(from)) = (element(to), element(from))
+        && find_coercion_pathway(from, to, context) != CoercionPath::None
+    {
+        return CoercionPath::ArrayCoerce;
+    }
+    let string = |info: Option<&TypeInfo>| info.is_some_and(|info| info.category == b'S');
+    if (context >= CoercionContext::Assignment && string(to))
+        || (context == CoercionContext::Explicit && string(from))
+    {
+        return CoercionPath::ViaIo;
+    }
+    CoercionPath::None
+}
 
 /// Whether a value of type `from` becomes a value of type `to` with no cast written, as
 /// `can_coerce_type` with `COERCION_IMPLICIT` says for two built-in types. An array becomes an
 /// array of another type when its elements do.
 pub fn can_coerce_implicitly(from: Oid, to: Oid) -> bool {
-    if from == to || IMPLICIT.binary_search(&(from, to)).is_ok() {
-        return true;
-    }
-    match (TypeInfo::get(from), TypeInfo::get(to)) {
-        (Some(from), Some(to)) if from.is_array() && to.is_array() => {
-            can_coerce_implicitly(from.elem, to.elem)
-        }
-        _ => false,
-    }
+    find_coercion_pathway(from, to, CoercionContext::Implicit) != CoercionPath::None
 }
 
 /// Whether a value of type `from` becomes a value of type `to` where the type of the place it goes
@@ -24,16 +109,7 @@ pub fn can_coerce_implicitly(from: Oid, to: Oid) -> bool {
 /// two built-in types: an implicit cast, an assignment cast, or the output function of `from` when
 /// `to` is a string type. An array becomes an array of another type when its elements do.
 pub fn can_coerce_assigned(from: Oid, to: Oid) -> bool {
-    if can_coerce_implicitly(from, to) || ASSIGNMENT.binary_search(&(from, to)).is_ok() {
-        return true;
-    }
-    match (TypeInfo::get(from), TypeInfo::get(to)) {
-        (Some(from), Some(to)) if from.is_array() && to.is_array() => {
-            can_coerce_assigned(from.elem, to.elem)
-        }
-        (_, Some(to)) => to.category == b'S',
-        _ => false,
-    }
+    find_coercion_pathway(from, to, CoercionContext::Assignment) != CoercionPath::None
 }
 
 /// Whether the type has `typispreferred`, such as `text`, `float8` and `timestamptz`.
@@ -79,7 +155,7 @@ pub fn common_type(types: &[Option<Oid>]) -> Result<Oid, Mismatch> {
             }
         }
     }
-    Ok(held.unwrap_or(crate::oid::TEXT))
+    Ok(held.unwrap_or(oid::TEXT))
 }
 
 #[cfg(test)]
