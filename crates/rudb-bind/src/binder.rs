@@ -3396,7 +3396,7 @@ impl<'a> Binder<'a> {
 
     /// Has the scan `node` produce its row number, as the column after its last, once a `rowid`
     /// reads it.
-    pub(crate) fn number_rows(&mut self, node: NodeRef) {
+    pub(crate) fn number_scan(&mut self, node: NodeRef) {
         let Node::Get { columns, .. } = *self.plan.node(node) else { return };
         let mut fields = self.plan.field_list(columns).to_vec();
         if fields.last().is_some_and(|field| field.name == FILE_ROW_NUMBER) {
@@ -3422,7 +3422,7 @@ impl<'a> Binder<'a> {
     ) {
         let width = exprs.len();
         for (binding, scan) in scope.rowids_in(places.clone()) {
-            self.number_rows(scan);
+            self.number_scan(scan);
             exprs.push(self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt));
             names.push(self.plan.intern(ROWID));
         }
@@ -4727,7 +4727,7 @@ impl<'a> Binder<'a> {
             && left_rowids.len() + right_rowids.len() == scope.rowids.len();
         if carried {
             for (binding, scan) in left_rowids {
-                self.number_rows(scan);
+                self.number_scan(scan);
                 kept.push(self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt));
                 let null = self.plan.add_value(Value::Null);
                 padded.push(self.plan.add_expr(Expr::Constant(null), LogicalType::BigInt));
@@ -4736,8 +4736,8 @@ impl<'a> Binder<'a> {
             for ((binding, scan), (lone_binding, lone_scan)) in
                 right_rowids.into_iter().zip(lone_rowids)
             {
-                self.number_rows(scan);
-                self.number_rows(lone_scan);
+                self.number_scan(scan);
+                self.number_scan(lone_scan);
                 kept.push(self.plan.add_expr(Expr::Column(binding), LogicalType::BigInt));
                 padded.push(self.plan.add_expr(Expr::Column(lone_binding), LogicalType::BigInt));
                 names.push(self.plan.intern(ROWID));

@@ -762,7 +762,7 @@ impl Binder<'_> {
                 return self.bind_alias(ast, parts[0], alias, scope);
             }
             if let Some(scan) = scope.rowid_scan(found.binding) {
-                self.number_rows(scan);
+                self.number_scan(scan);
             }
             return Ok(self.add_expr(Expr::Column(found.binding), found.ty.clone()));
         }
@@ -782,7 +782,7 @@ impl Binder<'_> {
             }
         }
         if let Some((_, _, _, Some(scan))) = found {
-            self.number_rows(scan);
+            self.number_scan(scan);
         }
         let found = found.map(|(at, binding, ty, _)| (at, binding, ty));
         let Some((at, binding, ty)) = found else {
