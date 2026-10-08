@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.9.2
+
+#2848 ports the string functions of `varlena.c`, `oracle_compat.c`, `encode.c` and the other string files of PostgreSQL as kernels, with the values and the errors of PostgreSQL. #2849 adds `string_to_table` as the unnest of the array of its kernel, and `normalize` and `IS NORMALIZED` as a port of `unicode_norm.c` over the vendored Unicode tables of the PostgreSQL pin.
+
+#2850 resolves the polymorphic types of a call of `pg_proc` as `enforce_generic_type_consistency` does, and ports the array functions of PostgreSQL: `array_dims`, `array_position`, `array_positions`, `array_remove`, `array_replace`, `array_reverse`, `array_sort`, `array_shuffle`, `array_sample`, `trim_array`, `width_bucket` over thresholds and `array_to_string`. `array_shuffle` and `array_sample` are volatile, so folding and the optimizer do not fold or copy them.
+
+#2846 reads a stable LIKE chunk in one pass, and #2847 decompresses the leading runs of an FSST chunk in one pass.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.9.1
 
 This release publishes the PG1 work, because the release gate of 0.9.0 failed and nothing from 0.9.0 was published. 0.9.0 failed on an xtask test that still looked for the old lists of implicit and assignment casts after #2836 wrote them as one table. #2844 fixes the test.
