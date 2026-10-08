@@ -23,6 +23,15 @@ use crate::advisory::{no_such_function, spelled_call};
 use crate::binder::Binder;
 use crate::scope::Scope;
 
+/// How a call was written apart from its arguments, for the rules of `func_get_detail`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Written<'a> {
+    /// The names of the last arguments, for a call with named arguments.
+    pub(crate) names: &'a [&'a str],
+    /// The call has `VARIADIC` before its last argument.
+    pub(crate) variadic: bool,
+}
+
 /// The PostgreSQL type of a value of `ty` when that type binds back as `ty`, so that the rules for
 /// a call see the type that the value has. A DECIMAL is a `numeric` with a typmod.
 fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
@@ -30,6 +39,16 @@ fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
     let back = rudb_pgtypes::logical_type(oid)?;
     let exact = back == *ty || matches!(ty, LogicalType::Decimal { .. });
     exact.then_some(oid)
+}
+
+/// The list of one dimension inside a list of lists, or `ty` itself.
+fn innermost_list(ty: &LogicalType) -> &LogicalType {
+    match ty {
+        LogicalType::List(element) if matches!(**element, LogicalType::List(_)) => {
+            innermost_list(element)
+        }
+        ty => ty,
+    }
 }
 
 /// The functions whose result is an `int4` in PostgreSQL and a BIGINT here.
@@ -207,16 +226,56 @@ impl Binder<'_> {
         self.cast_bound(*input, &target, declared, false).map(Some)
     }
 
+    /// A call written with named arguments or with `VARIADIC` in a PostgreSQL session, which
+    /// only a function of `pg_proc` can take. The arguments by position come first and the named
+    /// ones after them, in the order of the call, as `func_get_detail` reads them.
+    pub(crate) fn pg_written_call(
+        &mut self,
+        ast: &Ast,
+        call: ast::ExprRef,
+        written: &str,
+        positional: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let named = ast.named_args(call);
+        let mut arguments = positional.to_vec();
+        arguments.extend(named.iter().map(|target| target.expr));
+        let names: Vec<&str> = named.iter().map(|target| ast.string(target.alias)).collect();
+        let mut bound = Vec::with_capacity(arguments.len());
+        for &argument in &arguments {
+            bound.push(self.bind_expr(ast, argument, scope)?);
+        }
+        let untyped: Vec<bool> = arguments
+            .iter()
+            .map(|&argument| {
+                matches!(ast.expr(argument), ast::Expr::Literal { kind: LiteralKind::String, .. })
+            })
+            .collect();
+        let how = Written { names: &names, variadic: ast.variadic(call) };
+        let found = self.pg_proc_call(ast, written, &arguments, &bound, &untyped, how, scope)?;
+        found.ok_or_else(|| {
+            let message = format!("named arguments and VARIADIC in a call of {written}");
+            Error::not_implemented(format!("{message} are not supported"))
+                .state(SqlState::FEATURE_NOT_SUPPORTED)
+                .pg(format!("{message} are not supported"))
+                .with_span(self.current_span)
+        })
+    }
+
     /// The call `written(arguments)` bound to the function of `pg_proc` that PostgreSQL finds for
     /// it, or `None` when the call takes another path here.
     ///
     /// The function is found by the rules of `func_get_detail` over the types of the arguments,
-    /// with `unknown` for a string literal and a null. A function in C with a kernel here is
-    /// called as the kernel, with each argument cast to the declared type, and a function in SQL
-    /// has its body bound in place of the call, with `$1` and the others the arguments. No
-    /// function, or more than one, is the error of PostgreSQL. A name that is also an aggregate
-    /// or a window function, and an argument of a type that PostgreSQL does not have, take the
-    /// path of the pin.
+    /// with `unknown` for a string literal and a null, and over the names of the named arguments.
+    /// The arguments go to the places that their names give, and an argument that the call does
+    /// not give takes its default. A function in C with a kernel here is called as the kernel,
+    /// with each argument cast to the declared type, and a function in SQL has its body bound in
+    /// place of the call, with `$1` and the others the arguments. A call with named arguments or
+    /// `VARIADIC` to a function with neither calls the function of the pin with the arguments in
+    /// their places. No function, or more than one, is the error of PostgreSQL. A name that is
+    /// also an aggregate or a window function, and an argument of a type that PostgreSQL does not
+    /// have, take the path of the pin.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pg_proc_call(
         &mut self,
         ast: &Ast,
@@ -224,20 +283,27 @@ impl Binder<'_> {
         arguments: &[ast::ExprRef],
         bound: &[ExprRef],
         untyped: &[bool],
+        how: Written<'_>,
         scope: &Scope,
     ) -> Result<Option<ExprRef>> {
-        use rudb_pgtypes::{Failure, Resolution, oid};
+        use rudb_pgtypes::{Resolution, oid};
+        let special = !how.names.is_empty() || how.variadic;
         let procs = rudb_pgtypes::procs(written);
-        if procs.is_empty() || procs.iter().any(|proc| proc.kind != b'f') {
+        if (procs.is_empty() && !special) || procs.iter().any(|proc| proc.kind != b'f') {
             return Ok(None);
         }
         let mut types = Vec::with_capacity(bound.len());
         let mut oids = Vec::with_capacity(bound.len());
-        for (&argument, &untyped) in bound.iter().zip(untyped) {
+        for (at, (&argument, &untyped)) in bound.iter().zip(untyped).enumerate() {
             let ty = self.plan().expr_type(argument).clone();
+            // An array of any number of dimensions has the type of its elements' array.
+            let typed = match how.variadic && at + 1 == bound.len() {
+                true => innermost_list(&ty),
+                false => &ty,
+            };
             let oid = match untyped || ty == LogicalType::Null {
                 true => oid::UNKNOWN,
-                false => match exact_oid(&ty) {
+                false => match exact_oid(typed) {
                     Some(oid) => oid,
                     None => return Ok(None),
                 },
@@ -245,29 +311,24 @@ impl Binder<'_> {
             types.push(ty);
             oids.push(oid);
         }
-        let candidate = match rudb_pgtypes::resolve_function(written, &oids) {
+        let call = rudb_pgtypes::Call { args: &oids, names: how.names, variadic: how.variadic };
+        let candidate = match rudb_pgtypes::resolve_call(written, call) {
             Resolution::Found(candidate) => candidate,
             Resolution::NotFound(failure) => {
-                let detail = match failure {
-                    Failure::Name => "There is no function of that name.",
-                    Failure::Count => {
-                        "No function of that name accepts the given number of arguments."
-                    }
-                    Failure::Types => {
-                        let error = no_such_function(written, &types, untyped);
-                        return Err(error.with_span(self.current_span));
-                    }
-                };
-                let call = spelled_call(written, &types, untyped);
+                let call = spelled_call(written, &types, untyped, how.names);
                 let message = format!("function {call} does not exist");
-                return Err(Error::binder(message.clone())
-                    .state(SqlState::UNDEFINED_FUNCTION)
-                    .pg(message)
-                    .detail(detail)
-                    .with_span(self.current_span));
+                let mut error =
+                    Error::binder(message.clone()).state(SqlState::UNDEFINED_FUNCTION).pg(message);
+                if let Some(detail) = failure.detail() {
+                    error = error.detail(detail);
+                }
+                if let Some(hint) = failure.hint() {
+                    error = error.hint(hint);
+                }
+                return Err(error.with_span(self.current_span));
             }
             Resolution::Ambiguous => {
-                let call = spelled_call(written, &types, untyped);
+                let call = spelled_call(written, &types, untyped, how.names);
                 let message = format!("function {call} is not unique");
                 return Err(Error::binder(message.clone())
                     .state(SqlState::AMBIGUOUS_FUNCTION)
@@ -278,8 +339,21 @@ impl Binder<'_> {
             }
         };
         let proc = candidate.proc;
-        if candidate.variadic != 0 || candidate.defaults != 0 {
+        if candidate.variadic != 0 {
             return Ok(None);
+        }
+        // `VARIADIC` before the argument of a variadic `any` gives the values as one array.
+        if how.variadic && proc.variadic == oid::ANY {
+            let (Some(&last), Some(ty)) = (arguments.last(), types.last()) else {
+                return Ok(None);
+            };
+            if !matches!(ty, LogicalType::List(_)) || untyped.last() == Some(&true) {
+                return Err(Error::binder("VARIADIC argument must be an array")
+                    .state(SqlState::DATATYPE_MISMATCH)
+                    .pg("VARIADIC argument must be an array")
+                    .with_span(ast.expr_span(last)));
+            }
+            return self.variadic_any_call(ast, written, arguments, bound, scope).map(Some);
         }
         let Some(declared) = candidate
             .args
@@ -301,13 +375,27 @@ impl Binder<'_> {
             }
             _ => None,
         };
-        if !kernel && body.is_none() {
+        if !kernel && body.is_none() && !special {
             return Ok(None);
         }
-        let mut cast = Vec::with_capacity(bound.len());
-        for ((&argument, &input), ty) in arguments.iter().zip(bound).zip(&declared) {
-            cast.push(self.argument_as(ast, argument, input, ty)?);
+        // Each argument in the place of its declared argument, and the defaults in the others.
+        let mut placed: Vec<Option<ExprRef>> = vec![None; proc.args.len()];
+        for (index, (&at, ty)) in candidate.order.iter().zip(&declared).enumerate() {
+            let value = match (arguments.get(index), bound.get(index)) {
+                (Some(&argument), Some(&input)) => self.argument_as(ast, argument, input, ty)?,
+                _ => {
+                    let default = candidate.default_of(at).ok_or_else(|| {
+                        Error::internal(format!("argument {at} of {written} has no default"))
+                    })?;
+                    self.default_argument(default, candidate.args[index], ty)?
+                }
+            };
+            placed[at] = Some(value);
         }
+        let cast = placed
+            .into_iter()
+            .collect::<Option<Vec<ExprRef>>>()
+            .ok_or_else(|| Error::internal(format!("a call of {written} with an empty place")))?;
         if let Some(body) = body {
             // A body that the parser or the binder here cannot take yet leaves the call to the
             // path of the pin.
@@ -316,9 +404,86 @@ impl Binder<'_> {
             self.inlined = outer;
             return Ok(inlined.ok().map(|call| self.cast_to(call, &returns)));
         }
+        if !kernel {
+            return self.call(written, cast).map(Some);
+        }
         let name = self.plan_mut().intern(&format!("{}{}", rudb_kernels::pgproc::PREFIX, proc.src));
         let args = self.plan_mut().add_expr_list(&cast);
         Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
+    /// The default `text` of an argument of the PostgreSQL type `oid`, read by the input function
+    /// of the type as `proargdefaults` holds it.
+    fn default_argument(
+        &mut self,
+        text: &str,
+        oid: rudb_pgtypes::Oid,
+        ty: &LogicalType,
+    ) -> Result<ExprRef> {
+        let session = self.session;
+        let read = session.postgres().and_then(|postgres| postgres.input.as_ref());
+        let value = match read.and_then(|input| input.read(oid, text)) {
+            Some(value) => self.add_constant(value?),
+            None => self.add_constant(Value::Varchar(text.into())),
+        };
+        Ok(self.cast_to(value, ty))
+    }
+
+    /// A call with `VARIADIC` before the array of a function whose variadic argument is `any`,
+    /// which takes each element of the array as one of its values. A null array gives a null, as
+    /// it does in PostgreSQL, and an array of more dimensions gives its elements in order.
+    fn variadic_any_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let (Some(&array), Some((_, fixed))) = (bound.last(), bound.split_last()) else {
+            return Err(Error::internal(format!("VARIADIC in a call of {written} with no array")));
+        };
+        let mut flat = "$1".to_string();
+        for _ in 1..depth(self.plan().expr_type(array)) {
+            flat = format!("flatten({flat})");
+        }
+        let named = |name: &str| same_name(written, name);
+        // Each element is text by the output function of its type, as an argument of concat is.
+        // That is the cast to text, but for a boolean, which the output writes as `t` or `f`.
+        let element = match innermost_list(self.plan().expr_type(array)) {
+            LogicalType::List(element) if **element == LogicalType::Boolean => {
+                "CASE WHEN __rudb_e THEN 't' WHEN NOT __rudb_e THEN 'f' END"
+            }
+            _ => "CAST(__rudb_e AS VARCHAR)",
+        };
+        let texts = format!("list_transform({flat}, lambda __rudb_e: {element})");
+        let text = match fixed {
+            [] if named("concat") => format!("array_to_string({texts}, '')"),
+            [_] if named("concat_ws") => {
+                format!("array_to_string({texts}, CAST($2 AS VARCHAR))")
+            }
+            [] if named("num_nulls") || named("num_nonnulls") => {
+                let nulls = format!("(len({flat}) - list_count({flat}))");
+                let counted = match named("num_nulls") {
+                    true => nulls,
+                    false => format!("list_count({flat})"),
+                };
+                format!("CAST({counted} AS INTEGER)")
+            }
+            _ => {
+                let message = format!("VARIADIC in a call of {written} is not supported");
+                return Err(Error::not_implemented(message.clone())
+                    .state(SqlState::FEATURE_NOT_SUPPORTED)
+                    .pg(message)
+                    .with_span(ast.expr_span(arguments[arguments.len() - 1])));
+            }
+        };
+        let mut inlined = vec![array];
+        inlined.extend(fixed);
+        let outer = self.inlined.replace(inlined);
+        let call = self.bind_macro_body(written, &text, scope);
+        self.inlined = outer;
+        call
     }
 
     /// The call `written(arguments)` bound as PostgreSQL binds it, or `None` when the name is not
@@ -386,6 +551,9 @@ impl Binder<'_> {
             return Ok(Some(call));
         }
         if let Some(call) = self.array_fill_call(ast, written, arguments, scope)? {
+            return Ok(Some(call));
+        }
+        if let Some(call) = self.concat_call(ast, written, arguments, scope)? {
             return Ok(Some(call));
         }
         if let Some(call) = self.regexp_call(ast, written, arguments, scope)? {
@@ -662,6 +830,31 @@ impl Binder<'_> {
         let name = self.plan_mut().intern(rudb_kernels::PG_SUBSTR);
         let args = self.plan_mut().add_expr_list(&cast);
         Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
+    /// `concat` or `concat_ws` with its values written by the output functions of their types, or
+    /// `None` for any other call.
+    fn concat_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let name = match () {
+            () if same_name(written, "concat") => "concat",
+            () if same_name(written, "concat_ws") => "concat_ws",
+            () => return Ok(None),
+        };
+        if arguments.is_empty() {
+            return Ok(None);
+        }
+        let mut texts = Vec::with_capacity(arguments.len());
+        for &argument in arguments {
+            let bound = self.bind_expr(ast, argument, scope)?;
+            texts.push(self.output_text(bound)?);
+        }
+        self.call(name, texts).map(Some)
     }
 
     /// `array_fill(value, dimensions [, lower_bounds])` of a PostgreSQL session, or `None` for any

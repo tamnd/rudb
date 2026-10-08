@@ -8,14 +8,14 @@
 
 use rudb_common::{Result, Value};
 
-use crate::pgmath;
+use crate::{pgdatetime, pgmath};
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// Whether the C function `src` has a kernel.
 pub fn has(src: &str) -> bool {
-    pgmath::SOURCES.binary_search(&src).is_ok()
+    pgmath::SOURCES.binary_search(&src).is_ok() || pgdatetime::SOURCES.binary_search(&src).is_ok()
 }
 
 /// The value of a call of a kernel of a C function, or `None` for any other name. A null
@@ -25,7 +25,10 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     if args.iter().any(Value::is_null) {
         return Ok(Some(Value::Null));
     }
-    pgmath::call(src, args)
+    match pgmath::call(src, args)? {
+        Some(value) => Ok(Some(value)),
+        None => pgdatetime::call(src, args),
+    }
 }
 
 /// The function of one `float8` of the kernel `name`, for the loop over a column.
@@ -39,6 +42,8 @@ mod tests {
 
     #[test]
     fn the_sources_are_sorted() {
-        assert!(pgmath::SOURCES.windows(2).all(|pair| pair[0] < pair[1]));
+        for sources in [pgmath::SOURCES, pgdatetime::SOURCES] {
+            assert!(sources.windows(2).all(|pair| pair[0] < pair[1]));
+        }
     }
 }

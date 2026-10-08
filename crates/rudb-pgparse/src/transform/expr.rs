@@ -5,8 +5,11 @@
 //! given back here as the expression that the DuckDB transform makes for the same text, so the
 //! binder has one form of each.
 
+use rudb_common::{Error, SqlState};
 use rudb_parse::NONE;
-use rudb_parse::ast::{BinaryOp, CaseArm, Expr, ExprRef, LiteralKind, OrderItem, Slice, UnaryOp};
+use rudb_parse::ast::{
+    BinaryOp, CaseArm, Expr, ExprRef, LiteralKind, OrderItem, Slice, Target, UnaryOp,
+};
 
 use super::{Made, Transform, clause, not_yet};
 use crate::nodes::{
@@ -543,13 +546,17 @@ impl Transform<'_> {
         if call.agg_within_group {
             return clause("WithinGroup");
         }
-        if call.func_variadic {
-            return clause("Variadic");
-        }
-        if let Some(node) =
-            call.args.iter().flatten().find(|node| matches!(node, Node::NamedArgExpr(_)))
-        {
-            return Err(not_yet(node));
+        let named = call.args.iter().flatten().any(|node| matches!(node, Node::NamedArgExpr(_)));
+        if named || call.func_variadic {
+            let plain = call.over.is_none()
+                && call.agg_order.is_empty()
+                && call.agg_filter.is_none()
+                && !call.agg_distinct
+                && !call.agg_star;
+            if !plain {
+                return clause("Variadic");
+            }
+            return self.written_call(call);
         }
         let parts = Self::strings(&call.funcname)?;
         // These calls are rewritten by the DuckDB transform, and the rules move to
@@ -595,6 +602,50 @@ impl Transform<'_> {
         let ignore_nulls = call.ignore_nulls == 1;
         let window = Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec };
         Ok(self.push(window, location))
+    }
+
+    /// A plain call with named arguments or with `VARIADIC`, which the binder resolves by the rules
+    /// of `func_get_detail`. The arguments before the first name are the arguments of the call, and
+    /// the named ones are kept beside it in the order they were written. A positional argument
+    /// after a name and a name given twice are the errors of `ParseFuncOrColumn`.
+    fn written_call(&mut self, call: &FuncCall) -> Made<ExprRef> {
+        let name = self.names(&call.funcname)?;
+        let first = call.args.iter().position(|node| matches!(node, Some(Node::NamedArgExpr(_))));
+        let first = first.unwrap_or(call.args.len());
+        let args = self.row_items(&call.args[..first], false)?;
+        let mut named: Vec<Target> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for node in call.args[first..].iter().flatten() {
+            let Node::NamedArgExpr(arg) = node else {
+                let positional = self.expr(node)?;
+                let error = Error::parser("positional argument cannot follow named argument")
+                    .state(SqlState::SYNTAX_ERROR)
+                    .with_span(self.ast.expr_span(positional));
+                return Err(error.into());
+            };
+            let text = arg.name.as_deref().unwrap_or_default();
+            let Some(value) = &arg.arg else { return Err(not_yet(node)) };
+            let expr = self.expr(value)?;
+            if seen.contains(&text) {
+                let message = format!("argument name \"{text}\" used more than once");
+                let error = Error::parser(message)
+                    .state(SqlState::SYNTAX_ERROR)
+                    .with_span(self.at(arg.location));
+                return Err(error.into());
+            }
+            seen.push(text);
+            named.push(Target { expr, alias: self.intern(text) });
+        }
+        let filter = NONE;
+        let made = self.push(Expr::Function { name, args, distinct: false, filter }, call.location);
+        if !named.is_empty() {
+            let named = self.ast.target_slice(named);
+            self.ast.named_args.push((made, named));
+        }
+        if call.func_variadic {
+            self.ast.variadic_calls.push(made);
+        }
+        Ok(made)
     }
 
     /// A call that the grammar made for a form of SQL syntax, with the name in `pg_catalog`.

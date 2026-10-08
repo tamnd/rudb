@@ -26,6 +26,7 @@ use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Pla
 
 use crate::binder::{AliasClause, Binder, PendingSubquery, WindowCall};
 use crate::fold;
+use crate::pgcalls::Written;
 use crate::scope::Scope;
 
 /// The pin's list macros over `list_concat`: the name, its parameters as the pin prints them, which
@@ -233,6 +234,15 @@ impl Binder<'_> {
                 let modified = distinct || filter != NONE || !ast.aggregate_order(expr).is_empty();
                 let expanded = self.user_macro(ast, expr, name, args, modified, scope)?;
                 expanded.ok_or_else(|| Error::internal("a macro that went away while it was bound"))
+            }
+            ast::Expr::Function { name, args, .. }
+                if self.semantics.function_rules() == FunctionRules::Postgres
+                    && (ast.variadic(expr) || !ast.named_args(expr).is_empty()) =>
+            {
+                let written = ast.name(name).last().unwrap_or_default();
+                let arguments = ast.expr_list(args);
+                let bound = self.pg_written_call(ast, expr, written, arguments, scope)?;
+                Ok(self.postgres_result(written, bound))
             }
             ast::Expr::Function { .. } if ast.misnamed(expr).is_some() => {
                 let message = ast.misnamed(expr).map_or("", |(message, _)| message);
@@ -1637,8 +1647,15 @@ impl Binder<'_> {
             return Ok(cast);
         }
         if postgres
-            && let Some(call) =
-                self.pg_proc_call(ast, &written, &arguments, &bound, &untyped, scope)?
+            && let Some(call) = self.pg_proc_call(
+                ast,
+                &written,
+                &arguments,
+                &bound,
+                &untyped,
+                Written::default(),
+                scope,
+            )?
         {
             return Ok(call);
         }
@@ -3692,6 +3709,16 @@ impl Binder<'_> {
         struct_members_meet(from, ty)?;
         self.resolve_placeholder(expr, ty);
         Ok(self.add_expr(Expr::Cast { input: expr, try_cast }, ty.clone()))
+    }
+
+    /// `expr` as text by the output function of its PostgreSQL type, as `concat` writes a value.
+    /// Of the types here, only a boolean has a cast to text that is not its output function: the
+    /// cast writes `true` and the output writes `t`.
+    pub(crate) fn output_text(&mut self, expr: ExprRef) -> Result<ExprRef> {
+        if *self.plan().expr_type(expr) == LogicalType::Boolean {
+            return Ok(self.pg_output(expr, rudb_pgtypes::oid::BOOL));
+        }
+        self.checked_cast_to(expr, &LogicalType::Varchar, false)
     }
 
     /// The cast of `expr` to text with the output function of the PostgreSQL type `oid`, as

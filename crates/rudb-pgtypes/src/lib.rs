@@ -169,7 +169,9 @@ pub use procs::{Proc, func_name_as_type, procs};
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };
-pub use resolve::{Candidate, Failure, Resolution, is_polymorphic, resolve_function};
+pub use resolve::{
+    Call, Candidate, Failure, Resolution, is_polymorphic, resolve_call, resolve_function,
+};
 pub use row::{OutputSettings, RowEncoder, encodable, pg_type, text_values};
 pub use scalar::{
     ByteaOutput, NAME_MAX_BYTES, bool_in, bool_out, bytea_in, bytea_out, char_in, char_out,
