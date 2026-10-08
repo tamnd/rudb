@@ -25,7 +25,7 @@
 use rudb_common::LogicalType;
 use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice, SortKey};
 
-use crate::fold::VOLATILE;
+use rudb_bind::fold::volatile_function;
 
 /// Rebuilds the tree under `at` bottom up, giving `step` the chance to put something above each node.
 ///
@@ -494,10 +494,9 @@ pub(crate) fn node_columns(
 
 /// Whether asking for this expression twice can give two answers.
 ///
-/// The list is [`VOLATILE`], which is the one folding refuses to fold and is read from the pinned
-/// binary's `duckdb_functions()`. rudb answers to none of those names yet, so this is false for
-/// everything today and is here so that the first one to land is refused by a pass that already knew
-/// about it rather than copied by a pass that had never heard of it.
+/// The functions are the ones of [`volatile_function`]: the list that folding refuses to fold,
+/// read from the pinned binary's `duckdb_functions()`, and the kernels of the volatile functions of
+/// `pg_proc`.
 ///
 /// Copying is where it matters. A pass that moves an expression somewhere else is fine either way,
 /// and a pass that writes it down twice has turned one call into two.
@@ -508,7 +507,7 @@ pub fn volatile(plan: &Plan, expr: ExprRef) -> bool {
         Expr::Compare { left, right, .. } => volatile(plan, left) || volatile(plan, right),
         Expr::Conjunction { children, .. } => any_volatile(plan, children),
         Expr::Function { name, args } => {
-            VOLATILE.contains(&plan.string(name)) || any_volatile(plan, args)
+            volatile_function(plan.string(name)) || any_volatile(plan, args)
         }
         Expr::Aggregate { args, filter, .. } => {
             any_volatile(plan, args) || filter.is_some_and(|inner| volatile(plan, inner))
@@ -594,7 +593,7 @@ pub(crate) fn constant(plan: &Plan, expr: ExprRef) -> bool {
         Expr::Compare { left, right, .. } => constant(plan, left) && constant(plan, right),
         Expr::Conjunction { children, .. } => all_constant(plan, children),
         Expr::Function { name, args } => {
-            !VOLATILE.contains(&plan.string(name)) && all_constant(plan, args)
+            !volatile_function(plan.string(name)) && all_constant(plan, args)
         }
         Expr::Case { arms, otherwise } => {
             plan.arm_list(arms)

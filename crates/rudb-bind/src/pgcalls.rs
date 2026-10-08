@@ -394,7 +394,17 @@ impl Binder<'_> {
             }
             return self.variadic_any_call(ast, written, arguments, bound, scope).map(Some);
         }
-        let Some(returns) = rudb_pgtypes::logical_type(proc.result) else { return Ok(None) };
+        // The polymorphic types take their actual types from the arguments. An argument that
+        // takes its default has the declared type. PostgreSQL gives no position for an error of
+        // the polymorphic types.
+        let generic = {
+            let actual: Vec<_> = (0..candidate.args.len())
+                .map(|index| oids.get(index).copied().unwrap_or(candidate.args[index]))
+                .collect();
+            rudb_pgtypes::enforce_generic_types(&actual, &candidate.args, proc.result)
+                .map_err(|error| Error::from(error).unplaced())?
+        };
+        let Some(returns) = rudb_pgtypes::logical_type(generic.result) else { return Ok(None) };
         // A function that returns a set is the unnest of the array of its kernel, so it binds
         // only as the argument of the unnest of a select list or of `FROM`.
         let rows = match proc.retset {
@@ -420,11 +430,11 @@ impl Binder<'_> {
         if !kernel && body.is_none() && !special {
             return Ok(None);
         }
-        // A polymorphic argument of a body is the argument as the call gives it, which the body
-        // casts as it needs.
+        // A polymorphic argument of a body whose actual type has no type here is the argument as
+        // the call gives it, which the body casts as it needs.
         let mut declared = Vec::with_capacity(candidate.args.len());
-        for &oid in &candidate.args {
-            match rudb_pgtypes::logical_type(oid) {
+        for (&oid, &actual) in candidate.args.iter().zip(&generic.args) {
+            match rudb_pgtypes::logical_type(actual) {
                 Some(ty) => declared.push(Some(ty)),
                 None if body.is_some() && rudb_pgtypes::is_polymorphic(oid) => declared.push(None),
                 None => return Ok(None),
@@ -448,7 +458,7 @@ impl Binder<'_> {
             };
             placed[at] = Some(value);
         }
-        let cast = placed
+        let mut cast = placed
             .into_iter()
             .collect::<Option<Vec<ExprRef>>>()
             .ok_or_else(|| Error::internal(format!("a call of {written} with an empty place")))?;
@@ -462,6 +472,13 @@ impl Binder<'_> {
         }
         if !kernel {
             return self.call(written, cast).map(Some);
+        }
+        // A kernel that writes the elements of its array takes them as text, by the output
+        // function of their type.
+        if rudb_kernels::pgproc::outputs(proc.src)
+            && let Some(array) = cast.first_mut()
+        {
+            *array = self.output_texts(*array)?;
         }
         if let Some(array) = rows {
             let list = LogicalType::List(Box::new(returns));

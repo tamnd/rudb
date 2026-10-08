@@ -377,7 +377,7 @@ fn can_coerce(inputs: &[Oid], targets: &[Oid]) -> bool {
 }
 
 /// The rows of `pg_range`: a range type, the type of its bounds and its multirange type.
-const RANGES: [(Oid, Oid, Oid); 6] = [
+pub(crate) const RANGES: [(Oid, Oid, Oid); 6] = [
     (oid::INT4RANGE, oid::INT4, oid::INT4MULTIRANGE),
     (oid::NUMRANGE, oid::NUMERIC, oid::NUMMULTIRANGE),
     (oid::TSRANGE, oid::TIMESTAMP, oid::TSMULTIRANGE),
@@ -387,19 +387,19 @@ const RANGES: [(Oid, Oid, Oid); 6] = [
 ];
 
 /// `get_element_type`: the element type of an array type.
-fn element_type(array: Oid) -> Option<Oid> {
+pub(crate) fn element_type(array: Oid) -> Option<Oid> {
     TypeInfo::get(array)
         .filter(|info| info.category == b'A' && info.elem != 0)
         .map(|info| info.elem)
 }
 
 /// `get_range_subtype`: the type of the bounds of a range type.
-fn range_subtype(range: Oid) -> Option<Oid> {
+pub(crate) fn range_subtype(range: Oid) -> Option<Oid> {
     RANGES.iter().find(|row| row.0 == range).map(|row| row.1)
 }
 
 /// `get_multirange_range`: the range type of a multirange type.
-fn multirange_range(multirange: Oid) -> Option<Oid> {
+pub(crate) fn multirange_range(multirange: Oid) -> Option<Oid> {
     RANGES.iter().find(|row| row.2 == multirange).map(|row| row.0)
 }
 
