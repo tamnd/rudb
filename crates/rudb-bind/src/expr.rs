@@ -2353,7 +2353,8 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<ExprRef> {
         let subject = self.bind_expr(ast, operand, scope)?;
-        self.bind_mark_subquery(ast, subject, query, CompareOp::Equal, negated, scope)
+        let row = self.row_items(ast, operand, subject);
+        self.bind_mark_subquery(ast, subject, row, query, CompareOp::Equal, negated, scope)
     }
 
     fn bind_quantified_subquery(
@@ -2370,7 +2371,8 @@ impl Binder<'_> {
             Error::binder("Only comparisons can be used before ANY or ALL".to_string())
         })?;
         let op = if all { negate_comparison(op) } else { op };
-        self.bind_mark_subquery(ast, subject, query, op, all, scope)
+        let row = self.row_items(ast, operand, subject);
+        self.bind_mark_subquery(ast, subject, row, query, op, all, scope)
     }
 
     /// Binds `x op ANY (array)` or `x op ALL (array)`.
@@ -2508,16 +2510,63 @@ impl Binder<'_> {
         Ok(self.add_expr(Expr::Function { name: fold, args }, LogicalType::Boolean))
     }
 
+    /// The values of a row written before `IN`, `ANY` or `ALL`, such as `(a, b)` or `row(a)`.
+    ///
+    /// Only a row written out counts. A struct column is compared against one column of the query
+    /// as any other value is, which is also what the pin does.
+    fn row_items(&self, ast: &Ast, operand: ast::ExprRef, subject: ExprRef) -> Vec<ExprRef> {
+        if !matches!(ast.expr(operand), ast::Expr::Row { .. }) {
+            return Vec::new();
+        }
+        match self.plan().expr(subject) {
+            Expr::Function { name, args }
+                if self.plan().string(*name) == crate::structs::STRUCT_PACK
+                    && !self.plan().expr_list(*args).is_empty() =>
+            {
+                self.plan().expr_list(*args).to_vec()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn bind_mark_subquery(
         &mut self,
         ast: &Ast,
         subject: ExprRef,
+        row: Vec<ExprRef>,
         query: ast::QueryRef,
         comparison: CompareOp,
         negate: bool,
         outer: &Scope,
     ) -> Result<ExprRef> {
         let (node, inner, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
+        // A row against a query of one column whose values are rows is one comparison of two rows,
+        // and anything else of one column is a query of too few.
+        let tuple = |ty: &LogicalType| match ty {
+            LogicalType::Struct(fields) => fields.iter().all(|field| field.name.is_empty()),
+            _ => false,
+        };
+        let paired = match inner.columns.as_slice() {
+            [column] if tuple(&column.ty) => false,
+            _ => !row.is_empty(),
+        };
+        if !row.is_empty() && !correlations.is_empty() {
+            return Err(Error::not_implemented(
+                "Correlated IN/ANY/ALL with multiple columns not yet supported",
+            ));
+        }
+        if paired {
+            if inner.len() != row.len() {
+                return Err(Error::binder(format!(
+                    "Subquery returns {} columns - expected {}",
+                    inner.len(),
+                    row.len()
+                ))
+                .state(SqlState::SYNTAX_ERROR));
+            }
+            return self.bind_mark_row(node, &inner, row, comparison, negate);
+        }
         let [column] = inner.columns.as_slice() else {
             let many = if inner.len() > 1 { "many" } else { "few" };
             return Err(Error::binder(format!(
@@ -2528,6 +2577,16 @@ impl Binder<'_> {
             .pg(format!("subquery has too {many} columns")));
         };
         let candidate_type = column.ty.clone();
+        if let (LogicalType::Struct(left), LogicalType::Struct(right)) =
+            (self.plan().expr_type(subject), &candidate_type)
+            && left.len() != right.len()
+        {
+            let left = self.plan().expr_type(subject);
+            return Err(Error::binder(format!(
+                "Cannot compare values of type {left} and {candidate_type} in IN/ANY/ALL clause - \
+                 an explicit cast is required"
+            )));
+        }
         let candidate_name = column.name.clone();
         let source = self.add_expr(Expr::Column(column.binding), candidate_type.clone());
         let marker_value = self.add_constant(Value::Boolean(true));
@@ -2551,6 +2610,74 @@ impl Binder<'_> {
             conditions: vec![condition],
             dependent: !correlations.is_empty(),
             reads: correlations,
+            index: projected,
+            inside_aggregate: self.in_aggregate,
+        });
+        if negate { self.call("not", vec![marker]) } else { Ok(marker) }
+    }
+
+    /// `(a, b) op ANY (SELECT x, y ...)`, a row against a query of as many columns.
+    ///
+    /// `=` is one equality a column, which is what lets the join find a row by all of them at once,
+    /// and `<>` is the same question turned over, true when any one column differs. The ordered
+    /// comparisons are the two rows compared as rows, in order and with a null after every value,
+    /// so `(1, NULL) < (1, 2)` is false. That is how the pin orders them, and it is not the answer
+    /// a column at a time would give. Only an uncorrelated query gets here.
+    fn bind_mark_row(
+        &mut self,
+        node: NodeRef,
+        inner: &Scope,
+        row: Vec<ExprRef>,
+        comparison: CompareOp,
+        negate: bool,
+    ) -> Result<ExprRef> {
+        let projected = self.fresh_index();
+        let mut exprs = Vec::with_capacity(row.len() + 1);
+        let mut names = Vec::with_capacity(row.len() + 1);
+        for column in &inner.columns {
+            exprs.push(self.add_expr(Expr::Column(column.binding), column.ty.clone()));
+            names.push(self.plan_mut().intern(&column.name));
+        }
+        exprs.push(self.add_constant(Value::Boolean(true)));
+        names.push(self.plan_mut().intern("mark"));
+        let list = self.plan_mut().add_expr_list(&exprs);
+        let names = self.plan_mut().add_name_list(&names);
+        let node =
+            self.add_node(Node::Project { input: node, index: projected, exprs: list, names });
+        let candidates: Vec<ExprRef> = (0..row.len())
+            .map(|at| {
+                let ty = inner.columns[at].ty.clone();
+                let binding = rudb_plan::ColumnBinding::new(projected, at as u32);
+                self.plan_mut().add_expr(Expr::Column(binding), ty)
+            })
+            .collect();
+        let conditions = match comparison {
+            CompareOp::Equal | CompareOp::NotEqual => {
+                let mut tests = Vec::with_capacity(row.len());
+                for (&value, &candidate) in row.iter().zip(&candidates) {
+                    tests.push(self.compare(comparison, value, candidate)?);
+                }
+                if comparison == CompareOp::Equal {
+                    tests
+                } else {
+                    vec![self.conjunction(ConjunctionOp::Or, tests)]
+                }
+            }
+            _ => {
+                let unnamed = vec![String::new(); row.len()];
+                let left = self.pack_struct(&unnamed, &row)?;
+                let right = self.pack_struct(&unnamed, &candidates)?;
+                vec![self.compare(comparison, left, right)?]
+            }
+        };
+        let binding = rudb_plan::ColumnBinding::new(projected, row.len() as u32);
+        let marker = self.add_expr(Expr::Column(binding), LogicalType::Boolean);
+        self.scalar_subqueries.push(PendingSubquery {
+            node,
+            kind: rudb_plan::JoinKind::Mark,
+            conditions,
+            dependent: false,
+            reads: Vec::new(),
             index: projected,
             inside_aggregate: self.in_aggregate,
         });
