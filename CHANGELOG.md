@@ -8,6 +8,20 @@ The count does not restart at a handover, because a version number cannot go bac
 
 There is now a third handover. The C series is the query compiler plan in `spec/compiler`, and it takes the minor version over at 0.5.0, which is the release where C1 closed. From here the minor version counts C milestones, and G series work ships in whatever release it lands in, the same as M and F work.
 
+There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
+
+## 0.9.0
+
+This release closes PG1 (#2489). A PostgreSQL client connects to `rudb-server` over the wire protocol, authenticates, runs simple and extended queries and gets its rows, types and errors in the PostgreSQL format. The PG series now names the minor version.
+
+#2820 to #2824 add functions in FROM, `WITH ORDINALITY`, `ROWS FROM`, `(r).*` and the JSON set functions in a PostgreSQL session. #2825, #2827, #2828 and #2830 add a PostgreSQL flavour of regular expression in `rudb-regex` and bind `~`, `regexp_matches`, `regexp_replace`, `regexp_split_to_table`, `SIMILAR TO` and the other pattern functions to it. #2831 makes `substring` and `substr` follow the SQL standard, #2833 adds `array_fill`, and #2834 reads a table name as its whole row and tests a row for null by its fields.
+
+#2836 and #2837 find the function of a call by the rules of `func_get_detail` over the vendored `pg_proc.dat` and `pg_cast.dat`, and port the math functions of `float.c`, `int.c` and `numeric.c`. #2838 ports the numeric `sqrt`, `exp`, `ln`, `log` and `power` digit for digit and makes a SQL-body function of `pg_proc` inline. #2839 adds the `FloatRange` rule: the float operators check overflow, underflow and a zero divisor as `float.h` does, and an integer overflow is `22003 integer out of range`.
+
+#2826 asks for a dictionary block that a LIKE decides as a whole as a whole read, so it is not kept, which held about 44 MB of `Title` in ClickBench q23. #2829 rounds the end of a released part of the file up to the fault window. #2832 decodes only the leading values of a dictionary block that the LIKE sample reads, which was about a sixth of ClickBench q21 to q24. #2835 fixes the patterns of `scripts/text-order` so that the hot text section of the shell holds the functions that open a database again.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.8.43
 
 This release makes the release gate pass again, so it is the first release since 0.8.34 with archives on GitHub and the first since 0.8.1 on crates.io, and it continues the PostgreSQL session work.
