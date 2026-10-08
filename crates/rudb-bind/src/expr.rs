@@ -12,10 +12,10 @@
 
 use rudb_common::{
     CastInput, CastOutput, CharacterTypes, CommonTypes, ConditionTypes, CountTypes, DeclaredType,
-    Error, ErrorTexts, Field, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH, NumberCasts,
-    NumberLiterals, OperatorRules, RegexRules, Result, RowNulls, Semantics, Session, SetFunctions,
-    SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting, looks_like_rule,
-    rule_names,
+    Error, ErrorTexts, Field, FloatRange, FunctionRules, LogicalType, MAX_DECIMAL_WIDTH,
+    NumberCasts, NumberLiterals, OperatorRules, RegexRules, Result, RowNulls, Semantics, Session,
+    SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value, is_clustering_setting,
+    looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_kernels::pgjson::JsonSet;
@@ -1253,6 +1253,20 @@ impl Binder<'_> {
                 let right = self.cast_to(right, &LogicalType::Numeric);
                 return self.call("//", vec![left, right]);
             }
+        }
+        // A float operator of PostgreSQL checks the range of its result. That is an operator of
+        // two numbers where one is a float.
+        let float = |ty: &LogicalType| matches!(ty, LogicalType::Float | LogicalType::Double);
+        let number = |ty: &LogicalType| {
+            ty.is_numeric() || matches!(ty, LogicalType::Numeric | LogicalType::Null)
+        };
+        let types = [left, right].map(|side| self.plan().expr_type(side).clone());
+        if self.semantics.float_range() == FloatRange::Postgres
+            && types.iter().any(float)
+            && types.iter().all(number)
+            && let (Some(name), Some(checked)) = (function_of(op), pg_float_operator(op))
+        {
+            return self.call_as(name, checked, vec![left, right]);
         }
         match function_of(op) {
             Some(name) if checked_slash && !self.semantics.null_on_division_by_zero() => {
@@ -4680,6 +4694,21 @@ fn negate_comparison(op: CompareOp) -> CompareOp {
         CompareOp::DistinctFrom => CompareOp::NotDistinctFrom,
         CompareOp::NotDistinctFrom => CompareOp::DistinctFrom,
     }
+}
+
+/// The kernel of a float operator of PostgreSQL, which checks the range of the result, for the
+/// operators that have one.
+fn pg_float_operator(op: BinaryOp) -> Option<&'static str> {
+    use rudb_kernels::scalar::{
+        PG_FLOAT_ADD, PG_FLOAT_DIVIDE, PG_FLOAT_MULTIPLY, PG_FLOAT_SUBTRACT,
+    };
+    Some(match op {
+        BinaryOp::Add => PG_FLOAT_ADD,
+        BinaryOp::Subtract => PG_FLOAT_SUBTRACT,
+        BinaryOp::Multiply => PG_FLOAT_MULTIPLY,
+        BinaryOp::Divide | BinaryOp::IntegerDivide => PG_FLOAT_DIVIDE,
+        _ => return None,
+    })
 }
 
 /// The function an operator resolves to, if there is one behind it.

@@ -23,7 +23,9 @@
 //! zero for a timestamp and a time, which carry no zone, and are refused for a date and an interval
 //! the way the pin refuses them.
 
-use rudb_common::{Error, LogicalType, Result, Value, civil_from_days, days_from_civil, time_tz};
+use rudb_common::{
+    Error, LogicalType, Result, SqlState, Value, civil_from_days, days_from_civil, time_tz,
+};
 
 use crate::cast;
 use crate::scalar::{Op, negation_overflow, overflow};
@@ -1089,6 +1091,8 @@ pub(crate) fn combine(left: &Value, right: &Value, subtract: bool) -> Result<Val
     let whole = |a: i32, b: i32| {
         a.checked_add(b).ok_or_else(|| {
             overflow(Op::Add, &LogicalType::Integer, &Value::Integer(a), &Value::Integer(b))
+                .state(SqlState::DATETIME_FIELD_OVERFLOW)
+                .pg("interval out of range")
         })
     };
     Ok(Value::Interval {
@@ -1111,9 +1115,9 @@ pub(crate) fn negated(value: &Value) -> Result<Value> {
         return Err(Error::internal(format!("{value} is not an interval")));
     };
     Ok(Value::Interval {
-        months: months.checked_neg().ok_or_else(negation_overflow)?,
-        days: days.checked_neg().ok_or_else(negation_overflow)?,
-        micros: micros.checked_neg().ok_or_else(negation_overflow)?,
+        months: months.checked_neg().ok_or_else(|| negation_overflow(&LogicalType::Interval))?,
+        days: days.checked_neg().ok_or_else(|| negation_overflow(&LogicalType::Interval))?,
+        micros: micros.checked_neg().ok_or_else(|| negation_overflow(&LogicalType::Interval))?,
     })
 }
 

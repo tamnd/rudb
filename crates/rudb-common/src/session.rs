@@ -199,6 +199,7 @@ pub struct Semantics {
     disable_timestamptz_casts: bool,
     error_texts: ErrorTexts,
     errors_as_json: bool,
+    float_range: FloatRange,
     function_rules: FunctionRules,
     from_functions: FromFunctions,
     integer_division: bool,
@@ -243,6 +244,7 @@ impl Default for Semantics {
             query_columns: QueryColumns::Pin,
             conflict_arbiter: ConflictArbiter::Pin,
             from_functions: FromFunctions::Pin,
+            float_range: FloatRange::Pin,
             row_fields: RowFields::Pin,
             row_nulls: RowNulls::Pin,
             character_types: CharacterTypes::Pin,
@@ -410,6 +412,11 @@ impl Semantics {
     #[must_use]
     pub fn conflict_arbiter(self) -> ConflictArbiter {
         self.conflict_arbiter
+    }
+    /// What a float operator gives for a result past the range of its type.
+    #[must_use]
+    pub fn float_range(self) -> FloatRange {
+        self.float_range
     }
     /// What a function in `FROM` that is not a table function is.
     #[must_use]
@@ -808,6 +815,19 @@ pub enum QueryColumns {
     Pin,
     /// As in PostgreSQL: the statement is `42701 column "x" specified more than once`, after the
     /// column list renames the first columns.
+    Postgres,
+}
+
+/// What a float operator gives for a result past the range of its type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FloatRange {
+    /// As in DuckDB: the result of IEEE 754, an infinity or a zero.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: `+`, `-`, `*` and `/` of `float4` and `float8` check the result as
+    /// `float.h` does. An infinity from operands that are not infinite is `22003 value out of
+    /// range: overflow`, a zero from a product or a quotient of operands that are not zero is
+    /// `22003 value out of range: underflow`, and a zero divisor is `22012 division by zero`.
     Postgres,
 }
 
@@ -1414,6 +1434,7 @@ impl Session {
             self.semantics.query_columns = QueryColumns::Postgres;
             self.semantics.conflict_arbiter = ConflictArbiter::Postgres;
             self.semantics.from_functions = FromFunctions::Postgres;
+            self.semantics.float_range = FloatRange::Postgres;
             self.semantics.row_fields = RowFields::Postgres;
             self.semantics.row_nulls = RowNulls::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;

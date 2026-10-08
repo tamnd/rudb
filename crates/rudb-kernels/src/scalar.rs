@@ -928,7 +928,7 @@ fn sign_of<A: Fn(usize) -> usize>(
                                     out[index] = answer;
                                     Ok(())
                                 }
-                                None if negating => Err(negation_overflow()),
+                                None if negating => Err(negation_overflow(returns)),
                                 None => Err(abs_overflow(&arg.value_at(index))),
                             }
                         })?;
@@ -1260,8 +1260,8 @@ fn binary(
     if name == "__rudb_mean" {
         return mean_of(left, right, returns, rows);
     }
-    if let Some((op, floating_zero_errors)) = arithmetic_op(name) {
-        return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
+    if let Some((op, checks)) = arithmetic_op(name) {
+        return arithmetic_of(op, checks, left, right, returns, written);
     }
     if matches!(name, "&" | "|" | "xor" | "<<" | ">>") {
         return bitwise_of(name, left, right, returns);
@@ -1275,17 +1275,44 @@ fn binary(
     }
 }
 
-/// The spelling of an arithmetic operator as the operator, and `None` for anything else.
-fn arithmetic_op(name: &str) -> Option<(Op, bool)> {
+/// The spelling of an arithmetic operator as the operator and its checks, and `None` for anything
+/// else.
+fn arithmetic_op(name: &str) -> Option<(Op, Checks)> {
     Some(match name {
-        "+" => (Op::Add, false),
-        "-" => (Op::Subtract, false),
-        "*" => (Op::Multiply, false),
-        "//" | "__rudb_checked_slash" | "__rudb_divide" => (Op::Divide, true),
-        "%" | "__rudb_mod" => (Op::Modulo, false),
-        "__rudb_checked_remainder" => (Op::Modulo, true),
+        "+" => (Op::Add, Checks::Overflow),
+        "-" => (Op::Subtract, Checks::Overflow),
+        "*" => (Op::Multiply, Checks::Overflow),
+        "//" | "__rudb_checked_slash" | "__rudb_divide" => (Op::Divide, Checks::FloatZero),
+        "%" | "__rudb_mod" => (Op::Modulo, Checks::Overflow),
+        "__rudb_checked_remainder" => (Op::Modulo, Checks::FloatZero),
+        PG_FLOAT_ADD => (Op::Add, Checks::FloatRange),
+        PG_FLOAT_SUBTRACT => (Op::Subtract, Checks::FloatRange),
+        PG_FLOAT_MULTIPLY => (Op::Multiply, Checks::FloatRange),
+        PG_FLOAT_DIVIDE => (Op::Divide, Checks::FloatRange),
         _ => return None,
     })
+}
+
+/// `float8pl` and the other float operators of PostgreSQL, which check the range of the result.
+/// The binder calls them in place of `+`, `-`, `*` and `/` of a float under
+/// [`FloatRange::Postgres`](rudb_common::FloatRange::Postgres).
+pub const PG_FLOAT_ADD: &str = "__rudb_pg_float_add";
+/// See [`PG_FLOAT_ADD`].
+pub const PG_FLOAT_SUBTRACT: &str = "__rudb_pg_float_subtract";
+/// See [`PG_FLOAT_ADD`].
+pub const PG_FLOAT_MULTIPLY: &str = "__rudb_pg_float_multiply";
+/// See [`PG_FLOAT_ADD`].
+pub const PG_FLOAT_DIVIDE: &str = "__rudb_pg_float_divide";
+
+/// What an arithmetic operator checks besides the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checks {
+    /// The overflow of an integer or a decimal. A float gives the IEEE result.
+    Overflow,
+    /// Also a zero divisor of a float, which is an error and not an infinity or a nan.
+    FloatZero,
+    /// Also the range of a float result as PostgreSQL checks it, see [`float_range_error`].
+    FloatRange,
 }
 
 /// The form pairings a binary kernel in this file has a loop for.
@@ -1741,7 +1768,7 @@ where
 /// `+`, `-`, `*`, `//` and `%`, on the types the binder has already made match.
 fn arithmetic_of(
     op: Op,
-    floating_zero_errors: bool,
+    checks: Checks,
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
@@ -1778,11 +1805,11 @@ fn arithmetic_of(
         let left = opened_left.as_ref().unwrap_or(left);
         let right = opened_right.as_ref().unwrap_or(right);
         if (direct(left) || mapped(left)) && (direct(right) || mapped(right)) {
-            return arithmetic_of(op, floating_zero_errors, left, right, returns, written);
+            return arithmetic_of(op, checks, left, right, returns, written);
         }
         return Ok(None);
     }
-    by_form!(left, right, arithmetic_runs, op, floating_zero_errors, left, right, returns, written)
+    by_form!(left, right, arithmetic_runs, op, checks, left, right, returns, written)
 }
 
 /// The bitwise operators and `xor` over two runs of one integer type.
@@ -1953,7 +1980,7 @@ fn arithmetic_runs<L, R>(
     other: &Data,
     at_right: R,
     op: Op,
-    floating_zero_errors: bool,
+    checks: Checks,
     left: &Vector,
     right: &Vector,
     returns: &LogicalType,
@@ -1976,20 +2003,11 @@ where
     // already null before it raises on a zero, so it keeps the careful loop.
     if matches!(op, Op::Divide | Op::Modulo) {
         return guarded_runs(
-            one,
-            at_left,
-            other,
-            at_right,
-            op,
-            floating_zero_errors,
-            base,
-            left,
-            right,
-            returns,
-            written,
+            one, at_left, other, at_right, op, checks, base, left, right, returns, written,
         );
     }
-    fast_runs(one, at_left, other, at_right, op, &base, returns, rows)
+    let range = checks == Checks::FloatRange;
+    fast_runs(one, at_left, other, at_right, op, range, &base, returns, rows)
 }
 
 /// Adding, subtracting and multiplying, which is the arithmetic a scan spends its time in.
@@ -2004,6 +2022,7 @@ fn fast_runs<L, R>(
     other: &Data,
     at_right: R,
     op: Op,
+    range: bool,
     base: &Validity,
     returns: &LogicalType,
     rows: usize,
@@ -2050,14 +2069,27 @@ where
     macro_rules! floats {
         ($variant:ident, $native:ty, $widen:expr, $narrow:expr) => {
             if let (Data::$variant(a), Data::$variant(b)) = (one, other) {
-                let step = |x: $native, y: $native| {
-                    let (x, y) = ($widen(x), $widen(y));
-                    ($narrow(float_step(op, x, y)), false)
-                };
                 let mut out = vec![0 as $native; rows];
                 // A float does not overflow, it reaches infinity, so the flag is never set and the
-                // operator match can stay inside the step rather than outside the loop.
-                let _ = sweep(&mut out, a, &at_left, b, &at_right, step);
+                // operator match can stay inside the step rather than outside the loop. Where the
+                // range is checked, a result out of it sends the vector back to the row at a time
+                // path as an overflow does, which raises the error or does not for a null row.
+                if range {
+                    let step = |x: $native, y: $native| {
+                        let (x, y) = ($widen(x), $widen(y));
+                        let result = $narrow(float_step(op, x, y));
+                        (result, float_out_of_range(op, x, y, f64::from(result)))
+                    };
+                    if sweep(&mut out, a, &at_left, b, &at_right, step) {
+                        return Ok(None);
+                    }
+                } else {
+                    let step = |x: $native, y: $native| {
+                        let (x, y) = ($widen(x), $widen(y));
+                        ($narrow(float_step(op, x, y)), false)
+                    };
+                    let _ = sweep(&mut out, a, &at_left, b, &at_right, step);
+                }
                 blank(&mut out, base);
                 return finish(returns, Data::$variant(out.into()), base.clone());
             }
@@ -2099,7 +2131,7 @@ fn guarded_runs<L, R>(
     other: &Data,
     at_right: R,
     op: Op,
-    floating_zero_errors: bool,
+    checks: Checks,
     base: Validity,
     left: &Vector,
     right: &Vector,
@@ -2160,7 +2192,16 @@ where
                 let mut out = vec![0 as $native; rows];
                 let validity = over_valid(rows, base, |index| {
                     let (x, y) = (a[at_left(index)], b[at_right(index)]);
-                    if y == 0.0 && floating_zero_errors {
+                    if checks == Checks::FloatRange {
+                        let (x, y) = ($widen(x), $widen(y));
+                        let result = $narrow(float_step(op, x, y));
+                        if let Some(error) = float_range_error(op, x, y, f64::from(result)) {
+                            return Err(error);
+                        }
+                        out[index] = result;
+                        return Ok(());
+                    }
+                    if y == 0.0 && checks == Checks::FloatZero {
                         return Err(divided_by_zero(
                             written,
                             op.symbol(),
@@ -2417,6 +2458,66 @@ fn float_step(op: Op, x: f64, y: f64) -> f64 {
         Op::Multiply => x * y,
         Op::Divide => x / y,
         Op::Modulo => x % y,
+    }
+}
+
+/// Whether `x op y = result` is past the range of a float, as `float8_pl`, `float8_mi`,
+/// `float8_mul` and `float8_div` of `float.h` check it. That is an infinity from operands that are
+/// not infinite, and a zero from a product or a quotient of operands that are not zero. A zero
+/// divisor of a number is out of the range too. A `float4` result is checked after it is narrowed,
+/// with the operands that it was computed from.
+fn float_out_of_range(op: Op, x: f64, y: f64, result: f64) -> bool {
+    let infinite = result.is_infinite() && !x.is_infinite();
+    match op {
+        Op::Add | Op::Subtract => infinite && !y.is_infinite(),
+        Op::Multiply => (infinite && !y.is_infinite()) || (result == 0.0 && x != 0.0 && y != 0.0),
+        Op::Divide => {
+            (y == 0.0 && !x.is_nan()) || infinite || (result == 0.0 && x != 0.0 && !y.is_infinite())
+        }
+        Op::Modulo => false,
+    }
+}
+
+/// The error of PostgreSQL for a result that [`float_out_of_range`] finds, or `None`.
+fn float_range_error(op: Op, x: f64, y: f64, result: f64) -> Option<Error> {
+    if !float_out_of_range(op, x, y, result) {
+        return None;
+    }
+    let message = match op {
+        Op::Divide if y == 0.0 => {
+            return Some(
+                Error::invalid_input("division by zero")
+                    .state(SqlState::DIVISION_BY_ZERO)
+                    .unplaced(),
+            );
+        }
+        _ if result.is_infinite() => "value out of range: overflow",
+        _ => "value out of range: underflow",
+    };
+    Some(Error::out_of_range(message).state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE).unplaced())
+}
+
+/// A float operator of PostgreSQL over two values, see [`PG_FLOAT_ADD`].
+fn pg_float_arithmetic(op: Op, left: &Value, right: &Value, ty: &LogicalType) -> Result<Value> {
+    let (Some(x), Some(y)) = (approximate(left), approximate(right)) else {
+        let types = (left.logical_type(), right.logical_type());
+        return Err(Error::internal(format!("{} on {} and {}", op.word(), types.0, types.1)));
+    };
+    let result = float_step(op, x, y);
+    if matches!(ty, LogicalType::Float) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "arithmetic on a FLOAT column produces a FLOAT"
+        )]
+        let result = result as f32;
+        return match float_range_error(op, x, y, f64::from(result)) {
+            Some(error) => Err(error),
+            None => Ok(Value::Float(result)),
+        };
+    }
+    match float_range_error(op, x, y, result) {
+        Some(error) => Err(error),
+        None => Ok(Value::Double(result)),
     }
 }
 
@@ -4608,6 +4709,14 @@ pub fn call_values(
         ("__rudb_checked_slash", [left, right]) => {
             arithmetic(Op::Divide, left, right, returns, written)
         }
+        (PG_FLOAT_ADD, [left, right]) => pg_float_arithmetic(Op::Add, left, right, returns),
+        (PG_FLOAT_SUBTRACT, [left, right]) => {
+            pg_float_arithmetic(Op::Subtract, left, right, returns)
+        }
+        (PG_FLOAT_MULTIPLY, [left, right]) => {
+            pg_float_arithmetic(Op::Multiply, left, right, returns)
+        }
+        (PG_FLOAT_DIVIDE, [left, right]) => pg_float_arithmetic(Op::Divide, left, right, returns),
         ("__rudb_checked_remainder", [left, right]) => {
             if approximate(right) == Some(0.0) {
                 Err(divided_by_zero(written, "%", left, right))
@@ -4852,7 +4961,7 @@ pub fn call_values(
 /// Which arithmetic, kept separate from the spelling so that the overflow message can name it the
 /// way DuckDB names it.
 ///
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
     Add,
     Subtract,
@@ -4899,12 +5008,26 @@ pub(crate) fn overflow(op: Op, ty: &LogicalType, left: &Value, right: &Value) ->
         (left.to_string(), right.to_string())
     };
     let word = if decimal && matches!(op, Op::Subtract) { "subtract" } else { op.word() };
-    Error::out_of_range(format!(
+    let error = Error::out_of_range(format!(
         "Overflow in {word} of {} ({left} {} {right}){}",
         ty.physical_name(),
         op.symbol(),
         ending(op, ty)
-    ))
+    ));
+    integer_range(error, ty)
+}
+
+/// `error` with the text and the SQLSTATE of PostgreSQL for an integer result past the range of
+/// `ty`, such as `22003 integer out of range` of `int4pl`. A type that PostgreSQL does not have
+/// keeps the error as it is.
+fn integer_range(error: Error, ty: &LogicalType) -> Error {
+    let name = match ty {
+        LogicalType::SmallInt => "smallint",
+        LogicalType::Integer => "integer",
+        LogicalType::BigInt => "bigint",
+        _ => return error,
+    };
+    error.state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE).pg(format!("{name} out of range")).unplaced()
 }
 
 /// The sentence DuckDB says when a divisor is zero, which is not every divisor by zero.
@@ -4928,7 +5051,7 @@ fn divided_by_zero(written: Written<'_>, symbol: &str, left: &Value, right: &Val
 /// `abs` says it differently: `Overflow on abs(-2147483648)`, with no type in it and no punctuation
 /// on the end.
 fn abs_overflow(value: &Value) -> Error {
-    Error::out_of_range(format!("Overflow on abs({value})"))
+    integer_range(Error::out_of_range(format!("Overflow on abs({value})")), &value.logical_type())
 }
 
 /// Negation says it differently again, and names neither the type nor the value it was given.
@@ -4938,8 +5061,8 @@ fn abs_overflow(value: &Value) -> Error {
 /// both are a value nothing can widen: a column, where the constant folder has no value to look at
 /// until the loop is already running, and a `HUGEINT`, where there is no wider signed type to move
 /// to. Per #264.
-pub(crate) fn negation_overflow() -> Error {
-    Error::out_of_range("Overflow in negation of numeric value!")
+pub(crate) fn negation_overflow(ty: &LogicalType) -> Error {
+    integer_range(Error::out_of_range("Overflow in negation of numeric value!"), ty)
 }
 
 /// The digits a decimal holds, rather than the number it means.
@@ -5229,7 +5352,7 @@ fn negate(value: &Value, ty: &LogicalType) -> Result<Value> {
             Some(whole) => whole
                 .checked_neg()
                 .and_then(|negated| fit(negated, ty))
-                .ok_or_else(negation_overflow),
+                .ok_or_else(|| negation_overflow(ty)),
             None => Err(Error::not_implemented(format!("negating a {}", value.logical_type()))),
         },
     }
@@ -5465,6 +5588,80 @@ mod tests {
         )
         .expect_err("2147483647 + 1 is not an integer");
         assert_eq!(error.message(), "Overflow in addition of INT32 (2147483647 + 1)!");
+    }
+
+    /// The float operators of PostgreSQL give the errors of `float.h` on both paths, with a null
+    /// row that holds no error, and an integer overflow has the text of PostgreSQL too.
+    #[test]
+    fn the_float_operators_of_postgres_check_the_range_of_the_result() {
+        let state = |error: Error| {
+            let text = error.fields().and_then(|fields| fields.postgres.clone());
+            format!("{} {}", error.reported_state(), text.unwrap_or_else(|| error.message().into()))
+        };
+        let double = |values: &[Option<f64>]| {
+            let values: Vec<Value> =
+                values.iter().map(|value| value.map_or(Value::Null, Value::Double)).collect();
+            Vector::from_values(LogicalType::Double, &values).expect("rows")
+        };
+        let ten = Vector::constant(LogicalType::Double, Value::Double(10.0), 3);
+        let big = double(&[Some(1.0), None, Some(1e308)]);
+        let tiny = double(&[Some(1.0), None, Some(1e-308)]);
+        let negative = double(&[Some(1.0), None, Some(-1e308)]);
+        for (name, left, right, expected) in [
+            (PG_FLOAT_MULTIPLY, &big, &ten, "22003 value out of range: overflow"),
+            (PG_FLOAT_ADD, &big, &big, "22003 value out of range: overflow"),
+            (PG_FLOAT_SUBTRACT, &big, &negative, "22003 value out of range: overflow"),
+            (PG_FLOAT_MULTIPLY, &tiny, &tiny, "22003 value out of range: underflow"),
+            (PG_FLOAT_DIVIDE, &tiny, &big, "22003 value out of range: underflow"),
+            (PG_FLOAT_DIVIDE, &big, &tiny, "22003 value out of range: overflow"),
+        ] {
+            let args = [left.clone(), right.clone()];
+            agrees(name, &args, &LogicalType::Double);
+            let error = call(name, &args, &LogicalType::Double, None).expect_err(name);
+            assert_eq!(state(error), expected, "{name}");
+        }
+        let zero = double(&[Some(0.0), None, Some(0.0)]);
+        let nan = double(&[Some(f64::NAN), None, Some(1.0)]);
+        let error = call(PG_FLOAT_DIVIDE, &[nan.clone(), zero.clone()], &LogicalType::Double, None);
+        assert_eq!(state(error.expect_err("one by zero")), "22012 division by zero");
+        let nan = Vector::constant(LogicalType::Double, Value::Double(f64::NAN), 1);
+        let zero = Vector::constant(LogicalType::Double, Value::Double(0.0), 1);
+        let answer = call(PG_FLOAT_DIVIDE, &[nan, zero], &LogicalType::Double, None);
+        assert!(matches!(answer.expect("nan").value_at(0), Value::Double(v) if v.is_nan()));
+        // An infinity from an infinity, and a nan, are results.
+        let infinite = double(&[Some(f64::INFINITY), None, Some(f64::NEG_INFINITY)]);
+        for name in [PG_FLOAT_ADD, PG_FLOAT_SUBTRACT, PG_FLOAT_MULTIPLY, PG_FLOAT_DIVIDE] {
+            let args = [infinite.clone(), ten.clone()];
+            agrees(name, &args, &LogicalType::Double);
+            assert!(call(name, &args, &LogicalType::Double, None).is_ok(), "{name}");
+        }
+        // A `float4` result is checked after it is narrowed.
+        let float = |value: f32| Vector::constant(LogicalType::Float, Value::Float(value), 1);
+        let error = call(PG_FLOAT_MULTIPLY, &[float(3e38), float(10.0)], &LogicalType::Float, None);
+        assert_eq!(state(error.expect_err("past a float4")), "22003 value out of range: overflow");
+        let error =
+            call(PG_FLOAT_MULTIPLY, &[float(1e-38), float(1e-10)], &LogicalType::Float, None);
+        assert_eq!(
+            state(error.expect_err("under a float4")),
+            "22003 value out of range: underflow"
+        );
+        for (ty, left, expected) in [
+            (LogicalType::SmallInt, Value::SmallInt(i16::MAX), "22003 smallint out of range"),
+            (LogicalType::Integer, Value::Integer(i32::MAX), "22003 integer out of range"),
+            (LogicalType::BigInt, Value::BigInt(i64::MAX), "22003 bigint out of range"),
+        ] {
+            let one = cast::cast_value(&Value::Integer(1), &ty, false).expect("one");
+            let error =
+                call_values("+", &[left.clone(), one], &ty, None).expect_err("past the type");
+            assert_eq!(state(error), expected);
+            let error =
+                call_values("abs", &[cast::cast_value(&left, &ty, false).expect("max")], &ty, None);
+            assert!(error.is_ok());
+        }
+        let error = call_values("-", &[Value::Integer(i32::MIN)], &LogicalType::Integer, None);
+        assert_eq!(state(error.expect_err("past an int4")), "22003 integer out of range");
+        let error = call_values("abs", &[Value::BigInt(i64::MIN)], &LogicalType::BigInt, None);
+        assert_eq!(state(error.expect_err("past an int8")), "22003 bigint out of range");
     }
 
     /// A zero divisor is three different things depending on the operator, and this is the line
