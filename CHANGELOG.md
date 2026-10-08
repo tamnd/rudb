@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.0
+
+This release closes J7 (#1851), the JOB claim. On server2, on one fresh load of the IMDb snapshot, rudb answers all 113 JOB queries as DuckDB does in 5,780 ms of hot time against DuckDB's 80,336, which is 13.9 times faster, with no query slower than DuckDB and the highest per-query ratio 0.284, on 13d. All eight conditions of the gate hold in the same run, at six threads and again at one thread, where rudb is 15.7 times faster, and the load took 57.5 s against 97.2 s. The report is `reports/2026-10-08/job-gate.md` in rudb-bench (tamnd/rudb-bench#274), and it also has the cold totals and the run with the consistent reduction turned off. The minor version counts closed milestones, and J7 is one, so the PG series goes on from here at 0.10.y.
+
+The last query over a third was 33a, at 0.346. #2857 lets the join order search read a small relation that joins two large sides once more ahead of the join tree, so `movie_link` narrows both movies before either `title` is read, and 33a went to 0.112.
+
+#2863 carries the collation of a column as an implicit collation, #2864 sends the notices of the parse as PostgreSQL does, and #2865 reads `rowid` as a table's row number through joins and refuses it where the pin does.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.9.4
 
 #2856 names the collations of `pg_collation` and checks `COLLATE` as PostgreSQL does, with the error for two different explicit collations in one call. #2858 maps the case of text by its collation in `upper`, `lower`, `initcap` and `casefold`, over the Unicode case tables of the PostgreSQL pin: `C` maps only the ASCII letters, `pg_c_utf8` maps by the simple mappings and `pg_unicode_fast` by the full mappings. #2859 matches `ILIKE` by the lower case of the collation. #2861 gives a regular expression the character classes, the case folding and the word boundaries of its collation.
