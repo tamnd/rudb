@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Thirty nine passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Forty passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -42,6 +42,7 @@ pub mod order;
 pub mod pass;
 pub mod pgexplain;
 pub mod pregroup;
+pub mod present;
 pub mod presize;
 pub mod reach;
 pub mod reorder;
@@ -215,6 +216,10 @@ pub const RANK: u8 = 11;
 /// place itself. Before join ordering, because a region it takes is a region nobody has to order, and
 /// the search over a region of seventeen relations is the most expensive thing planning does.
 ///
+/// Testing a key an inner join reads for null at its scan goes between the two. After the
+/// consistent rewrite, because a region that rewrite answered has no join left to drop the rows,
+/// and before join ordering, because the rows the test takes out are rows ordering would count.
+///
 /// Factoring a sum by the small columns of its products goes after the average has been read off a
 /// sum of the same column and after pre grouping, so that it sees the sums and counts those two
 /// leave and so that a grouping either of them made is one it leaves alone.
@@ -231,7 +236,7 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 39] = [
+pub static PASSES: [&(dyn Pass + Sync); 40] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
     &dependent::DependentGroupKeys,
@@ -244,6 +249,7 @@ pub static PASSES: [&(dyn Pass + Sync); 39] = [
     &filter::FilterPushdown,
     &delim::Deliminator,
     &consistent::ConsistentExtremes,
+    &present::PresentKeys,
     &order::JoinOrder,
     &semi::MarkToSemi,
     &semi::DistinctToSemi,
@@ -383,7 +389,7 @@ pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
 /// searches, and everything after it is choosing how the plan runs, which is what somebody means by
 /// the optimizer. A test holds the index to the pass, so a pass added in front of join ordering
 /// moves the line with it or fails.
-pub const REWRITES: usize = 12;
+pub const REWRITES: usize = 13;
 
 /// [`optimize_with`], saying how many wall nanoseconds of it were the rewrites.
 ///
