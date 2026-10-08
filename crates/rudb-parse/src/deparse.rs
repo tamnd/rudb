@@ -376,6 +376,11 @@ fn source(ast: &Ast, index: SourceRef) -> String {
             let call = format!("{}({})", parts(ast, name), written.join(", "));
             label(ast, call, alias, columns)
         }
+        Source::Calls { calls, alias, columns } => {
+            let written: Vec<String> =
+                ast.expr_list(calls).iter().map(|&call| expr(ast, call)).collect();
+            label(ast, format!("ROWS FROM ({})", written.join(", ")), alias, columns)
+        }
         // A `VALUES` in a `FROM` clause is wrapped in a select of its own, named `valueslist`, and
         // then given whatever alias was written. Measured, including the name.
         Source::Values { rows, alias, columns } => {

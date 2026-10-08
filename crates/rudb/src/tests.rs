@@ -14599,3 +14599,46 @@ fn with_ordinality_numbers_the_rows_of_a_call() {
         vec![vec![big(5000)]]
     );
 }
+
+/// An unnest in a correlated subquery is made once for each outer row, as in the pin.
+#[test]
+fn an_unnest_in_a_correlated_subquery_is_made_for_each_outer_row() {
+    let db = Database::new();
+    let big = Value::BigInt;
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT * FROM (VALUES (1), (2)) v(n), LATERAL (SELECT unnest(range(n))) s ORDER BY ALL"
+        ),
+        vec![vec![integer(1), big(0)], vec![integer(2), big(0)], vec![integer(2), big(1)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT n, (SELECT count(*) FROM (SELECT unnest(range(n)))) FROM (VALUES (1), (3)) v(n) \
+             ORDER BY ALL",
+        ),
+        vec![vec![integer(1), big(1)], vec![integer(3), big(3)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT * FROM (VALUES (2), (3)) v(n), \
+             LATERAL (SELECT unnest([n, n * 10]) AS u WHERE true) s ORDER BY ALL",
+        ),
+        vec![
+            vec![integer(2), integer(2)],
+            vec![integer(2), integer(20)],
+            vec![integer(3), integer(3)],
+            vec![integer(3), integer(30)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT x FROM (VALUES ([1, 2]), ([3])) v(l), LATERAL (SELECT unnest(l) + 1 AS x) s \
+             ORDER BY ALL",
+        ),
+        vec![vec![integer(2)], vec![integer(3)], vec![integer(4)]]
+    );
+}

@@ -1148,6 +1148,17 @@ pub enum Source {
         /// they did not name has been handed the rewrite to debug rather than their own statement.
         pragma: bool,
     },
+    /// The calls of `ROWS FROM (f(), g())` in PostgreSQL, whose rows are put side by side: row n
+    /// holds row n of each call, and a call with fewer rows gives nulls. A call that gives a row
+    /// gives a column for each field.
+    Calls {
+        /// The calls, as a run of [`ExprRef`] in `Ast::expr_lists`.
+        calls: Slice,
+        /// The alias, or `NONE`.
+        alias: StrRef,
+        /// Column aliases from `AS t(a, b)`, as a run of [`StrRef`].
+        columns: Slice,
+    },
     /// A `VALUES` in the `FROM` clause.
     Values {
         /// The rows, as a run of [`Slice`] in `Ast::rows`.

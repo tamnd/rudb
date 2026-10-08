@@ -288,6 +288,7 @@ pub(crate) fn unsupported(plan: &Plan, at: NodeRef, outer: &TableSet) -> Option<
         | Node::SetOp { .. }
         | Node::Values { .. }
         | Node::TableFunction { .. }
+        | Node::LateralFunction { .. }
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
         | Node::CteScan { .. } => None,
@@ -467,6 +468,37 @@ fn push(
             held(plan, at, domain, index, keys, outer)
         }
         Node::TableFunction { .. } => lateral(plan, at, domain, index, keys),
+        // The call is made once per row of its input, so the domain goes under the input and the
+        // arguments read the domain columns that the input carries up. The columns of the call
+        // are put after the row it was given, so the carried columns stay where they were.
+        Node::LateralFunction {
+            input,
+            index: at_index,
+            function,
+            args,
+            options,
+            settings,
+            columns,
+            ordinality,
+        } => {
+            let below = push(plan, input, domain, index, keys, outer)?;
+            let map = mapping(keys, &below);
+            let held = plan.expr_list(args).to_vec();
+            let rewritten: Vec<ExprRef> =
+                held.into_iter().map(|expr| remap(plan, expr, &map)).collect();
+            let args = plan.add_expr_list(&rewritten);
+            let node = plan.add_node(Node::LateralFunction {
+                input: below.node,
+                index: at_index,
+                function,
+                args,
+                options,
+                settings,
+                columns,
+                ordinality,
+            });
+            Some(Pushed { node, keys: below.keys, moved: below.moved })
+        }
         Node::CrossProduct { left, right } => {
             let empty = plan.add_expr_list(&[]);
             sides(plan, left, right, JoinKind::Inner, empty, domain, index, keys, outer)

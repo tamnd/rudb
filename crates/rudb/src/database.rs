@@ -8905,7 +8905,9 @@ fn simple_cacheable(ast: &Ast, plan: &Plan, catalog: &Catalog) -> bool {
             let parts: Vec<&str> = ast.name(name).collect();
             catalog.resolve(&parts).is_ok_and(|name| catalog.table(&name).is_ok())
         }
-        ast::Source::Function { .. } | ast::Source::Pivot { .. } => false,
+        ast::Source::Function { .. } | ast::Source::Calls { .. } | ast::Source::Pivot { .. } => {
+            false
+        }
         _ => true,
     });
     fixed
