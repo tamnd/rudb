@@ -3,18 +3,33 @@
 
 /// The category of a key word, which decides where the grammar takes it as a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::session) enum Category {
+pub enum Category {
     Unreserved,
     ColName,
     TypeFuncName,
     Reserved,
 }
 
+use std::borrow::Cow;
+
 use Category::{ColName, Reserved, TypeFuncName, Unreserved};
 
 /// The category of `word`, in lower case, or `None` when it is not a key word.
-pub(in crate::session) fn category(word: &str) -> Option<Category> {
+pub fn category(word: &str) -> Option<Category> {
     KEYWORDS.binary_search_by(|(known, _)| known.cmp(&word)).ok().map(|at| KEYWORDS[at].1)
+}
+
+/// `quote_identifier` of `ruleutils.c`: the name as it is when it starts with a lower case letter
+/// or `_`, has only lower case letters, digits and `_` after that, and is not a key word other than
+/// an unreserved one, and otherwise the name in double quotes with each quote in it doubled.
+pub fn quote_identifier(name: &str) -> Cow<'_, str> {
+    let simple = name.bytes().next().is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
+        && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        && category(name).is_none_or(|category| category == Unreserved);
+    match simple {
+        true => Cow::Borrowed(name),
+        false => Cow::Owned(format!("\"{}\"", name.replace('"', "\"\""))),
+    }
 }
 
 static KEYWORDS: [(&str, Category); 499] = [
@@ -518,3 +533,35 @@ static KEYWORDS: [(&str, Category); 499] = [
     ("yes", Unreserved),
     ("zone", Unreserved),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_name_is_quoted_as_quote_ident_quotes_it() {
+        for (name, quoted) in [
+            ("a", "a"),
+            ("_a1", "_a1"),
+            ("abort", "abort"),
+            ("", "\"\""),
+            ("a$", "\"a$\""),
+            ("1a", "\"1a\""),
+            ("A", "\"A\""),
+            ("é", "\"é\""),
+            ("a b", "\"a b\""),
+            ("a\"b", "\"a\"\"b\""),
+            ("int", "\"int\""),
+            ("between", "\"between\""),
+            ("user", "\"user\""),
+            ("select", "\"select\""),
+        ] {
+            assert_eq!(quote_identifier(name), quoted, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_key_words_are_sorted() {
+        assert!(KEYWORDS.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+}

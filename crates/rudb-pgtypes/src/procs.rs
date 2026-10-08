@@ -90,6 +90,11 @@ pub fn procs(name: &str) -> &'static [Proc] {
     &PROCS[start..end]
 }
 
+/// Every built-in function, sorted by name.
+pub fn builtin_procs() -> &'static [Proc] {
+    &PROCS
+}
+
 /// The type that a call of a function with the name of a type converts its argument to, as
 /// `FuncNameAsType` of PostgreSQL finds it: a built-in type with this `typname` that is not the
 /// row type of a table.

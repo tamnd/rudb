@@ -15,7 +15,6 @@ mod copy;
 mod cursor;
 mod database;
 mod extended;
-mod keywords;
 mod literal;
 mod prepare;
 mod role;

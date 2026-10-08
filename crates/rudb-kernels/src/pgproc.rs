@@ -8,27 +8,34 @@
 
 use rudb_common::{Result, Value};
 
-use crate::{pgdatetime, pgmath};
+use crate::{pgdatetime, pgmath, pgstring};
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
+/// The C functions of each module of kernels, sorted.
+const SOURCES: [&[&str]; 3] = [pgmath::SOURCES, pgdatetime::SOURCES, pgstring::SOURCES];
+
 /// Whether the C function `src` has a kernel.
 pub fn has(src: &str) -> bool {
-    pgmath::SOURCES.binary_search(&src).is_ok() || pgdatetime::SOURCES.binary_search(&src).is_ok()
+    SOURCES.iter().any(|sources| sources.binary_search(&src).is_ok())
 }
 
 /// The value of a call of a kernel of a C function, or `None` for any other name. A null
-/// argument gives a null, as every function here is strict.
+/// argument of a strict function gives a null. The functions that are not strict, as
+/// `proisstrict` has them, see the null.
 pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let Some(src) = name.strip_prefix(PREFIX) else { return Ok(None) };
-    if args.iter().any(Value::is_null) {
+    if args.iter().any(Value::is_null) && !pgstring::NULLS.contains(&src) {
         return Ok(Some(Value::Null));
     }
-    match pgmath::call(src, args)? {
-        Some(value) => Ok(Some(value)),
-        None => pgdatetime::call(src, args),
+    if let Some(value) = pgmath::call(src, args)? {
+        return Ok(Some(value));
     }
+    if let Some(value) = pgdatetime::call(src, args)? {
+        return Ok(Some(value));
+    }
+    pgstring::call(src, args)
 }
 
 /// The function of one `float8` of the kernel `name`, for the loop over a column.
@@ -42,8 +49,17 @@ mod tests {
 
     #[test]
     fn the_sources_are_sorted() {
-        for sources in [pgmath::SOURCES, pgdatetime::SOURCES] {
+        for sources in SOURCES {
             assert!(sources.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn a_kernel_sees_a_null_when_its_function_is_not_strict() {
+        for proc in rudb_pgtypes::builtin_procs() {
+            if matches!(proc.lang, b'i' | b'c') && has(proc.src) {
+                assert_eq!(proc.strict, !pgstring::NULLS.contains(&proc.src), "{}", proc.src);
+            }
         }
     }
 }

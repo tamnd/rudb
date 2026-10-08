@@ -1,4 +1,6 @@
-//! MD5, SHA-1 and SHA-256, which `md5`, `md5_number`, `sha1` and `sha256` answer with.
+//! MD5, SHA-1 and the SHA-2 digests, which `md5`, `md5_number`, `sha1`, `sha256` and the
+//! `sha224` to `sha512` of a PostgreSQL session answer with, and the CRC-32 and CRC-32C checksums
+//! of `crc32` and `crc32c`.
 //!
 //! These are the digests of RFC 1321 and FIPS 180-4 and nothing more, written here so the kernels
 //! need no hashing crate. None of them is meant to protect anything, so they are written for being
@@ -190,16 +192,50 @@ const SHA256_CONSTANTS: [u32; 64] = [
 
 /// The SHA-256 digest of `message`.
 pub(crate) fn sha256(message: &[u8]) -> [u8; 32] {
-    let mut state: [u32; 8] = [
-        0x6a09_e667,
-        0xbb67_ae85,
-        0x3c6e_f372,
-        0xa54f_f53a,
-        0x510e_527f,
-        0x9b05_688c,
-        0x1f83_d9ab,
-        0x5be0_cd19,
-    ];
+    let state = sha256_state(
+        message,
+        [
+            0x6a09_e667,
+            0xbb67_ae85,
+            0x3c6e_f372,
+            0xa54f_f53a,
+            0x510e_527f,
+            0x9b05_688c,
+            0x1f83_d9ab,
+            0x5be0_cd19,
+        ],
+    );
+    let mut out = [0; 32];
+    for (at, word) in state.iter().enumerate() {
+        out[4 * at..4 * at + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// The SHA-224 digest of `message`, which is SHA-256 from other first values, cut to 28 bytes.
+pub(crate) fn sha224(message: &[u8]) -> [u8; 28] {
+    let state = sha256_state(
+        message,
+        [
+            0xc105_9ed8,
+            0x367c_d507,
+            0x3070_dd17,
+            0xf70e_5939,
+            0xffc0_0b31,
+            0x6858_1511,
+            0x64f9_8fa7,
+            0xbefa_4fa4,
+        ],
+    );
+    let mut out = [0; 28];
+    for (at, word) in state.iter().take(7).enumerate() {
+        out[4 * at..4 * at + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// The state of SHA-256 after `message`, from the first values `state`.
+fn sha256_state(message: &[u8], mut state: [u32; 8]) -> [u32; 8] {
     for block in padded(message, false).chunks_exact(64) {
         let mut words = [0u32; 64];
         for i in 0..16 {
@@ -238,11 +274,195 @@ pub(crate) fn sha256(message: &[u8]) -> [u8; 32] {
             *held = held.wrapping_add(moved);
         }
     }
-    let mut out = [0; 32];
+    state
+}
+
+/// The first 64 bits of the fractional parts of the cube roots of the first 80 primes.
+const SHA512_CONSTANTS: [u64; 80] = [
+    0x428a_2f98_d728_ae22,
+    0x7137_4491_23ef_65cd,
+    0xb5c0_fbcf_ec4d_3b2f,
+    0xe9b5_dba5_8189_dbbc,
+    0x3956_c25b_f348_b538,
+    0x59f1_11f1_b605_d019,
+    0x923f_82a4_af19_4f9b,
+    0xab1c_5ed5_da6d_8118,
+    0xd807_aa98_a303_0242,
+    0x1283_5b01_4570_6fbe,
+    0x2431_85be_4ee4_b28c,
+    0x550c_7dc3_d5ff_b4e2,
+    0x72be_5d74_f27b_896f,
+    0x80de_b1fe_3b16_96b1,
+    0x9bdc_06a7_25c7_1235,
+    0xc19b_f174_cf69_2694,
+    0xe49b_69c1_9ef1_4ad2,
+    0xefbe_4786_384f_25e3,
+    0x0fc1_9dc6_8b8c_d5b5,
+    0x240c_a1cc_77ac_9c65,
+    0x2de9_2c6f_592b_0275,
+    0x4a74_84aa_6ea6_e483,
+    0x5cb0_a9dc_bd41_fbd4,
+    0x76f9_88da_8311_53b5,
+    0x983e_5152_ee66_dfab,
+    0xa831_c66d_2db4_3210,
+    0xb003_27c8_98fb_213f,
+    0xbf59_7fc7_beef_0ee4,
+    0xc6e0_0bf3_3da8_8fc2,
+    0xd5a7_9147_930a_a725,
+    0x06ca_6351_e003_826f,
+    0x1429_2967_0a0e_6e70,
+    0x27b7_0a85_46d2_2ffc,
+    0x2e1b_2138_5c26_c926,
+    0x4d2c_6dfc_5ac4_2aed,
+    0x5338_0d13_9d95_b3df,
+    0x650a_7354_8baf_63de,
+    0x766a_0abb_3c77_b2a8,
+    0x81c2_c92e_47ed_aee6,
+    0x9272_2c85_1482_353b,
+    0xa2bf_e8a1_4cf1_0364,
+    0xa81a_664b_bc42_3001,
+    0xc24b_8b70_d0f8_9791,
+    0xc76c_51a3_0654_be30,
+    0xd192_e819_d6ef_5218,
+    0xd699_0624_5565_a910,
+    0xf40e_3585_5771_202a,
+    0x106a_a070_32bb_d1b8,
+    0x19a4_c116_b8d2_d0c8,
+    0x1e37_6c08_5141_ab53,
+    0x2748_774c_df8e_eb99,
+    0x34b0_bcb5_e19b_48a8,
+    0x391c_0cb3_c5c9_5a63,
+    0x4ed8_aa4a_e341_8acb,
+    0x5b9c_ca4f_7763_e373,
+    0x682e_6ff3_d6b2_b8a3,
+    0x748f_82ee_5def_b2fc,
+    0x78a5_636f_4317_2f60,
+    0x84c8_7814_a1f0_ab72,
+    0x8cc7_0208_1a64_39ec,
+    0x90be_fffa_2363_1e28,
+    0xa450_6ceb_de82_bde9,
+    0xbef9_a3f7_b2c6_7915,
+    0xc671_78f2_e372_532b,
+    0xca27_3ece_ea26_619c,
+    0xd186_b8c7_21c0_c207,
+    0xeada_7dd6_cde0_eb1e,
+    0xf57d_4f7f_ee6e_d178,
+    0x06f0_67aa_7217_6fba,
+    0x0a63_7dc5_a2c8_98a6,
+    0x113f_9804_bef9_0dae,
+    0x1b71_0b35_131c_471b,
+    0x28db_77f5_2304_7d84,
+    0x32ca_ab7b_40c7_2493,
+    0x3c9e_be0a_15c9_bebc,
+    0x431d_67c4_9c10_0d4c,
+    0x4cc5_d4be_cb3e_42b6,
+    0x597f_299c_fc65_7e2a,
+    0x5fcb_6fab_3ad6_faec,
+    0x6c44_198c_4a47_5817,
+];
+
+/// The SHA-512 digest of `message`.
+pub(crate) fn sha512(message: &[u8]) -> [u8; 64] {
+    let state = sha512_state(
+        message,
+        [
+            0x6a09_e667_f3bc_c908,
+            0xbb67_ae85_84ca_a73b,
+            0x3c6e_f372_fe94_f82b,
+            0xa54f_f53a_5f1d_36f1,
+            0x510e_527f_ade6_82d1,
+            0x9b05_688c_2b3e_6c1f,
+            0x1f83_d9ab_fb41_bd6b,
+            0x5be0_cd19_137e_2179,
+        ],
+    );
+    let mut out = [0; 64];
     for (at, word) in state.iter().enumerate() {
-        out[4 * at..4 * at + 4].copy_from_slice(&word.to_be_bytes());
+        out[8 * at..8 * at + 8].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+/// The SHA-384 digest of `message`, which is SHA-512 from other first values, cut to 48 bytes.
+pub(crate) fn sha384(message: &[u8]) -> [u8; 48] {
+    let state = sha512_state(
+        message,
+        [
+            0xcbbb_9d5d_c105_9ed8,
+            0x629a_292a_367c_d507,
+            0x9159_015a_3070_dd17,
+            0x152f_ecd8_f70e_5939,
+            0x6733_2667_ffc0_0b31,
+            0x8eb4_4a87_6858_1511,
+            0xdb0c_2e0d_64f9_8fa7,
+            0x47b5_481d_befa_4fa4,
+        ],
+    );
+    let mut out = [0; 48];
+    for (at, word) in state.iter().take(6).enumerate() {
+        out[8 * at..8 * at + 8].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// The state of SHA-512 after `message`, from the first values `state`. The message is padded to
+/// 128 byte blocks with its length in bits in the last sixteen bytes.
+fn sha512_state(message: &[u8], mut state: [u64; 8]) -> [u64; 8] {
+    let bits = (message.len() as u128).wrapping_mul(8);
+    let mut padded = message.to_vec();
+    padded.push(0x80);
+    while padded.len() % 128 != 112 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bits.to_be_bytes());
+    for block in padded.chunks_exact(128) {
+        let mut words = [0u64; 80];
+        for (word, bytes) in words.iter_mut().zip(block.chunks_exact(8)) {
+            let mut eight = [0; 8];
+            eight.copy_from_slice(bytes);
+            *word = u64::from_be_bytes(eight);
+        }
+        for i in 16..80 {
+            let low = words[i - 15].rotate_right(1)
+                ^ words[i - 15].rotate_right(8)
+                ^ (words[i - 15] >> 7);
+            let high =
+                words[i - 2].rotate_right(19) ^ words[i - 2].rotate_right(61) ^ (words[i - 2] >> 6);
+            words[i] =
+                words[i - 16].wrapping_add(low).wrapping_add(words[i - 7]).wrapping_add(high);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (constant, word) in SHA512_CONSTANTS.iter().zip(words) {
+            let chosen = (e & f) ^ (!e & g);
+            let first = h
+                .wrapping_add(e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41))
+                .wrapping_add(chosen)
+                .wrapping_add(*constant)
+                .wrapping_add(word);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let second = (a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39))
+                .wrapping_add(majority);
+            (h, g, f, e, d, c, b, a) =
+                (g, f, e, d.wrapping_add(first), c, b, a, first.wrapping_add(second));
+        }
+        for (held, moved) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *held = held.wrapping_add(moved);
+        }
+    }
+    state
+}
+
+/// The CRC-32 of `message` with the reflected polynomial `polynomial`: `0xedb8_8320` for the
+/// CRC-32 of ISO 3309 and `0x82f6_3b78` for the CRC-32C of Castagnoli.
+pub(crate) fn crc32(message: &[u8], polynomial: u32) -> u32 {
+    let mut crc = !0u32;
+    for &byte in message {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (polynomial & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 /// A digest in lower case hexadecimal, which is how the pin writes all three.
@@ -274,6 +494,30 @@ mod tests {
             lower_hex(&sha256(b"abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn the_other_sha_2_digests_and_the_checksums_are_the_standards_answers() {
+        assert_eq!(
+            lower_hex(&sha224(b"abc")),
+            "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"
+        );
+        assert_eq!(
+            lower_hex(&sha384(b"")),
+            "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"
+        );
+        assert_eq!(
+            lower_hex(&sha512(b"")),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+        let long = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        assert_eq!(
+            lower_hex(&sha512(long)),
+            "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
+        );
+        assert_eq!(crc32(b"abc", 0xedb8_8320), 891_568_578);
+        assert_eq!(crc32(b"abc", 0x82f6_3b78), 910_901_175);
+        assert_eq!(crc32(b"", 0xedb8_8320), 0);
     }
 
     #[test]

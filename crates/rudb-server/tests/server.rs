@@ -1318,6 +1318,344 @@ fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
 }
 
 #[test]
+fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
+    let dirs = Dirs::new("pgstring");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // psql writes a null as an empty string, and so does this.
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The values are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "select btrim('  a  '), btrim('xxaxx', 'x'), ltrim('  a'), rtrim('a  '), \
+            ltrim('xxa', 'x'), rtrim('axx', 'x');",
+            "a|a|a|a|a|a",
+        ),
+        (
+            "select bit_length('ab'), char_length('abc'), character_length('é'), \
+            octet_length('é'), length('abc');",
+            "16|3|1|2|3",
+        ),
+        (
+            "select lower('ABÉ'), upper('abé'), initcap('hello wORLD foo_bar 1abc');",
+            "abé|ABÉ|Hello World Foo_Bar 1abc",
+        ),
+        (
+            "select lpad('abc', 5), lpad('abc', 5, 'xy'), lpad('abc', 2), rpad('abc', 5, 'xy'), \
+            lpad('abc', 5, ''), lpad('a', -1);",
+            "  abc|xyabc|ab|abcxy|abc|",
+        ),
+        (
+            "select overlay('abcdef' placing 'XY' from 2), overlay('abcdef' placing 'XY' from 2 \
+            for 0);",
+            "aXYdef|aXYbcdef",
+        ),
+        ("select position('c' in 'abc'), strpos('abc', ''), position('' in 'abc');", "3|1|1"),
+        (
+            "select trim(leading 'x' from 'xxaxx'), trim(trailing from '  a  '), trim(both from \
+            '  a  '), trim('  a  ');",
+            "axx|  a|a|a",
+        ),
+        ("select ascii('a'), ascii('é'), ascii(''), chr(65), chr(233);", "97|233|0|A|é"),
+        (
+            "select concat('a', null, 1), concat_ws(',', 'a', null, 'b'), concat_ws(null, 'a');",
+            "a1|a,b|",
+        ),
+        (
+            "select format('%s %s', 'a', 1), format('%I', 'a b'), format('%L', 'it''s'), \
+            format('%L', null), format('%s', null);",
+            "a 1|\"a b\"|'it''s'|NULL|",
+        ),
+        (
+            "select format('%2$s %1$s', 'a', 'b'), format('%-5s|', 'a'), format('%5s|', 'a'), \
+            format('%*s|', 4, 'a'), format('%%');",
+            "b a|a    ||    a||   a||%",
+        ),
+        (
+            "select format(null), format('x', null), format('%s %s', variadic array['a', 'b']);",
+            "|x|a b",
+        ),
+        (
+            "select left('abc', 2), left('abc', -1), right('abc', 2), right('abc', -1), \
+            left('abc', 0);",
+            "ab|ab|bc|bc|",
+        ),
+        (
+            "select md5('abc'), md5(''::bytea);",
+            "900150983cd24fb0d6963f7d28e17f72|d41d8cd98f00b204e9800998ecf8427e",
+        ),
+        ("select parse_ident('a.b'), parse_ident('\"A b\".c');", "{a,b}|{\"A b\",c}"),
+        (
+            "select quote_ident('a'), quote_ident('a b'), quote_ident('A'), \
+            quote_ident('select'), quote_ident('a\"b');",
+            "a|\"a b\"|\"A\"|\"select\"|\"a\"\"b\"",
+        ),
+        (
+            "select quote_literal('a'), quote_literal('it''s'), quote_literal(e'a\\\\b'), \
+            quote_literal(1), quote_nullable(null), quote_nullable('a');",
+            "'a'|'it''s'|E'a\\\\b'|'1'|NULL|'a'",
+        ),
+        (
+            "select repeat('ab', 3), repeat('ab', 0), repeat('ab', -1), replace('abcabc', 'b', \
+            'X'), replace('abc', '', 'X');",
+            "ababab|||aXcaXc|abc",
+        ),
+        ("select reverse('abc'), reverse('é');", "cba|é"),
+        (
+            "select split_part('a,b,c', ',', 2), split_part('a,b,c', ',', -1), \
+            split_part('a,b,c', ',', 5), split_part('a,b,c', '', 1);",
+            "b|c||a,b,c",
+        ),
+        ("select starts_with('abc', 'ab'), starts_with('abc', '');", "t|t"),
+        (
+            "select string_to_array('a,b,,c', ','), string_to_array('a,b,,c', ',', ''), \
+            string_to_array('abc', null), string_to_array('abc', ''), string_to_array('', ',');",
+            "{a,b,\"\",c}|{a,b,NULL,c}|{a,b,c}|{abc}|{}",
+        ),
+        (
+            "select substr('abc', 2), substr('abc', 2, 1), substring('abc', 2), substring('abc' \
+            for 2);",
+            "bc|b|bc|ab",
+        ),
+        ("select translate('abc', 'ab', 'x'), translate('abc', '', 'x');", "xc|abc"),
+        ("select unistr('d\\0061t\\+000061'), unistr('é');", "data|é"),
+        ("select casefold('ABC');", "abc"),
+        (
+            "select bit_count('\\x0f'::bytea), get_bit('\\x0f'::bytea, 0), \
+            get_byte('\\x0f'::bytea, 0), set_bit('\\x00'::bytea, 0, 1), \
+            set_byte('\\x00'::bytea, 0, 65);",
+            "4|1|15|\\x01|\\x41",
+        ),
+        (
+            "select length('\\x0102'::bytea), octet_length('\\x0102'::bytea), \
+            btrim('\\x000100'::bytea, '\\x00'::bytea), substr('\\x010203'::bytea, 2, 1);",
+            "2|2|\\x01|\\x02",
+        ),
+        (
+            "select sha224('abc'), sha256('abc'), sha384(''), sha512('');",
+            "\\x23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7|\\xba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|\\x38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b|\\xcf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+        ),
+        (
+            "select encode('abc'::bytea, 'hex'), encode('abc'::bytea, 'base64'), \
+            encode('a\\000b'::bytea, 'escape'), encode('abc', 'base64url');",
+            "616263|YWJj|a\\000b|YWJj",
+        ),
+        (
+            "select decode('616263', 'hex'), decode('YWJj', 'base64'), decode('a\\000b', \
+            'escape');",
+            "\\x616263|\\x616263|\\x610062",
+        ),
+        (
+            "select convert_from('abc'::bytea, 'UTF8'), convert_to('abc', 'UTF8'), \
+            convert('abc'::bytea, 'UTF8', 'LATIN1');",
+            "abc|\\x616263|\\x616263",
+        ),
+        ("select crc32('abc'::bytea), crc32c('abc'::bytea);", "891568578|910901175"),
+        ("select pg_client_encoding(), to_hex(-1), to_bin(5), to_oct(8);", "UTF8|ffffffff|101|10"),
+        ("select 'abc' || 1, 1 || 'abc', 'a' || null, null::text || 'a';", "abc1|1abc||"),
+        ("select 'abc' like 'a%', 'abc' ilike 'A%', 'abc' ~~ 'a_c', 'abc' !~~ 'x%';", "t|t|t|t"),
+        (
+            "select ltrim('\\x000100'::bytea, '\\x00'::bytea), rtrim('\\x000100'::bytea, \
+            '\\x00'::bytea);",
+            "\\x0100|\\x0001",
+        ),
+        ("select reverse('\\x0102'::bytea);", "\\x0201"),
+        (
+            "select parse_ident('a b', false), parse_ident('A.b c', false), \
+            parse_ident('a.\"b\"c', false);",
+            "{a}|{a,b}|{a,b}",
+        ),
+        ("select parse_ident('a.b.c.d'), parse_ident(' a . \"B\" ');", "{a,b,c,d}|{a,B}"),
+        (
+            "select quote_ident(''), quote_ident('_a1$'), quote_ident('a$'), quote_ident('1a'), \
+            quote_ident('é'), quote_ident('int'), quote_ident('abort'), quote_ident('between'), \
+            quote_ident('user');",
+            "\"\"|\"_a1$\"|\"a$\"|\"1a\"|\"é\"|\"int\"|abort|\"between\"|\"user\"",
+        ),
+        (
+            "select format('%s', array[1,2]), format('%L', 1.5), format('%L', true), \
+            format('%I', 1), format('%s', 1.5::float8), format('%L', array['a']);",
+            "{1,2}|'1.5'|'t'|\"1\"|1.5|'{a}'",
+        ),
+        ("select unistr('\\d83d\\de00');", "😀"),
+        ("select unistr('\\110000');", "ᄀ00"),
+        (
+            "select split_part('abc', 'abc', 1), split_part('abc', 'abc', 2), split_part('', \
+            ',', 1), split_part('a,b', ',', -3);",
+            "|||",
+        ),
+        (
+            "select string_to_array('a,b', ',', 'b'), string_to_array(null, ','), \
+            string_to_array('a,,b', null, 'a'), string_to_array('abc', null, 'b');",
+            "{a,NULL}||{NULL,\",\",\",\",b}|{a,NULL,c}",
+        ),
+        (
+            "select string_to_array('', ''), string_to_array('', null), string_to_array('ab', \
+            'ab', 'ab');",
+            "{}|{}|{\"\",\"\"}",
+        ),
+        (
+            "select set_bit('\\x0000'::bytea, 9, 1), set_byte('\\x00'::bytea, 0, 256), \
+            set_byte('\\x00'::bytea, 0, -1);",
+            "\\x0002|\\x00|\\xff",
+        ),
+        ("select decode('YW=j', 'base64');", "\\x61"),
+        ("select decode('\\\\\\101', 'escape'), decode('61 62', 'hex');", "\\x5c41|\\x6162"),
+        ("select encode('', 'hex'), decode('', 'base64'), encode('a', 'HEX');", "|\\x|61"),
+        (
+            "select convert_to('é', 'LATIN1'), convert_from('\\xe9', 'LATIN1'), \
+            convert('\\xc3a9', 'UTF8', 'LATIN1'), convert_to('é', 'SQL_ASCII');",
+            "\\xe9|é|\\xe9|\\xc3a9",
+        ),
+        ("select chr(127), chr(128), length(chr(1114111));", "||1"),
+        (
+            "select initcap('ÉCOLE éCOLE'), initcap('a-b c''d'), initcap(''), initcap('ǆa');",
+            "École École|A-B C'D||Ǆa",
+        ),
+        ("select casefold('ẞ ß Σ'), lower('ẞ ß Σ');", "ß ß σ|ß ß σ"),
+        (
+            "select bit_count('\\xff00'::bytea), crc32(''), crc32c(''), sha224('');",
+            "8|0|0|\\xd14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f",
+        ),
+        (
+            "select btrim('xyaxy', 'yx'), btrim('', 'x'), btrim('a', ''), ltrim('ééa', 'é'), \
+            btrim('\\x01'::bytea, ''::bytea);",
+            "a||a|a|\\x01",
+        ),
+        ("select to_ascii('abc', 'LATIN1');", "abc"),
+        ("select to_ascii('abc', 8);", "abc"),
+        ("select repeat('', 1000000000) = '';", "t"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "TDCZ", "{sql}");
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        ("select chr(0);", "54000", "null character not permitted"),
+        ("select chr(-1);", "22023", "character number must be positive"),
+        ("select chr(1114112);", "54000", "requested character too large for encoding: 1114112"),
+        ("select format('%s');", "22023", "too few arguments for format()"),
+        ("select format('%z', 1);", "22023", "unrecognized format() type specifier \"z\""),
+        ("select split_part('a,b', ',', 0);", "22023", "field position must not be zero"),
+        (
+            "select to_ascii('abc');",
+            "0A000",
+            "encoding conversion from UTF8 to ASCII not supported",
+        ),
+        ("select unistr('\\xyz');", "42601", "invalid Unicode escape"),
+        ("select decode('6', 'hex');", "22023", "invalid hexadecimal data: odd number of digits"),
+        ("select encode('abc'::bytea, 'nope');", "22023", "unrecognized encoding: \"nope\""),
+        ("select repeat('abc', 500000000);", "54000", "requested length too large"),
+        (
+            "select parse_ident('a.'), parse_ident('\"a'), parse_ident('a b'), parse_ident('.a');",
+            "22023",
+            "string is not a valid identifier: \"a.\"",
+        ),
+        ("select parse_ident('a.');", "22023", "string is not a valid identifier: \"a.\""),
+        ("select parse_ident('\"a');", "22023", "string is not a valid identifier: \"\"a\""),
+        ("select parse_ident('a b');", "22023", "string is not a valid identifier: \"a b\""),
+        ("select parse_ident('\"\"');", "22023", "string is not a valid identifier: \"\"\"\""),
+        ("select parse_ident('');", "22023", "string is not a valid identifier: \"\""),
+        (
+            "select format('%I', null);",
+            "22004",
+            "null values cannot be formatted as an SQL identifier",
+        ),
+        (
+            "select format('%1$s %s', 'a', 'b'), format('%3$s', 'a');",
+            "22023",
+            "too few arguments for format()",
+        ),
+        (
+            "select format('%0$s', 'a');",
+            "22023",
+            "format specifies argument 0, but arguments are numbered from 1",
+        ),
+        (
+            "select format('%-*s|', -4, 'a'), format('%*s|', -4, 'a'), format('%*2$s|', 'a', 5), \
+            format('%1$*2$s|', 'a', 5);",
+            "22023",
+            "too few arguments for format()",
+        ),
+        (
+            "select format('%*s|', null, 'a'), format('%*s|', 'x', 'a');",
+            "22P02",
+            "invalid input syntax for type integer: \"x\"",
+        ),
+        ("select format('%', 'a');", "22023", "unterminated format() type specifier"),
+        ("select format('%1', 'a');", "22023", "unterminated format() type specifier"),
+        ("select format('%s %', 'a');", "22023", "unterminated format() type specifier"),
+        (
+            "select format('%s', variadic null::text[]), format('%s %s', variadic array[1, 2]);",
+            "22023",
+            "too few arguments for format()",
+        ),
+        (
+            "select format('%s', variadic null::text[]) is null;",
+            "22023",
+            "too few arguments for format()",
+        ),
+        (
+            "select unistr('é'), unistr('\\U0001F600'), unistr('a\\\\b'), unistr('\\+00E9'), \
+            unistr('\\00e9');",
+            "42601",
+            "invalid Unicode escape",
+        ),
+        ("select unistr('\\u12');", "42601", "invalid Unicode escape"),
+        ("select unistr('\\d800');", "42601", "invalid Unicode surrogate pair"),
+        ("select unistr('a\\');", "42601", "invalid Unicode escape"),
+        ("select get_bit('\\x0f'::bytea, 16);", "2202E", "index 16 out of valid range, 0..7"),
+        ("select get_byte('\\x0f'::bytea, -1);", "2202E", "index -1 out of valid range, 0..0"),
+        ("select set_byte('\\x0f'::bytea, 1, 0);", "2202E", "index 1 out of valid range, 0..0"),
+        ("select set_bit('\\x00'::bytea, 0, 2);", "22023", "new bit must be 0 or 1"),
+        (
+            "select get_bit('\\x80'::bytea, 7), get_bit('\\x01'::bytea, 0), \
+            set_bit('\\x00'::bytea, 9, 1);",
+            "2202E",
+            "index 9 out of valid range, 0..7",
+        ),
+        (
+            "select decode('YW Jj', 'base64'), decode('YWI=', 'base64'), decode('YWI', \
+            'base64url'), decode('6g', 'hex');",
+            "22023",
+            "invalid hexadecimal digit: \"g\"",
+        ),
+        ("select decode('Y', 'base64');", "22023", "invalid base64 end sequence"),
+        ("select decode('a\\', 'escape');", "22P02", "invalid input syntax for type bytea"),
+        ("select decode('a\\9', 'escape');", "22P02", "invalid input syntax for type bytea"),
+        ("select decode('6', 'hex');", "22023", "invalid hexadecimal data: odd number of digits"),
+        ("select decode('x', 'nope');", "22023", "unrecognized encoding: \"nope\""),
+        (
+            "select convert_to('€', 'LATIN1');",
+            "22P05",
+            "character with byte sequence 0xe2 0x82 0xac in encoding \"UTF8\" has no equivalent \
+            in encoding \"LATIN1\"",
+        ),
+        (
+            "select convert_from('\\xff', 'UTF8');",
+            "22021",
+            "invalid byte sequence for encoding \"UTF8\": 0xff",
+        ),
+        ("select convert_to('a', 'nope');", "22023", "invalid destination encoding name \"nope\""),
+        ("select chr(55296);", "54000", "requested character not valid for encoding: 55296"),
+    ] {
+        // An error of a kernel comes after the row description.
+        let messages = client.query(sql);
+        assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_parameter_in_a_call_gets_the_type_of_postgres() {
     let dirs = Dirs::new("unknowns");
     let server = Server::start(dirs.config()).unwrap();
