@@ -42,35 +42,60 @@ impl Binder<'_> {
         Some(call)
     }
 
-    /// The relation of one row that a call in `FROM` gives.
+    /// The relation that the calls of a function source give. One call that does not return a
+    /// set gives one row. The calls of `ROWS FROM` give their rows side by side, and a call that
+    /// gives fewer rows than the others gives nulls for the rest.
     pub(crate) fn bind_value_source(
         &mut self,
         ast: &Ast,
-        call: ast::ExprRef,
+        calls: &[ast::ExprRef],
         alias: ast::StrRef,
         columns: ast::Slice,
         ordinality: bool,
     ) -> Result<(NodeRef, Scope)> {
-        let written = match ast.expr(call) {
-            ast::Expr::Function { name, .. } => {
-                ast.name(name).last().unwrap_or_default().to_owned()
-            }
-            _ => return Err(Error::internal("a function source that is not a call")),
-        };
+        if self.semantics.from_functions() != FromFunctions::Postgres {
+            return Err(Error::not_implemented("ROWS FROM"));
+        }
+        let mut written = Vec::with_capacity(calls.len());
+        for &call in calls {
+            let ast::Expr::Function { name, .. } = ast.expr(call) else {
+                return Err(Error::internal("a function source that is not a call"));
+            };
+            written.push(ast.name(name).last().unwrap_or_default().to_owned());
+        }
         // The arguments cannot read a column of the sources on the left, as for a table function.
         // A call that returns a set, such as `regexp_split_to_table`, is an unnest, which gives
-        // the rows here as it does in a select list.
+        // the rows here as it does in a select list. Next to other calls, a call that does not
+        // return a set is a set of one row, so the unnests put the rows of all of them side by
+        // side.
         let waiting = self.scalar_subqueries.len();
         let previous = std::mem::replace(&mut self.clause, "table function arguments");
         let outer_unnests = std::mem::take(&mut self.unnests);
         let outer_index = self.unnest_index.take();
         let outer_here = std::mem::replace(&mut self.unnest_here, true);
-        let value = self.bind_expr(ast, call, &Scope::empty());
+        let mut values = Vec::with_capacity(calls.len());
+        let mut bound = Ok(());
+        for &call in calls {
+            let made = self.unnests.len();
+            match self.bind_expr(ast, call, &Scope::empty()) {
+                Ok(value) if calls.len() > 1 && self.unnests.len() == made => {
+                    match self.unnest_one(value) {
+                        Ok(value) => values.push(value),
+                        Err(error) => bound = Err(error),
+                    }
+                }
+                Ok(value) => values.push(value),
+                Err(error) => bound = Err(error),
+            }
+            if bound.is_err() {
+                break;
+            }
+        }
         self.clause = previous;
         self.unnest_here = outer_here;
         let unnests = std::mem::replace(&mut self.unnests, outer_unnests);
         let index = std::mem::replace(&mut self.unnest_index, outer_index);
-        let value = value?;
+        bound?;
         let mut input = self.add_node(Node::Dummy);
         for pending in self.scalar_subqueries.split_off(waiting) {
             input = self.attach_subquery(input, pending);
@@ -78,7 +103,7 @@ impl Binder<'_> {
         if let Some(index) = index {
             input = self.plan_unnests(input, index, &unnests)?;
         }
-        // `WITH ORDINALITY` numbers the elements of an unnest, and the one row of any other call
+        // `WITH ORDINALITY` numbers the rows of the unnests, and the one row of any other call
         // is 1. An unnest of more than one level would number only the last level.
         let number = match (ordinality, index) {
             (false, _) => None,
@@ -93,45 +118,58 @@ impl Binder<'_> {
                 ));
             }
         };
-        let number = number.map(|expr| (expr, ORDINALITY.to_owned()));
-        let label = if alias == NONE { written.clone() } else { ast.string(alias).to_owned() };
-        let ty = self.plan().expr_type(value).clone();
-        // A row is computed once and its fields are read from the column that holds it.
-        let (node, mut scope) = match &ty {
-            LogicalType::Struct(fields) if Field::unnamed(fields) => {
-                return Err(Error::binder(
-                    "a column definition list is required for functions returning \"record\"",
-                )
-                .state(SqlState::SYNTAX_ERROR));
-            }
-            LogicalType::Struct(fields) => {
-                // The number passes through the projection of the row, as the fields read only it.
-                let mut inner = vec![(value, written)];
-                inner.extend(number.clone());
-                let (row, held) = self.project(input, &inner);
-                let number = number.map(|(_, name)| {
-                    let expr = self.plan_mut().add_expr(Expr::Column(held[1]), LogicalType::BigInt);
-                    (expr, name)
-                });
-                let column = self.plan_mut().add_expr(Expr::Column(held[0]), ty.clone());
-                let mut exprs = Vec::with_capacity(fields.len());
-                for (at, field) in fields.iter().enumerate() {
-                    let key = self.add_constant(Value::BigInt(at as i64 + 1));
-                    let args = self.plan_mut().add_expr_list(&[column, key]);
-                    let name = self.plan_mut().intern(STRUCT_EXTRACT);
-                    let expr = self.add_expr(Expr::Function { name, args }, field.ty.clone());
-                    exprs.push((expr, field.name.clone()));
+        let label = if alias == NONE { written[0].clone() } else { ast.string(alias).to_owned() };
+        let types: Vec<LogicalType> =
+            values.iter().map(|&value| self.plan().expr_type(value).clone()).collect();
+        if types
+            .iter()
+            .any(|ty| matches!(ty, LogicalType::Struct(fields) if Field::unnamed(fields)))
+        {
+            return Err(Error::binder(
+                "a column definition list is required for functions returning \"record\"",
+            )
+            .state(SqlState::SYNTAX_ERROR));
+        }
+        // A row is computed once and its fields are read from the column that holds it, so a
+        // call that gives a row is projected first, with the other values and the number.
+        let mut base = input;
+        let mut reads = values.clone();
+        let mut number = number;
+        if types.iter().any(|ty| matches!(ty, LogicalType::Struct(_))) {
+            let mut inner: Vec<_> =
+                values.iter().zip(&written).map(|(&value, name)| (value, name.clone())).collect();
+            inner.extend(number.map(|expr| (expr, ORDINALITY.to_owned())));
+            let (row, held) = self.project(input, &inner);
+            base = row;
+            reads = held[..values.len()]
+                .iter()
+                .zip(&types)
+                .map(|(&binding, ty)| self.plan_mut().add_expr(Expr::Column(binding), ty.clone()))
+                .collect();
+            number = number.map(|_| {
+                let binding = held[values.len()];
+                self.plan_mut().add_expr(Expr::Column(binding), LogicalType::BigInt)
+            });
+        }
+        let mut exprs = Vec::new();
+        for ((&read, ty), name) in reads.iter().zip(&types).zip(&written) {
+            match ty {
+                LogicalType::Struct(fields) => {
+                    for (at, field) in fields.iter().enumerate() {
+                        let key = self.add_constant(Value::BigInt(at as i64 + 1));
+                        let args = self.plan_mut().add_expr_list(&[read, key]);
+                        let name = self.plan_mut().intern(STRUCT_EXTRACT);
+                        let expr = self.add_expr(Expr::Function { name, args }, field.ty.clone());
+                        exprs.push((expr, field.name.clone()));
+                    }
                 }
-                exprs.extend(number);
-                self.scoped(row, &exprs, &label)
+                // One call that gives a value names its column for the alias of the source.
+                _ if calls.len() == 1 && alias != NONE => exprs.push((read, label.clone())),
+                _ => exprs.push((read, name.clone())),
             }
-            _ => {
-                let name = if alias == NONE { written } else { label.clone() };
-                let mut exprs = vec![(value, name)];
-                exprs.extend(number);
-                self.scoped(input, &exprs, &label)
-            }
-        };
+        }
+        exprs.extend(number.map(|expr| (expr, ORDINALITY.to_owned())));
+        let (node, mut scope) = self.scoped(base, &exprs, &label);
         scope.relabel(&label);
         if !columns.is_empty() {
             let names: Vec<&str> = ast.name(columns).collect();

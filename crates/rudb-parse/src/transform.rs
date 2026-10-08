@@ -7407,6 +7407,11 @@ mod tests {
             Source::Values { rows, alias: values_alias, .. } => {
                 format!("{}{}", show_rows(ast, rows), alias(values_alias))
             }
+            Source::Calls { calls, alias: calls_alias, .. } => {
+                let calls: Vec<String> =
+                    ast.expr_list(calls).iter().map(|&call| show(ast, call)).collect();
+                format!("ROWS FROM ({}){}", calls.join(", "), alias(calls_alias))
+            }
             Source::Join { left, right, kind, natural, on, using } => {
                 let natural = if natural { "NATURAL " } else { "" };
                 let on = if on == NONE { String::new() } else { format!(" ON {}", show(ast, on)) };

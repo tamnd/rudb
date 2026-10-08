@@ -3011,7 +3011,7 @@ impl<'a> Binder<'a> {
             ast::Source::Function { name, args, alias, columns, pragma } => {
                 let ordinality = ast.with_ordinality(source);
                 if let Some(call) = self.value_call(ast, source, name) {
-                    return self.bind_value_source(ast, call, alias, columns, ordinality);
+                    return self.bind_value_source(ast, &[call], alias, columns, ordinality);
                 }
                 self.bind_table_function(ast, name, args, alias, columns, pragma, ordinality)
             }
@@ -3028,6 +3028,11 @@ impl<'a> Binder<'a> {
                     scope.rename(&names, &label)?;
                 }
                 Ok((node, scope))
+            }
+            ast::Source::Calls { calls, alias, columns } => {
+                let calls = ast.expr_list(calls).to_vec();
+                let ordinality = ast.with_ordinality(source);
+                self.bind_value_source(ast, &calls, alias, columns, ordinality)
             }
             ast::Source::Values { rows, alias, columns } => {
                 let bare = ast::Query::bare(ast::QueryBody::Values(rows));
@@ -3124,6 +3129,7 @@ impl<'a> Binder<'a> {
             ast::Source::Pivot { pivot } => ast.pivot(pivot).alias,
             ast::Source::Table { alias, .. }
             | ast::Source::Function { alias, .. }
+            | ast::Source::Calls { alias, .. }
             | ast::Source::Cte { alias, .. }
             | ast::Source::Subquery { alias, .. }
             | ast::Source::Values { alias, .. } => alias,

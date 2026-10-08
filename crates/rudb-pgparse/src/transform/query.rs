@@ -14,9 +14,9 @@ use crate::nodes::{
     FRAMEOPTION_EXCLUDE_CURRENT_ROW, FRAMEOPTION_EXCLUDE_GROUP, FRAMEOPTION_EXCLUDE_TIES,
     FRAMEOPTION_GROUPS, FRAMEOPTION_NONDEFAULT, FRAMEOPTION_ROWS, FRAMEOPTION_START_CURRENT_ROW,
     FRAMEOPTION_START_OFFSET_FOLLOWING, FRAMEOPTION_START_OFFSET_PRECEDING,
-    FRAMEOPTION_START_UNBOUNDED_FOLLOWING, FRAMEOPTION_START_UNBOUNDED_PRECEDING, JoinExpr,
-    JoinType, LimitOption, List, Node, RangeFunction, RangeVar, SelectStmt, SetOperation, SortBy,
-    SortByDir, SortByNulls, WindowDef, WithClause,
+    FRAMEOPTION_START_UNBOUNDED_FOLLOWING, FRAMEOPTION_START_UNBOUNDED_PRECEDING, FuncCall,
+    JoinExpr, JoinType, LimitOption, List, Node, RangeFunction, RangeVar, SelectStmt, SetOperation,
+    SortBy, SortByDir, SortByNulls, WindowDef, WithClause,
 };
 
 impl Transform<'_> {
@@ -493,8 +493,8 @@ impl Transform<'_> {
         Ok(self.ast.push_source(join, self.span))
     }
 
-    /// A function in `FROM`, with `WITH ORDINALITY` kept beside it. `ROWS FROM` and a column
-    /// definition list are not built yet.
+    /// A function in `FROM`, with `WITH ORDINALITY` kept beside it. A column definition list is
+    /// not built yet.
     fn function_source(&mut self, function: &RangeFunction) -> Made<SourceRef> {
         let source = self.function_call_source(function)?;
         if function.ordinality {
@@ -503,32 +503,62 @@ impl Transform<'_> {
         Ok(source)
     }
 
-    /// The source of the call of a function in `FROM`.
+    /// The source of the calls of a function in `FROM`, one call or the calls of `ROWS FROM`.
     fn function_call_source(&mut self, function: &RangeFunction) -> Made<SourceRef> {
-        if function.is_rowsfrom || function.functions.len() != 1 || !function.coldeflist.is_empty()
-        {
-            return clause("RowsFrom");
-        }
-        let Some(Node::List(pair)) = &function.functions[0] else {
-            return clause("RangeFunction");
-        };
-        if pair.get(1).is_some_and(Option::is_some) {
+        if !function.coldeflist.is_empty() {
             return clause("ColumnDefList");
         }
-        let call = match pair.first() {
-            Some(Some(Node::FuncCall(call))) => call,
-            Some(Some(node)) => return Err(not_yet(node)),
-            _ => return clause("RangeFunction"),
-        };
-        if call.agg_star
-            || call.agg_distinct
-            || call.agg_within_group
-            || call.func_variadic
-            || call.over.is_some()
-            || call.agg_filter.is_some()
-            || !call.agg_order.is_empty()
-            || call.funcformat != crate::nodes::CoercionForm::COERCE_EXPLICIT_CALL
-        {
+        let mut calls = Vec::with_capacity(function.functions.len());
+        for item in &function.functions {
+            let Some(Node::List(pair)) = item else {
+                return clause("RangeFunction");
+            };
+            if pair.get(1).is_some_and(Option::is_some) {
+                return clause("ColumnDefList");
+            }
+            match pair.first() {
+                Some(Some(Node::FuncCall(call))) => calls.push(&**call),
+                Some(Some(node)) => return Err(not_yet(node)),
+                _ => return clause("RangeFunction"),
+            }
+        }
+        // PostgreSQL reads `unnest(a, b)` as `ROWS FROM (unnest(a), unnest(b))`, which pads the
+        // shorter arrays with nulls. A `ROWS FROM` of one call is that call.
+        match calls[..] {
+            [call] if !function.is_rowsfrom && spread_unnest(call) => {
+                let calls: Vec<FuncCall> = call
+                    .args
+                    .iter()
+                    .map(|arg| FuncCall { args: vec![arg.clone()], ..call.clone() })
+                    .collect();
+                let calls: Vec<&FuncCall> = calls.iter().collect();
+                self.calls_source(&calls, function)
+            }
+            [call] => self.call_source(call, function),
+            _ => self.calls_source(&calls, function),
+        }
+    }
+
+    /// The source of the calls of `ROWS FROM`, whose rows are put side by side.
+    fn calls_source(&mut self, calls: &[&FuncCall], function: &RangeFunction) -> Made<SourceRef> {
+        let mut exprs = Vec::with_capacity(calls.len());
+        for call in calls {
+            if !plain_call(call) {
+                return clause("FuncCall");
+            }
+            if call.args.iter().flatten().any(|node| matches!(node, Node::NamedArgExpr(_))) {
+                return clause("NamedArgExpr");
+            }
+            exprs.push(self.function(call)?);
+        }
+        let calls = self.ast.expr_slice(exprs);
+        let (alias, columns) = self.alias(function.alias.as_deref())?;
+        Ok(self.ast.push_source(Source::Calls { calls, alias, columns }, self.span))
+    }
+
+    /// The source of one call in `FROM`.
+    fn call_source(&mut self, call: &FuncCall, function: &RangeFunction) -> Made<SourceRef> {
+        if !plain_call(call) {
             return clause("FuncCall");
         }
         // A call with no named argument is kept as an expression too, for a function that is not
@@ -699,6 +729,31 @@ impl Transform<'_> {
             return clause("WindowDef");
         })
     }
+}
+
+/// Whether a call in `FROM` is a plain call, with no aggregate or window clause and no `VARIADIC`.
+fn plain_call(call: &FuncCall) -> bool {
+    !(call.agg_star
+        || call.agg_distinct
+        || call.agg_within_group
+        || call.func_variadic
+        || call.over.is_some()
+        || call.agg_filter.is_some()
+        || !call.agg_order.is_empty()
+        || call.funcformat != crate::nodes::CoercionForm::COERCE_EXPLICIT_CALL)
+}
+
+/// Whether a call in `FROM` is an `unnest` of more than one array, which PostgreSQL spreads into
+/// one `unnest` for each array. The test is the one of `transformRangeFunction`.
+fn spread_unnest(call: &FuncCall) -> bool {
+    matches!(&call.funcname[..], [Some(Node::String(name))] if &**name == "unnest")
+        && call.args.len() > 1
+        && call.agg_order.is_empty()
+        && call.agg_filter.is_none()
+        && call.over.is_none()
+        && !call.agg_star
+        && !call.agg_distinct
+        && !call.func_variadic
 }
 
 fn windowing(message: String) -> Error {

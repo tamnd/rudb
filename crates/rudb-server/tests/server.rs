@@ -3140,6 +3140,73 @@ fn with_ordinality_numbers_the_rows_of_a_function_in_from() {
     server.stop().unwrap();
 }
 
+/// `ROWS FROM` puts the rows of its calls side by side, and a call with fewer rows gives nulls. A
+/// call that does not return a set gives one row. `unnest` of more than one array is the
+/// `ROWS FROM` of an `unnest` for each array, and a LATERAL call is made for each outer row.
+#[test]
+fn rows_from_puts_the_rows_of_its_calls_side_by_side() {
+    let dirs = Dirs::new("rowsfrom");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut result = |sql: &str| {
+        let messages = client.query(sql);
+        let shape = messages.iter().find(|m| m.tag == b'T').unwrap();
+        let names: Vec<String> = row_shape(shape).into_iter().map(|(name, ..)| name).collect();
+        let rows: Vec<String> = messages
+            .iter()
+            .filter(|m| m.tag == b'D')
+            .map(|m| {
+                let values = data_row(m).into_iter().map(|value| {
+                    value.map_or_else(String::new, |value| String::from_utf8(value).unwrap())
+                });
+                values.collect::<Vec<_>>().join("|")
+            })
+            .collect();
+        (names.join(","), rows.join(";"))
+    };
+    // The values and the names of the columns of the PostgreSQL 19 oracle.
+    for (sql, names, rows) in [
+        (
+            "select * from rows from (generate_series(1, 2), generate_series(1, 3))",
+            "generate_series,generate_series",
+            "1|1;2|2;|3",
+        ),
+        (
+            "select * from rows from (generate_series(1, 2), generate_series(1, 3)) with ordinality as t(a, b, n)",
+            "a,b,n",
+            "1|1|1;2|2|2;|3|3",
+        ),
+        (
+            "select * from rows from (upper('a'), generate_series(1, 2))",
+            "upper,generate_series",
+            "A|1;|2",
+        ),
+        ("select * from unnest(array[1, 2], array['a', 'b', 'c'])", "unnest,unnest", "1|a;2|b;|c"),
+        ("select * from unnest(array[1, 2], array['a']) as u(x)", "x,unnest", "1|a;2|"),
+        ("select * from rows from (generate_series(1, 2)) r", "r", "1;2"),
+        (
+            "select * from rows from (pg_input_error_info('x', 'int4'), generate_series(1, 2))",
+            "message,detail,hint,sql_error_code,generate_series",
+            "invalid input syntax for type integer: \"x\"|||22P02|1;||||2",
+        ),
+        (
+            "select * from (values (1), (2)) v(n), lateral rows from (generate_series(1, n), unnest(array['x'])) r",
+            "n,generate_series,unnest",
+            "1|1|x;2|1|x;2|2|",
+        ),
+        (
+            "select * from (values (1), (2)) v(n), lateral (select generate_series(1, n)) s",
+            "n,generate_series",
+            "1|1;2|1;2|2",
+        ),
+        ("select pg_typeof(generate_series(1::int8, 1))", "pg_typeof", "bigint"),
+    ] {
+        assert_eq!(result(sql), (names.to_string(), rows.to_string()), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn the_columns_of_values_and_of_a_set_operation_take_the_common_type_of_postgresql() {
     let dirs = Dirs::new("set-op-type");

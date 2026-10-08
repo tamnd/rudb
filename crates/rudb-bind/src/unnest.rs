@@ -68,6 +68,18 @@ fn element(ty: &LogicalType) -> Option<&LogicalType> {
     }
 }
 
+/// Whether a type is an integer type of 32 bits or fewer, an `integer` in PostgreSQL.
+fn small_integer(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+    )
+}
+
 /// How many levels of list or array a type has.
 fn nesting(ty: &LogicalType) -> usize {
     element(ty).map_or(0, |inner| 1 + nesting(inner))
@@ -227,6 +239,22 @@ impl Binder<'_> {
             }
             _ => bound,
         };
+        let column = self.push_unnest(arg, depth, produced);
+        if self.unnest_grouping.is_some() {
+            self.grouped_unnests.push(GroupedUnnest { arg: written, depth, column });
+        }
+        Ok(column)
+    }
+
+    /// An unnest of the list of one `value`, which makes the value a set of one row.
+    pub(crate) fn unnest_one(&mut self, value: ExprRef) -> Result<ExprRef> {
+        let ty = self.plan().expr_type(value).clone();
+        let arg = self.call("list_value", vec![value])?;
+        Ok(self.push_unnest(arg, 1, ty))
+    }
+
+    /// Adds the unnest of `arg` to the block, and gives the column of what it makes.
+    fn push_unnest(&mut self, arg: ExprRef, depth: usize, produced: LogicalType) -> ExprRef {
         let index = match self.unnest_index {
             Some(index) => index,
             None => {
@@ -238,11 +266,7 @@ impl Binder<'_> {
         let position = self.unnests.len();
         self.unnests.push(UnnestCall { arg, depth });
         let binding = ColumnBinding::new(index, position as u32);
-        let column = self.add_expr(Expr::Column(binding), produced);
-        if self.unnest_grouping.is_some() {
-            self.grouped_unnests.push(GroupedUnnest { arg: written, depth, column });
-        }
-        Ok(column)
+        self.add_expr(Expr::Column(binding), produced)
     }
 
     /// A set-returning function in the select list of a PostgreSQL session, which makes a row per
@@ -294,20 +318,20 @@ impl Binder<'_> {
                     return fits(&format!("-{}", ast.string(text)));
                 }
             }
+            // A cast the query wrote gives the type, which the cast of the engine to BIGINT
+            // below would hide for `1::int8`.
+            ast::Expr::Cast { ty, try_cast: false, .. } => {
+                let written = ast.string(ty);
+                let ty = crate::statement::session_type(self.catalog(), self.session, written);
+                return ty.is_ok_and(|ty| small_integer(&ty));
+            }
             _ => {}
         }
         let value = match *self.plan().expr(bound) {
             Expr::Cast { input, .. } => input,
             _ => bound,
         };
-        matches!(
-            self.plan().expr_type(value),
-            LogicalType::TinyInt
-                | LogicalType::SmallInt
-                | LogicalType::Integer
-                | LogicalType::UTinyInt
-                | LogicalType::USmallInt
-        )
+        small_integer(self.plan().expr_type(value))
     }
 
     /// The columns a root `unnest` of a struct stands for, each a `struct_extract` of `input`, and

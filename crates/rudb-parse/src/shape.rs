@@ -304,6 +304,12 @@ impl Shape<'_> {
                 self.string(alias),
                 self.names(columns)
             ),
+            Source::Calls { calls, alias, columns } => format!(
+                "calls{{{}, alias: {}, columns: {}}}",
+                self.exprs(calls),
+                self.string(alias),
+                self.names(columns)
+            ),
             Source::Values { rows, alias, columns } => format!(
                 "values{{{}, alias: {}, columns: {}}}",
                 self.rows(rows),
