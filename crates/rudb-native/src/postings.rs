@@ -280,6 +280,16 @@ fn put_gap(out: &mut Vec<u8>, mut gap: u32) {
     out.push(gap as u8);
 }
 
+/// How long the extents of a value rows section are, so that the rows of a few values are read
+/// without the rows of the rest.
+///
+/// A filter that keeps the values other than one common one reads the stream of every value but
+/// that one, and as one extent the section was read whole and held for as long as its reader. On
+/// the ClickBench 10m Parquet mirror, `MobilePhoneModel <> ''` in q11 read ten megabytes of rows
+/// for the empty model to use the one megabyte after them. Small in a test, so that a table of a
+/// hundred thousand rows is split.
+pub(crate) const EXTENT_BYTES: usize = if cfg!(test) { 4096 } else { 1 << 18 };
+
 /// One column's value rows, as read out of the file.
 #[derive(Debug)]
 pub struct ValueRows {
@@ -289,11 +299,32 @@ pub struct ValueRows {
     counts_at: usize,
     ends_at: usize,
     stream_at: usize,
+    /// The front of the payload, which is the extents that hold the counts and ends, and the whole
+    /// of it when it is one extent.
+    bytes: Vec<u8>,
+    /// Every extent of the payload, for the rows `bytes` does not reach.
+    extents: Vec<section::Extent>,
+}
+
+/// The extents [`ValueRows::rows_of`] read last, joined, starting `start` bytes into the payload,
+/// with `next` the extent after them.
+#[derive(Default)]
+struct Window {
+    start: usize,
+    next: usize,
     bytes: Vec<u8>,
 }
 
+/// How long the counts and ends at the front of a payload are, once the first sixteen bytes are in.
+fn head_of(bytes: &[u8]) -> Option<usize> {
+    let word = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let values = word(8)? as usize;
+    let ranges = word(12)? as usize;
+    16_usize.checked_add(ranges.checked_mul(16)?)?.checked_add(values.checked_mul(12)?)
+}
+
 impl ValueRows {
-    fn parse(bytes: Vec<u8>) -> Option<Self> {
+    fn parse(bytes: Vec<u8>, extents: Vec<section::Extent>, total: usize) -> Option<Self> {
         let word = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
         let long = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
         let rows = long(0)?;
@@ -311,11 +342,11 @@ impl ValueRows {
         let counts_at = 16 + ranges * 16;
         let ends_at = counts_at.checked_add(values.checked_mul(4)?)?;
         let stream_at = ends_at.checked_add(values.checked_mul(8)?)?;
-        let stream = bytes.len().checked_sub(stream_at)? as u64;
+        let stream = total.checked_sub(stream_at)? as u64;
         if values > 0 && long(ends_at + (values - 1) * 8)? != stream {
             return None;
         }
-        Some(Self { rows, values, whole, counts_at, ends_at, stream_at, bytes })
+        Some(Self { rows, values, whole, counts_at, ends_at, stream_at, bytes, extents })
     }
 
     /// The table's rows, which is what a set of them is over.
@@ -361,7 +392,7 @@ impl ValueRows {
     ///
     /// If a code is past the end of the dictionary or the stream does not decode to the counts it
     /// says it holds.
-    pub fn rows_of(&self, codes: &[u32]) -> Result<Rids> {
+    pub fn rows_of(&self, reader: &Reader, codes: &[u32]) -> Result<Rids> {
         let total =
             self.held(codes).ok_or_else(|| invalid("a code past the end of its dictionary"))?;
         // Laid out in the form the set settles in, so a set of more than one row in a thousand,
@@ -383,11 +414,12 @@ impl ValueRows {
                 put(row);
             }
         }
+        let mut window = Window::default();
         for &code in codes {
             let code = code as usize;
             let from = self.stream_at + if code == 0 { 0 } else { self.end(code - 1) };
             let to = self.stream_at + self.end(code);
-            let stream = self.bytes.get(from..to).ok_or_else(|| invalid("value rows truncated"))?;
+            let stream = self.span(reader, &mut window, from, to)?;
             let mut row = 0_u64;
             let mut gap = 0_u64;
             let mut shift = 0;
@@ -414,6 +446,7 @@ impl ValueRows {
                 return Err(invalid("value rows do not hold the count they say"));
             }
         }
+        drop(window);
         if dense {
             Rids::from_words(self.rows, words)
         } else {
@@ -424,6 +457,50 @@ impl ValueRows {
             }
             Rids::from_sorted(self.rows, members)
         }
+    }
+
+    /// Bytes `from..to` of the payload, out of its front when that reaches them and otherwise out
+    /// of the extents that hold them, read and checked into `window`.
+    ///
+    /// The window drops the extents before `from` and adds the ones up to `to`, so that values
+    /// asked for in code order read each extent once and hold no more than the value being read
+    /// and the extents it spans.
+    fn span<'a>(
+        &'a self,
+        reader: &Reader,
+        window: &'a mut Window,
+        from: usize,
+        to: usize,
+    ) -> Result<&'a [u8]> {
+        let truncated = || invalid("value rows truncated");
+        if from == to {
+            return Ok(&[]);
+        }
+        if let Some(front) = self.bytes.get(from..to) {
+            return Ok(front);
+        }
+        let first =
+            self.extents.partition_point(|one| one.first + u64::from(one.length) <= from as u64);
+        let starts = self.extents.get(first).ok_or_else(truncated)?.first as usize;
+        if window.bytes.is_empty()
+            || from < window.start
+            || window.start + window.bytes.len() < starts
+        {
+            window.bytes.clear();
+            window.start = starts;
+            window.next = first;
+        } else if starts > window.start {
+            window.bytes.drain(..starts - window.start);
+            window.start = starts;
+        }
+        while window.start + window.bytes.len() < to {
+            let one = self.extents.get(window.next).ok_or_else(truncated)?;
+            let at = window.bytes.len();
+            window.bytes.resize(at + one.length as usize, 0);
+            reader.extent_in_place(one, &mut window.bytes[at..])?;
+            window.next += 1;
+        }
+        window.bytes.get(from - window.start..to - window.start).ok_or_else(truncated)
     }
 }
 
@@ -437,7 +514,25 @@ pub fn value_rows(reader: &Reader, column: usize) -> Option<ValueRows> {
     if !held.usable(table.generation()) {
         return None;
     }
-    let mut parsed = ValueRows::parse(reader.payload(held).ok()?)?;
+    let extents = reader.extents(held).ok()?;
+    let mut total = 0_u64;
+    for one in &extents {
+        if one.first != total {
+            return None;
+        }
+        total = total.checked_add(u64::from(one.length))?;
+    }
+    // The extents that hold the counts and ends, and none of the rows after them.
+    let mut bytes = Vec::new();
+    for one in &extents {
+        if bytes.len() >= head_of(&bytes).unwrap_or(16) {
+            break;
+        }
+        let at = bytes.len();
+        bytes.resize(at + one.length as usize, 0);
+        reader.extent_in_place(one, &mut bytes[at..]).ok()?;
+    }
+    let mut parsed = ValueRows::parse(bytes, extents, usize::try_from(total).ok()?)?;
     let rows = table.rows() as u64;
     // Rows after the ones the section was built over, which a table extended since has, are rows
     // it knows nothing about, the same as the rows of a part the dictionary does not code.
@@ -541,9 +636,15 @@ mod tests {
         assert!(current(&reader));
         let held = value_rows(&reader, 0).expect("the section is in the file");
         assert_eq!(held.values(), dictionary.len());
+        assert!(held.extents.len() > 2, "the rows are split into {} extents", held.extents.len());
+        assert_eq!(
+            held.bytes.len(),
+            EXTENT_BYTES,
+            "and only the first is read until a value is asked"
+        );
         for code in 0..dictionary.len() {
             let Value::Varchar(text) = dictionary.value_at(code) else { continue };
-            let rows = held.rows_of(&[code as u32]).expect("rows");
+            let rows = held.rows_of(&reader, &[code as u32]).expect("rows");
             let wanted = values
                 .iter()
                 .enumerate()
@@ -553,10 +654,10 @@ mod tests {
             assert_eq!(rows.iter().collect::<Vec<_>>(), wanted, "value {text}");
             assert_eq!(held.held(&[code as u32]), Some(wanted.len() as u64));
         }
-        let two = held.rows_of(&[0, 1]).expect("two values");
+        let two = held.rows_of(&reader, &[0, 1]).expect("two values");
         let one = held.held(&[0]).unwrap_or(0) + held.held(&[1]).unwrap_or(0);
         assert_eq!(two.len(), one);
-        assert!(held.rows_of(&[dictionary.len() as u32]).is_err());
+        assert!(held.rows_of(&reader, &[dictionary.len() as u32]).is_err());
         fs::remove_file(&path).expect("clean up");
     }
 

@@ -2647,7 +2647,7 @@ impl<'a> Scan<'a> {
             if held.saturating_mul(SPARSE_READ as u64) > index.rows() {
                 continue;
             }
-            if let Ok(rows) = index.rows_of(&codes) {
+            if let Ok(rows) = index.rows_of(reader, &codes) {
                 out.push(rows);
             }
         }
