@@ -75,8 +75,15 @@ def aliases(binary):
 
 
 def pattern(name):
-    """NAME with its crate hashes, back references and LLVM suffix left open."""
+    """NAME with its crate hashes, back references, impl numbers and LLVM suffix left open.
+
+    An impl block is named by its number among the crate's impl blocks, so adding one renumbers the
+    ones after it. `Catalog::open_in` went from `Mss_` to `Mst_` that way and left the section, with
+    much of what opens a database beside it. The number is left open, and so is whether there is one,
+    since the first block has none.
+    """
     name = re.sub(r'\.llvm\.[0-9]+$', '.llvm.*', name)
+    name = re.sub(r'(?<=N[A-Za-z])([MX])(?:s[0-9A-Za-z]*_)?', r'\1*', name)
     name = re.sub(r'17h[0-9a-f]{16}E', '17h*E', name)
     name = re.sub(r'Cs[0-9A-Za-z]+_', 'Cs*_', name)
     return re.sub(r'B[0-9A-Za-z]{0,4}_', 'B*_', name)
