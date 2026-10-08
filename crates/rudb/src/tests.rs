@@ -15230,3 +15230,33 @@ fn join_by_names_the_join_type_the_pin_plans_with() {
         .to_string();
     assert!(error.contains("More than one row returned by a subquery"), "{error}");
 }
+
+#[test]
+fn a_correlated_aggregate_answers_its_projection_over_an_empty_group() {
+    let db = Database::new();
+    for sql in [
+        "CREATE TABLE p(id INTEGER, g INTEGER)",
+        "INSERT INTO p VALUES (0, 0), (1, 1)",
+        "CREATE TABLE c(g INTEGER, v INTEGER)",
+        "INSERT INTO c VALUES (1, 1)",
+    ] {
+        db.execute(sql).unwrap();
+    }
+    // The pin answers 7, 'n', NULL, NULL and -1 for the `p` row no `c` row matches. A `list` does
+    // not read the padded row the missing group is, and `max(v) + 1` is still null over it.
+    let got = rows(
+        &db,
+        "SELECT id, (SELECT coalesce(sum(v), 7)::INTEGER FROM c WHERE c.g = p.g), \
+         (SELECT CASE WHEN bool_or(v = 1) THEN 'y' ELSE 'n' END FROM c WHERE c.g = p.g), \
+         (SELECT list(v) FROM c WHERE c.g = p.g), (SELECT max(v) + 1 FROM c WHERE c.g = p.g), \
+         (SELECT (coalesce(len(list(v)), -1) + count(*))::INTEGER FROM c WHERE c.g = p.g) \
+         FROM p ORDER BY id",
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![integer(0), integer(7), text("n"), Value::Null, Value::Null, integer(-1)],
+            vec![integer(1), integer(1), text("y"), list(&[1]), integer(2), integer(2)],
+        ]
+    );
+}
