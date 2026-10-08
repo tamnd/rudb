@@ -2057,10 +2057,12 @@ impl<'a> Aggregate<'a> {
         let closing = self.closes();
         if keys.len() > 1 || closing {
             for key in &mut keys {
+                // The runs are asked about before the data, which a run length key answers by
+                // laying itself out flat.
                 if key.logical_type().is_integer()
+                    && !(closing && (key.packed_parts().is_some() || key.run_parts().is_some()))
                     && key.data().is_none()
                     && key.constant_value().is_none()
-                    && !(closing && (key.packed_parts().is_some() || key.run_parts().is_some()))
                 {
                     *key = key.opened()?;
                 }

@@ -41,7 +41,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rudb_common::{Cause, Error, Field, LogicalType, Result, Value, slow};
 
@@ -487,6 +487,26 @@ fn held_as(ty: LogicalType) -> LogicalType {
     }
 }
 
+/// Where a run length body keeps its flat form once [`Vector::laid_runs`] has written it out.
+///
+/// Shared between clones, so a vector cloned into two operators lays itself out once. It is not
+/// part of what the vector holds, which the runs already say, so it never makes two vectors equal
+/// or unequal.
+#[derive(Clone, Default)]
+struct Laid(Arc<OnceLock<Option<Vector>>>);
+
+impl std::fmt::Debug for Laid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() { "Laid(out)" } else { "Laid" })
+    }
+}
+
+impl PartialEq for Laid {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// What the vector holds, which is what its form is decided by.
 #[derive(Debug, Clone, PartialEq)]
 enum Body {
@@ -568,6 +588,7 @@ enum Body {
     Runs {
         ends: Vec<u32>,
         values: Arc<Vector>,
+        laid: Laid,
     },
     /// One child vector holding every element of every row, and a start and a length per row.
     ///
@@ -1656,7 +1677,7 @@ impl Vector {
             ty: values.ty.clone(),
             len,
             validity: Validity::AllValid,
-            body: Body::Runs { ends, values: Arc::new(values) },
+            body: Body::Runs { ends, values: Arc::new(values), laid: Laid::default() },
         })
     }
 
@@ -2121,7 +2142,7 @@ impl Vector {
                     + spans.capacity() * size_of::<(u32, u32)>()
                     + share(table.footprint(), table)
             }
-            Body::Runs { ends, values } => {
+            Body::Runs { ends, values, .. } => {
                 ends.capacity() * size_of::<u32>() + share(values.footprint(), values)
             }
             // The ids are shared between every cut of one link join's output, and the source is
@@ -2173,7 +2194,15 @@ impl Vector {
                 Some(&code) => values.is_null_at(code as usize),
                 None => true,
             },
-            Body::Runs { ends, values } => match run_holding(ends, index) {
+            // Runs that cover the vector over values with no nulls have a value for every row, which
+            // is said without the search for the row's run.
+            Body::Runs { ends, values, .. }
+                if values.flat_and_all_valid()
+                    && ends.last().map(|&end| end as usize) == Some(self.len) =>
+            {
+                false
+            }
+            Body::Runs { ends, values, .. } => match run_holding(ends, index) {
                 Some(run) => values.is_null_at(run),
                 None => true,
             },
@@ -2251,14 +2280,17 @@ impl Vector {
         }
     }
 
-    /// The data, for a flat vector, and `None` for any other form.
+    /// The data, for a flat vector or for runs it can be laid out from, and `None` for any other
+    /// form.
     ///
     /// A kernel that wants a slice asks for it and takes the flat path if it gets one. A kernel
-    /// that can do better on a constant or a dictionary checks [`Self::form`] first.
+    /// that can do better on a constant, a dictionary or runs checks [`Self::form`] first, since
+    /// asking a run length vector for its data writes it out flat (see [`Self::laid_runs`]).
     #[must_use]
     pub fn data(&self) -> Option<&Data> {
         match &self.body {
             Body::Flat(data) => Some(data),
+            Body::Runs { .. } => self.laid_runs()?.data(),
             _ => None,
         }
     }
@@ -2332,7 +2364,7 @@ impl Vector {
     #[must_use]
     pub fn run_parts(&self) -> Option<(&[u32], &Self)> {
         match &self.body {
-            Body::Runs { ends, values } => Some((ends, values.as_ref())),
+            Body::Runs { ends, values, .. } => Some((ends, values.as_ref())),
             _ => None,
         }
     }
@@ -2356,7 +2388,7 @@ impl Vector {
     pub fn positions(&self) -> Option<(Cow<'_, [u32]>, &Self)> {
         match &self.body {
             Body::Dictionary { codes, values, .. } => Some((Cow::Borrowed(codes), values.as_ref())),
-            Body::Runs { ends, values } => {
+            Body::Runs { ends, values, .. } => {
                 let mut at = Vec::with_capacity(self.len);
                 for (run, &stop) in ends.iter().enumerate() {
                     let run = u32::try_from(run).unwrap_or(u32::MAX);
@@ -2481,9 +2513,12 @@ impl Vector {
                 Some(&code) => values.value_at(code as usize),
                 None => Value::Null,
             },
-            Body::Runs { ends, values } => match run_holding(ends, index) {
-                Some(run) => values.value_at(run),
-                None => Value::Null,
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.value_at(index),
+                None => match run_holding(ends, index) {
+                    Some(run) => values.value_at(run),
+                    None => Value::Null,
+                },
             },
             // The one read every other reader of this form is: follow the id, and answer null when
             // there is no row to follow. Written out once per reader rather than through a helper
@@ -2598,9 +2633,12 @@ impl Vector {
                 Some(&code) => values.try_value_at(code as usize),
                 None => Ok(Value::Null),
             },
-            Body::Runs { ends, values } => match run_holding(ends, index) {
-                Some(run) => values.try_value_at(run),
-                None => Ok(Value::Null),
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.try_value_at(index),
+                None => match run_holding(ends, index) {
+                    Some(run) => values.try_value_at(run),
+                    None => Ok(Value::Null),
+                },
             },
             Body::Nested { entries, child } => match (entries.get(index), &self.ty) {
                 (Some(&(start, len)), LogicalType::Map(key, value)) => {
@@ -2657,7 +2695,10 @@ impl Vector {
             Body::Dictionary { codes, values, .. } => {
                 values.text_at(usize::try_from(*codes.get(index)?).ok()?)
             }
-            Body::Runs { ends, values } => values.text_at(run_holding(ends, index)?),
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.text_at(index),
+                None => values.text_at(run_holding(ends, index)?),
+            },
             Body::Gathered { source, rids, offset } => {
                 source.text_at(row_of(rids, *offset, index)?)
             }
@@ -2693,7 +2734,10 @@ impl Vector {
             Body::Dictionary { codes, values, .. } => {
                 values.bytes_at(usize::try_from(*codes.get(index)?).ok()?)
             }
-            Body::Runs { ends, values } => values.bytes_at(run_holding(ends, index)?),
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.bytes_at(index),
+                None => values.bytes_at(run_holding(ends, index)?),
+            },
             Body::Gathered { source, rids, offset } => {
                 source.bytes_at(row_of(rids, *offset, index)?)
             }
@@ -2732,9 +2776,12 @@ impl Vector {
                 Some(&code) => values.try_bytes_at(code as usize),
                 None => Ok(None),
             },
-            Body::Runs { ends, values } => match run_holding(ends, index) {
-                Some(run) => values.try_bytes_at(run),
-                None => Ok(None),
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.try_bytes_at(index),
+                None => match run_holding(ends, index) {
+                    Some(run) => values.try_bytes_at(run),
+                    None => Ok(None),
+                },
             },
             Body::Gathered { source, rids, offset } => match row_of(rids, *offset, index) {
                 Some(row) => source.try_bytes_at(row),
@@ -2908,9 +2955,12 @@ impl Vector {
                 Some(&code) => values.try_bytes_len_at(code as usize),
                 None => Ok(None),
             },
-            Body::Runs { ends, values } => match run_holding(ends, index) {
-                Some(run) => values.try_bytes_len_at(run),
-                None => Ok(None),
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.try_bytes_len_at(index),
+                None => match run_holding(ends, index) {
+                    Some(run) => values.try_bytes_len_at(run),
+                    None => Ok(None),
+                },
             },
             Body::ExternalText { source } => source.bytes_len_at(index),
             _ => Ok(self.bytes_at(index).map(<[u8]>::len)),
@@ -3208,7 +3258,10 @@ impl Vector {
             Body::Dictionary { codes, values, .. } => {
                 values.signed_at(usize::try_from(*codes.get(index)?).ok()?)
             }
-            Body::Runs { ends, values } => values.signed_at(run_holding(ends, index)?),
+            Body::Runs { ends, values, .. } => match self.laid_runs() {
+                Some(flat) => flat.signed_at(index),
+                None => values.signed_at(run_holding(ends, index)?),
+            },
             Body::Gathered { source, rids, offset } => {
                 source.signed_at(row_of(rids, *offset, index)?)
             }
@@ -3385,7 +3438,7 @@ impl Vector {
             }
             // A run's value once per run, laid out as many times as the run is long. A cut has
             // only the runs it touches, so the values are few and widening them all is cheap.
-            Body::Runs { ends, values } => {
+            Body::Runs { ends, values, .. } => {
                 let mut entries = Vec::new();
                 if !values.none_null() || !values.signed_block(&mut entries) {
                     return false;
@@ -3561,7 +3614,7 @@ impl Vector {
             // the range starts and stops, and every end moved to be relative to the new row zero. A
             // cut of a hundred rows out of a column of a hundred million is a handful of runs, which
             // is the reason this form is worth cutting as itself rather than copying out.
-            Body::Runs { ends, values } if len > 0 => {
+            Body::Runs { ends, values, .. } if len > 0 => {
                 let first = run_holding(ends, at).unwrap_or(0);
                 let last = run_holding(ends, end - 1).unwrap_or(first);
                 let cut: Vec<u32> = ends[first..=last]
@@ -3569,7 +3622,7 @@ impl Vector {
                     .map(|&stop| stop.min(end as u32) - at as u32)
                     .collect();
                 let values = values.slice(first, last - first + 1)?;
-                Body::Runs { ends: cut, values: Arc::new(values) }
+                Body::Runs { ends: cut, values: Arc::new(values), laid: Laid::default() }
             }
             // An empty cut has no run to point at and an empty run length body would be a vector of
             // no runs claiming a length, so it comes back as the empty flat vector instead.
@@ -3633,7 +3686,7 @@ impl Vector {
             return Ok(self.clone());
         }
         slow::took(Cause::Flatten);
-        if let Some(flat) = self.decoded_codes().or_else(|| self.expanded_runs()) {
+        if let Some(flat) = self.decoded_codes().or_else(|| self.runs_written_out()) {
             return Ok(flat);
         }
         if let Some(flat) = self.unpacked_whole() {
@@ -3778,8 +3831,42 @@ impl Vector {
     /// held as runs of four rows, the way `l_orderkey` is, was a search a row. Here each run's
     /// place is laid out as long as the run is, and the values are copied through those places the
     /// way a dictionary's values are copied through its codes.
+    /// Whether this is a flat vector with no nulls, which is said without reading a mask.
+    fn flat_and_all_valid(&self) -> bool {
+        matches!(self.validity, Validity::AllValid) && matches!(self.body, Body::Flat(_))
+    }
+
+    /// The flat form of a run length vector, laid out the first time something asks for it and
+    /// kept beside the runs from then on, or `None` for any other form or one that cannot be.
+    ///
+    /// A part held as runs is read two ways. An aggregate closing groups out of sorted runs wants
+    /// the runs, which are its groups already, and a hash table or a probe wants a value a row.
+    /// The second way went through a search over the ends for every row, and a build over
+    /// `l_orderkey` held as runs of four rows cost twice what it did over the flat column. Laid out
+    /// once, every reader after the first reads a row as an index, and a reader that only wants the
+    /// runs never pays for it. Clones of one vector share what was laid out, and a cut lays out its
+    /// own rows.
+    fn laid_runs(&self) -> Option<&Self> {
+        let Body::Runs { laid, .. } = &self.body else {
+            return None;
+        };
+        laid.0.get_or_init(|| self.expanded_runs()).as_ref()
+    }
+
+    /// The flat form of a run length vector, taken from what [`Self::laid_runs`] kept when there
+    /// is one and written out without keeping it otherwise, since the caller owns the copy.
+    fn runs_written_out(&self) -> Option<Self> {
+        let Body::Runs { laid, .. } = &self.body else {
+            return None;
+        };
+        match laid.0.get() {
+            Some(flat) => flat.clone(),
+            None => self.expanded_runs(),
+        }
+    }
+
     fn expanded_runs(&self) -> Option<Self> {
-        let Body::Runs { ends, values } = &self.body else {
+        let Body::Runs { ends, values, .. } = &self.body else {
             return None;
         };
         if !matches!(values.validity, Validity::AllValid)
@@ -3829,7 +3916,7 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
         }
-        if let Some(flat) = self.decoded_codes().or_else(|| self.expanded_runs()) {
+        if let Some(flat) = self.decoded_codes().or_else(|| self.runs_written_out()) {
             return Ok(flat);
         }
         self.copied((0..self.len).collect(), false)
@@ -4462,10 +4549,17 @@ impl Vector {
                 // A run length body is a dictionary whose code is worked out from the position
                 // rather than stored, so the walk down is the same walk with a search where the
                 // lookup was. `NOWHERE` searches for nothing and stays `NOWHERE`.
-                Body::Runs { ends, values } => {
-                    runs_holding(ends, &mut at);
-                    values.as_ref()
-                }
+                // Laid out already, the runs are a flat vector and the positions are the rows of it.
+                // They are not laid out for this, since the walk over the ends costs no more than
+                // laying them out would, and an aggregate gathering its keys at the start of each
+                // run asks for a quarter of the rows of a key it otherwise reads only as runs.
+                Body::Runs { ends, values, laid } => match laid.0.get().and_then(Option::as_ref) {
+                    Some(flat) => flat,
+                    None => {
+                        runs_holding(ends, &mut at);
+                        values.as_ref()
+                    }
+                },
                 // The same walk the dictionary above takes, with the sentinel folded into the one
                 // this loop already has. That composition is the whole reason a gather is a body
                 // rather than an operator: a filter over the output of a link join selects into the
@@ -7474,6 +7568,25 @@ mod tests {
             runs.gather(&wanted).unwrap().flatten().unwrap(),
             flat.gather(&wanted).unwrap().flatten().unwrap()
         );
+        // Read a row at a time, the runs lay themselves out once and stay runs.
+        let read = runs.clone();
+        assert_eq!(read.data(), flat.data());
+        assert_eq!(read.form(), Form::Rle);
+        assert!(read.run_parts().is_some());
+        for row in [0, 3, 8, 30] {
+            assert_eq!(read.signed_at(row), flat.signed_at(row));
+            assert_eq!(read.value_at(row), flat.value_at(row));
+            assert!(!read.is_null_at(row));
+        }
+        assert!(read.is_null_at(rows.len()));
+        assert_eq!(read.gather(&wanted).unwrap(), flat.gather(&wanted).unwrap());
+        assert_eq!(cut.data(), integers(&rows[2..22]).data());
+        // Runs over values with nulls are not laid out, and say so by having no data.
+        let holes =
+            Vector::from_values(LogicalType::Integer, &[Value::Integer(1), Value::Null]).unwrap();
+        let runs = Vector::runs(vec![2, 5], holes).unwrap();
+        assert!(runs.data().is_none());
+        assert!(!runs.is_null_at(1) && runs.is_null_at(2) && runs.is_null_at(4));
     }
 
     #[test]
