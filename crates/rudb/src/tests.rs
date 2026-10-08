@@ -14985,3 +14985,83 @@ fn postgres_explain_rejects_the_options_postgres_rejects() {
         assert!(error.contains(message), "{sql}: {error}");
     }
 }
+
+#[test]
+fn a_count_of_a_qualified_star_leaves_out_the_rows_an_outer_join_made_up() {
+    let db = Database::new();
+    for sql in [
+        "CREATE TABLE l (id INTEGER)",
+        "CREATE TABLE r (id INTEGER, y VARCHAR)",
+        "CREATE TABLE shadow (rowid INTEGER, v INTEGER)",
+        "INSERT INTO l VALUES (1), (2), (3)",
+        "INSERT INTO r VALUES (2, NULL), (3, 'x'), (NULL, NULL)",
+        "INSERT INTO shadow VALUES (NULL, 1), (NULL, NULL)",
+    ] {
+        db.execute(sql).unwrap();
+    }
+    let counts = |sql: &str| -> Vec<i64> {
+        rows(&db, sql)
+            .into_iter()
+            .flatten()
+            .map(|value| match value {
+                Value::BigInt(count) => count,
+                other => panic!("{sql} counted {other:?}"),
+            })
+            .collect()
+    };
+    let cases: [(&str, &[i64]); 11] = [
+        (
+            "SELECT count(l.*), count(r.*), count(r.id) FROM l LEFT JOIN r ON l.id = r.id",
+            &[3, 2, 2],
+        ),
+        // A row null in every column is still a row.
+        ("SELECT count(r.*), count(r.id) FROM r", &[3, 2]),
+        ("SELECT count(l.*), count(r.*) FROM l FULL OUTER JOIN r ON l.id = r.id", &[3, 3]),
+        ("SELECT count(t.*) FROM l LEFT JOIN (SELECT * FROM r) t ON l.id = t.id", &[2]),
+        ("WITH c AS (SELECT * FROM r) SELECT count(c.*) FROM l LEFT JOIN c ON l.id = c.id", &[2]),
+        ("SELECT count(t.*) FROM (SELECT r.* FROM l LEFT JOIN r ON l.id = r.id) t", &[3]),
+        ("SELECT count(t.*) FROM (VALUES (1, 2), (NULL, NULL)) t(x, y)", &[2]),
+        ("SELECT count(p.*), count(q.*) FROM range(3) p POSITIONAL JOIN range(1) q", &[3, 1]),
+        // The table's own `rowid` column is null, and its rows are still counted.
+        (
+            "SELECT count(shadow.*), count(shadow.v) FROM l LEFT JOIN shadow ON l.id = shadow.v",
+            &[1, 1],
+        ),
+        // A struct column is counted where it is not null.
+        (
+            "SELECT count(st.*) FROM l LEFT JOIN (SELECT 2 id, {'x': NULL} st) t ON l.id = t.id",
+            &[1],
+        ),
+        ("SELECT count(r.*) OVER () FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id", &[2, 2, 2]),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(counts(sql), expected, "{sql}");
+    }
+    assert_eq!(
+        rows(&db, "SELECT column_name FROM (DESCRIBE SELECT count(r.*) FROM r)"),
+        vec![vec![text("count(r.*)")]]
+    );
+    let hidden = failure(&db, "SELECT count(r.*) FROM l LEFT JOIN r rr ON l.id = rr.id");
+    assert!(hidden.starts_with("Referenced table \"r\" not found"), "{hidden}");
+    for sql in [
+        "SELECT min(r.*) FROM r",
+        "SELECT count(DISTINCT r.*) FROM r",
+        "SELECT count(r.* EXCLUDE (y)) FROM r",
+        "SELECT count(* RENAME (y AS v)) FROM r",
+    ] {
+        let refused = failure(&db, sql);
+        assert!(
+            refused.contains("STAR expression is only allowed as the root"),
+            "{sql}: {refused}"
+        );
+    }
+    db.execute("CREATE TABLE piv(g INT, y VARCHAR)").unwrap();
+    db.execute("INSERT INTO piv VALUES (1, 'x'), (1, 'z'), (NULL, NULL)").unwrap();
+    assert_eq!(
+        rows(&db, "PIVOT piv ON y USING count(piv.*) ORDER BY 1 NULLS LAST"),
+        vec![
+            vec![Value::Integer(1), Value::BigInt(1), Value::BigInt(1)],
+            vec![Value::Null, Value::BigInt(0), Value::BigInt(0)]
+        ]
+    );
+}

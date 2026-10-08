@@ -103,6 +103,11 @@ pub(crate) struct Rowid {
     pub(crate) scan: NodeRef,
     /// Where the table's columns start in the scope, which orders it among them in an error.
     pub(crate) at: usize,
+    /// Whether the name `rowid` reaches it. One that it does not is only there for `count(t.*)`,
+    /// which needs something that is null exactly on the rows an outer join made up for `t`: the
+    /// row number of a table whose own column is called `rowid`, or a constant put over a
+    /// relation that has no row number at all.
+    pub(crate) named: bool,
 }
 
 /// The columns a name can resolve against.
@@ -129,7 +134,26 @@ impl Scope {
 
     /// Makes `rowid` reachable for the table whose columns start at `at`.
     pub(crate) fn add_rowid(&mut self, column: Visible, scan: NodeRef, at: usize) {
-        self.rowids.push(Rowid { column, scan, at });
+        self.rowids.push(Rowid { column, scan, at, named: true });
+    }
+
+    /// Adds what `count(t.*)` reads for the relation whose columns start at `at`, which the name
+    /// `rowid` does not reach.
+    pub(crate) fn add_marker(&mut self, column: Visible, scan: NodeRef, at: usize) {
+        self.rowids.push(Rowid { column, scan, at, named: false });
+    }
+
+    /// The row number or the marker of each relation called `table`, with the node that makes it.
+    pub(crate) fn markers_of(
+        &self,
+        compare: IdentifierCompare,
+        table: &str,
+    ) -> Vec<(ColumnBinding, NodeRef)> {
+        self.rowids
+            .iter()
+            .filter(|rowid| compare.same(&rowid.column.table, table))
+            .map(|rowid| (rowid.column.binding, rowid.scan))
+            .collect()
     }
 
     /// The scan whose row number `binding` is, when it is a `rowid`.
@@ -243,7 +267,8 @@ impl Scope {
             self.rowids
                 .iter()
                 .filter(|rowid| {
-                    compare.same(&rowid.column.name, column)
+                    rowid.named
+                        && compare.same(&rowid.column.name, column)
                         && table.is_none_or(|table| compare.same(&rowid.column.table, table))
                 })
                 .map(|rowid| (rowid.at, &rowid.column)),

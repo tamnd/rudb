@@ -45,7 +45,7 @@ use crate::scope::{Joined, Scope, Visible};
 const NAME: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::NAME, typmod: -1 };
 const VOID: DeclaredType = DeclaredType { oid: rudb_pgtypes::oid::VOID, typmod: -1 };
 /// The name a table's row number answers to.
-const ROWID: &str = "rowid";
+pub(crate) const ROWID: &str = "rowid";
 
 /// Binds a parsed statement against a catalog.
 ///
@@ -386,6 +386,9 @@ pub(crate) struct Binder<'a> {
     /// Whether the next table bound has no `rowid`, which is the table an `INSERT` or an `UPDATE`
     /// returns its rows from. Only that one, so a query in its `RETURNING` reads its own.
     pub(crate) unnumbered: bool,
+    /// Whether the statement last asked about writes `count(t.*)`, kept against where its syntax
+    /// tree is and how many expressions it holds so that every source of it asks only once.
+    pub(crate) counted: Option<((usize, usize), bool)>,
     /// The type and the default of each column an `INSERT` writes, handed to the `VALUES` right
     /// under it so that a `DEFAULT` item there can be the default of the column it lands in.
     pub(crate) insert_defaults: Option<Vec<(LogicalType, Option<String>)>>,
@@ -549,6 +552,7 @@ impl<'a> Binder<'a> {
             want_ascending: false,
             upsert: false,
             unnumbered: false,
+            counted: None,
             insert_defaults: None,
             insert_inputs: None,
             copy_into: None,
@@ -3065,6 +3069,17 @@ impl<'a> Binder<'a> {
         ast: &Ast,
         source: ast::SourceRef,
     ) -> Result<(NodeRef, Scope)> {
+        let (node, mut scope) = self.bind_one_source(ast, source)?;
+        // A join is made of sources that went through here on their own, and a table already has
+        // its row number to count by.
+        let joined = matches!(ast.source(source), ast::Source::Join { .. });
+        if joined || !scope.rowids.is_empty() || !self.counts_relations(ast) {
+            return Ok((node, scope));
+        }
+        Ok((self.mark_rows(node, &mut scope), scope))
+    }
+
+    fn bind_one_source(&mut self, ast: &Ast, source: ast::SourceRef) -> Result<(NodeRef, Scope)> {
         match ast.source(source) {
             // An error about the table points at its name, as it does in both dialects.
             ast::Source::Table { name, alias, columns } => self
@@ -3402,8 +3417,8 @@ impl<'a> Binder<'a> {
         // after it down, so after a `DELETE` the two count differently.
         let compare = self.semantics.identifier_compare();
         let unnumbered = std::mem::take(&mut self.unnumbered);
-        if !excluded && !unnumbered && !fields.iter().any(|field| compare.same(&field.name, ROWID))
-        {
+        if !excluded && !unnumbered {
+            let shadowed = fields.iter().any(|field| compare.same(&field.name, ROWID));
             let column = Visible {
                 table: label.clone(),
                 name: ROWID.to_string(),
@@ -3418,7 +3433,13 @@ impl<'a> Binder<'a> {
                 hidden: false,
                 using: None,
             };
-            scope.add_rowid(column, node, 0);
+            // A column of the table's own called `rowid` wins the name, and the row number is
+            // still what `count(t.*)` counts the table's rows by.
+            if shadowed {
+                scope.add_marker(column, node, 0);
+            } else {
+                scope.add_rowid(column, node, 0);
+            }
         }
         Ok((node, scope))
     }
@@ -5380,8 +5401,13 @@ impl<'a> Binder<'a> {
         let mut bound = Vec::with_capacity(args.len());
         let mut failure = None;
         let written_keys = sorted.iter().map(|item| item.expr);
-        for arg in args.iter().copied().chain(written_keys) {
-            match self.bind_expr(ast, arg, scope) {
+        for (at, arg) in args.iter().copied().chain(written_keys).enumerate() {
+            let expr = if at < args.len() {
+                self.bind_counted(ast, name, &args, arg, scope)
+            } else {
+                self.bind_expr(ast, arg, scope)
+            };
+            match expr {
                 Ok(expr) => bound.push(expr),
                 Err(error) => {
                     failure = Some(error);
@@ -6041,7 +6067,7 @@ impl<'a> Binder<'a> {
     ) -> Result<WindowParts> {
         let mut bound = Vec::with_capacity(args.len());
         for &arg in args {
-            let expr = self.bind_expr(ast, arg, scope)?;
+            let expr = self.bind_counted(ast, written.name, args, arg, scope)?;
             bound.push(self.over_aggregate(expr, scope)?);
         }
         // The keys inside the brackets are bound against the same rows the arguments are, because
