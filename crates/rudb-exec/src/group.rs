@@ -5811,6 +5811,9 @@ fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, us
     if rows < 3 || u32::try_from(rows).is_err() || key.validity().has_nulls(rows) {
         return None;
     }
+    if let Some((ends, values)) = key.run_parts() {
+        return held_runs(ends, values, rows, grouped);
+    }
     if let Some(packed) = key.packed_parts() {
         return CODES.with_borrow_mut(|codes| {
             codes.clear();
@@ -5830,6 +5833,33 @@ fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, us
         Data::UInt64(values) => flat!(values),
         _ => None,
     }
+}
+
+/// [`closed_runs`] of a key held as its runs, which is where they end with nothing to compare.
+///
+/// The reader holds a key stored as runs in that form, and its runs are the key's runs unless two
+/// next to each other hold the same value, which would be one group cut in two. The writer never
+/// leaves two like that, and a chunk that has them goes to the table, as does one whose runs go
+/// down when the promise is that the key goes up.
+fn held_runs(
+    ends: &[u32],
+    values: &Vector,
+    rows: usize,
+    grouped: bool,
+) -> Option<(Vec<u32>, usize)> {
+    if ends.last().map(|&end| end as usize) != Some(rows) || values.validity().has_nulls(ends.len())
+    {
+        return None;
+    }
+    let values = integers(values, ends.len())?;
+    let split = |pair: &[i64]| if grouped { pair[0] == pair[1] } else { pair[0] >= pair[1] };
+    if values.windows(2).any(split) {
+        return None;
+    }
+    // Every start but the first run's, and the last of them is where the last run starts.
+    let mut starts = ends[..ends.len() - 1].to_vec();
+    let to = starts.pop()? as usize;
+    (!starts.is_empty()).then_some((starts, to))
 }
 
 /// The total of every run of a packed argument, where run `group` is `starts[group]` up to
@@ -5953,6 +5983,10 @@ fn interior(key: &Vector, rows: usize, grouped: bool) -> Option<(usize, usize)> 
             }
             sliced(&values[..rows], grouped)
         }};
+    }
+    // A key held as its runs has its ends where the runs end, the same ones [`closed_runs`] reads.
+    if let Some((ends, values)) = key.run_parts() {
+        return held_runs(ends, values, rows, grouped).map(|(starts, to)| (starts[0] as usize, to));
     }
     // A packed code is the value less the frame's base, so codes are in the order the values are.
     if let Some(packed) = key.packed_parts() {

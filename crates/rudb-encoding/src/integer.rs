@@ -454,6 +454,54 @@ pub fn run_length(bytes: &[u8]) -> bool {
     bytes.first().and_then(|&tag| Kind::from_tag(tag).ok()) == Some(Kind::Rle)
 }
 
+/// The run values of a run length chunk and where each run ends, without writing out its rows, or
+/// `None` for a chunk of any other kind.
+///
+/// The ends are exclusive and increase, and a run of no rows is left out. A reader that holds what
+/// it decodes keeps a key column stored in its own order this way, so a grouping by that key reads
+/// where its runs end rather than comparing every row with the one before it to find them again.
+///
+/// # Errors
+///
+/// As [`decode_as`].
+pub fn decode_runs_as<T: Lane>(bytes: &[u8]) -> Result<Option<(Vec<T>, Vec<u32>)>> {
+    if !run_length(bytes) {
+        return Ok(None);
+    }
+    let mut reader = Reader::new(bytes);
+    reader.u8()?;
+    let count = reader.u32()?;
+    let run_values = decode_chunk(&mut reader)?;
+    let run_lengths = decode_chunk(&mut reader)?;
+    if reader.remaining() != 0 {
+        return Err(Error::internal(format!(
+            "{} bytes left over after decoding a chunk",
+            reader.remaining()
+        )));
+    }
+    if run_values.len() != run_lengths.len() {
+        return Err(Error::internal("an RLE chunk has more runs than run lengths"));
+    }
+    let mut values = Vec::with_capacity(run_values.len());
+    let mut ends = Vec::with_capacity(run_values.len());
+    let mut end = 0_u64;
+    for (&value, &length) in run_values.iter().zip(&run_lengths) {
+        let length =
+            u64::try_from(length).map_err(|_| Error::internal("a negative RLE run length"))?;
+        if length == 0 {
+            continue;
+        }
+        end += length;
+        if end > u64::from(count) {
+            return Err(Error::internal("an RLE run ends past its chunk"));
+        }
+        values.push(lane::<T>(value)?);
+        ends.push(end as u32);
+    }
+    check_count(end as usize, count as usize)?;
+    Ok(Some((values, ends)))
+}
+
 /// Decodes a chunk that sits at the front of a longer buffer, and says how many bytes it took.
 ///
 /// A string column holds integer chunks inside its own body, and the reader on that side cannot
@@ -2043,6 +2091,26 @@ mod tests {
         let bytes = round_trip(&values);
         assert_eq!(kind_of(&bytes), Kind::Rle);
         assert!(bytes.len() < 2000, "{} bytes for 1000 runs", bytes.len());
+    }
+
+    #[test]
+    fn a_run_length_chunk_reads_back_as_its_runs() {
+        let mut values = Vec::new();
+        for run in 0..1000_i64 {
+            values.extend(std::iter::repeat_n(run * 3 + 1, (run % 5 + 2) as usize));
+        }
+        let bytes = round_trip(&values);
+        assert_eq!(kind_of(&bytes), Kind::Rle);
+        let (runs, ends) = decode_runs_as::<i32>(&bytes).unwrap().expect("a run length chunk");
+        assert_eq!(runs.len(), 1000);
+        assert_eq!(ends.last().copied(), Some(values.len() as u32));
+        let mut start = 0;
+        for (&value, &end) in runs.iter().zip(&ends) {
+            assert!(values[start..end as usize].iter().all(|&row| row == i64::from(value)));
+            start = end as usize;
+        }
+        let packed = round_trip(&(0..5000).collect::<Vec<i64>>());
+        assert!(decode_runs_as::<i64>(&packed).unwrap().is_none(), "not a run length chunk");
     }
 
     #[test]
