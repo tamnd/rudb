@@ -489,15 +489,20 @@ pub enum Write {
 }
 
 /// The `RETURNING` query of a writing statement, bound over the table it writes.
+///
+/// Only a `DELETE` reads the `rowid` of that table there. The pin has none for the rows an
+/// `INSERT` or an `UPDATE` returns, and refuses the name as a column the table does not have.
 fn returning(
     ast: &Ast,
     catalog: &Catalog,
     parameters: &Parameters,
     session: &Session,
     query: Option<ast::QueryRef>,
+    rowid: bool,
 ) -> Result<Option<Box<Plan>>> {
     let Some(query) = query else { return Ok(None) };
     let mut binder = Binder::with(catalog, parameters, session);
+    binder.unnumbered = !rowid;
     let (root, scope) = binder.bind_query(ast, query)?;
     if let Some(placeholders) = parameters.placeholders() {
         placeholders.answer(scope.fields());
@@ -3392,7 +3397,7 @@ fn insert(
     let root = generate(&mut binder, (root, index), &fields, target, 0)?;
     let source = finish(binder, root)?;
     excluded_returning(ast, written.returning)?;
-    let returning = returning(ast, catalog, parameters, session, written.returning)?;
+    let returning = returning(ast, catalog, parameters, session, written.returning, false)?;
     let conflict = match written.conflict {
         Some(conflict) => {
             Some(bind_conflict(ast, catalog, parameters, session, &name, &targets, conflict)?)
@@ -3941,7 +3946,7 @@ fn change(
     };
     let hit = column(&mut binder, width);
     let hit = binder.checked_cast_to(hit, &LogicalType::Boolean, false)?;
-    let returning = returning(ast, catalog, parameters, session, written.returning)?;
+    let returning = returning(ast, catalog, parameters, session, written.returning, delete)?;
     // A delete that marks its rows gone needs only which rows those are, so the source reads the
     // columns of the condition and not the rest. See [`Catalog::takes_rows`].
     // A trigger reads every column of the rows it changed, so a statement that fires one keeps them.

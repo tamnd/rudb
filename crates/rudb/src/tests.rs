@@ -14383,6 +14383,145 @@ fn a_whole_number_literal_takes_the_integer_type_it_meets_when_it_fits() {
 }
 
 #[test]
+fn a_qualified_name_two_tables_share_blames_the_alias() {
+    let db = scripted(&["CREATE TABLE t (i INTEGER, j INTEGER)", "INSERT INTO t VALUES (42, 1)"]);
+    let duplicate = "Ambiguous reference to table \"t\" (duplicate alias \"t\", explicitly alias \
+                     one of the tables using \"AS my_alias\")";
+    for statement in [
+        "SELECT t.i FROM t, t",
+        "SELECT t.j FROM t JOIN t ON true",
+        "SELECT t.x FROM (SELECT 42 x) t, (SELECT 84 x) t",
+    ] {
+        assert_eq!(refusal(&db, statement), duplicate, "{statement}");
+    }
+    assert_eq!(rows(&db, "SELECT t.x FROM (SELECT 42 x) t, t"), vec![vec![integer(42)]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM t, t"), vec![vec![Value::BigInt(1)]]);
+}
+
+#[test]
+fn rowid_reads_a_tables_row_number_and_a_star_leaves_it_out() {
+    let db = scripted(&[
+        "CREATE TABLE a (i INTEGER)",
+        "INSERT INTO a VALUES (10), (11), (12), (13)",
+        "CREATE TABLE b (rowid INTEGER, j INTEGER)",
+        "INSERT INTO b VALUES (7, 8)",
+    ]);
+    let big = Value::BigInt;
+    assert_eq!(
+        rows(&db, "SELECT rowid, i, typeof(rowid) FROM a ORDER BY rowid"),
+        vec![
+            vec![big(0), integer(10), Value::Varchar("BIGINT".into())],
+            vec![big(1), integer(11), Value::Varchar("BIGINT".into())],
+            vec![big(2), integer(12), Value::Varchar("BIGINT".into())],
+            vec![big(3), integer(13), Value::Varchar("BIGINT".into())],
+        ]
+    );
+    assert_eq!(rows(&db, "SELECT * FROM a WHERE rowid = 2"), vec![vec![integer(12)]]);
+    assert_eq!(rows(&db, "SELECT rowid, * FROM b"), vec![vec![integer(7), integer(7), integer(8)]]);
+    assert_eq!(
+        rows(&db, "SELECT a2.rowid FROM a, a a2 WHERE a.rowid = a2.rowid AND a.i = 11"),
+        vec![vec![big(1)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT (SELECT a2.rowid FROM a a2 WHERE a.rowid = a2.rowid) FROM a ORDER BY 1"),
+        vec![vec![big(0)], vec![big(1)], vec![big(2)], vec![big(3)]]
+    );
+    for (statement, message) in [
+        (
+            "SELECT rowid FROM a, a a2",
+            "Ambiguous reference to column name \"rowid\" (use: 'a.rowid' or 'a2.rowid')",
+        ),
+        (
+            "SELECT rowid FROM a JOIN b ON true",
+            "Ambiguous reference to column name \"rowid\" (use: 'a.rowid' or 'b.rowid')",
+        ),
+    ] {
+        assert_eq!(refusal(&db, statement), message, "{statement}");
+    }
+    for statement in [
+        "SELECT rowid FROM (SELECT * FROM a)",
+        "WITH c AS (SELECT * FROM a) SELECT rowid FROM c",
+        "SELECT rowid FROM range(3)",
+    ] {
+        assert!(
+            refusal(&db, statement).starts_with("Referenced column \"rowid\" not found"),
+            "{statement}"
+        );
+    }
+    db.execute("CREATE TABLE r (id INTEGER)").unwrap();
+    db.execute("INSERT INTO r VALUES (1), (2)").unwrap();
+    for statement in [
+        "INSERT INTO r VALUES (3) RETURNING rowid",
+        "UPDATE r SET id = 5 WHERE id = 1 RETURNING rowid",
+    ] {
+        assert!(
+            refusal(&db, statement).starts_with("Referenced column \"rowid\" not found"),
+            "{statement}"
+        );
+    }
+    assert!(
+        refusal(&db, "INSERT INTO r VALUES (3) RETURNING r.rowid")
+            .starts_with("Table \"r\" does not have a column named \"rowid\"")
+    );
+    // A delete reads rowid back, though the number is the row's place among the rows deleted
+    // rather than its place in the table, which the pin answers with.
+    let deleted = db.execute("DELETE FROM r WHERE id = 2 RETURNING typeof(rowid), id").unwrap();
+    assert_eq!((deleted.text_at(0, 0), deleted.text_at(0, 1)), ("BIGINT".into(), "2".into()));
+    db.execute("INSERT INTO a SELECT rowid FROM a WHERE i = 13").unwrap();
+    db.execute("UPDATE a SET i = rowid + 100 WHERE i < 12").unwrap();
+    db.execute("DELETE FROM a WHERE rowid = (SELECT max(rowid) FROM a)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT i FROM a ORDER BY rowid"),
+        vec![vec![integer(100)], vec![integer(101)], vec![integer(12)], vec![integer(13)]]
+    );
+}
+
+#[test]
+fn rowid_is_read_through_a_join_that_puts_its_sides_under_a_projection() {
+    let db = scripted(&[
+        "CREATE TABLE l (a INTEGER)",
+        "CREATE TABLE r (b INTEGER)",
+        "CREATE TABLE s (a INTEGER, b INTEGER)",
+        "INSERT INTO l VALUES (1), (2)",
+        "INSERT INTO r VALUES (10), (20)",
+        "INSERT INTO s VALUES (1, 10)",
+        "CREATE TABLE t0 (c0 INTEGER)",
+        "INSERT INTO t0 VALUES (1), (2), (3)",
+        "CREATE TABLE t1 (c0 INTEGER)",
+        "INSERT INTO t1 VALUES (3), (4)",
+    ]);
+    let (big, null) = (Value::BigInt, Value::Null);
+    let on = "ON EXISTS (SELECT 1 FROM s WHERE s.a = l.a AND s.b = r.b) ORDER BY ALL";
+    assert_eq!(
+        rows(&db, &format!("SELECT l.rowid, r.rowid FROM l FULL JOIN r {on}")),
+        vec![vec![big(0), big(0)], vec![big(1), null.clone()], vec![null.clone(), big(1)]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT l.rowid, r.rowid FROM l LEFT JOIN r {on}")),
+        vec![vec![big(0), big(0)], vec![big(1), null.clone()]]
+    );
+    assert_eq!(
+        rows(&db, &format!("SELECT l.rowid, r.rowid FROM l RIGHT JOIN r {on}")),
+        vec![vec![big(0), big(0)], vec![null.clone(), big(1)]]
+    );
+    assert_eq!(rows(&db, &format!("SELECT l.rowid FROM l SEMI JOIN r {on}")), vec![vec![big(0)]]);
+    let joined = vec![
+        vec![integer(1), big(0), null.clone()],
+        vec![integer(2), big(1), null.clone()],
+        vec![integer(3), big(2), big(0)],
+        vec![integer(4), null, big(1)],
+    ];
+    for join in ["t0 NATURAL FULL JOIN t1", "t0 FULL JOIN t1 USING (c0)"] {
+        let sql = format!("SELECT c0, t0.rowid, t1.rowid FROM {join} ORDER BY ALL");
+        assert_eq!(rows(&db, &sql), joined, "{sql}");
+    }
+    assert_eq!(
+        refusal(&db, "SELECT c0, rowid FROM t0 NATURAL FULL JOIN t1"),
+        "Ambiguous reference to column name \"rowid\" (use: 't0.rowid' or 't1.rowid')"
+    );
+}
+
+#[test]
 fn an_error_working_out_a_generated_column_names_the_column() {
     let db = Database::new();
     db.execute("CREATE TABLE t (a INTEGER, b AS (a + 1), c VARCHAR, d BOOLEAN AS (c))").unwrap();
