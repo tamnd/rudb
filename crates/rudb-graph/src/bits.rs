@@ -315,6 +315,13 @@ impl BitVector {
         Some(self.select(nth, false))
     }
 
+    /// The word holding the `nth` set bit, counting from zero, and how many ones of that word come
+    /// before it, searching from word `from` on, for a caller that asks about ranks that rise. See
+    /// [`Rank::word_holding`] for the search and when it answers `None`.
+    pub(crate) fn word_holding(&self, nth: u64, from: usize) -> Option<(usize, u32)> {
+        self.rank.word_holding(nth, from)
+    }
+
     /// The bitmap itself, least significant bit of word zero first.
     ///
     /// For a caller that walks the bits in order, which is one load per sixty four of them, where

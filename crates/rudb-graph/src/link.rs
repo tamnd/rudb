@@ -392,10 +392,15 @@ impl Link {
     /// This is [`Link::forward`] over the rows a filter or a reduction left, and it is for the
     /// monotone form again. A child there is a `select1` and a `rank0`, about three hundred
     /// instructions between them, and on q09 those were a tenth of the query for 319,404 children.
-    /// The children a scan hands up are ascending, so the next one is usually a few words further
-    /// along the bitmap than the last, and walking those words is a count of ones per word. A
-    /// child further away than `Link::WALK` children, or one before the last, is searched for
-    /// again, so the answer is the same in any order and only the cost depends on it.
+    /// The children a scan hands up are ascending, so the search for each starts at the word the
+    /// last one was found in and gallops out over the count of ones before each word, which finds
+    /// a near child in a load or two and a far one in a few halvings. The parent is then the zeros
+    /// before the child's bit, which is the bit less the ones before it, and the ones before the
+    /// `n`th one are `n`. This replaced a walk of up to a thousand children a word at a time and a
+    /// `select1` past that, and on the 2,988 rows of `partsupp` that q02 keeps through `part` the
+    /// two came to 113 cycles a child, most of them in the select. A child before the last starts
+    /// the search from the first word again, so the answer is the same in any order and only the
+    /// cost depends on it.
     pub fn forward_each(&self, children: &[Rid], out: &mut Vec<Rid>) {
         out.clear();
         out.reserve(children.len());
@@ -419,38 +424,26 @@ impl Link {
             }
         };
         let words = vector.words();
-        // The last child answered, the position of its bit and its parent.
-        let mut last: Option<(Rid, usize, Rid)> = None;
+        // The last child answered and the word its bit is in, where the next search starts.
+        let (mut last, mut from) = (0, 0);
         for &child in children {
             if child >= self.children {
                 out.push(NO_PARENT);
                 continue;
             }
-            let near = last.filter(|&(from, ..)| child >= from && child - from <= Self::WALK);
-            let (at, parent) = match near {
-                Some((from, at, parent)) => {
-                    walk_ones(words, at, parent, child - from).unwrap_or((usize::MAX, NO_PARENT))
-                }
-                None => match vector.select1(child) {
-                    Some(at) => (at, vector.rank0(at)),
-                    None => (usize::MAX, NO_PARENT),
-                },
-            };
-            if parent == NO_PARENT {
-                last = None;
-            } else {
-                last = Some((child, at, parent));
+            if child < last {
+                from = 0;
             }
+            let parent = match vector.word_holding(child, from) {
+                Some((word, within)) => {
+                    (last, from) = (child, word);
+                    count(word * 64 + crate::bits::nth_set(words[word], within) as usize) - child
+                }
+                None => NO_PARENT,
+            };
             out.push(parent);
         }
     }
-
-    /// How many children [`Link::forward_each`] walks the bitmap across before it searches instead.
-    ///
-    /// A word walked is about five instructions and holds a few dozen children on a table with a
-    /// few children per parent, and a search is about three hundred, so the break even is some
-    /// thousands of children and this stays well under it.
-    const WALK: Rid = 1024;
 
     /// The children of a parent row, as a half open range of child `rid`s.
     ///
@@ -743,39 +736,6 @@ fn reserved(width: usize) -> u64 {
 }
 
 /// A row count as a `u64`, which is what every count in a header is.
-/// The position and parent of the one bit `skip` ones after the one at `at`, whose parent is
-/// `parent`, or `None` if the bitmap runs out first.
-///
-/// Each zero crossed is a parent boundary. A word at a time: shift out the bits at or before the
-/// current one, and either the ones left in the word are too few, so count them and its zeros and
-/// move on, or the one wanted is in it.
-fn walk_ones(words: &[u64], at: usize, mut parent: Rid, skip: Rid) -> Option<(usize, Rid)> {
-    if skip == 0 {
-        return Some((at, parent));
-    }
-    let mut left = skip - 1;
-    let mut from = at + 1;
-    loop {
-        let index = from / 64;
-        let offset = from % 64;
-        let word = *words.get(index)? >> offset;
-        let span = 64 - offset;
-        let ones = u64::from(word.count_ones());
-        if ones > left {
-            #[expect(clippy::cast_possible_truncation, reason = "under the ones in one word")]
-            let within = crate::bits::nth_set(word, left as u32) as usize;
-            // The zeros between `from` and the one found are the parents crossed.
-            parent += count(within) - left;
-            return Some((from + within, parent));
-        }
-        // The caller checked the child against the count of children, so the one wanted is in
-        // the words and the tail past the length is never reached.
-        parent += count(span) - ones;
-        left -= ones;
-        from += span;
-    }
-}
-
 fn count(rows: usize) -> u64 {
     u64::try_from(rows).unwrap_or(u64::MAX)
 }
