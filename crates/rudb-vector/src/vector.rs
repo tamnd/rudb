@@ -504,6 +504,12 @@ struct Layout {
 }
 
 impl Laid {
+    fn of(flat: Vector) -> Self {
+        let layout = Layout::default();
+        let _ = layout.flat.set(Some(flat));
+        Self(Arc::new(layout))
+    }
+
     fn flat(&self) -> Option<&Vector> {
         self.0.flat.get().and_then(Option::as_ref)
     }
@@ -3636,7 +3642,13 @@ impl Vector {
             // the range starts and stops, and every end moved to be relative to the new row zero. A
             // cut of a hundred rows out of a column of a hundred million is a handful of runs, which
             // is the reason this form is worth cutting as itself rather than copying out.
-            Body::Runs { ends, values, .. } if len > 0 => {
+            // A cut of runs laid out already is laid out too, as the same cut of the flat form, so a
+            // page laid out once when it was read stays that way through every chunk taken off it.
+            Body::Runs { ends, values, laid } if len > 0 => {
+                let laid = match laid.flat() {
+                    Some(flat) => Laid::of(flat.slice(at, len)?),
+                    None => Laid::default(),
+                };
                 let first = run_holding(ends, at).unwrap_or(0);
                 let last = run_holding(ends, end - 1).unwrap_or(first);
                 let cut: Vec<u32> = ends[first..=last]
@@ -3644,7 +3656,7 @@ impl Vector {
                     .map(|&stop| stop.min(end as u32) - at as u32)
                     .collect();
                 let values = values.slice(first, last - first + 1)?;
-                Body::Runs { ends: cut, values: Arc::new(values), laid: Laid::default() }
+                Body::Runs { ends: cut, values: Arc::new(values), laid }
             }
             // An empty cut has no run to point at and an empty run length body would be a vector of
             // no runs claiming a length, so it comes back as the empty flat vector instead.
@@ -3873,6 +3885,20 @@ impl Vector {
             return None;
         };
         laid.0.flat.get_or_init(|| self.expanded_runs()).as_ref()
+    }
+
+    /// The same runs laid out flat beside them now rather than on the first read, for a vector that
+    /// is kept and read again, so that every cut of it is laid out already (see [`Self::slice`]).
+    /// Anything else comes back as it was.
+    ///
+    /// A part read off a page is held between queries and cut into chunks for each of them. Laid
+    /// out on the first read, each chunk was laid out again by every query that read it a row at a
+    /// time, which on a `partsupp` or `lineitem` join cost more than the runs saved anywhere else.
+    /// Laid out when it is read, it is the copy a flat part costs to decode, once.
+    #[must_use]
+    pub fn laid_out(self) -> Self {
+        let _ = self.laid_runs();
+        self
     }
 
     /// The flat form of a run length vector, taken from what [`Self::laid_runs`] kept when there
@@ -7620,6 +7646,9 @@ mod tests {
         assert!(read.is_null_at(rows.len()));
         assert_eq!(read.gather(&wanted).unwrap(), flat.gather(&wanted).unwrap());
         assert_eq!(cut.data(), integers(&rows[2..22]).data());
+        // A cut of runs laid out is laid out already, and the runs held off a page start that way.
+        assert!(format!("{:?}", read.slice(2, 20).unwrap()).contains("Laid(out)"));
+        assert!(format!("{:?}", runs.clone().laid_out()).contains("Laid(out)"));
         // Rows far apart over many runs, which the walk gallops to, then one that goes back. Fewer
         // rows than runs, so the gather walks rather than laying the runs out.
         let (mut ends, mut rows) = (Vec::new(), Vec::new());

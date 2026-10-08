@@ -14192,7 +14192,9 @@ const HELD_RUN: usize = 3;
 /// `l_orderkey` is stored as runs of about four rows, one run an order. Held flat it was written
 /// out a row at a time, and then a grouping by it compared every row with the one before it to find
 /// the same runs again, which on TPC-H q18 was a quarter of the query. Held as runs, the ends are
-/// where the groups are, and the part takes a run's value and end where it took four values.
+/// where the groups are. It is laid out flat beside its runs as well (see [`Vector::laid_out`]),
+/// since a join or a filter reads it a row at a time and a row of runs is a search. The flat form
+/// is the copy the part cost before, and the runs are a run's value and end on top of it.
 fn cascade_runs(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Option<Vector>> {
     fn held<T: integer::Lane>(bytes: &[u8], rows: usize) -> Result<Option<(Vec<T>, Vec<u32>)>> {
         let runs = integer::decode_runs_as::<T>(bytes)
@@ -14215,7 +14217,7 @@ fn cascade_runs(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Option<Ve
     if ends.last().map_or(0, |&end| end as usize) != rows {
         return Err(invalid("cascade page holds the wrong number of rows"));
     }
-    Ok(Some(Vector::runs(ends, Vector::flat(ty.clone(), values)?)?))
+    Ok(Some(Vector::runs(ends, Vector::flat(ty.clone(), values)?)?.laid_out()))
 }
 
 /// How many bytes a part of this type costs written out plainly, which is what the cascade has to
