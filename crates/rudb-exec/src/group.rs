@@ -2702,8 +2702,14 @@ impl<'a> Aggregate<'a> {
             coded_read: 0,
             // One map as wide as the room is cleared before a row pays for it, but only by the
             // table before the split. There are sixty four partitions, and each clearing one of its
-            // own up front would be up to sixty four megabytes cleared for nothing.
-            coded_free: if share.before_the_split() { crate::table::WIDE_COMBOS } else { 0 },
+            // own up front would be up to sixty four megabytes cleared for nothing. Nor by an
+            // aggregate that closes its groups, whose table sees only the first and the last run of
+            // each chunk. On TPC-H q02 that was a map grown to 200,000 places for 642 rows.
+            coded_free: if share.before_the_split() && !self.closes() {
+                crate::table::WIDE_COMBOS
+            } else {
+                0
+            },
             coded_map: Places::default(),
             same: Vec::new(),
             leaders: Vec::new(),
