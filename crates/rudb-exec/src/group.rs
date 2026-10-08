@@ -1899,6 +1899,49 @@ impl<'a> Aggregate<'a> {
         self
     }
 
+    /// The slots of a finished table whose call under [`Self::having_total`] can pass it, or `None`
+    /// to answer every group.
+    ///
+    /// The table's groups are answered at the end whether a `HAVING` above wants them or not, and
+    /// ClickBench 29 has 404 thousand of them for the 15 that pass a total over a hundred thousand.
+    /// Answering all of them was 25 MB of keys and answers made at the peak of the query, for the
+    /// filter to throw away. A group is left out only when its answer is certain to fail: a null,
+    /// or a whole number below the bound that its column can hold, so that a total too wide for
+    /// its type still reaches the finish and fails there the way it always did.
+    fn passing_total(&self, states: &[Accumulator], groups: usize) -> Option<Vec<usize>> {
+        let (call, minimum) = self.having_total?;
+        let held = self.calls.get(call)?;
+        if self.count_only || self.compact_numeric || held.distinct || !held.finishes_plainly() {
+            return None;
+        }
+        let width = match held.returns.physical() {
+            PhysicalType::Int8 => 8,
+            PhysicalType::Int16 => 16,
+            PhysicalType::Int32 => 32,
+            PhysicalType::Int64 => 64,
+            PhysicalType::Int128 => 128,
+            _ => return None,
+        };
+        let calls = self.calls.len();
+        let state = held.state_of(call);
+        let fails = |slot: usize| {
+            let held = &states[slot * calls + state];
+            let (total, seen) = match held.counted() {
+                Some(count) => (i128::from(count), true),
+                None => match held.exact_total() {
+                    Some(total) => total,
+                    None => return false,
+                },
+            };
+            let fits = width == 128 || (total >> (width - 1) == 0 || total >> (width - 1) == -1);
+            !seen || (total < minimum && fits)
+        };
+        // A named slot sends its keys out a value at a time where a run of slots copies them a
+        // block at a time, so a bound that keeps most of the groups is left to the filter.
+        let kept: Vec<usize> = (0..groups).filter(|&slot| !fails(slot)).collect();
+        (kept.len() <= groups / 2).then_some(kept)
+    }
+
     /// What this operator produces, which is the group expressions followed by the aggregates.
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
@@ -3559,7 +3602,7 @@ impl<'a> Aggregate<'a> {
                 }
                 Some(kept)
             }
-            _ => None,
+            _ => self.passing_total(&states, groups),
         };
         let output_groups = selected.as_ref().map_or(groups, Vec::len);
         // A min or a max over a dictionary column is holding a code rather than a string, and the
@@ -9293,6 +9336,31 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, values);
+    }
+
+    /// A table under a `HAVING` on a total answers only the groups that can pass it, and those
+    /// groups come out the same as they do without the bound.
+    #[test]
+    fn a_having_total_answers_only_the_table_groups_that_pass_it() {
+        let plan =
+            parsed("Aggregate #1 groups=[#0.0::INTEGER] aggregates=[sum(#0.0::INTEGER)::BIGINT]");
+        let (aggregate, out) = aggregate(&plan);
+        let aggregate = aggregate.having_total(0, 15_000);
+        let mut local = aggregate.local();
+        let values: Vec<i32> = (0..20_000).rev().collect();
+        for part in values.chunks(1_024) {
+            aggregate.sink(&chunk(part), &mut local).expect("a chunk of groups");
+        }
+        aggregate.combine(local).expect("the instance");
+        aggregate.finalize(&rudb_pipeline::Lease::alone()).expect("the answer");
+        let mut seen: Vec<i32> = Vec::new();
+        for row in answer(&out) {
+            let Value::Integer(key) = row[0] else { panic!("the group is {:?}", row[0]) };
+            assert_eq!(row[1], Value::BigInt(i64::from(key)), "{row:?}");
+            seen.push(key);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (15_000..20_000).collect::<Vec<_>>());
     }
 
     /// An aggregate whose private tables outgrow the cache gives them up and still answers once.
