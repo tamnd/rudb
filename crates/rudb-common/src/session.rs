@@ -222,6 +222,7 @@ pub struct Semantics {
     sequence_owners: SequenceOwners,
     set_functions: SetFunctions,
     show_behavior: ShowBehavior,
+    subscripts: Subscripts,
     single_arrow_lambdas: bool,
     type_names: TypeNames,
     unknown_types: UnknownTypes,
@@ -273,6 +274,7 @@ impl Default for Semantics {
             sequence_owners: SequenceOwners::Table,
             set_functions: SetFunctions::Pin,
             show_behavior: ShowBehavior::Auto,
+            subscripts: Subscripts::Pin,
             single_arrow_lambdas: false,
             type_names: TypeNames::Pin,
             unknown_types: UnknownTypes::Pin,
@@ -442,6 +444,11 @@ impl Semantics {
     #[must_use]
     pub fn set_functions(self) -> SetFunctions {
         self.set_functions
+    }
+    /// How a subscript and a slice of a list read the list.
+    #[must_use]
+    pub fn subscripts(self) -> Subscripts {
+        self.subscripts
     }
     /// Whether casts from local timestamps to zoned timestamps are refused.
     #[must_use]
@@ -918,6 +925,17 @@ pub enum SetFunctions {
     #[default]
     Pin,
     /// As in PostgreSQL: also `generate_series`, which gives one row for each value.
+    Postgres,
+}
+
+/// How a subscript and a slice of a list read the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Subscripts {
+    /// As in DuckDB: a subscript of any integer type, where a negative index counts from the end.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the subscript is coerced to `integer`, and an index outside the array gives
+    /// a null, or for a slice, only the part of the array that is inside the bounds.
     Postgres,
 }
 
@@ -1439,6 +1457,7 @@ impl Session {
             self.semantics.row_nulls = RowNulls::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
+            self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
         }
         self.postgres = Postgreses(postgres);

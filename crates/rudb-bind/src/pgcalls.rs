@@ -11,8 +11,10 @@
 
 use rudb_catalog::{Catalog, same_name};
 use rudb_common::{
-    Error, FunctionRules, LogicalType, RegexRules, Result, SetFunctions, SqlState, Value,
+    Error, FunctionRules, LogicalType, RegexRules, Result, SetFunctions, SqlState, Subscripts,
+    Value,
 };
+use rudb_kernels::pgarray;
 use rudb_kernels::pgjson::JsonSet;
 use rudb_kernels::pgregexp::{self, Function};
 use rudb_parse::ast::LiteralKind;
@@ -36,7 +38,7 @@ pub(crate) struct Written<'a> {
 /// The PostgreSQL type of a value of `ty` when that type binds back as `ty`, so that the rules for
 /// a call see the type that the value has. A DECIMAL is a `numeric` with a typmod, and a list of
 /// DECIMAL values is a `numeric[]`.
-fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
+pub(crate) fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
     let oid = rudb_pgtypes::pg_type(ty).oid;
     let back = rudb_pgtypes::logical_type(oid)?;
     let decimal = |ty: &LogicalType| matches!(ty, LogicalType::Decimal { .. });
@@ -735,6 +737,98 @@ impl Binder<'_> {
                     .collect();
                 format!("CAST(({}) AS INTEGER)", each.join(" + "))
             }
+            // The seconds field of PostgreSQL has the fraction of the second in it, and the pin
+            // has that in its microseconds field.
+            [field, moment] if named("date_part") && seconds(field) => {
+                format!("(CAST(date_part('microsecond', ({moment})) AS DOUBLE) / 1000000)")
+            }
+            _ => return Ok(None),
+        };
+        self.bind_macro_body(written, &text, scope).map(Some)
+    }
+
+    /// A subscript `array[index]` or a slice `array[lower:upper]` of a list in a session with
+    /// [`Subscripts::Postgres`], which the transform writes as `array_extract` and `array_slice`.
+    /// `None` for another call, and for a subscript of a value that is not a list, which the pin
+    /// binds. Each subscript is coerced to `integer` as `transformArraySubscripts` does it, and an
+    /// omitted bound of a slice, an empty list from the transform, is the first or the last
+    /// element.
+    pub(crate) fn pg_subscript(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        let name = match bound.len() {
+            2 if same_name(written, "array_extract") => pgarray::ARRAY_SUBSCRIPT,
+            3 if same_name(written, "array_slice") => pgarray::ARRAY_SLICE,
+            _ => return Ok(None),
+        };
+        let target = self.plan().expr_type(bound[0]).clone();
+        let LogicalType::List(element) = &target else {
+            return Ok(None);
+        };
+        if self.semantics.subscripts() != Subscripts::Postgres {
+            return Ok(None);
+        }
+        let returns = match name {
+            pgarray::ARRAY_SUBSCRIPT => (**element).clone(),
+            _ => target.clone(),
+        };
+        let mut args = vec![bound[0]];
+        for at in 1..bound.len() {
+            let arg = match ast.expr(arguments[at]) {
+                ast::Expr::List { items } if ast.expr_list(items).is_empty() => {
+                    let omitted = if at == 1 { 1 } else { i32::MAX };
+                    self.add_constant(Value::Integer(omitted))
+                }
+                _ => self.subscript_index(ast, arguments[at], bound[at])?,
+            };
+            args.push(arg);
+        }
+        let name = self.plan_mut().intern(name);
+        let args = self.plan_mut().add_expr_list(&args);
+        Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
+    /// One subscript as an `integer`. A string literal is read by the input function of `integer`,
+    /// and a type with no implicit or assignment cast to `integer` is the error of PostgreSQL.
+    fn subscript_index(
+        &mut self,
+        ast: &Ast,
+        written: ast::ExprRef,
+        bound: ExprRef,
+    ) -> Result<ExprRef> {
+        if let Some(value) = self.read_literal(ast, written, rudb_pgtypes::oid::INT4) {
+            return Ok(self.cast_to(value?, &LogicalType::Integer));
+        }
+        let ty = self.plan().expr_type(bound).clone();
+        if let Some(oid) = crate::expr::written_oid(ast, written, &ty)
+            && !rudb_pgtypes::can_coerce_assigned(oid, rudb_pgtypes::oid::INT4)
+        {
+            return Err(Error::binder("array subscript must have type integer")
+                .state(SqlState::DATATYPE_MISMATCH)
+                .with_span(ast.leftmost_span(written)));
+        }
+        self.checked_cast_to(bound, &LogicalType::Integer, false)
+    }
+
+    /// The functions of the shape of an array, `cardinality`, `array_ndims`, `array_length`,
+    /// `array_lower` and `array_upper`, written out over the lengths of the lists, or `None` for
+    /// another call. A call of one of them comes here after the lookup of `pg_proc`, which gives
+    /// the errors of PostgreSQL for its argument types and has no kernel for it.
+    pub(crate) fn array_shape_call(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
+        let named = |name: &str| same_name(written, name);
+        let texts: Vec<String> =
+            arguments.iter().map(|&argument| deparse::expression(ast, argument)).collect();
+        let text = match texts.as_slice() {
             [array] if named("cardinality") => {
                 let depth = self.array_depth(ast, arguments[0], scope)?;
                 let mut flat = format!("({array})");
@@ -770,11 +864,6 @@ impl Binder<'_> {
                     "CAST(CASE WHEN ((len(({array})) > 0) AND (({dimension}) BETWEEN 1 AND \
                      {depth})) THEN ({bound}) END AS INTEGER)"
                 )
-            }
-            // The seconds field of PostgreSQL has the fraction of the second in it, and the pin
-            // has that in its microseconds field.
-            [field, moment] if named("date_part") && seconds(field) => {
-                format!("(CAST(date_part('microsecond', ({moment})) AS DOUBLE) / 1000000)")
             }
             _ => return Ok(None),
         };
@@ -1067,7 +1156,7 @@ impl Binder<'_> {
         for at in 1..bound.len() {
             cast.push(self.argument_as(ast, arguments[at], bound[at], &dimensions)?);
         }
-        let name = self.plan_mut().intern(rudb_kernels::pgarray::ARRAY_FILL);
+        let name = self.plan_mut().intern(pgarray::ARRAY_FILL);
         let args = self.plan_mut().add_expr_list(&cast);
         let returns = LogicalType::List(Box::new(element));
         Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))

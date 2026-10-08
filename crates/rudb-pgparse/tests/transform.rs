@@ -40,7 +40,7 @@ const SAME: &[&str] = &[
     "select a::pg_catalog.int4, cast(a as pg_catalog.varchar(10)), a::pg_catalog.numeric(10,2)[], a::\"MyType\", a::s.t from t",
     "select $1, $2 from t",
     "select coalesce(a, b), nullif(a, b), greatest(a, b), least(a, b) from t",
-    "select a[1], a[1:2], a[:2], (a).b, a collate \"C\" from t",
+    "select a[1], a[1:2], (a).b, a collate \"C\" from t",
     "select current_date, current_timestamp, current_user, localtime(3), session_user from t",
     "select extract(year from a), substring(a from 1 for 2), position('a' in b), trim(both 'x' from a), trim(leading from a), overlay(a placing 'b' from 1 for 2), a at time zone 'UTC' from t",
     "select string_agg(a, ',' order by a) from t",
@@ -146,4 +146,13 @@ fn a_star_after_a_value_is_every_field_of_the_value() {
     assert!(shape("select (r).* from s").contains("[fields{column['r']} as -]"));
     assert!(shape("select (f(x)).*, (r).a from s").contains("fields{"));
     assert!(!shape("select r.* from s").contains("fields{"));
+}
+
+/// An omitted bound of a slice is an empty list, because `a[1:-1]` of PostgreSQL is not `a[1:]`.
+#[test]
+fn an_omitted_bound_of_a_slice_is_an_empty_list() {
+    let shape = |sql: &str| transform(sql).map(|ast| shape::script(&ast)).unwrap();
+    let tree = shape("select a[:2], a[2:] from t");
+    assert!(tree.contains("[column['a'], list[], number{'2'}]"), "{tree}");
+    assert!(tree.contains("[column['a'], number{'2'}, list[]]"), "{tree}");
 }
