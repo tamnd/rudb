@@ -516,7 +516,12 @@ impl Binder<'_> {
     }
 
     /// The call of the kernel of the C function `src` of `pg_proc`.
-    fn pgproc_kernel(&mut self, src: &str, args: &[ExprRef], returns: LogicalType) -> ExprRef {
+    pub(crate) fn pgproc_kernel(
+        &mut self,
+        src: &str,
+        args: &[ExprRef],
+        returns: LogicalType,
+    ) -> ExprRef {
         let name = self.plan_mut().intern(&format!("{}{src}", rudb_kernels::pgproc::PREFIX));
         let args = self.plan_mut().add_expr_list(args);
         self.add_expr(Expr::Function { name, args }, returns)
