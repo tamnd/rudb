@@ -41,13 +41,16 @@ use crate::rid::{NO_PARENT, PART_ROWS, Rid};
 
 /// Below one member in this many rows, a set is held as a sorted list rather than a bitmap.
 ///
-/// Section 4.3's number. At one in a thousand the list is eight bytes a member against a bitmap's
-/// thousand bits, so the list is about a sixteenth of the size, and it stays smaller until one in
-/// sixty four, so the threshold is on the side of the bitmap. That side is the one a scan wants.
-/// Moving the line to sixty four took 2.7 million instructions off q17 at SF1 and put 2.8 million
-/// on q20 and 1.7 million on q08, whose sets between the two lines are tested a row at a time
-/// further on, so it stays here until those tests walk the list instead.
-pub const SPARSE_RATIO: u64 = 1000;
+/// A list is eight bytes a member and a bitmap a bit a row, so the list is the smaller one up to one
+/// member in sixty four rows. What decides the line is what the two cost to use rather than to
+/// hold, though: most of what is done with a set is done a member at a time to a list and a word at
+/// a time to a bitmap, and a member costs a few times what a word does. So the line is at a few
+/// times sixty four rows a member. Section 4.3 put it at one in a thousand, which left the sets of
+/// q17 and q02 at SF1, one part in a thousand and one `partsupp` row in 268, as bitmaps written,
+/// counted and walked a word at a time for a few hundred members. At one in sixty four, q20's one
+/// part in 94 became a list, and counting its parts and laying it out cost 2.4 million
+/// instructions more than the bitmap.
+pub const SPARSE_RATIO: u64 = 256;
 
 /// Parents apart past which a push finds the next held parent's run with a select rather than by
 /// reading on through the link, as [`crate::adjacency`] does for the same reason.
@@ -246,10 +249,12 @@ impl Rids {
         match &self.body {
             Body::Full => self.rows.div_ceil(part),
             Body::Sparse(members) => {
-                let (mut touched, mut last) = (0, u64::MAX);
+                // The first row past the last part counted, so a member costs a compare and only
+                // a part costs a division.
+                let (mut touched, mut next) = (0, 0);
                 for &member in members {
-                    if member / part != last {
-                        last = member / part;
+                    if member >= next {
+                        next = (member / part + 1) * part;
                         touched += 1;
                     }
                 }
@@ -588,6 +593,30 @@ impl Rids {
         Pushed { rids: Self::settle_dense(children, words), parts, skipped, stopped: false }
     }
 
+    /// The rows of `rows`, as offsets from `first` in ascending order, that the set holds.
+    ///
+    /// What a scan keeps of a part after its filter has had the whole part. A test is a search for
+    /// a sparse set, so a sparse set walks its members in the part alongside the rows instead, and
+    /// the other forms test each row, which is a load.
+    #[must_use]
+    pub fn held_of(&self, first: Rid, rows: impl Iterator<Item = usize>) -> Vec<u32> {
+        let offset = |row: usize| u32::try_from(row).ok();
+        match &self.body {
+            Body::Sparse(members) => {
+                let from = members.partition_point(|&member| member < first);
+                let mut members = members[from..].iter().map(|&member| member - first).peekable();
+                rows.filter(|&row| {
+                    let row = count(row);
+                    while members.next_if(|&member| member < row).is_some() {}
+                    members.peek() == Some(&row)
+                })
+                .filter_map(offset)
+                .collect()
+            }
+            _ => rows.filter(|&row| self.contains(first + count(row))).filter_map(offset).collect(),
+        }
+    }
+
     /// The members from `first` for `len` rows, as offsets from `first`, in order.
     ///
     /// What a scan keeps of a part the set was pushed into. A sparse set answers from the members in
@@ -765,7 +794,19 @@ impl Rids {
         let members = words.iter().map(|word| u64::from(word.count_ones())).sum::<u64>();
         match shape(rows, members) {
             Form::Full => Self::full(rows),
-            Form::Sparse => Self { rows, body: Body::Sparse(ones(&words).collect()) },
+            Form::Sparse => {
+                // A loop into a list of the right length, because collecting the members out of
+                // the iterator over each word's ones grew it a push at a time.
+                let mut list = Vec::with_capacity(index(members));
+                for (at, &word) in words.iter().enumerate() {
+                    let mut rest = word;
+                    while rest != 0 {
+                        list.push(count(at) * 64 + u64::from(rest.trailing_zeros()));
+                        rest &= rest - 1;
+                    }
+                }
+                Self { rows, body: Body::Sparse(list) }
+            }
             Form::Dense => Self { rows, body: Body::Dense { words, members } },
         }
     }
@@ -1194,9 +1235,10 @@ mod tests {
         );
     }
 
-    /// The offsets a scan keeps out of a part are the members in it, for each of the three forms.
+    /// The offsets a scan keeps out of a part are the members in it, and the rows of it held are the
+    /// ones that are members, for each of the three forms.
     #[test]
-    fn the_offsets_in_a_range_are_its_members_counted_from_its_start() {
+    fn the_offsets_in_a_range_and_the_rows_held_of_it_are_its_members() {
         let rows = 10_000;
         let sparse = Rids::from_sorted(rows, vec![3, 100, 101, 9999]).expect("sorted");
         let dense = Rids::from_sorted(rows, (0..rows).step_by(3).collect()).expect("sorted");
@@ -1211,6 +1253,9 @@ mod tests {
                     set.form()
                 );
                 assert_eq!(set.count_in(first, index(u64::from(len))), expected.len());
+                let every_other = (0..index(u64::from(len))).step_by(2);
+                let held: Vec<u32> = expected.iter().copied().filter(|at| at % 2 == 0).collect();
+                assert_eq!(set.held_of(first, every_other), held, "{:?}", set.form());
             }
         }
     }

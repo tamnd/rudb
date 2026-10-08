@@ -1545,12 +1545,7 @@ impl<'a> Scan<'a> {
         // it for the reduction first left the filter a selected chunk, and the comparison on a
         // selected column was the slow path on Q3 at SF1, seven hundred times a query.
         if let Some((rows, first)) = reduced {
-            let held: Vec<u32> = kept
-                .iter()
-                .filter(|&row| rows.contains(first + row as u64))
-                .filter_map(|row| u32::try_from(row).ok())
-                .collect();
-            kept = Selection::from_indices(held);
+            kept = Selection::from_indices(rows.held_of(first, kept.iter()));
         }
         // Marked rather than cut only where nothing after this reads the chunk before the aggregate
         // does. A join's filter below narrows the chunk again, and a reduction has already moved
