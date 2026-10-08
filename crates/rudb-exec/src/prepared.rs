@@ -2204,6 +2204,9 @@ fn narrow_reading(chunk: &Chunk, rows: &[usize], reads: &[usize]) -> Result<Chun
 fn reads(plan: &Plan, expr: ExprRef, schema: &Schema) -> Vec<usize> {
     let mut reads = Vec::new();
     plan.read_columns(expr, &mut |_, binding| reads.extend(schema.position_of(binding)));
+    // Inside a lambda's body the parameters are columns of the chunk too, and a cut that left
+    // them out would give an arm after the first a null where each element should be.
+    plan.read_parameters(expr, &mut |binding| reads.extend(schema.position_of(binding)));
     reads.sort_unstable();
     reads.dedup();
     reads
