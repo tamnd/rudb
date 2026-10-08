@@ -112,6 +112,7 @@ mod float;
 mod generated;
 mod json;
 mod jsonb;
+pub mod keywords;
 mod number;
 mod number_format;
 mod numeric;
@@ -130,7 +131,7 @@ pub use array::{
     check_bounds, int2vector_in, int2vector_out, int2vector_recv, int2vector_send, item_count,
     oidvector_in, oidvector_out, oidvector_recv, oidvector_send,
 };
-pub use binary::{Recv, name_recv};
+pub use binary::{Recv, name_recv, verify_utf8};
 pub use coerce::{
     Cast, CoercionContext, CoercionPath, Mismatch, can_coerce_assigned, can_coerce_implicitly,
     common_type, find_cast, find_coercion_pathway, is_preferred,
@@ -165,7 +166,7 @@ pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,
     soft_input_error,
 };
-pub use procs::{Proc, func_name_as_type, procs};
+pub use procs::{Proc, builtin_procs, func_name_as_type, procs};
 pub use reg::{
     RegInput, RegKind, qualified_name_list, reg_in, reg_out_oid, split_identifier_string,
 };

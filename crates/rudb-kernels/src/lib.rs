@@ -99,6 +99,7 @@ pub mod pgjson;
 mod pgmath;
 pub mod pgproc;
 pub mod pgregexp;
+mod pgstring;
 pub mod prepare;
 mod printf;
 mod quantile;

@@ -70,27 +70,7 @@ impl<'a> Recv<'a> {
     /// UTF-8, so the check is the check of `pg_verify_mbstr`: a zero byte or a byte sequence that
     /// is not UTF-8 is an error that shows the bytes of the bad character.
     pub fn text(&mut self) -> Result<&'a str, TypeError> {
-        let rest = self.rest();
-        let valid = match std::str::from_utf8(rest) {
-            Ok(text) if !text.contains('\0') => return Ok(text),
-            Ok(text) => text.len(),
-            Err(error) => error.valid_up_to(),
-        };
-        let bad = rest[..valid].iter().position(|&b| b == 0).unwrap_or(valid);
-        // pg_encoding_mblen_or_incomplete gives the length from the first byte.
-        let len = match rest[bad] {
-            b if b & 0x80 == 0 => 1,
-            b if b & 0xe0 == 0xc0 => 2,
-            b if b & 0xf0 == 0xe0 => 3,
-            b if b & 0xf8 == 0xf0 => 4,
-            _ => 1,
-        };
-        let bytes: Vec<String> =
-            rest[bad..].iter().take(len).map(|b| format!("0x{b:02x}")).collect();
-        Err(TypeError::new(
-            SqlState::CHARACTER_NOT_IN_REPERTOIRE,
-            format!("invalid byte sequence for encoding \"UTF8\": {}", bytes.join(" ")),
-        ))
+        verify_utf8(self.rest())
     }
 
     /// `boolrecv`: any byte other than 0 is true.
@@ -149,6 +129,30 @@ pub fn name_recv(text: &str) -> Result<&str, TypeError> {
     let mut error = TypeError::new(SqlState::NAME_TOO_LONG, "identifier too long".to_string());
     error.detail = Some(format!("Identifier must be less than {} characters.", NAME_MAX_BYTES + 1));
     Err(error)
+}
+
+/// `pg_verify_mbstr` for UTF-8: the bytes as a string, or for a zero byte or a byte sequence that
+/// is not UTF-8, the error that shows the bytes of the bad character.
+pub fn verify_utf8(bytes: &[u8]) -> Result<&str, TypeError> {
+    let valid = match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => return Ok(text),
+        Ok(text) => text.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let bad = bytes[..valid].iter().position(|&b| b == 0).unwrap_or(valid);
+    // pg_encoding_mblen_or_incomplete gives the length from the first byte.
+    let len = match bytes[bad] {
+        b if b & 0x80 == 0 => 1,
+        b if b & 0xe0 == 0xc0 => 2,
+        b if b & 0xf0 == 0xe0 => 3,
+        b if b & 0xf8 == 0xf0 => 4,
+        _ => 1,
+    };
+    let shown: Vec<String> = bytes[bad..].iter().take(len).map(|b| format!("0x{b:02x}")).collect();
+    Err(TypeError::new(
+        SqlState::CHARACTER_NOT_IN_REPERTOIRE,
+        format!("invalid byte sequence for encoding \"UTF8\": {}", shown.join(" ")),
+    ))
 }
 
 #[cfg(test)]

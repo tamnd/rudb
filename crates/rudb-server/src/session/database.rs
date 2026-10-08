@@ -11,13 +11,13 @@ use rudb_common::Fields;
 use rudb_pgwire::{CommandTag, OutBuf};
 
 use super::Failure;
-use super::keywords::{Category, category};
 use super::role::{Invalid, Parser, Spec, failure, notice, truncate, with_detail};
 use super::setting::{Token, spanned};
 use crate::databases::{self, Catalog, Row, UTF8, encoding_name};
 use crate::locale::{self, Codeset};
 use crate::roles::{self, BOOTSTRAP_SUPERUSER, FIRST_NORMAL_OID};
 use crate::server::Shared;
+use rudb_pgtypes::keywords::{Category, category};
 
 /// The value of an option, as the grammar gives it to the `defGet` functions.
 #[derive(Debug, Clone, PartialEq, Eq)]

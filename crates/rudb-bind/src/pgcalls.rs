@@ -17,6 +17,7 @@ use rudb_kernels::pgjson::JsonSet;
 use rudb_kernels::pgregexp::{self, Function};
 use rudb_parse::ast::LiteralKind;
 use rudb_parse::{Ast, ast, deparse};
+use rudb_pgtypes::keywords::quote_identifier;
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 
 use crate::advisory::{no_such_function, spelled_call};
@@ -39,6 +40,18 @@ fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
     let back = rudb_pgtypes::logical_type(oid)?;
     let exact = back == *ty || matches!(ty, LogicalType::Decimal { .. });
     exact.then_some(oid)
+}
+
+/// A function of `pg_proc` named `written` whose every form has a kernel here, so that a call of
+/// it in a PostgreSQL session is the kernel and not a macro of the pin with the same name.
+pub(crate) fn kernel_function(written: &str) -> bool {
+    let procs = rudb_pgtypes::procs(written);
+    !procs.is_empty()
+        && procs.iter().all(|proc| {
+            proc.kind == b'f'
+                && matches!(proc.lang, b'i' | b'c')
+                && rudb_kernels::pgproc::has(proc.src)
+        })
 }
 
 /// The list of one dimension inside a list of lists, or `ty` itself.
@@ -70,15 +83,6 @@ fn string_literal(ast: &Ast, expr: ast::ExprRef) -> Option<&str> {
         ast::Expr::Literal { kind: LiteralKind::String, text } => Some(ast.string(text)),
         _ => None,
     }
-}
-
-/// An identifier as PostgreSQL's `quote_ident` writes it, in quotes when it has a capital letter
-/// or when it would not read back as the same name without them.
-fn quote_ident(name: &str) -> String {
-    if name.chars().any(char::is_uppercase) {
-        return format!("\"{}\"", name.replace('"', "\"\""));
-    }
-    rudb_parse::quoted(name)
 }
 
 /// The name of the sequence in a default of the form `nextval('name')`.
@@ -148,8 +152,8 @@ fn serial_sequence_of(catalog: &Catalog, table: &str, column: &str) -> Result<Va
     }
     Ok(Value::Varchar(format!(
         "{}.{}",
-        quote_ident(&sequence.schema),
-        quote_ident(&sequence.table)
+        quote_identifier(&sequence.schema),
+        quote_identifier(&sequence.table)
     )))
 }
 
@@ -340,7 +344,29 @@ impl Binder<'_> {
         };
         let proc = candidate.proc;
         if candidate.variadic != 0 {
-            return Ok(None);
+            // A kernel of a variadic `any` takes its values as text, by the output function of
+            // the type of each value, as `format()` writes them.
+            let fixed = bound.len() - candidate.variadic;
+            if proc.variadic != oid::ANY
+                || !how.names.is_empty()
+                || !rudb_kernels::pgproc::has(proc.src)
+                || !matches!(proc.lang, b'i' | b'c')
+            {
+                return Ok(None);
+            }
+            let Some(returns) = rudb_pgtypes::logical_type(proc.result) else { return Ok(None) };
+            let mut args = Vec::with_capacity(fixed + 1);
+            for (index, &oid) in candidate.args[..fixed].iter().enumerate() {
+                let Some(ty) = rudb_pgtypes::logical_type(oid) else { return Ok(None) };
+                args.push(self.argument_as(ast, arguments[index], bound[index], &ty)?);
+            }
+            let mut texts = Vec::with_capacity(candidate.variadic);
+            for &value in &bound[fixed..] {
+                texts.push(self.output_text(value)?);
+            }
+            let values = self.call("list_value", texts)?;
+            args.push(values);
+            return Ok(Some(self.pgproc_kernel(proc.src, &args, returns)));
         }
         // `VARIADIC` before the argument of a variadic `any` gives the values as one array.
         if how.variadic && proc.variadic == oid::ANY {
@@ -355,14 +381,6 @@ impl Binder<'_> {
             }
             return self.variadic_any_call(ast, written, arguments, bound, scope).map(Some);
         }
-        let Some(declared) = candidate
-            .args
-            .iter()
-            .map(|&oid| rudb_pgtypes::logical_type(oid))
-            .collect::<Option<Vec<LogicalType>>>()
-        else {
-            return Ok(None);
-        };
         let Some(returns) = rudb_pgtypes::logical_type(proc.result) else { return Ok(None) };
         let kernel = matches!(proc.lang, b'i' | b'c') && rudb_kernels::pgproc::has(proc.src);
         let body = match proc.lang {
@@ -378,12 +396,26 @@ impl Binder<'_> {
         if !kernel && body.is_none() && !special {
             return Ok(None);
         }
+        // A polymorphic argument of a body is the argument as the call gives it, which the body
+        // casts as it needs.
+        let mut declared = Vec::with_capacity(candidate.args.len());
+        for &oid in &candidate.args {
+            match rudb_pgtypes::logical_type(oid) {
+                Some(ty) => declared.push(Some(ty)),
+                None if body.is_some() && rudb_pgtypes::is_polymorphic(oid) => declared.push(None),
+                None => return Ok(None),
+            }
+        }
         // Each argument in the place of its declared argument, and the defaults in the others.
         let mut placed: Vec<Option<ExprRef>> = vec![None; proc.args.len()];
         for (index, (&at, ty)) in candidate.order.iter().zip(&declared).enumerate() {
-            let value = match (arguments.get(index), bound.get(index)) {
-                (Some(&argument), Some(&input)) => self.argument_as(ast, argument, input, ty)?,
-                _ => {
+            let value = match (arguments.get(index), bound.get(index), ty) {
+                (Some(&argument), Some(&input), Some(ty)) => {
+                    self.argument_as(ast, argument, input, ty)?
+                }
+                (Some(_), Some(&input), None) => input,
+                (_, _, None) => return Ok(None),
+                (_, _, Some(ty)) => {
                     let default = candidate.default_of(at).ok_or_else(|| {
                         Error::internal(format!("argument {at} of {written} has no default"))
                     })?;
@@ -407,9 +439,14 @@ impl Binder<'_> {
         if !kernel {
             return self.call(written, cast).map(Some);
         }
-        let name = self.plan_mut().intern(&format!("{}{}", rudb_kernels::pgproc::PREFIX, proc.src));
-        let args = self.plan_mut().add_expr_list(&cast);
-        Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+        Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
+    }
+
+    /// The call of the kernel of the C function `src` of `pg_proc`.
+    fn pgproc_kernel(&mut self, src: &str, args: &[ExprRef], returns: LogicalType) -> ExprRef {
+        let name = self.plan_mut().intern(&format!("{}{src}", rudb_kernels::pgproc::PREFIX));
+        let args = self.plan_mut().add_expr_list(args);
+        self.add_expr(Expr::Function { name, args }, returns)
     }
 
     /// The default `text` of an argument of the PostgreSQL type `oid`, read by the input function
@@ -457,6 +494,16 @@ impl Binder<'_> {
             _ => "CAST(__rudb_e AS VARCHAR)",
         };
         let texts = format!("list_transform({flat}, lambda __rudb_e: {element})");
+        // `format()` takes the texts as they are, so the kernel sees the values of the array.
+        if let [format] = fixed
+            && named("format")
+        {
+            let outer = self.inlined.replace(vec![array]);
+            let values = self.bind_macro_body(written, &texts, scope);
+            self.inlined = outer;
+            let format = self.cast_to(*format, &LogicalType::Varchar);
+            return Ok(self.pgproc_kernel("text_format", &[format, values?], LogicalType::Varchar));
+        }
         let text = match fixed {
             [] if named("concat") => format!("array_to_string({texts}, '')"),
             [_] if named("concat_ws") => {
@@ -507,6 +554,13 @@ impl Binder<'_> {
             && self.semantics.set_functions() == SetFunctions::Postgres
         {
             return Err(self.misplaced_set_function());
+        }
+        if arguments.is_empty() && named("pg_client_encoding") {
+            let setting = self.session.postgres().and_then(|pg| pg.settings.get("client_encoding"));
+            let encoding =
+                setting.as_deref().and_then(rudb_common::guc::encoding).unwrap_or("UTF8");
+            let constant = self.add_constant(Value::Varchar(encoding.into()));
+            return Ok(Some(constant));
         }
         if arguments.is_empty() && named("pg_backend_pid") {
             let backend = self.session.postgres().map_or(0, |postgres| postgres.backend);
@@ -572,10 +626,6 @@ impl Binder<'_> {
                     .map(|text| format!("CAST((({text}) {test}) AS INTEGER)"))
                     .collect();
                 format!("CAST(({}) AS INTEGER)", each.join(" + "))
-            }
-            // The fill is a space when the call does not give one.
-            [string, length] if named("lpad") || named("rpad") => {
-                format!("{written}(({string}), ({length}), ' ')")
             }
             [array] if named("cardinality") => {
                 let depth = self.array_depth(ast, arguments[0], scope)?;

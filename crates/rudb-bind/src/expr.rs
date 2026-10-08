@@ -1597,7 +1597,9 @@ impl Binder<'_> {
         if !modified && let Some(call) = self.advisory_call(ast, &written, &arguments, scope)? {
             return Ok(call);
         }
-        if let Some(expanded) = self.builtin_macro(ast, &written, &arguments, scope)? {
+        if !(postgres && crate::pgcalls::kernel_function(&written))
+            && let Some(expanded) = self.builtin_macro(ast, &written, &arguments, scope)?
+        {
             return Ok(expanded);
         }
         if kind_of(&written) == Some(FunctionKind::Aggregate) {
