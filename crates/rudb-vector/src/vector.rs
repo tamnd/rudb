@@ -3464,6 +3464,10 @@ impl Vector {
                 }
                 true
             }
+            // Laid out already, the flat form is a copy, where a run at a time is a resize a run.
+            Body::Runs { laid, .. } if laid.flat().is_some() => {
+                laid.flat().is_some_and(|flat| flat.signed_block(out))
+            }
             // A run's value once per run, laid out as many times as the run is long. A cut has
             // only the runs it touches, so the values are few and widening them all is cheap.
             Body::Runs { ends, values, .. } => {
@@ -3859,12 +3863,6 @@ impl Vector {
         })
     }
 
-    /// A run length vector of fixed width values written out flat, a run at a time.
-    ///
-    /// The general copy finds the run of every row with a search over the ends, which over a part
-    /// held as runs of four rows, the way `l_orderkey` is, was a search a row. Here each run's
-    /// place is laid out as long as the run is, and the values are copied through those places the
-    /// way a dictionary's values are copied through its codes.
     /// Whether this is a flat vector with no nulls, which is said without reading a mask.
     fn flat_and_all_valid(&self) -> bool {
         matches!(self.validity, Validity::AllValid) && matches!(self.body, Body::Flat(_))
@@ -3878,8 +3876,8 @@ impl Vector {
     /// The second way went through a search over the ends for every row, and a build over
     /// `l_orderkey` held as runs of four rows cost twice what it did over the flat column. Laid out
     /// once, every reader after the first reads a row as an index, and a reader that only wants the
-    /// runs never pays for it. Clones of one vector share what was laid out, and a cut lays out its
-    /// own rows.
+    /// runs never pays for it. Clones of one vector share what was laid out, and a cut of one laid
+    /// out is laid out as well.
     fn laid_runs(&self) -> Option<&Self> {
         let Body::Runs { laid, .. } = &self.body else {
             return None;
@@ -3913,6 +3911,14 @@ impl Vector {
         }
     }
 
+    /// A run length vector of fixed width values written out flat, a run at a time.
+    ///
+    /// The general copy finds the run of every row with a search over the ends, which over a part
+    /// held as runs of four rows, the way `l_orderkey` is, was a search a row. Here each run's
+    /// value is written as many times as the run is long, which is one store a row. Laying out the
+    /// run of every row first and copying through those the way a dictionary is copied through
+    /// its codes was a write and a read a row more, and on q09, which decodes `lineitem` again on
+    /// every run, it was a third of the decode.
     fn expanded_runs(&self) -> Option<Self> {
         let Body::Runs { ends, values, .. } = &self.body else {
             return None;
@@ -3925,15 +3931,11 @@ impl Vector {
         let Body::Flat(data) = &values.body else {
             return None;
         };
-        let mut places = Vec::with_capacity(self.len);
-        for (run, &end) in ends.iter().enumerate() {
-            places.resize(end as usize, run as u32);
-        }
         Some(Self {
             ty: self.ty.clone(),
             len: self.len,
             validity: Validity::AllValid,
-            body: Body::flat(copy_by_codes(data, &places)?),
+            body: Body::flat(repeated_by_runs(data, ends, self.len)?),
         })
     }
 
@@ -6177,6 +6179,32 @@ pub(crate) fn placed_of(data: &Data, inverse: &[u32]) -> Data {
 
 /// The fixed width values at `codes`, copied in one pass without making the positions first.
 /// `None` for strings and for no data, which [`copy_of`] copies.
+/// Each of `data`'s values written out as many times as its run in `ends` is long, for fixed width
+/// layouts, and `None` for any other. The ends rise and the last is `len`, which
+/// [`Vector::runs`] checks when the runs are made.
+fn repeated_by_runs(data: &Data, ends: &[u32], len: usize) -> Option<Data> {
+    macro_rules! repeated {
+        ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {
+            match data {
+                $(Data::$variant(values) => {
+                    let values = values.as_slice();
+                    if values.len() < ends.len() {
+                        return None;
+                    }
+                    let mut out: Vec<$native> = Vec::with_capacity(len);
+                    for (&value, &end) in values.iter().zip(ends) {
+                        let run = (end as usize).saturating_sub(out.len());
+                        out.extend(std::iter::repeat_n(value, run));
+                    }
+                    Some(Data::$variant(Buffer::from_vec(out)))
+                })+
+                _ => None,
+            }
+        };
+    }
+    crate::for_each_layout!(fixed, repeated)
+}
+
 fn copy_by_codes(data: &Data, codes: &[u32]) -> Option<Data> {
     macro_rules! copied {
         ($(($variant:ident, $native:ty, $zero:expr)),+ $(,)?) => {

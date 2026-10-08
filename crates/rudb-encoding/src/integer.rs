@@ -482,6 +482,27 @@ pub fn decode_runs_as<T: Lane>(bytes: &[u8]) -> Result<Option<(Vec<T>, Vec<u32>)
     if run_values.len() != run_lengths.len() {
         return Err(Error::internal("an RLE chunk has more runs than run lengths"));
     }
+    // Every run at least a row and at most the chunk, which is every chunk the writer makes, is
+    // checked in one pass with no branch a run, and then the ends are a running total. No end can
+    // pass the chunk's count without the last one doing so, and the total of fewer than 2^32 runs
+    // of under 2^32 rows each fits in a `u64`. Checking each run as it went was most of reading
+    // `l_orderkey` as its runs.
+    let (least, most) = run_lengths
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(least, most), &length| (least.min(length), most.max(length)));
+    if least >= 1 && most <= i64::from(count) {
+        let mut end = 0_u64;
+        let ends: Vec<u32> = run_lengths
+            .iter()
+            .map(|&length| {
+                end += length as u64;
+                end as u32
+            })
+            .collect();
+        check_count(end as usize, count as usize)?;
+        let values = run_values.into_iter().map(lane::<T>).collect::<Result<Vec<T>>>()?;
+        return Ok(Some((values, ends)));
+    }
     let mut values = Vec::with_capacity(run_values.len());
     let mut ends = Vec::with_capacity(run_values.len());
     let mut end = 0_u64;
