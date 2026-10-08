@@ -1559,7 +1559,15 @@ impl Runner {
         for (index, statement) in statements.into_iter().enumerate().skip(from) {
             if let Some(parsed) = copy::parse(statement.sql()) {
                 let offset = statement.offset();
-                let started = if implicit { self.begin_implicit() } else { Ok(()) };
+                // PostgreSQL reads the options of a COPY when it runs, which a failed block does
+                // not let it do.
+                let started = if self.connection.transaction() == Transaction::Aborted {
+                    Err(aborted_failure())
+                } else if implicit {
+                    self.begin_implicit()
+                } else {
+                    Ok(())
+                };
                 let done = match started.and_then(|()| {
                     parsed.map_err(|failure| Failure {
                         position: failure.position.map(|at| at + offset),
