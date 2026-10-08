@@ -4918,6 +4918,11 @@ impl<'a> Binder<'a> {
         on: ast::ExprRef,
         using: ast::Slice,
     ) -> Result<(NodeRef, Scope)> {
+        // A mark join compares the two sides and nothing else, so a query in its condition has no
+        // place to run. The corpus refuses it in the same words as a condition of the wrong shape.
+        if kind == ast::JoinKind::Mark && on != NONE && crate::columns::has_subquery(ast, on) {
+            return Err(unsupported_mark());
+        }
         let hold = !matches!(kind, ast::JoinKind::Inner | ast::JoinKind::Cross)
             && on != NONE
             && crate::columns::has_subquery(ast, on);
@@ -4946,6 +4951,9 @@ impl<'a> Binder<'a> {
         // A row of the right side exists only for the left row it was evaluated against, so a kind
         // that has to produce right rows with no left row has nothing to produce them from. The
         // pinned build says this and names only the two kinds that work.
+        if !correlated.is_empty() && kind == ast::JoinKind::Mark {
+            return Err(unsupported_mark());
+        }
         if !correlated.is_empty()
             && !matches!(kind, ast::JoinKind::Inner | ast::JoinKind::Cross | ast::JoinKind::Left)
         {
@@ -4953,6 +4961,12 @@ impl<'a> Binder<'a> {
                 "The combining JOIN type must be INNER or LEFT for a LATERAL reference",
             ));
         }
+        let (right_node, right_scope, marker) = if kind == ast::JoinKind::Mark {
+            let (node, scope, marker) = self.mark_side(right_node, right_scope);
+            (node, scope, Some(marker))
+        } else {
+            (right_node, right_scope, None)
+        };
         self.distinct_table_names(ast, &[left], right)?;
         let split = left_scope.len();
         // Which table index came from which side, kept before the two scopes become one. A query
@@ -5114,6 +5128,31 @@ impl<'a> Binder<'a> {
         if matches!(kind, ast::JoinKind::Semi | ast::JoinKind::Anti) {
             scope.truncate(split);
         }
+        // A mark join is the left side and the one column saying whether a row matched, and a
+        // right semi or anti join is the right side alone.
+        if let Some(marker) = marker {
+            self.mark_conditions(&conditions, &left_tables, &right_tables)?;
+            scope.truncate(split);
+            scope.push(marker);
+        }
+        if matches!(kind, ast::JoinKind::RightSemi | ast::JoinKind::RightAnti) {
+            scope.columns.drain(..split);
+            scope.rowids.retain(|rowid| rowid.at >= split);
+            for rowid in &mut scope.rowids {
+                rowid.at -= split;
+            }
+        }
+        if !pair.is_empty()
+            && matches!(
+                kind,
+                ast::JoinKind::Single | ast::JoinKind::RightSemi | ast::JoinKind::RightAnti
+            )
+        {
+            return Err(Error::not_implemented(
+                "a subquery that reads both sides of a JOIN BY join, written in its condition"
+                    .to_string(),
+            ));
+        }
         if !pair.is_empty() && kind == ast::JoinKind::Full && correlated.is_empty() {
             return self.bind_full_pair_join(ast, left, right, on, scope);
         }
@@ -5139,6 +5178,7 @@ impl<'a> Binder<'a> {
             let node = self.add_node(Node::CrossProduct { left: left_node, right: right_node });
             return Ok((node, scope));
         }
+        let swap = matches!(kind, ast::JoinKind::RightSemi | ast::JoinKind::RightAnti);
         let kind = match kind {
             ast::JoinKind::Inner | ast::JoinKind::Cross => JoinKind::Inner,
             ast::JoinKind::Left => JoinKind::Left,
@@ -5147,7 +5187,15 @@ impl<'a> Binder<'a> {
             ast::JoinKind::Semi => JoinKind::Semi,
             ast::JoinKind::Anti => JoinKind::Anti,
             ast::JoinKind::Positional => JoinKind::Positional,
+            ast::JoinKind::Mark => JoinKind::Mark,
+            ast::JoinKind::Single => JoinKind::Single,
+            ast::JoinKind::RightSemi => JoinKind::Semi,
+            ast::JoinKind::RightAnti => JoinKind::Anti,
         };
+        // The right side is the one that is kept, so it is the left input of the join that keeps
+        // it. Every column is read through its binding, so nothing else changes.
+        let (left_node, right_node) =
+            if swap { (right_node, left_node) } else { (left_node, right_node) };
         let conditions = self.plan.add_expr_list(&conditions);
         let node = if correlated.is_empty() {
             self.add_node(Node::Join {
@@ -5170,6 +5218,119 @@ impl<'a> Binder<'a> {
             return Ok((node, scope));
         }
         Ok((node, scope))
+    }
+
+    /// The right side of a `JOIN BY (TYPE MARK)`, under a projection that adds the column the join
+    /// sets to whether a left row matched, and that column as the scope will show it.
+    ///
+    /// The mark join takes its marker from the last column of its right input, which is how a
+    /// subquery planned as one hands it over too. The column is named `__mark_join_marker` and
+    /// its table is `__internal_mark_join_ref` and an index, as on the pin, so `t1.*` leaves it
+    /// out. The right side's own columns stay visible to the condition and to nothing after it.
+    fn mark_side(&mut self, node: NodeRef, mut scope: Scope) -> (NodeRef, Scope, Visible) {
+        let index = self.fresh_index();
+        let mut exprs = Vec::with_capacity(scope.columns.len() + 1);
+        let mut names = Vec::with_capacity(scope.columns.len() + 1);
+        for (at, column) in scope.columns.iter_mut().enumerate() {
+            exprs.push(self.plan.add_expr(Expr::Column(column.binding), column.ty.clone()));
+            names.push(self.plan.intern(&column.name));
+            column.binding = ColumnBinding::new(index, at as u32);
+        }
+        scope.rowids.clear();
+        let marker = Visible {
+            table: format!("__internal_mark_join_ref{index}"),
+            name: "__mark_join_marker".to_string(),
+            binding: ColumnBinding::new(index, exprs.len() as u32),
+            ty: LogicalType::Boolean,
+            not_null: false,
+            key: None,
+            default: None,
+            origin: None,
+            qualified: false,
+            also: None,
+            hidden: false,
+            using: None,
+        };
+        let yes = self.plan.add_value(Value::Boolean(true));
+        exprs.push(self.plan.add_expr(Expr::Constant(yes), LogicalType::Boolean));
+        names.push(self.plan.intern(&marker.name));
+        let exprs = self.plan.add_expr_list(&exprs);
+        let names = self.plan.add_name_list(&names);
+        let node = self.add_node(Node::Project { input: node, index, exprs, names });
+        (node, scope, marker)
+    }
+
+    /// Whether the condition of a `JOIN BY (TYPE MARK)` has a shape a mark join answers.
+    ///
+    /// Each conjunct has to be a comparison whose operands read one side each, or no side, which
+    /// is what a subquery planned as a mark join produces. Then the whole has to be one such
+    /// comparison, equalities alone, `IS NOT DISTINCT FROM` alone, or a group: `IS NOT DISTINCT
+    /// FROM` on operands of one type followed by one last comparison of any kind but the two
+    /// distinct ones, on operands of one type that is not a union or an unnamed struct, and not
+    /// nested at all for an ordered comparison. That is the list upstream accepts, in its order,
+    /// so the group keys have to come first.
+    fn mark_conditions(
+        &self,
+        conditions: &[ExprRef],
+        left_tables: &[u32],
+        right_tables: &[u32],
+    ) -> Result<()> {
+        use rudb_plan::CompareOp;
+        let mut conjuncts = Vec::new();
+        // Popped in the order they are written, since the group rule reads the last one.
+        let mut pending: Vec<ExprRef> = conditions.iter().rev().copied().collect();
+        while let Some(at) = pending.pop() {
+            match self.plan.expr(at) {
+                Expr::Conjunction { op: ConjunctionOp::And, children } => {
+                    pending.extend(self.plan.expr_list(*children).iter().rev());
+                }
+                _ => conjuncts.push(at),
+            }
+        }
+        // Which sides an operand reads, as (left, right).
+        let sides = |expr: ExprRef| {
+            let mut read = (false, false);
+            self.plan.read_columns(expr, &mut |_, binding| {
+                read.0 |= left_tables.contains(&binding.table);
+                read.1 |= right_tables.contains(&binding.table);
+            });
+            read
+        };
+        let mut comparisons = Vec::with_capacity(conjuncts.len());
+        for &conjunct in &conjuncts {
+            let Expr::Compare { op, left, right } = *self.plan.expr(conjunct) else {
+                return Err(unsupported_mark());
+            };
+            let (a, b) = (sides(left), sides(right));
+            let one_each = |a: (bool, bool), b: (bool, bool)| !a.1 && !b.0;
+            if !one_each(a, b) && !one_each(b, a) {
+                return Err(unsupported_mark());
+            }
+            comparisons.push((op, self.plan.expr_type(left), self.plan.expr_type(right)));
+        }
+        let all = |wanted: CompareOp| comparisons.iter().all(|&(op, ..)| op == wanted);
+        if comparisons.len() == 1 || all(CompareOp::Equal) || all(CompareOp::NotDistinctFrom) {
+            return Ok(());
+        }
+        let Some((&(last, left, right), groups)) = comparisons.split_last() else {
+            return Err(unsupported_mark());
+        };
+        let grouped = groups
+            .iter()
+            .all(|&(op, left, right)| op == CompareOp::NotDistinctFrom && left == right);
+        let ordered = matches!(
+            last,
+            CompareOp::Less
+                | CompareOp::LessOrEqual
+                | CompareOp::Greater
+                | CompareOp::GreaterOrEqual
+        );
+        let quantified = left == right
+            && !matches!(left, LogicalType::Union(_))
+            && !matches!(left, LogicalType::Struct(fields) if Field::unnamed(fields))
+            && (matches!(last, CompareOp::Equal | CompareOp::NotEqual)
+                || (ordered && !left.is_nested()));
+        if grouped && quantified { Ok(()) } else { Err(unsupported_mark()) }
     }
 
     /// The column a bare name reads after a join `USING` it, when the left copy is not that
@@ -6946,4 +7107,10 @@ fn volatile_node(plan: &Plan, node: NodeRef) -> bool {
         _ => false,
     };
     here || plan.node(node).children().into_iter().flatten().any(|child| volatile_node(plan, child))
+}
+
+/// What a `JOIN BY (TYPE MARK)` whose condition a mark join cannot answer says, in the corpus's
+/// words.
+fn unsupported_mark() -> Error {
+    Error::not_implemented("Unsupported explicit MARK join conditions".to_string())
 }

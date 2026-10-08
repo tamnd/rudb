@@ -5005,8 +5005,51 @@ impl<'a> Transform<'a> {
                     using: Slice::default(),
                 }))
             }
+            // `JoinByClause <- 'JOIN' 'BY' Parens('TYPE' ColLabel) TableRef JoinQualifier`, which
+            // names one of the pin's own join types, including the mark and single joins a subquery
+            // is planned as and the two that keep the right side.
+            "JoinByClause" => {
+                let mut leaves = Vec::new();
+                self.leaves(self.descendant(node, "ColLabel"), &mut leaves);
+                let label = leaves.last().map_or("", |&leaf| self.text(leaf));
+                let kind = self.join_by_type(&self.fold_identifier(label))?;
+                let right = self.table_ref(self.find(node, "TableRef"))?;
+                let (on, using) = self.join_qualifier(self.find(node, "JoinQualifier"))?;
+                Ok(self.push_source(Source::Join { left, right, kind, natural: false, on, using }))
+            }
             _ => self.unsupported(node),
         }
+    }
+
+    /// The join type a `JOIN BY (TYPE name)` names, which is a name of the pin's `JoinType` enum,
+    /// in any case and with `_join` after it or not. `full` is the one spelled differently from
+    /// the enum value it means. `invalid` is a value of the enum and is refused with its own
+    /// sentence, and anything else is refused the way the pin refuses a name that is not a value.
+    fn join_by_type(&self, label: &str) -> Result<JoinKind> {
+        let lower = label.to_ascii_lowercase();
+        let name = lower.strip_suffix("_join").unwrap_or(&lower);
+        Ok(match name {
+            "inner" => JoinKind::Inner,
+            "left" => JoinKind::Left,
+            "right" => JoinKind::Right,
+            "full" => JoinKind::Full,
+            "semi" => JoinKind::Semi,
+            "anti" => JoinKind::Anti,
+            "mark" => JoinKind::Mark,
+            "single" => JoinKind::Single,
+            "right_semi" => JoinKind::RightSemi,
+            "right_anti" => JoinKind::RightAnti,
+            "invalid" => {
+                return Err(Error::parser(format!(
+                    "\"{label}\" is not a valid join type for JOIN BY"
+                )));
+            }
+            _ => {
+                return Err(Error::not_implemented(format!(
+                    "Enum value: unrecognized value \"{name}\" for enum \"JoinType\""
+                )));
+            }
+        })
     }
 
     /// `JoinType <- FullJoin / LeftJoin / RightJoin / SemiJoin / AntiJoin / InnerJoin`, absent
