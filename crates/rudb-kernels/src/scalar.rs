@@ -3532,9 +3532,6 @@ fn like_ranked(
     finish(returns, Data::Bool(out.into()), base)
 }
 
-/// How many rows of a chunk [`like_stable`] looks up in the memo before trusting it with the rest.
-const PROBED: usize = 64;
-
 fn like_stable(
     dictionary: &Arc<Vector>,
     codes: &[u32],
@@ -3554,56 +3551,41 @@ fn like_stable(
     if !Arc::ptr_eq(&cache.dictionary, dictionary) {
         return like_vector_run(dictionary, codes, like, base, rows, returns);
     }
-    // Once the memo has seen the values a chunk points at, which after the first few chunks of a
-    // scan is nearly every chunk, the answer is one load and a test a row. So that is tried first
-    // as a loop with nothing in it that can stop it, and only a chunk with a row the memo has not
-    // decided goes the long way below. On JOB 19c the long way was an eighth of the query, spent
-    // on rows the memo already knew. Where the values are too many for the memo ever to know most
-    // of them, as the four million names of JOB 17f, the whole loop ran and then the long way did
-    // too, so the first rows are looked at before the rest and one the memo has not decided sends
-    // the chunk the long way at once.
+    // One pass answers every row the memo has decided and notes the ones it has not, and only
+    // those are decided and filled in after. The answer is one load and a test a row, and the load
+    // is a miss into a memo of a few hundred kilobytes, so it is done once a row. The pass used to
+    // be tried as a loop with nothing in it that could stop it, and any row it found undecided sent
+    // the whole chunk round again through a loop that looked every row up a second time. On
+    // ClickBench `URL` that was nearly every chunk: the dictionary is in the order values were first
+    // seen, so a scan keeps meeting values of groups nobody has decided yet, and q21 spent a quarter
+    // of its time looking rows up.
+    let Some(codes) = codes.get(..rows) else {
+        return Err(Error::internal("a stable dictionary chunk has fewer codes than rows"));
+    };
+    if matches!(base, Validity::AllInvalid) && rows > 0 {
+        return finish(returns, Data::Bool(vec![false; rows].into()), base.normalize(rows));
+    }
     let pair = |code: u32| {
         let (index, shift) = StableLike::slot(code as usize);
         cache.state.get(index).map_or(0, |word| word.load(Ordering::Acquire)) >> shift
     };
-    let first = rows.min(PROBED);
-    if rows > 0 && codes.len() >= rows && codes[..first].iter().all(|&code| pair(code) & 1 == 1) {
-        let mut out = vec![false; rows];
-        let mut undecided = 0;
-        for (slot, &code) in out.iter_mut().zip(&codes[..rows]) {
-            let pair = pair(code);
-            undecided |= !pair & 1;
-            *slot = pair & 3 == 3;
-        }
-        if undecided == 0 {
-            return finish(returns, Data::Bool(out.into()), base.normalize(rows));
+    let mut out = vec![false; rows];
+    let mut pending = Vec::new();
+    for (index, (slot, &code)) in out.iter_mut().zip(codes).enumerate() {
+        let pair = pair(code);
+        *slot = pair & 3 == 3;
+        if pair & 1 == 0 {
+            pending.push(index);
         }
     }
-    let mut out = vec![false; rows];
+    // A null row's code is whatever the column left there, so it is not asked about.
+    if let Validity::Mask(mask) = &base {
+        pending.retain(|&index| mask.get(index));
+    }
     let mut characters = Vec::new();
-    // A chunk of fewer rows than a group is what a selective read left behind, so the rows it
-    // cannot answer yet wait until the loop is done, and then only their values are decided when
-    // they are spread too thin over their groups for a group walk to pay.
-    let sparse = rows < LIKE_GROUP;
-    let mut pending = Vec::new();
-    let validity = over_valid(rows, base, |index| {
-        let code = codes[index] as usize;
-        out[index] = match cache.peek(code) {
-            Some(held) => held,
-            None if sparse => {
-                pending.push(index);
-                return Ok(());
-            }
-            None => {
-                cache.decide_group(code, like, &mut characters)?;
-                cache
-                    .peek(code)
-                    .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
-            }
-        };
-        Ok(())
-    })?;
-    if !pending.is_empty() {
+    // A chunk of fewer rows than a group is what a selective read left behind, so its values are
+    // decided on their own when they are spread too thin over their groups for a group walk to pay.
+    if rows < LIKE_GROUP && !pending.is_empty() {
         let mut wanted: Vec<u32> = pending.iter().map(|&index| codes[index]).collect();
         wanted.sort_unstable();
         wanted.dedup();
@@ -3613,19 +3595,21 @@ fn like_stable(
             .count();
         if wanted.len() * SPARSE_LIKE < groups * LIKE_GROUP {
             cache.decide_codes(&wanted, like, &mut characters)?;
-        } else {
-            for &code in &wanted {
-                if cache.peek(code as usize).is_none() {
-                    cache.decide_group(code as usize, like, &mut characters)?;
-                }
-            }
-        }
-        for index in pending {
-            out[index] = cache
-                .peek(codes[index] as usize)
-                .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?;
         }
     }
+    for index in pending {
+        let code = codes[index] as usize;
+        out[index] = match cache.peek(code) {
+            Some(held) => held,
+            None => {
+                cache.decide_group(code, like, &mut characters)?;
+                cache
+                    .peek(code)
+                    .ok_or_else(|| Error::internal("a stable dictionary code is out of range"))?
+            }
+        };
+    }
+    let validity = if rows == 0 { Validity::AllValid } else { base.normalize(rows) };
     finish(returns, Data::Bool(out.into()), validity)
 }
 
