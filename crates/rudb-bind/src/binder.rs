@@ -969,12 +969,13 @@ impl<'a> Binder<'a> {
                 self.sort_group_operators(&field.ty, false, span)?;
             }
         }
-        if !all && self.semantics.recursive_union() == RecursiveUnion::Postgres {
-            if !table.iter().all(|field| hashable(&field.ty)) {
-                return Err(Error::not_implemented("could not implement recursive UNION")
-                    .state(SqlState::FEATURE_NOT_SUPPORTED)
-                    .detail("All column datatypes must be hashable."));
-            }
+        if !all
+            && self.semantics.recursive_union() == RecursiveUnion::Postgres
+            && !table.iter().all(|field| hashable(&field.ty))
+        {
+            return Err(Error::not_implemented("could not implement recursive UNION")
+                .state(SqlState::FEATURE_NOT_SUPPORTED)
+                .detail("All column datatypes must be hashable."));
         }
         let mut args = Vec::with_capacity(args.len());
         for fold in &folds {
