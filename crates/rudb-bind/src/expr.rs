@@ -1223,7 +1223,7 @@ impl Binder<'_> {
         }
         let mut op = op;
         if self.semantics.unknown_types() == UnknownTypes::Postgres {
-            self.unknown_operand(ast, written, op, &mut left, &mut right)?;
+            self.unknown_operand(ast, written, op, [&mut left, &mut right], scope)?;
         }
         if self.semantics.operator_rules() == OperatorRules::Postgres {
             // A string literal joined to a `bytea` is a `bytea` too.
@@ -1404,18 +1404,9 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<()> {
         use rudb_pgtypes::oid::{BPCHAR, VARCHAR};
-        let declared = |binder: &Self, written: ast::ExprRef, expr: ExprRef| match ast.expr(written)
-        {
-            ast::Expr::Column { .. } => binder
-                .through(expr, scope)
-                .and_then(|column| column.origin)
-                .and_then(|origin| origin.ty),
-            ast::Expr::Cast { ty, .. } => rudb_pgtypes::declared_type(ast.string(ty)),
-            _ => None,
-        };
         let sides = [(written[0], *left), (written[1], *right)].map(|(written, expr)| {
             let written = uncollated(ast, written);
-            let ty = declared(self, written, expr);
+            let ty = self.written_declared(ast, written, expr, scope);
             let column = matches!(ast.expr(written), ast::Expr::Column { .. })
                 && ty.is_some_and(|ty| ty.oid == BPCHAR && ty.typmod >= 4);
             let untyped = matches!(
@@ -1449,6 +1440,25 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// The PostgreSQL type a column or a cast declares, which can say more than the type of its
+    /// value, as a `name` column holds a `VARCHAR` and is a `name`.
+    fn written_declared(
+        &self,
+        ast: &Ast,
+        written: ast::ExprRef,
+        expr: ExprRef,
+        scope: &Scope,
+    ) -> Option<DeclaredType> {
+        match ast.expr(written) {
+            ast::Expr::Column { .. } => self
+                .through(expr, scope)
+                .and_then(|column| column.origin)
+                .and_then(|origin| origin.ty),
+            ast::Expr::Cast { ty, .. } => rudb_pgtypes::declared_type(ast.string(ty)),
+            _ => None,
+        }
+    }
+
     /// Casts an operand of no known type on one side of an operator to the type that PostgreSQL
     /// picks for it. That is a parameter and a string literal, which are both of type `unknown` in
     /// PostgreSQL.
@@ -1464,13 +1474,17 @@ impl Binder<'_> {
     ///
     /// A string literal is read by the input function of the type, as it is in a cast, so
     /// `1 + '1.5'` is the error of PostgreSQL and not 3.
+    ///
+    /// The other side is of the type that its column or its cast declares when the value has
+    /// that type, so a string compared with a `name` column is read as a `name` and loses what
+    /// is past 63 bytes.
     fn unknown_operand(
         &mut self,
         ast: &Ast,
         written: [ast::ExprRef; 2],
         op: BinaryOp,
-        left: &mut ExprRef,
-        right: &mut ExprRef,
+        [left, right]: [&mut ExprRef; 2],
+        scope: &Scope,
     ) -> Result<()> {
         use rudb_pgtypes::{OperatorResolution, oid};
         let unknown = |binder: &Self, at: usize, side: ExprRef| {
@@ -1480,12 +1494,23 @@ impl Binder<'_> {
                     ast::Expr::Literal { kind: LiteralKind::String, .. }
                 )
         };
-        let (unknown_left, other) = match (unknown(self, 0, *left), unknown(self, 1, *right)) {
-            (true, false) => (true, self.plan().expr_type(*right).clone()),
-            (false, true) => (false, self.plan().expr_type(*left).clone()),
+        let (unknown_left, known_side) = match (unknown(self, 0, *left), unknown(self, 1, *right)) {
+            (true, false) => (true, *right),
+            (false, true) => (false, *left),
             _ => return Ok(()),
         };
-        let Some(known) = crate::pgcalls::exact_oid(&other) else { return Ok(()) };
+        let other = self.plan().expr_type(known_side).clone();
+        let known_written = uncollated(ast, written[usize::from(unknown_left)]);
+        let declared = self
+            .written_declared(ast, known_written, known_side, scope)
+            .filter(|declared| rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(&other));
+        let known = match declared {
+            Some(declared) => declared.oid,
+            None => match crate::pgcalls::exact_oid(&other) {
+                Some(oid) => oid,
+                None => return Ok(()),
+            },
+        };
         let index = usize::from(!unknown_left);
         let mut oids = [known; 2];
         oids[index] = oid::UNKNOWN;

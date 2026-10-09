@@ -1487,6 +1487,32 @@ fn the_temporary_objects_of_a_session_go_when_it_ends() {
     server.stop().unwrap();
 }
 
+/// A string compared with a `name` column is a `name`, so the input of `name` cuts it to 63 bytes
+/// before the comparison, as in PostgreSQL.
+#[test]
+fn a_string_compared_with_a_name_is_a_name() {
+    let dirs = Dirs::new("pgnamecmp");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let long = "1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMNOPQR";
+    let messages = client.query(&format!(
+        "create temp table names (f1 name); insert into names values ('{long}'), ('abc')"
+    ));
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for (test, count) in [
+        (format!("f1 = '{long}'"), "1"),
+        (format!("'{long}' = f1"), "1"),
+        (format!("f1 <> '{long}'"), "1"),
+        (format!("f1 < '{long}'"), "0"),
+        ("f1 ~ '^123'".to_string(), "1"),
+    ] {
+        let sql = format!("select count(*)::text from names where {test}");
+        assert_eq!(scalar(&mut client, &sql), count, "{test}");
+    }
+    server.stop().unwrap();
+}
+
 /// A prefix operator of `pg_operator` that the grammar does not name, such as `@` for the absolute
 /// value, is the operator PostgreSQL finds for the type of its operand.
 #[test]
