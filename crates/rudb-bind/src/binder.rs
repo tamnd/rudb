@@ -19,8 +19,8 @@ use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error,
     ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin, RecursiveUnion, Result,
-    Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey, TableNames, UnknownTypes,
-    Value, ValuesNames,
+    Semantics, Session, ShowBehavior, SortOperators, Span, SqlState, Stat, StateKey, TableNames,
+    UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -963,6 +963,12 @@ impl<'a> Binder<'a> {
             .with_span(first_column(ast, right)));
         }
         let (recursive, over) = self.project_onto(recursive, &other, &fields, &name)?;
+        if !all {
+            for (at, field) in fields.iter().enumerate() {
+                let span = set_op_column(ast, left, at, fields.len());
+                self.sort_group_operators(&field.ty, false, span)?;
+            }
+        }
         if !all && self.semantics.recursive_union() == RecursiveUnion::Postgres {
             let hashable = |field: &Field| {
                 crate::pgcalls::exact_oid(&field.ty).is_none_or(rudb_pgtypes::hashable)
@@ -1636,6 +1642,12 @@ impl<'a> Binder<'a> {
         }
         let index = self.fresh_index();
         let all = operator.quantifier == Quantifier::All;
+        if !all {
+            for (at, column) in merged.iter().enumerate() {
+                let span = set_op_column(ast, left, at, left_scope.len());
+                self.sort_group_operators(&column.ty, false, span)?;
+            }
+        }
         let sides: Vec<[Option<(ColumnBinding, LogicalType)>; 2]> = merged
             .iter()
             .map(|column| {
@@ -1958,13 +1970,15 @@ impl<'a> Binder<'a> {
             let everything = groups_everything(ast, &written)?;
             self.unnest_grouping = Some(everything);
             let mut groups = Vec::with_capacity(group_items.len());
-            for item in &group_items {
+            for &(item, written) in &group_items {
                 // `GROUP BY ALL` groups on what a star or a `COLUMNS` in the list stands for.
-                if everything && let Some(expanded) = self.bind_star_each(ast, *item, &input)? {
+                if everything && let Some(expanded) = self.bind_star_each(ast, item, &input)? {
                     groups.extend(expanded);
                     continue;
                 }
-                let group = self.bind_expr(ast, *item, &input)?;
+                let group = self.bind_expr(ast, item, &input)?;
+                let ty = self.plan.expr_type(group).clone();
+                self.sort_group_operators(&ty, false, ast.leftmost_span(written))?;
                 self.check_sort_collation(group)?;
                 groups.push(group);
             }
@@ -2100,6 +2114,7 @@ impl<'a> Binder<'a> {
         self.joined_above = outer_joined_above;
         self.distinct_order(ast, written.distinct, &output, &sorted)?;
         let mut on = self.distinct_on(ast, written.distinct, &output)?;
+        self.distinct_operators(ast, written.distinct, &targets, &exprs[..visible], &on)?;
         // A plain DISTINCT sorted on something it does not select is, as on the pin, a DISTINCT ON
         // what it selects, keeping the first row of each.
         if extra && written.distinct == Distinct::Yes {
@@ -2514,25 +2529,27 @@ impl<'a> Binder<'a> {
         describe(ast, target, self.semantics)
     }
 
-    /// The expressions a `GROUP BY` clause names, with positions and output aliases followed.
+    /// The expressions a `GROUP BY` clause names, with positions and output aliases followed,
+    /// each with the item as written, where an error about the key is placed.
     fn group_items(
         &self,
         ast: &Ast,
         select: &ast::Select,
         targets: &[ast::Target],
-    ) -> Result<Vec<ast::ExprRef>> {
+    ) -> Result<Vec<(ast::ExprRef, ast::ExprRef)>> {
         if groups_everything(ast, select)? {
             // GROUP BY ALL means every target that is not itself an aggregate, which is the set
             // that would otherwise have to be written out again by hand.
             return Ok(targets
                 .iter()
                 .filter(|target| !self.aggregates(ast, target.expr))
-                .map(|target| target.expr)
+                .map(|target| (target.expr, target.expr))
                 .collect());
         }
         let mut items = Vec::new();
         for &item in ast.expr_list(select.group_by) {
-            items.push(self.output_reference(ast, item, targets, "GROUP BY")?.unwrap_or(item));
+            let named = self.output_reference(ast, item, targets, "GROUP BY")?;
+            items.push((named.unwrap_or(item), item));
         }
         Ok(items)
     }
@@ -2619,6 +2636,7 @@ impl<'a> Binder<'a> {
                     });
                     sorted.push(Sorted { position, written: item.expr, extra: held.is_none() });
                     let ty = self.plan.expr_type(exprs[position]).clone();
+                    self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
                     let expr = self.column(project, position, ty);
                     let expr = self.collate_key(expr, exprs[position])?;
                     keys.push(self.sort_key(expr, item));
@@ -2645,6 +2663,7 @@ impl<'a> Binder<'a> {
             };
             sorted.push(Sorted { position, written: item.expr, extra });
             let ty = self.plan.expr_type(exprs[position]).clone();
+            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
             let expr = self.column(project, position, ty);
             let expr = self.order_key(expr, exprs[position], ordinal.as_deref())?;
             keys.push(self.sort_key(expr, item));
@@ -2669,6 +2688,8 @@ impl<'a> Binder<'a> {
             let (item, ordinal) = self.ordinal_collation(ast, item);
             if let Some(expanded) = self.bind_star_each(ast, item.expr, output)? {
                 for expr in expanded {
+                    let ty = self.plan.expr_type(expr).clone();
+                    self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
                     let expr = self.collate_key(expr, expr)?;
                     keys.push(self.sort_key(expr, item));
                 }
@@ -2686,6 +2707,8 @@ impl<'a> Binder<'a> {
                     self.bind_expr(ast, item.expr, output)?
                 }
             };
+            let ty = self.plan.expr_type(expr).clone();
+            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
             let expr = self.order_key(expr, expr, ordinal.as_deref())?;
             keys.push(self.sort_key(expr, item));
         }
@@ -2853,6 +2876,108 @@ impl<'a> Binder<'a> {
             && let Some(&(_, item)) = on.iter().find(|(position, _)| !keys.contains(position))
         {
             return misplaced(item, message);
+        }
+        Ok(())
+    }
+
+    /// The rule of [`SortOperators::Postgres`] for a key, as `get_sort_group_operators` checks
+    /// it: a key that sorts needs the ordering operator of its type, and each key needs the
+    /// equality operator. The operators come from the default btree or hash operator class of
+    /// the type, so a type with none, such as `json`, is error 42883 at `span`. A type that
+    /// PostgreSQL does not have is left to the pin.
+    pub(crate) fn sort_group_operators(
+        &self,
+        ty: &LogicalType,
+        sorts: bool,
+        span: Span,
+    ) -> Result<()> {
+        if self.semantics.sort_operators() != SortOperators::Postgres {
+            return Ok(());
+        }
+        let Some(oid) = crate::pgcalls::exact_oid(ty) else {
+            return Ok(());
+        };
+        let name = rudb_pgtypes::format_type(oid);
+        let error = |missing: &str| {
+            Error::binder(format!("could not identify {missing} operator for type {name}"))
+                .state(SqlState::UNDEFINED_FUNCTION)
+                .with_span(span)
+        };
+        if sorts && !rudb_pgtypes::has_ordering(oid) {
+            return Err(
+                error("an ordering").hint("Use an explicit ordering operator or modify the query.")
+            );
+        }
+        if !rudb_pgtypes::has_equality(oid) {
+            return Err(error("an equality"));
+        }
+        Ok(())
+    }
+
+    /// The rule of [`SortOperators::Postgres`] for the keys of a `DISTINCT`, as
+    /// `transformDistinctClause` and `transformDistinctOnClause` check them: each column that a
+    /// plain `DISTINCT` selects, or each expression of a `DISTINCT ON`, needs the equality
+    /// operator of its type. `exprs` are the columns that the query selects and `on` the bound
+    /// expressions of a `DISTINCT ON`.
+    fn distinct_operators(
+        &self,
+        ast: &Ast,
+        distinct: Distinct,
+        targets: &[ast::Target],
+        exprs: &[ExprRef],
+        on: &[ExprRef],
+    ) -> Result<()> {
+        let keys: Vec<(ExprRef, ast::ExprRef)> = match distinct {
+            Distinct::No => return Ok(()),
+            // A star selects more than one column, and its columns are placed at the star.
+            Distinct::Yes => {
+                let written = |at: usize| match targets.len() == exprs.len() {
+                    true => targets[at].expr,
+                    false => targets.first().map_or(NONE, |target| target.expr),
+                };
+                exprs.iter().enumerate().map(|(at, &expr)| (expr, written(at))).collect()
+            }
+            Distinct::On(items) => {
+                on.iter().copied().zip(ast.expr_list(items).iter().copied()).collect()
+            }
+        };
+        for (expr, written) in keys {
+            let ty = self.plan.expr_type(expr).clone();
+            self.sort_group_operators(&ty, false, ast.leftmost_span(written))?;
+        }
+        Ok(())
+    }
+
+    /// The rule of [`SortOperators::Postgres`] for the arguments of a `DISTINCT` aggregate, as
+    /// `transformAggregateCall` checks them: each one needs the equality operator of its type,
+    /// and then the ordering operator, because the aggregate sorts its inputs to find the values
+    /// that are the same.
+    pub(crate) fn distinct_aggregate_operators(
+        &self,
+        ast: &Ast,
+        args: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<()> {
+        for (&arg, &written) in bound.iter().zip(args) {
+            let ty = self.plan.expr_type(arg).clone();
+            self.sort_group_operators(&ty, false, ast.leftmost_span(written))?;
+        }
+        if self.semantics.sort_operators() != SortOperators::Postgres {
+            return Ok(());
+        }
+        for (&arg, &written) in bound.iter().zip(args) {
+            let ty = self.plan.expr_type(arg);
+            if let Some(oid) = crate::pgcalls::exact_oid(ty)
+                && !rudb_pgtypes::has_ordering(oid)
+            {
+                return Err(Error::binder(format!(
+                    "could not identify an ordering operator for type {}",
+                    rudb_pgtypes::format_type(oid)
+                ))
+                .state(SqlState::UNDEFINED_FUNCTION)
+                .detail("Aggregates with DISTINCT must be able to sort their inputs.")
+                .with_span(ast.leftmost_span(written)));
+            }
         }
         Ok(())
     }
@@ -5663,12 +5788,19 @@ impl<'a> Binder<'a> {
             return Err(error);
         }
         let keys = bound.split_off(args.len());
+        for (&key, item) in keys.iter().zip(sorted) {
+            let ty = self.plan.expr_type(key).clone();
+            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+        }
         // A distinct aggregate sees each value once, and a key that is not one of the values would
         // have more than one of them to sort that value by.
         if distinct && !keys.iter().all(|&key| bound.iter().any(|&arg| self.same_expr(arg, key))) {
             return Err(Error::binder(
                 "In a DISTINCT aggregate, ORDER BY expressions must appear in the argument list",
             ));
+        }
+        if distinct {
+            self.distinct_aggregate_operators(ast, &args, &bound)?;
         }
 
         // `min` and `max` of a parameter of no type read `text` in PostgreSQL.
@@ -6320,6 +6452,8 @@ impl<'a> Binder<'a> {
         for item in ast.order_list(written.order).to_vec() {
             let expr = self.bind_expr(ast, item.expr, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
+            let ty = self.plan.expr_type(expr).clone();
+            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
             let expr = self.collate_key(expr, expr)?;
             inner.push(self.sort_key(expr, item));
         }
@@ -6327,12 +6461,16 @@ impl<'a> Binder<'a> {
         for &key in ast.expr_list(held.partition) {
             let expr = self.bind_expr(ast, key, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
+            let ty = self.plan.expr_type(expr).clone();
+            self.sort_group_operators(&ty, false, ast.leftmost_span(key))?;
             partition.push(self.collate_key(expr, expr)?);
         }
         let mut order = Vec::new();
         for item in ast.order_list(held.order).to_vec() {
             let expr = self.bind_expr(ast, item.expr, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
+            let ty = self.plan.expr_type(expr).clone();
+            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
             let expr = self.collate_key(expr, expr)?;
             order.push(self.sort_key(expr, item));
         }
@@ -6657,6 +6795,17 @@ fn first_column(ast: &Ast, query: ast::QueryRef) -> Span {
         _ => None,
     };
     first.map_or_else(|| ast.query_span(query), |expr| ast.expr_span(expr))
+}
+
+/// Where PostgreSQL places an error about the column `at` of a set operation: at the column as
+/// the leftmost `SELECT` under the operation writes it, or at its first column when the column
+/// is not written one for one.
+fn set_op_column(ast: &Ast, query: ast::QueryRef, at: usize, width: usize) -> Span {
+    if let ast::QueryBody::SetOp { left, .. } = ast.query(query).body {
+        return set_op_column(ast, left, at, width);
+    }
+    written_column(ast, query, at, width)
+        .map_or_else(|| first_column(ast, query), |expr| ast.leftmost_span(expr))
 }
 
 /// A key of the `ORDER BY` of a `SELECT`: the column of the projection that it sorts on, the
