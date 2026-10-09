@@ -957,18 +957,18 @@ mod tests {
 
     #[test]
     fn one_partition_deduplicates_pairs_and_counts_groups_across_the_runs_it_was_handed() {
-        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let row = |group, user| Record { user, group };
         // Three instances, and the pair (3, 10) arrives in two of them, which is the case the
         // deduplication has to see across a run boundary rather than only within one run.
         let mut first = Run::default();
-        first.push(row(3, 10, 5), true);
-        first.push(row(3, 10, 5), true);
+        first.push(row(3, 10), true);
+        first.push(row(3, 10), true);
         let mut second = Run::default();
-        second.push(row(3, 11, 5), true);
-        second.push(row(3, 10, 5), true);
+        second.push(row(3, 11), true);
+        second.push(row(3, 10), true);
         let mut third = Run::default();
-        third.push(row(4, 10, 5), true);
-        third.push(row(0, 10, 5), false);
+        third.push(row(4, 10), true);
+        third.push(row(0, 10), false);
         let mut partition = Held { runs: vec![first, Run::default(), second, third] };
         let rows = finished(&mut partition, &signed());
         assert_eq!(
@@ -979,18 +979,18 @@ mod tests {
                 vec![Value::Null, Value::BigInt(1)],
             ]
         );
-        assert_eq!(size_of::<Record>(), 16);
+        assert_eq!(size_of::<Record>(), 12);
     }
 
     #[test]
     fn a_group_held_as_a_dictionary_code_comes_out_as_the_string_the_code_stands_for() {
-        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let row = |group, user| Record { user, group };
         let mut run = Run::default();
-        run.push(row(2, 10, 5), true);
-        run.push(row(2, 11, 5), true);
-        run.push(row(2, 10, 5), true);
-        run.push(row(1, 10, 5), true);
-        run.push(row(0, 10, 5), false);
+        run.push(row(2, 10), true);
+        run.push(row(2, 11), true);
+        run.push(row(2, 10), true);
+        run.push(row(1, 10), true);
+        run.push(row(0, 10), false);
         let mut partition = Held { runs: vec![run] };
         let rows = finished(&mut partition, &Shape::Alone(Column::Dictionary(words())));
         // Code 0 is "zero" in the dictionary and the group whose key was null still answers NULL,
@@ -1014,13 +1014,13 @@ mod tests {
             let Shape::Many(composite) = &shape else { panic!("a composite") };
             ((phone - i64::from(i16::MIN) + 1) * composite.strides[0] + word + 1) as i32
         };
-        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let row = |group, user| Record { user, group };
         let mut run = Run::default();
-        run.push(row(code(7, 2), 10, 5), true);
-        run.push(row(code(7, 2), 11, 5), true);
-        run.push(row(code(7, 2), 10, 5), true);
-        run.push(row(code(7, 1), 10, 5), true);
-        run.push(row(code(-3, 1), 10, 5), true);
+        run.push(row(code(7, 2), 10), true);
+        run.push(row(code(7, 2), 11), true);
+        run.push(row(code(7, 2), 10), true);
+        run.push(row(code(7, 1), 10), true);
+        run.push(row(code(-3, 1), 10), true);
         let mut partition = Held { runs: vec![run] };
         assert_eq!(
             finished(&mut partition, &shape),
@@ -1040,11 +1040,11 @@ mod tests {
         // that is left of the composite is the word's own code.
         let code = |word: i64| (word + 1) as i32;
         let (first, second) = (code(1), code(2));
-        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let row = |group, user| Record { user, group };
         let mut run = Run::default();
-        run.push(row(first, 10, 5), true);
-        run.push(row(second, 10, 5), true);
-        run.push(row(second, 11, 5), true);
+        run.push(row(first, 10), true);
+        run.push(row(second, 10), true);
+        run.push(row(second, 11), true);
         let mut partition = Held { runs: vec![run] };
         assert_eq!(
             finished(&mut partition, &shape),
@@ -1082,14 +1082,14 @@ mod tests {
         //
         // At one split as well as at several, because a query small enough to finish on one thread
         // asks for one split and that is the arithmetic in `split_of` that has no bits left to shift.
-        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let row = |group, user| Record { user, group };
         for splits in [1, SPLITS] {
             let mut first = Run::default();
-            first.push(row(3, 10, 5), true);
-            first.push(row(3, 11, 5), true);
+            first.push(row(3, 10), true);
+            first.push(row(3, 11), true);
             let mut second = Run::default();
-            second.push(row(3, 12, 9), true);
-            second.push(row(4, 12, 9), true);
+            second.push(row(3, 12), true);
+            second.push(row(4, 12), true);
             let mut left = Held { runs: vec![first] };
             let mut right = Held { runs: vec![second] };
             let memory = Memory::unlimited();
@@ -1112,15 +1112,15 @@ mod tests {
         // A split is cut up when it holds more pairs than one thread's fair share, and then no piece
         // of it has all of any group and the counts have to be added up afterwards. Asking for a
         // thread per pair makes every split too big for one, so every split here takes that path.
-        let row = |group, user, pair_hash| Record { user, group, pair_hash };
+        let row = |group, user| Record { user, group };
         let mut first = Run::default();
-        first.push(row(3, 10, 5), true);
-        first.push(row(3, 11, 5), true);
-        first.push(row(4, 12, 9), true);
+        first.push(row(3, 10), true);
+        first.push(row(3, 11), true);
+        first.push(row(4, 12), true);
         let mut second = Run::default();
-        second.push(row(3, 12, 9), true);
-        second.push(row(3, 14, 9), true);
-        second.push(row(4, 13, 5), true);
+        second.push(row(3, 12), true);
+        second.push(row(3, 14), true);
+        second.push(row(4, 13), true);
         let mut left = Held { runs: vec![first] };
         let mut right = Held { runs: vec![second] };
         let memory = Memory::unlimited();

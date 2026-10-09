@@ -34,7 +34,7 @@ pub(crate) const PARTITIONS: usize = 64;
 ///
 /// The number this wants to be is whatever keeps the table a partition builds inside the cache the
 /// thread building it has to itself. A row costs four bytes of bucket at the half load the table
-/// keeps and sixteen bytes of record, so sixteen thousand rows is a table of about three hundred and
+/// keeps and twelve bytes of record, so sixteen thousand rows is a table of about three hundred and
 /// fifty kilobytes, and that is the largest one measured that was still worth having.
 ///
 /// It is also the number the finishing passes ramp on. A partition is one thread's piece of work,
@@ -121,11 +121,32 @@ const EMPTY: u32 = u32::MAX;
 const NOTHING: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// One row on its way to the partition its pair hash picks.
+///
+/// Twelve bytes, packed to the group's alignment so that the user does not round the record up to
+/// sixteen. The pair hash used to ride along in the four bytes that rounding left, and the runs that
+/// hold these are most of what a grouped distinct count keeps: `COUNT(DISTINCT UserID) GROUP BY
+/// RegionID` on ten million rows held 25 MB of them at its peak. The hash is worked out again from
+/// the pair by whoever probes with it, which is two multiplies a row on passes that wait on memory
+/// rather than on arithmetic.
 #[derive(Debug, Clone, Copy)]
+#[repr(C, packed(4))]
 pub(crate) struct Record {
     pub(crate) user: i64,
     pub(crate) group: i32,
-    pub(crate) pair_hash: u32,
+}
+
+impl Record {
+    /// The hash the scatter picked this row's partition with.
+    #[inline]
+    fn pair_hash(self, valid: bool) -> u32 {
+        pair_hash(group_seed(self.group, valid), self.user)
+    }
+}
+
+/// The hash of a pair, from its group's seed.
+#[inline]
+fn pair_hash(seed: u64, user: i64) -> u32 {
+    folded(spread(mix(seed, user as u64)))
 }
 
 /// The hash of a group before it is folded to thirty two bits, which is where both hashes start.
@@ -183,7 +204,7 @@ pub(crate) struct Run {
 /// looks at its length when a chunk fills.
 const COMPACT_FROM: usize = 4_096;
 
-/// The rows in one chunk of a [`Run`], sixteen kilobytes of them.
+/// The rows in one chunk of a [`Run`], twelve kilobytes of them.
 const CHUNK: usize = 1_024;
 
 impl Run {
@@ -273,7 +294,7 @@ impl Run {
         for at in 0..len {
             let row = self.full[at / CHUNK][at % CHUNK];
             let valid = all_valid || self.validity[at];
-            let mut slot = row.pair_hash as usize & mask;
+            let mut slot = row.pair_hash(valid) as usize & mask;
             loop {
                 let held = buckets[slot];
                 if held == EMPTY {
@@ -380,8 +401,8 @@ pub(crate) fn scatter_seeded(
     valid: bool,
     user: i64,
 ) {
-    let pair_hash = folded(spread(mix(seed, user as u64)));
-    partitions[(pair_hash >> shift) as usize].push(Record { user, group, pair_hash }, valid);
+    let pair_hash = pair_hash(seed, user);
+    partitions[(pair_hash >> shift) as usize].push(Record { user, group }, valid);
 }
 
 /// The pair the previous row scattered, so that a row repeating it is dropped before it is hashed.
@@ -716,13 +737,15 @@ pub(crate) fn distinct_pairs(
         // flatten: this is the iterator over a run's chunks of pairs, and no column is copied out.
         for (source, &row) in run.chunks().flatten().enumerate() {
             let valid = all_valid || run.valid_at(source);
-            let tag = row.pair_hash & tag_mask;
-            let mut at = row.pair_hash as usize & pair_mask;
+            let seed = group_seed(row.group, valid);
+            let pair_hash = pair_hash(seed, row.user);
+            let tag = pair_hash & tag_mask;
+            let mut at = pair_hash as usize & pair_mask;
             loop {
                 let slot = pair_buckets[at];
                 if slot == EMPTY {
                     pair_buckets[at] = tag | (start + source) as u32;
-                    let group_hash = group_hash(row.group, valid);
+                    let group_hash = folded(seed);
                     let grouped = Grouped { group: row.group, valid };
                     if !(tally.open && tally.add(grouped, group_hash)) {
                         if parts[0].capacity() == 0 {
@@ -796,8 +819,8 @@ mod tests {
 
     use super::{
         CHUNK, COMPACT_FROM, Counted, Grouped, Held, PARTITIONS, ROWS_PER_PARTITION, Record,
-        Repeat, Run, distinct_pairs, folded, group_hash, group_seed, merged, mix, scatter,
-        scatter_seeded, shift, spread, used,
+        Repeat, Run, distinct_pairs, folded, group_hash, group_seed, merged, scatter,
+        scatter_seeded, shift, used,
     };
 
     /// Every pair a split was handed, with a tallied group standing in for as many pairs as it
@@ -843,8 +866,8 @@ mod tests {
     #[test]
     fn a_run_that_opens_with_an_invalid_key_keeps_its_validity() {
         let mut run = Run::default();
-        run.push(Record { user: 10, group: 0, pair_hash: 5 }, false);
-        run.push(Record { user: 11, group: 4, pair_hash: 5 }, true);
+        run.push(Record { user: 10, group: 0 }, false);
+        run.push(Record { user: 11, group: 4 }, true);
         assert_eq!(run.validity, [false, true]);
         assert!(!run.valid_at(0));
         assert!(run.valid_at(1));
@@ -854,14 +877,27 @@ mod tests {
     #[test]
     fn a_pair_bucket_reads_the_original_row_across_runs_and_hash_collisions() {
         assert_eq!(size_of::<Grouped>(), 8);
-        let first = Record { user: 10, group: 7, pair_hash: 3 };
-        let other = Record { user: 11, group: 7, pair_hash: 3 };
+        assert_eq!(size_of::<Record>(), 12);
+        // Two users whose pairs with group 7 hash the same, found by trying users until two meet,
+        // which at thirty two bits takes some tens of thousands of them.
+        let mut seen = std::collections::HashMap::new();
+        let (first, other) = (0_i64..)
+            .find_map(|user| {
+                let hash = Record { user, group: 7 }.pair_hash(true);
+                seen.insert(hash, user).map(|before| (before, user))
+            })
+            .expect("a collision");
+        assert_eq!(
+            Record { user: first, group: 7 }.pair_hash(true),
+            Record { user: other, group: 7 }.pair_hash(true)
+        );
+        let (first, other) = (Record { user: first, group: 7 }, Record { user: other, group: 7 });
         let mut left = Run::default();
         left.push(first, true);
         let mut right = Run::default();
         right.push(other, true);
         right.push(first, true);
-        right.push(Record { user: 12, group: 0, pair_hash: u32::MAX }, false);
+        right.push(Record { user: 12, group: 0 }, false);
         let mut partition = Held { runs: vec![left, right] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("colliding pairs");
@@ -876,9 +912,7 @@ mod tests {
         for round in 0..(COMPACT_FROM * 4) {
             let user = (round % 100) as i64;
             let valid = round % 3 != 0;
-            let seed = group_seed(7, valid);
-            let pair_hash = folded(spread(mix(seed, user as u64)));
-            run.push(Record { user, group: 7, pair_hash }, valid);
+            run.push(Record { user, group: 7 }, valid);
         }
         assert!(run.footprint() <= COMPACT_FROM * 2 * size_of::<Record>() + 4_096, "grew");
         let mut partition = Held { runs: vec![run] };
@@ -896,8 +930,7 @@ mod tests {
         let mut run = Run::default();
         let users = COMPACT_FROM * 3;
         for user in 0..users as i64 {
-            let pair_hash = folded(spread(mix(group_seed(1, true), user as u64)));
-            run.push(Record { user, group: 1, pair_hash }, true);
+            run.push(Record { user, group: 1 }, true);
         }
         assert_eq!(run.limit, usize::MAX);
         assert_eq!(run.len(), users);
@@ -915,9 +948,7 @@ mod tests {
         let users = CHUNK * 5 + 17;
         for round in 0..3 {
             for user in 0..users as i64 {
-                let seed = group_seed(round % 2, true);
-                let pair_hash = folded(spread(mix(seed, user as u64)));
-                run.push(Record { user, group: round % 2, pair_hash }, true);
+                run.push(Record { user, group: round % 2 }, true);
             }
         }
         assert!(run.chunks().all(|chunk| !chunk.is_empty()));
@@ -936,8 +967,7 @@ mod tests {
             let mut run = Run::default();
             for user in 0..20_000_i64 {
                 let group = (user % groups) as i32;
-                let pair_hash = folded(spread(mix(group_seed(group, true), user as u64)));
-                run.push(Record { user, group, pair_hash }, true);
+                run.push(Record { user, group }, true);
             }
             let mut held = Held { runs: vec![run] };
             distinct_pairs(&mut held, 4, &rudb_common::Memory::unlimited()).expect("a partition")
@@ -955,8 +985,8 @@ mod tests {
     #[test]
     fn a_null_key_does_not_join_the_group_whose_key_is_zero() {
         let mut run = Run::default();
-        run.push(Record { user: 10, group: 0, pair_hash: 5 }, false);
-        run.push(Record { user: 10, group: 0, pair_hash: 5 }, true);
+        run.push(Record { user: 10, group: 0 }, false);
+        run.push(Record { user: 10, group: 0 }, true);
         let mut partition = Held { runs: vec![run] };
         let counted = distinct_pairs(&mut partition, 1, &rudb_common::Memory::unlimited())
             .expect("a pair partition");
@@ -992,7 +1022,10 @@ mod tests {
                     };
                     let left = at(&plain);
                     assert_eq!(left, at(&seeded), "{group} {valid} {user}");
-                    assert_eq!(plain[left].at(0).pair_hash, seeded[left].at(0).pair_hash);
+                    assert_eq!(
+                        plain[left].at(0).pair_hash(valid),
+                        seeded[left].at(0).pair_hash(valid)
+                    );
                     assert_eq!(plain[left].validity, seeded[left].validity);
                 }
             }
