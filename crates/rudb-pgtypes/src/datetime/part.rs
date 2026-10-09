@@ -1,6 +1,6 @@
-//! `extract`: one field of a date, a time, a timestamp or an interval as a `numeric`, as
+//! `extract` and `date_part`: one field of a date, a time, a timestamp or an interval, as
 //! `extract_date` and `time_part_common` in `date.c` and `timestamp_part_common` and the functions
-//! next to it in `timestamp.c` compute it.
+//! next to it in `timestamp.c` compute it. `extract` gives a `numeric` and `date_part` a `float8`.
 //!
 //! The unit is lowercased and cut to the length of a name, and then looked up as a unit of an
 //! interval and then as a reserved word of the date input. A word that is neither is not
@@ -8,9 +8,11 @@
 //! infinite value gives a null for a unit that repeats, such as the month, and an infinity with
 //! the sign of the value for a unit that only grows, such as the year.
 //!
-//! A field that is a count is an integer. The seconds and the epoch have six digits after the
-//! point and the milliseconds three, and the Julian day of a timestamp is the day and the fraction
-//! of it that the time is, at the scale of the division of `numeric`.
+//! A field that is a count is an integer. In a `numeric`, the seconds and the epoch have six
+//! digits after the point and the milliseconds three, and the Julian day of a timestamp is the day
+//! and the fraction of it that the time is, at the scale of the division of `numeric`. In a
+//! `float8`, a field with a fraction is computed in `double` with the steps of the C code, so that
+//! it rounds as PostgreSQL rounds it.
 
 use rudb_common::SqlState;
 
@@ -64,6 +66,122 @@ const INTERVAL: &str = "interval";
 const USECS_PER_MINUTE: i64 = 60 * USECS_PER_SEC;
 const USECS_PER_HOUR: i64 = 60 * USECS_PER_MINUTE;
 
+/// The type of an answer, `numeric` for `extract` and `float8` for `date_part`, with the
+/// arithmetic of the C code for each field that is not a count.
+trait Answer: Sized {
+    fn count(value: i64) -> Self;
+    fn infinity(negative: bool) -> Self;
+    /// The seconds of a clock, from its whole seconds and its microseconds.
+    fn seconds(sec: i64, usec: i64) -> Self;
+    /// The milliseconds of a clock, from its whole seconds and its microseconds.
+    fn milliseconds(sec: i64, usec: i64) -> Self;
+    /// The Julian day `day` and the fraction of a day that `clock` seconds and `usec`
+    /// microseconds are.
+    fn julian(day: i64, clock: i64, usec: i64) -> Result<Self, TypeError>;
+    /// The seconds of a `time` in microseconds.
+    fn time_epoch(time: i64) -> Self;
+    /// The seconds of a `timetz` in microseconds with its zone in seconds west of UTC.
+    fn timetz_epoch(time: i64, zone: i32) -> Self;
+    /// The seconds since 1970-01-01 of a timestamp in microseconds since 2000-01-01.
+    fn stamp_epoch(ts: i64) -> Self;
+    /// The seconds of an interval, with a year of 365.25 days and a month of 30.
+    fn interval_epoch(interval: &Interval) -> Self;
+}
+
+impl Answer for Numeric {
+    fn count(value: i64) -> Self {
+        Numeric::from_integer(value.into())
+    }
+
+    fn infinity(negative: bool) -> Self {
+        if negative { Numeric::NEGATIVE_INFINITY } else { Numeric::INFINITY }
+    }
+
+    fn seconds(sec: i64, usec: i64) -> Self {
+        scaled(i128::from(sec) * i128::from(USECS_PER_SEC) + i128::from(usec), 6)
+    }
+
+    fn milliseconds(sec: i64, usec: i64) -> Self {
+        scaled(i128::from(sec) * i128::from(USECS_PER_SEC) + i128::from(usec), 3)
+    }
+
+    fn julian(day: i64, clock: i64, usec: i64) -> Result<Self, TypeError> {
+        let micros = i128::from(clock) * i128::from(USECS_PER_SEC) + i128::from(usec);
+        let fraction =
+            Numeric::from_integer(micros).div(&Numeric::from_integer(USECS_PER_DAY.into()))?;
+        Numeric::from_integer(day.into()).add(&fraction)
+    }
+
+    fn time_epoch(time: i64) -> Self {
+        scaled(time.into(), 6)
+    }
+
+    fn timetz_epoch(time: i64, zone: i32) -> Self {
+        scaled(i128::from(time) + i128::from(zone) * i128::from(USECS_PER_SEC), 6)
+    }
+
+    fn stamp_epoch(ts: i64) -> Self {
+        scaled(i128::from(ts) - i128::from(UNIX_TO_POSTGRES_USECS), 6)
+    }
+
+    fn interval_epoch(interval: &Interval) -> Self {
+        let Interval { time, day, month } = *interval;
+        // Four times the seconds of the days and the months is a whole number.
+        let quarters =
+            1461 * i64::from(month / 12) + 120 * i64::from(month % 12) + 4 * i64::from(day);
+        let seconds = i128::from(quarters) * i128::from(86_400 / 4);
+        scaled(seconds * i128::from(USECS_PER_SEC) + i128::from(time), 6)
+    }
+}
+
+impl Answer for f64 {
+    fn count(value: i64) -> Self {
+        value as f64
+    }
+
+    fn infinity(negative: bool) -> Self {
+        if negative { f64::NEG_INFINITY } else { f64::INFINITY }
+    }
+
+    fn seconds(sec: i64, usec: i64) -> Self {
+        sec as f64 + usec as f64 / 1_000_000.0
+    }
+
+    fn milliseconds(sec: i64, usec: i64) -> Self {
+        sec as f64 * 1000.0 + usec as f64 / 1000.0
+    }
+
+    fn julian(day: i64, clock: i64, usec: i64) -> Result<Self, TypeError> {
+        Ok(day as f64 + (clock as f64 + usec as f64 / 1_000_000.0) / 86_400.0)
+    }
+
+    fn time_epoch(time: i64) -> Self {
+        time as f64 / 1_000_000.0
+    }
+
+    fn timetz_epoch(time: i64, zone: i32) -> Self {
+        time as f64 / 1_000_000.0 + f64::from(zone)
+    }
+
+    fn stamp_epoch(ts: i64) -> Self {
+        // The subtraction in 64 bits loses no precision, and it overflows only near the end of
+        // the range, where the C code subtracts in `double`.
+        match ts.checked_sub(UNIX_TO_POSTGRES_USECS) {
+            Some(since) => since as f64 / 1_000_000.0,
+            None => (ts as f64 - UNIX_TO_POSTGRES_USECS as f64) / 1_000_000.0,
+        }
+    }
+
+    fn interval_epoch(interval: &Interval) -> Self {
+        let Interval { time, day, month } = *interval;
+        let mut seconds = time as f64 / 1_000_000.0;
+        seconds += (365.25 * 86_400.0) * f64::from(month / 12);
+        seconds += (30.0 * 86_400.0) * f64::from(month % 12);
+        seconds += 86_400.0 * f64::from(day);
+        seconds
+    }
+}
+
 /// `extract(text, date)`. `None` is a null.
 pub fn extract_date(units: &str, date: i32) -> Result<Option<Numeric>, TypeError> {
     let (low, unit) = lower_units(units);
@@ -83,7 +201,7 @@ pub fn extract_date(units: &str, date: i32) -> Result<Option<Numeric>, TypeError
             | Unit::Millennium
             | Unit::Julian
             | Unit::IsoYear
-            | Unit::Epoch => Ok(Some(infinity(date == DATE_NEGATIVE_INFINITY))),
+            | Unit::Epoch => Ok(Some(Answer::infinity(date == DATE_NEGATIVE_INFINITY))),
             _ => Err(not_supported(&low, DATE)),
         };
     }
@@ -102,9 +220,18 @@ pub fn extract_date(units: &str, date: i32) -> Result<Option<Numeric>, TypeError
 
 /// `extract(text, time)`, for microseconds since midnight.
 pub fn extract_time(units: &str, time: i64) -> Result<Numeric, TypeError> {
+    time_part_common(units, time)
+}
+
+/// `date_part(text, time)`, for microseconds since midnight.
+pub fn time_part(units: &str, time: i64) -> Result<f64, TypeError> {
+    time_part_common(units, time)
+}
+
+fn time_part_common<A: Answer>(units: &str, time: i64) -> Result<A, TypeError> {
     let (low, unit) = lower_units(units);
     match unit {
-        Some(Unit::Epoch) => Ok(scaled(time.into(), 6)),
+        Some(Unit::Epoch) => Ok(A::time_epoch(time)),
         None | Some(Unit::Reserved) => Err(not_recognized(&low, TIME)),
         Some(unit) => clock_field(unit, time).ok_or_else(|| not_supported(&low, TIME)),
     }
@@ -113,14 +240,21 @@ pub fn extract_time(units: &str, time: i64) -> Result<Numeric, TypeError> {
 /// `extract(text, timetz)`, for microseconds since midnight on the clock of the value and the
 /// offset of the value in seconds west of UTC.
 pub fn extract_timetz(units: &str, time: i64, zone: i32) -> Result<Numeric, TypeError> {
+    timetz_part_common(units, time, zone)
+}
+
+/// `date_part(text, timetz)`, with the arguments of [`extract_timetz`].
+pub fn timetz_part(units: &str, time: i64, zone: i32) -> Result<f64, TypeError> {
+    timetz_part_common(units, time, zone)
+}
+
+fn timetz_part_common<A: Answer>(units: &str, time: i64, zone: i32) -> Result<A, TypeError> {
     let (low, unit) = lower_units(units);
     match unit {
-        Some(Unit::Epoch) => {
-            Ok(scaled(i128::from(time) + i128::from(zone) * i128::from(USECS_PER_SEC), 6))
-        }
+        Some(Unit::Epoch) => Ok(A::timetz_epoch(time, zone)),
         None | Some(Unit::Reserved) => Err(not_recognized(&low, TIMETZ)),
         Some(unit) => zone_field(unit, zone)
-            .map(|value| Numeric::from_integer(value.into()))
+            .map(A::count)
             .or_else(|| clock_field(unit, time))
             .ok_or_else(|| not_supported(&low, TIMETZ)),
     }
@@ -128,19 +262,28 @@ pub fn extract_timetz(units: &str, time: i64, zone: i32) -> Result<Numeric, Type
 
 /// `extract(text, timestamp)`, for microseconds since 2000-01-01. `None` is a null.
 pub fn extract_timestamp(units: &str, ts: i64) -> Result<Option<Numeric>, TypeError> {
+    timestamp_part_common(units, ts)
+}
+
+/// `date_part(text, timestamp)`, for microseconds since 2000-01-01. `None` is a null.
+pub fn timestamp_part(units: &str, ts: i64) -> Result<Option<f64>, TypeError> {
+    timestamp_part_common(units, ts)
+}
+
+fn timestamp_part_common<A: Answer>(units: &str, ts: i64) -> Result<Option<A>, TypeError> {
     let (low, unit) = lower_units(units);
     if ts == TIMESTAMP_INFINITY || ts == TIMESTAMP_NEGATIVE_INFINITY {
         return non_finite_stamp(unit, &low, ts == TIMESTAMP_NEGATIVE_INFINITY, TIMESTAMP);
     }
     let unit = unit.ok_or_else(|| not_recognized(&low, TIMESTAMP))?;
     if unit == Unit::Epoch {
-        return Ok(Some(epoch(ts)));
+        return Ok(Some(A::stamp_epoch(ts)));
     }
     if unit == Unit::Reserved {
         return Err(not_supported(&low, TIMESTAMP));
     }
     let fields = Fields::of_timestamp(ts).ok_or_else(|| out_of_range("timestamp"))?;
-    stamp_field(unit, &fields, None).map(Some).ok_or_else(|| not_supported(&low, TIMESTAMP))
+    stamp_field(unit, &fields, None)?.map(Some).ok_or_else(|| not_supported(&low, TIMESTAMP))
 }
 
 /// `extract(text, timestamptz)`, for microseconds since 2000-01-01 UTC, with the fields of the
@@ -150,13 +293,30 @@ pub fn extract_timestamptz(
     ts: i64,
     zone: &(impl TimeZone + ?Sized),
 ) -> Result<Option<Numeric>, TypeError> {
+    timestamptz_part_common(units, ts, zone)
+}
+
+/// `date_part(text, timestamptz)`, with the arguments of [`extract_timestamptz`].
+pub fn timestamptz_part(
+    units: &str,
+    ts: i64,
+    zone: &(impl TimeZone + ?Sized),
+) -> Result<Option<f64>, TypeError> {
+    timestamptz_part_common(units, ts, zone)
+}
+
+fn timestamptz_part_common<A: Answer>(
+    units: &str,
+    ts: i64,
+    zone: &(impl TimeZone + ?Sized),
+) -> Result<Option<A>, TypeError> {
     let (low, unit) = lower_units(units);
     if ts == TIMESTAMP_INFINITY || ts == TIMESTAMP_NEGATIVE_INFINITY {
         return non_finite_stamp(unit, &low, ts == TIMESTAMP_NEGATIVE_INFINITY, TIMESTAMPTZ);
     }
     let unit = unit.ok_or_else(|| not_recognized(&low, TIMESTAMPTZ))?;
     if unit == Unit::Epoch {
-        return Ok(Some(epoch(ts)));
+        return Ok(Some(A::stamp_epoch(ts)));
     }
     if unit == Unit::Reserved {
         return Err(not_supported(&low, TIMESTAMPTZ));
@@ -171,13 +331,25 @@ pub fn extract_timestamptz(
         j2date((local.div_euclid(86_400) + i64::from(UNIX_EPOCH_JDATE)) as i32);
     let (hour, minute, second, _) = split_time(local.rem_euclid(86_400) * USECS_PER_SEC);
     let fields = Fields { year, month, day, hour, minute, second, usec: utc.usec };
-    stamp_field(unit, &fields, Some(-offset))
+    stamp_field(unit, &fields, Some(-offset))?
         .map(Some)
         .ok_or_else(|| not_supported(&low, TIMESTAMPTZ))
 }
 
 /// `extract(text, interval)`. `None` is a null.
 pub fn extract_interval(units: &str, interval: &Interval) -> Result<Option<Numeric>, TypeError> {
+    interval_part_common(units, interval)
+}
+
+/// `date_part(text, interval)`. `None` is a null.
+pub fn interval_part(units: &str, interval: &Interval) -> Result<Option<f64>, TypeError> {
+    interval_part_common(units, interval)
+}
+
+fn interval_part_common<A: Answer>(
+    units: &str,
+    interval: &Interval,
+) -> Result<Option<A>, TypeError> {
     let (low, unit) = lower_units(units);
     let unit = unit.ok_or_else(|| not_recognized(&low, INTERVAL))?;
     if *interval == Interval::INFINITY || *interval == Interval::NEGATIVE_INFINITY {
@@ -196,7 +368,7 @@ pub fn extract_interval(units: &str, interval: &Interval) -> Result<Option<Numer
             | Unit::Decade
             | Unit::Century
             | Unit::Millennium
-            | Unit::Epoch => Ok(Some(infinity(*interval == Interval::NEGATIVE_INFINITY))),
+            | Unit::Epoch => Ok(Some(A::infinity(*interval == Interval::NEGATIVE_INFINITY))),
             _ => Err(not_supported(&low, INTERVAL)),
         };
     }
@@ -205,12 +377,7 @@ pub fn extract_interval(units: &str, interval: &Interval) -> Result<Option<Numer
         return Err(not_recognized(&low, INTERVAL));
     }
     if unit == Unit::Epoch {
-        // A year is 365.25 days and a month 30, so four times the seconds of the days and the
-        // months is a whole number.
-        let quarters =
-            1461 * i64::from(month / 12) + 120 * i64::from(month % 12) + 4 * i64::from(day);
-        let seconds = i128::from(quarters) * i128::from(86_400 / 4);
-        return Ok(Some(scaled(seconds * i128::from(USECS_PER_SEC) + i128::from(time), 6)));
+        return Ok(Some(A::interval_epoch(interval)));
     }
     // `interval2itm`.
     let (year, mon) = (i64::from(month / 12), i64::from(month % 12));
@@ -230,7 +397,7 @@ pub fn extract_interval(units: &str, interval: &Interval) -> Result<Option<Numer
             return clock_field(unit, time).map(Some).ok_or_else(|| not_supported(&low, INTERVAL));
         }
     };
-    Ok(Some(Numeric::from_integer(value.into())))
+    Ok(Some(A::count(value)))
 }
 
 /// `downcase_truncate_identifier`: the unit with its ASCII letters lowercased, cut to the length
@@ -249,12 +416,12 @@ fn lower_units(units: &str) -> (String, Option<Unit>) {
 }
 
 /// `NonFiniteTimestampTzPart`, for a timestamp that is an infinity.
-fn non_finite_stamp(
+fn non_finite_stamp<A: Answer>(
     unit: Option<Unit>,
     low: &str,
     negative: bool,
     ty: &str,
-) -> Result<Option<Numeric>, TypeError> {
+) -> Result<Option<A>, TypeError> {
     match unit.ok_or_else(|| not_recognized(low, ty))? {
         Unit::Microsecond
         | Unit::Millisecond
@@ -277,35 +444,36 @@ fn non_finite_stamp(
         | Unit::Millennium
         | Unit::Julian
         | Unit::IsoYear
-        | Unit::Epoch => Ok(Some(infinity(negative))),
+        | Unit::Epoch => Ok(Some(A::infinity(negative))),
         Unit::Reserved => Err(not_supported(low, ty)),
     }
 }
 
 /// A field of the fields of a timestamp, with the zone in seconds west of UTC for a
 /// `timestamptz`. `None` for a unit that the type does not have.
-fn stamp_field(unit: Unit, fields: &Fields, zone: Option<i32>) -> Option<Numeric> {
+fn stamp_field<A: Answer>(
+    unit: Unit,
+    fields: &Fields,
+    zone: Option<i32>,
+) -> Result<Option<A>, TypeError> {
     let (year, month, day) = (fields.year, fields.month as i32, fields.day as i32);
     let value = match unit {
-        Unit::Tz | Unit::TzHour | Unit::TzMinute => zone_field(unit, zone?)?,
+        Unit::Tz | Unit::TzHour | Unit::TzMinute => zone.and_then(|zone| zone_field(unit, zone)),
         Unit::Julian => {
             let clock = (i64::from(fields.hour) * 60 + i64::from(fields.minute)) * 60
                 + i64::from(fields.second);
-            let micros = clock * USECS_PER_SEC + i64::from(fields.usec);
-            let fraction = Numeric::from_integer(micros.into())
-                .div(&Numeric::from_integer(USECS_PER_DAY.into()))
-                .ok()?;
-            return Numeric::from_integer(date2j(year, month, day).into()).add(&fraction).ok();
+            let day = date2j(year, month, day).into();
+            return A::julian(day, clock, i64::from(fields.usec)).map(Some);
         }
         Unit::Microsecond | Unit::Millisecond | Unit::Second | Unit::Minute | Unit::Hour => {
             let time = (i64::from(fields.hour) * 60 + i64::from(fields.minute)) * USECS_PER_MINUTE
                 + i64::from(fields.second) * USECS_PER_SEC
                 + i64::from(fields.usec);
-            return clock_field(unit, time);
+            return Ok(clock_field(unit, time));
         }
-        unit => date_field(unit, year, month, day)?,
+        unit => date_field(unit, year, month, day),
     };
-    Some(Numeric::from_integer(value.into()))
+    Ok(value.map(A::count))
 }
 
 /// A field of a date that a date and the timestamps have. `None` for another unit.
@@ -342,17 +510,18 @@ fn date_field(unit: Unit, year: i32, month: i32, day: i32) -> Option<i64> {
 
 /// A field of a clock in microseconds, which for an interval can pass 24 hours or be negative.
 /// `None` for another unit.
-fn clock_field(unit: Unit, time: i64) -> Option<Numeric> {
+fn clock_field<A: Answer>(unit: Unit, time: i64) -> Option<A> {
     let hour = time / USECS_PER_HOUR;
     let time = time - hour * USECS_PER_HOUR;
     let minute = time / USECS_PER_MINUTE;
     let micros = time - minute * USECS_PER_MINUTE;
+    let (sec, usec) = (micros / USECS_PER_SEC, micros % USECS_PER_SEC);
     Some(match unit {
-        Unit::Microsecond => Numeric::from_integer(micros.into()),
-        Unit::Millisecond => scaled(micros.into(), 3),
-        Unit::Second => scaled(micros.into(), 6),
-        Unit::Minute => Numeric::from_integer(minute.into()),
-        Unit::Hour => Numeric::from_integer(hour.into()),
+        Unit::Microsecond => A::count(micros),
+        Unit::Millisecond => A::milliseconds(sec, usec),
+        Unit::Second => A::seconds(sec, usec),
+        Unit::Minute => A::count(minute),
+        Unit::Hour => A::count(hour),
         _ => return None,
     })
 }
@@ -368,18 +537,9 @@ fn zone_field(unit: Unit, zone: i32) -> Option<i64> {
     })
 }
 
-/// The seconds since 1970-01-01 of a timestamp in microseconds since 2000-01-01.
-fn epoch(ts: i64) -> Numeric {
-    scaled(i128::from(ts) - i128::from(UNIX_TO_POSTGRES_USECS), 6)
-}
-
 /// `int64_div_fast_to_numeric`: `value / 10^scale`, with `scale` digits after the point.
 fn scaled(value: i128, scale: u32) -> Numeric {
     Numeric::from_decimal(value, scale)
-}
-
-fn infinity(negative: bool) -> Numeric {
-    if negative { Numeric::NEGATIVE_INFINITY } else { Numeric::INFINITY }
 }
 
 fn not_supported(low: &str, ty: &str) -> TypeError {

@@ -1993,10 +1993,12 @@ fn the_windows_of_a_query_are_computed_in_the_order_postgres_computes_them_in() 
     server.stop().unwrap();
 }
 
-/// `extract` gives a numeric with the value and the scale that PostgreSQL gives, reads a time
-/// stamp with a time zone in the zone of the session, and refuses a unit as PostgreSQL does.
+/// `extract` gives a numeric with the value and the scale that PostgreSQL gives and `date_part` a
+/// double, both read a time stamp with a time zone in the zone of the session, and both refuse a
+/// unit as PostgreSQL does. A function with a body in SQL, such as `date_part(text, date)` or
+/// `round(numeric)`, is its body.
 #[test]
-fn extract_gives_the_numeric_that_postgres_gives() {
+fn extract_and_date_part_give_the_answers_that_postgres_gives() {
     let dirs = Dirs::new("pgextract");
     let server = Server::start(dirs.config()).unwrap();
     let mut client = Client::unix(&server);
@@ -2023,6 +2025,22 @@ fn extract_gives_the_numeric_that_postgres_gives() {
         ("select pg_typeof(extract(year from now()))::text", "numeric"),
         ("select extract(century from date '0001-01-01 BC')::text", "-1"),
         ("select extract(\"Year\" from date '2020-07-01')::text", "2020"),
+        ("select pg_typeof(date_part('year', date '2020-07-01'))::text", "double precision"),
+        ("select date_part('year', date 'infinity')::text", "Infinity"),
+        ("select date_part('hour', date '2020-07-01')::text", "0"),
+        (
+            "select date_part('julian', timestamp '2020-07-01 18:00:01.5')::text",
+            "2459032.7500173612",
+        ),
+        (
+            "select date_part('epoch', interval '1 year 2 months 3 days 4.5 seconds')::text",
+            "37000804.5",
+        ),
+        ("select date_part('second', timetz '01:02:03.123+05')::text", "3.123"),
+        ("select date_part('millisecond', time '00:00:56.789012')::text", "56789.012"),
+        ("select round(2.5)::text", "3"),
+        ("select log(100.0)::text", "2.0000000000000000"),
+        ("select lpad('ab', 5)", "   ab"),
     ] {
         assert_eq!(scalar(&mut client, sql), value, "{sql}");
     }
@@ -2034,6 +2052,10 @@ fn extract_gives_the_numeric_that_postgres_gives() {
         ),
         "-14400"
     );
+    assert_eq!(
+        scalar(&mut client, "select date_part('hour', timestamptz '2020-07-01 12:00+00')::text"),
+        "8"
+    );
     for (sql, state, message) in [
         (
             "select extract(hour from date '2020-07-01')",
@@ -2044,6 +2066,16 @@ fn extract_gives_the_numeric_that_postgres_gives() {
             "select extract(foo from timestamp '2020-07-01')",
             "22023",
             "unit \"foo\" not recognized for type timestamp without time zone",
+        ),
+        (
+            "select date_part('day', time '01:00')",
+            "0A000",
+            "unit \"day\" not supported for type time without time zone",
+        ),
+        (
+            "select date_part('now', interval '1 day')",
+            "22023",
+            "unit \"now\" not recognized for type interval",
         ),
         (
             "select pg_catalog.extract('year', '2020-07-01')",
