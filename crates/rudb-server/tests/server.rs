@@ -921,11 +921,16 @@ fn a_name_that_if_exists_lets_go_gives_a_notice() {
     // client_min_messages above NOTICE keeps them from the client, and ERROR keeps warnings too.
     client.query("set client_min_messages = warning");
     assert_eq!(tags(&client.query("drop table if exists nx")), "CZ");
+    // The statements that the server runs without the engine keep the same rule, for example the
+    // first statements of pg_regress.
+    assert_eq!(tags(&client.query("drop database if exists nd")), "CZ");
+    assert_eq!(tags(&client.query("drop role if exists nr")), "CZ");
     assert_eq!(tags(&client.query("commit")), "NCZ");
     client.query("set client_min_messages = error");
     assert_eq!(tags(&client.query("commit")), "CZ");
     client.query("reset client_min_messages");
     assert_eq!(tags(&client.query("drop table if exists nx")), "NCZ");
+    assert_eq!(notices(&client.query("drop database if exists nd")), [skipping("database", "nd")]);
     server.stop().unwrap();
 }
 

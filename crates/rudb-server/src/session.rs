@@ -1395,7 +1395,8 @@ impl Runner {
                         now: now + UNIX_TO_POSTGRES_USECS,
                     },
                 };
-                let tag = role::execute(parsed, offset, &cx, out)?;
+                let notices = &mut role::Notices { out, least: self.least };
+                let tag = role::execute(parsed, offset, &cx, notices)?;
                 self.sync_superuser();
                 tag
             }
@@ -1411,7 +1412,8 @@ impl Runner {
                     sql,
                     guc: &self.guc,
                 };
-                database::execute(parsed, offset, &cx, out)?
+                let notices = &mut role::Notices { out, least: self.least };
+                database::execute(parsed, offset, &cx, notices)?
             }
             Command::Show(name) => {
                 let (column, value) = self.guc.show(name).map_err(failure)?;
