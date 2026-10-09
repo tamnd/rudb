@@ -862,34 +862,53 @@ const DENSE_WORD: u32 = 8;
     reason = "a mask is over a chunk, whose rows fit in a u32"
 )]
 pub fn mask_selection(words: &[u64], kept: usize) -> Selection {
-    let mut out = Vec::with_capacity(kept);
+    // Each run of kept rows is written as a whole block of 64 past the rows listed so far, and
+    // only its own rows are counted, so a run is a copy of fixed width with no tail to finish one
+    // row at a time, and whatever it writes past its rows is written over by the next run or cut
+    // off at the end. A word lists at most 64 rows and writes 64 past the last of them, which is
+    // the room kept at the end of the list.
+    let mut out = vec![0_u32; kept + 2 * 64];
+    let mut listed = 0;
     for (block, &word) in words.iter().enumerate() {
-        let base = (block * 64) as u32;
-        if word == u64::MAX {
-            out.extend(base..base + 64);
+        if word == 0 {
             continue;
         }
+        if out.len() < listed + 2 * 64 {
+            out.resize(listed + 2 * 64, 0);
+        }
+        let base = (block * 64) as u32;
         // A word that keeps most of its rows is walked by the rows it drops, each run between
-        // two dropped rows copied whole, since a filter that keeps nearly every row would
-        // otherwise pay a step for every row it keeps.
+        // two of them copied whole, since a filter that keeps nearly every row would otherwise
+        // pay a step for every row it keeps.
         if word.count_zeros() <= DENSE_WORD {
             let mut dropped = !word;
             let mut from = 0;
-            while dropped != 0 {
-                let at = dropped.trailing_zeros();
-                out.extend(base + from..base + at);
+            loop {
+                let at = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
+                let first = base.wrapping_add(from);
+                for (row, slot) in out[listed..listed + 64].iter_mut().enumerate() {
+                    *slot = first.wrapping_add(row as u32);
+                }
+                listed += (at - from) as usize;
+                if dropped == 0 {
+                    break;
+                }
                 from = at + 1;
                 dropped &= dropped - 1;
             }
-            out.extend(base + from..base + 64);
             continue;
         }
+        let run = &mut out[listed..listed + 64];
         let mut word = word;
+        let mut count = 0;
         while word != 0 {
-            out.push(base + word.trailing_zeros());
+            run[count & 63] = base + word.trailing_zeros();
+            count += 1;
             word &= word - 1;
         }
+        listed += count;
     }
+    out.truncate(listed);
     Selection::from_indices(out)
 }
 
