@@ -3343,8 +3343,9 @@ impl Vector {
     #[must_use]
     pub fn signed_gather(&self, at: &[u32], out: &mut Vec<i64>) -> bool {
         out.clear();
-        match &self.body {
-            Body::Flat(data) => data.signed_gather(self.len, at, out),
+        let rows = self.rows_or_self();
+        match &rows.body {
+            Body::Flat(data) => data.signed_gather(rows.len, at, out),
             _ => false,
         }
     }
@@ -3471,8 +3472,11 @@ impl Vector {
                 }
                 // A filter's selection over a part is a dictionary over the whole part, so widening
                 // every entry first was a pass over the part per chunk where the codes are a chunk.
-                if let Body::Flat(data) = &values.body {
-                    return data.signed_gather(values.len, codes, out);
+                // A part held as runs is the same through the rows laid out beside them, and copying
+                // all of them for every chunk was most of what q16 added reading `ps_partkey`.
+                let rows = values.rows_or_self();
+                if let Body::Flat(data) = &rows.body {
+                    return data.signed_gather(rows.len, codes, out);
                 }
                 let mut entries = Vec::new();
                 if !values.signed_block(&mut entries) {
@@ -3860,6 +3864,9 @@ impl Vector {
         let Body::Dictionary { codes, values, .. } = &self.body else {
             return None;
         };
+        // Runs laid out under the codes are read as their rows, which a filter over a key held as
+        // its runs leaves. The copy below walked the codes and then the runs a position at a time.
+        let values = values.rows_or_self();
         if !matches!(self.validity, Validity::AllValid)
             || !matches!(values.validity, Validity::AllValid)
         {
@@ -3893,6 +3900,20 @@ impl Vector {
     #[inline]
     fn flat_and_all_valid(&self) -> bool {
         matches!(self.validity, Validity::AllValid) && matches!(self.body, Body::Flat(_))
+    }
+
+    /// The rows of runs laid out, or this vector for any other form or for runs not laid out.
+    ///
+    /// A reader that takes a dictionary's values as flat when they are asks this first, since a
+    /// filter over a key held as its runs is a dictionary over the runs, and the rows beside them
+    /// are the flat values it was written for.
+    fn rows_or_self(&self) -> &Self {
+        match &self.body {
+            Body::Runs { laid, .. } if matches!(self.validity, Validity::AllValid) => {
+                laid.flat().unwrap_or(self)
+            }
+            _ => self,
+        }
     }
 
     /// The flat form of a run length vector, laid out the first time something asks for it and
@@ -7731,6 +7752,16 @@ mod tests {
         let past = handed.gather(&[3, 999]).unwrap();
         assert_eq!(past, flat.gather(&[3, 999]).unwrap());
         assert!(past.is_null_at(1));
+        // A filter's selection over the runs reads the rows laid out beside them.
+        let codes = vec![30_u32, 0, 9, 9, 25];
+        let over_runs = Vector::dictionary(codes.clone(), handed.clone()).unwrap();
+        let over_rows = Vector::dictionary(codes.clone(), flat.clone()).unwrap();
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        assert!(over_runs.signed_block(&mut got) && over_rows.signed_block(&mut want));
+        assert_eq!(got, want);
+        assert!(handed.signed_gather(&codes, &mut got) && flat.signed_gather(&codes, &mut want));
+        assert_eq!(got, want);
+        assert_eq!(over_runs.flatten().unwrap(), over_rows.flatten().unwrap());
         assert!(
             Vector::runs_laid_out(ends.to_vec(), values.clone(), flat.slice(0, 5).unwrap())
                 .is_err()
