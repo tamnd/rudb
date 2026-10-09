@@ -345,8 +345,12 @@ fn grouped(plan: &mut Plan, at: NodeRef) -> Option<NodeRef> {
         (source, plan.add_expr_list(&columns))
     };
     let staged = walk::fresh_index(plan);
-    let aggregate =
-        plan.add_node(Node::Aggregate { input: source, index: staged, groups, aggregates: Slice::EMPTY });
+    let aggregate = plan.add_node(Node::Aggregate {
+        input: source,
+        index: staged,
+        groups,
+        aggregates: Slice::EMPTY,
+    });
     let outputs: Vec<ExprRef> =
         projected.iter().enumerate().map(|(at, &expr)| column(plan, staged, at, expr)).collect();
     let outputs = plan.add_expr_list(&outputs);
