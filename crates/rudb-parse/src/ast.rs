@@ -85,6 +85,8 @@ pub type SettingRef = u32;
 pub type AttachRef = u32;
 /// An index into [`Ast::copies`].
 pub type CopyToRef = u32;
+/// An index into [`Ast::vacuums`].
+pub type VacuumRef = u32;
 /// An index into `Ast::windows`.
 pub type WindowRef = u32;
 
@@ -178,6 +180,35 @@ pub enum Statement {
     Execute { name: StrRef, values: QueryRef },
     /// `DEALLOCATE name` or `DEALLOCATE PREPARE name`.
     Deallocate(StrRef),
+    /// `VACUUM` or `ANALYZE`, as an index into [`Ast::vacuums`].
+    Vacuum(VacuumRef),
+}
+
+/// `VACUUM` or `ANALYZE`, with its options and the tables it names.
+///
+/// The two are one statement in both grammars. The options are kept as written, as a run of
+/// [`Ast::utility_options`], because which ones a statement takes is the business of the binder.
+/// The PostgreSQL grammar writes `VACUUM FULL` as the option `full`, and the DuckDB grammar is read
+/// into the same shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vacuum {
+    /// `VACUUM` rather than `ANALYZE`.
+    pub vacuum: bool,
+    /// The options, a run of [`Ast::utility_options`].
+    pub options: Slice,
+    /// The tables, none when the statement names none and means every table.
+    pub targets: Vec<VacuumTarget>,
+}
+
+/// One table of a [`Vacuum`] and the columns written after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumTarget {
+    /// The table name, as a run of parts, outermost first.
+    pub name: Slice,
+    /// The columns, as a run of parts, empty when none were written.
+    pub columns: Slice,
+    /// Where the table name was written.
+    pub span: Span,
 }
 
 /// One option of a PostgreSQL utility statement, such as `FORMAT JSON` in `EXPLAIN (FORMAT JSON)`.
@@ -1781,6 +1812,8 @@ pub struct Ast {
     pub attaches: Vec<Attach>,
     /// The `COPY ... TO` arena.
     pub copies: Vec<CopyTo>,
+    /// The `VACUUM` and `ANALYZE` arena.
+    pub vacuums: Vec<Vacuum>,
     /// Backing store for every [`Slice`] of utility options.
     pub utility_options: Vec<UtilityOption>,
     /// Backing store for every [`Slice`] of column definitions.

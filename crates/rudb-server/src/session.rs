@@ -1901,6 +1901,8 @@ fn command_tag(sql: &str, result: &QueryResult, before: Transaction) -> CommandT
         "ABORT" => CommandTag::Rollback,
         // `TABLE` is optional in the statement and always in the tag.
         "TRUNCATE" => CommandTag::TruncateTable,
+        // The British spelling is the same statement, and the tag has one spelling.
+        "ANALYSE" => CommandTag::Analyze,
         _ => (1..=words.len())
             .rev()
             .map(|n| CommandTag::from_name(&words[..n].join(" ")))

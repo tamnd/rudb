@@ -64,9 +64,9 @@ pub use session::{
     AggregateTypes, CastInput, CastOutput, CharacterTypes, Collations, ColumnNames, CommonTypes,
     ConditionTypes, ConflictArbiter, CountTypes, DefaultNullOrder, DistinctOrder, ErrorTexts,
     ExplainOutput, FloatRange, FromFunctions, FunctionRules, IdentifierCase, IdentifierCompare,
-    InsertColumns, JoinColumns, NumberCasts, NumberLiterals, OperatorRules, PlanErrors,
-    PreparedStatement, QueryColumns, RecursiveUnion, RegexRules, RowFields, RowNulls, Semantics,
-    SequenceOwners, Session, SessionTimeZone, SetFunctions, ShowBehavior, SortOperators,
+    InsertColumns, JoinColumns, Maintenance, NumberCasts, NumberLiterals, OperatorRules,
+    PlanErrors, PreparedStatement, QueryColumns, RecursiveUnion, RegexRules, RowFields, RowNulls,
+    Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions, ShowBehavior, SortOperators,
     Subscripts, TableNames, TypeNames, UnknownTypes, ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};

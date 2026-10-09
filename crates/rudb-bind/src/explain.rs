@@ -97,7 +97,7 @@ pub(crate) fn generic(ast: &Ast, options: Slice) -> bool {
 
 /// The value of an option that takes a Boolean, as `defGetBoolean` reads it: no value is true, and
 /// otherwise `0`, `1`, `true`, `false`, `on` or `off` in any case.
-fn boolean(ast: &Ast, option: &UtilityOption) -> Result<bool> {
+pub(crate) fn boolean(ast: &Ast, option: &UtilityOption) -> Result<bool> {
     let value = match option.arg {
         OptionArg::None => return Ok(true),
         OptionArg::Integer(0) => Some(false),
@@ -122,7 +122,7 @@ fn boolean(ast: &Ast, option: &UtilityOption) -> Result<bool> {
 }
 
 /// The value of an option as text, as `defGetString` gives it.
-fn string(ast: &Ast, option: &UtilityOption) -> Result<String> {
+pub(crate) fn string(ast: &Ast, option: &UtilityOption) -> Result<String> {
     match option.arg {
         OptionArg::None => {
             Err(Error::binder(format!("{} requires a parameter", ast.string(option.name)))

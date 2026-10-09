@@ -45,6 +45,7 @@ mod statement;
 mod structs;
 mod typed;
 mod unnest;
+mod vacuum;
 mod value_source;
 mod vector_types;
 
@@ -59,6 +60,7 @@ pub use statement::{
     bind_checks, bind_statement, bind_statement_outlined, bind_statement_sql, bind_statement_with,
     cascading,
 };
+pub use vacuum::Vacuum;
 
 #[cfg(test)]
 mod tests;

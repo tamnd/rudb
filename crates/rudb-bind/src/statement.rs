@@ -107,6 +107,8 @@ pub enum Bound {
     /// and `disable_logging`. They answer no rows and change settings, so they are run where a
     /// `SET` is run and not planned.
     Call(Call),
+    /// `VACUUM` or `ANALYZE`, with its tables checked.
+    Vacuum(crate::Vacuum),
 }
 
 /// A call to a table function that changes settings, with its arguments folded to constants.
@@ -781,6 +783,10 @@ pub(crate) fn bind_one(
             let plan = finish(binder, root)?;
             let typed = copy_values(ast, copy, catalog, parameters, session);
             copy_to(copy, &typed, plan).map(Bound::CopyTo)
+        }
+        ast::Statement::Vacuum(index) => {
+            crate::vacuum::vacuum(ast, &ast.vacuums[index as usize], catalog, session)
+                .map(Bound::Vacuum)
         }
         // The connection holds prepared statements, so the database runs these three itself and
         // only a caller that hands one straight to the binder gets here.

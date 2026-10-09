@@ -27,12 +27,12 @@ use rudb_common::session::IdentifierCase;
 use rudb_common::{Error, Span};
 use rudb_parse::Ast;
 use rudb_parse::ast::{
-    Expr, ExprRef, OptionArg, QueryRef, Slice, SourceRef, Statement, StrRef, UtilityOption,
-    WindowRef,
+    Expr, ExprRef, OptionArg, QueryRef, Slice, SourceRef, Statement, StrRef, UtilityOption, Vacuum,
+    VacuumTarget, WindowRef,
 };
 use rudb_parse::build::Interner;
 
-use crate::nodes::{CTEMaterialize, ExplainStmt, List, Node, RawStmt};
+use crate::nodes::{CTEMaterialize, ExplainStmt, List, Node, RawStmt, VacuumStmt};
 
 /// Why [`transform`] did not give a tree.
 #[derive(Debug)]
@@ -254,6 +254,7 @@ impl<'a> Transform<'a> {
             Some(Node::DeleteStmt(delete)) => self.delete(delete)?,
             Some(Node::IndexStmt(index)) => self.create_index(index)?,
             Some(Node::ExplainStmt(explain)) => self.explain(explain)?,
+            Some(Node::VacuumStmt(vacuum)) => self.vacuum(vacuum)?,
             Some(Node::TruncateStmt(truncate)) => {
                 let statements = self.truncate(truncate)?;
                 self.ast.statements.extend(statements);
@@ -278,8 +279,16 @@ impl<'a> Transform<'a> {
             Some(node) => return Err(not_yet(node)),
             None => return clause("ExplainStmt"),
         };
-        let mut options = Vec::with_capacity(explain.options.len());
-        for node in explain.options.iter().flatten() {
+        let options = self.utility_options(&explain.options)?;
+        Ok(Statement::Explain { query, analyze: false, statistics: false, codegen: false, options })
+    }
+
+    /// The option list of a utility statement, as a run of [`Ast::utility_options`]. The grammar
+    /// writes each option as a `DefElem`, the older spellings such as `VACUUM FULL` too, so every
+    /// spelling arrives as one list.
+    fn utility_options(&mut self, list: &List) -> Made<Slice> {
+        let mut options = Vec::with_capacity(list.len());
+        for node in list.iter().flatten() {
             let Node::DefElem(option) = node else {
                 return Err(not_yet(node));
             };
@@ -298,8 +307,34 @@ impl<'a> Transform<'a> {
         }
         let start = self.ast.utility_options.len() as u32;
         self.ast.utility_options.extend(options);
-        let options = Slice { start, len: self.ast.utility_options.len() as u32 - start };
-        Ok(Statement::Explain { query, analyze: false, statistics: false, codegen: false, options })
+        Ok(Slice { start, len: self.ast.utility_options.len() as u32 - start })
+    }
+
+    /// `VACUUM` or `ANALYZE`, which are one statement in the grammar, with the options as written
+    /// and each table with the columns written after it.
+    fn vacuum(&mut self, vacuum: &VacuumStmt) -> Made<Statement> {
+        let options = self.utility_options(&vacuum.options)?;
+        let mut targets = Vec::with_capacity(vacuum.rels.len());
+        for node in vacuum.rels.iter().flatten() {
+            let Node::VacuumRelation(relation) = node else {
+                return Err(not_yet(node));
+            };
+            let table = relation.relation.as_deref();
+            let span = table.map_or(self.span, |table| self.at(table.location));
+            let (name, _) = self.written_table(table)?;
+            let mut columns = Vec::with_capacity(relation.va_cols.len());
+            for column in relation.va_cols.iter().flatten() {
+                let Node::String(column) = column else {
+                    return Err(not_yet(column));
+                };
+                columns.push(self.intern(column));
+            }
+            let columns = self.ast.part_slice(columns);
+            targets.push(VacuumTarget { name, columns, span });
+        }
+        let index = self.ast.vacuums.len() as u32;
+        self.ast.vacuums.push(Vacuum { vacuum: vacuum.is_vacuumcmd, options, targets });
+        Ok(Statement::Vacuum(index))
     }
 
     /// The span of the token at a location, or the span of the statement when the location is not

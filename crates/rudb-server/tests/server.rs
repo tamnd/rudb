@@ -1518,6 +1518,81 @@ fn distinct_on_keeps_the_first_row_in_the_order_of_order_by() {
     server.stop().unwrap();
 }
 
+/// `VACUUM` and `ANALYZE` check their options, tables and columns as PostgreSQL does, warn for a
+/// view they skip, and a `VACUUM` does not run in a transaction block.
+#[test]
+fn vacuum_and_analyze_check_their_options_tables_and_columns() {
+    let dirs = Dirs::new("pgvacuum");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "create temp table kept (a int, b text); create temp view kept_v as select a from kept",
+    );
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for (sql, tag) in [
+        ("analyze kept", "ANALYZE"),
+        ("analyse kept(b)", "ANALYZE"),
+        ("vacuum analyze kept(a)", "VACUUM"),
+        ("vacuum (freeze, index_cleanup auto, parallel 2) kept", "VACUUM"),
+        ("analyze (buffer_usage_limit '256kB') kept", "ANALYZE"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "CZ", "{sql}");
+        assert_eq!(text(&messages[0]), tag, "{sql}");
+    }
+    for (sql, code, message, position) in [
+        ("vacuum (bogus) kept", "42601", "unrecognized VACUUM option \"bogus\"", Some("9")),
+        ("analyze (analyze) kept", "42601", "unrecognized ANALYZE option \"analyze\"", Some("10")),
+        (
+            "vacuum (parallel 2000) kept",
+            "42601",
+            "PARALLEL option must be between 0 and 1024",
+            Some("9"),
+        ),
+        (
+            "vacuum kept(a)",
+            "0A000",
+            "ANALYZE option must be specified when a column list is provided",
+            None,
+        ),
+        ("analyze kept(z)", "42703", "column \"z\" of relation \"kept\" does not exist", None),
+        (
+            "analyze kept(a, A)",
+            "42701",
+            "column \"a\" of relation \"kept\" appears more than once",
+            None,
+        ),
+        ("analyze nope", "42P01", "relation \"nope\" does not exist", None),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), position, "{sql}");
+    }
+    for (sql, action) in [("vacuum kept_v", "vacuum"), ("analyze kept_v", "analyze")] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "NCZ", "{sql}");
+        assert_eq!(messages[0].field(b'S').as_deref(), Some("WARNING"));
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("01000"));
+        let skipping =
+            format!("skipping \"kept_v\" --- cannot {action} non-tables or special system tables");
+        assert_eq!(messages[0].field(b'M'), Some(skipping));
+    }
+    client.query("begin");
+    assert_eq!(tags(&client.query("analyze kept")), "CZ");
+    let messages = client.query("vacuum kept");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("25001"));
+    assert_eq!(
+        messages[0].field(b'M').as_deref(),
+        Some("VACUUM cannot run inside a transaction block")
+    );
+    client.query("rollback");
+    server.stop().unwrap();
+}
+
 /// `ORDER BY ... USING op` sorts as the btree family that has the operator as its `<` or its `>`,
 /// in a query, in a window and in an aggregate, and another operator is the error of PostgreSQL.
 #[test]

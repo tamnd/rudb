@@ -578,6 +578,36 @@ fn statement_failure(sql: &str) -> String {
 }
 
 #[test]
+fn vacuum_and_analyze_check_their_options_tables_and_columns_as_the_pin_does() {
+    let Bound::Vacuum(vacuum) = bound("ANALYZE hits(url, counter)") else { panic!("a vacuum") };
+    assert!(!vacuum.vacuum && !vacuum.outside_transaction);
+    assert_eq!(vacuum.tables, [QualifiedName::new("memory", "main", "hits")]);
+    // The pin takes a column list without `ANALYZE`, and a `VACUUM` in a transaction block.
+    let Bound::Vacuum(vacuum) = bound("VACUUM visits(duration)") else { panic!("a vacuum") };
+    assert!(vacuum.vacuum && !vacuum.outside_transaction);
+    let Bound::Vacuum(vacuum) = bound("VACUUM") else { panic!("a vacuum") };
+    assert!(vacuum.tables.is_empty());
+    bound("VACUUM ANALYZE hits");
+    bound("ANALYSE");
+    for (sql, message) in [
+        ("VACUUM FULL hits", "Full vacuum option"),
+        ("VACUUM (FULL, VERBOSE) hits", "Verbose vacuum option"),
+        ("ANALYZE VERBOSE hits", "Verbose vacuum option"),
+        ("VACUUM FREEZE nope", "Freeze vacuum option"),
+        ("VACUUM (ANALYZE, bogus) hits", "unrecognized VACUUM option \"bogus\""),
+        ("ANALYZE hits(nope)", "Column with name \"nope\" does not exist"),
+        (
+            "ANALYZE hits(url, URL)",
+            "cannot vacuum or analyze the same column twice, i.e., there is a duplicate entry in \
+             the list of column names",
+        ),
+    ] {
+        assert_eq!(statement_failure(sql), message, "{sql}");
+    }
+    assert!(statement_failure("ANALYZE nope").starts_with("Table with name nope does not exist!"));
+}
+
+#[test]
 fn a_set_arrives_with_its_value_already_a_value() {
     let Bound::Setting(setting) = bound("SET memory_limit = '1GB'") else { panic!("a setting") };
     assert_eq!(setting.name, "memory_limit");
