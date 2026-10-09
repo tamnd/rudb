@@ -14166,7 +14166,7 @@ fn a_postgres_session_words_binder_errors_as_postgres() {
     let error = connection.execute("SELECT * FROM nope").expect_err("nope");
     assert_eq!(error.message(), "Table with name nope does not exist!");
     let error = connection.execute("SELECT * FROM range(3) ORDER BY 5").expect_err("5");
-    assert_eq!(error.message(), "ORDER BY term out of range - should be between 1 and 1");
+    assert_eq!(error.message(), "ORDER term out of range - should be between 1 and 1");
 }
 
 #[test]

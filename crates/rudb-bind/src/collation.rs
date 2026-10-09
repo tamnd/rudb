@@ -111,14 +111,29 @@ pub(crate) fn written_collation(ast: &Ast, right: ast::ExprRef) -> Option<String
     }
 }
 
+/// Whether a value of `ty` can be compared under a collation, which a string can and so can a list
+/// of strings, whose elements the pin puts through the collation one at a time.
+pub(crate) fn collatable(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::Varchar => true,
+        LogicalType::List(element) => collatable(element),
+        _ => false,
+    }
+}
+
+/// Whether `name` makes a list of its arguments, which is the one way a list takes the collation
+/// of the strings in it, because the type of the list is made from theirs.
+fn makes_a_list(name: &str) -> bool {
+    matches!(name, "list_value" | "list_pack")
+}
+
 /// The error of two different collations meeting in one comparison or one function.
 fn mixed() -> Error {
     Error::binder("Cannot combine types with different collation!")
 }
 
 /// Whether the pin puts the collation of one argument of `name` on all of them, which it does for
-/// the functions that look for one string in another. The list searches do too, and are left out
-/// here until a collation can be put on the strings in a list.
+/// the functions that look for one string in another and for the searches of a list.
 fn pushes_collations(name: &str) -> bool {
     [
         "~~",
@@ -137,6 +152,14 @@ fn pushes_collations(name: &str) -> bool {
         "instr",
         "strpos",
         "position",
+        "list_contains",
+        "list_has",
+        "array_contains",
+        "array_has",
+        "list_position",
+        "list_indexof",
+        "array_position",
+        "array_indexof",
     ]
     .iter()
     .any(|held| rudb_catalog::same_name(name, held))
@@ -345,8 +368,7 @@ impl Binder<'_> {
             matched.push(held);
         }
         let default = self.pin_collated.default.clone();
-        let strings: Vec<bool> =
-            columns.iter().map(|(_, ty)| *ty == LogicalType::Varchar).collect();
+        let strings: Vec<bool> = columns.iter().map(|(_, ty)| collatable(ty)).collect();
         let under = |names: &[Option<String>]| -> Vec<Option<String>> {
             let fallback = |name: &Option<String>| name.clone().or_else(|| default.clone());
             names
@@ -469,7 +491,7 @@ impl Binder<'_> {
         }
         let Some(name) = found else { return Ok(args) };
         for arg in &mut args {
-            if *self.plan().expr_type(*arg) == LogicalType::Varchar {
+            if collatable(self.plan().expr_type(*arg)) {
                 *arg = self.apply_collation(*arg, &name)?;
             }
         }
@@ -477,15 +499,18 @@ impl Binder<'_> {
     }
 
     /// An `ORDER BY 1 COLLATE nocase`, which the pin reads as the first column sorted under the
-    /// collation, as the item with the `COLLATE` taken off and the collation.
+    /// collation, as the item with the `COLLATE` taken off and the collation. A `#1` and the name
+    /// of a column of `output` are read the same way, so an alias wins over a column of the same
+    /// name in the `FROM` clause, as it does in the pin's `OrderBinder`.
     pub(crate) fn ordinal_collation(
         &self,
         ast: &Ast,
         item: ast::OrderItem,
+        output: &Scope,
     ) -> (ast::OrderItem, Option<String>) {
         if self.semantics.collations() == Collations::Pin
             && let ast::Expr::Binary { op: BinaryOp::Collate, left, right } = ast.expr(item.expr)
-            && matches!(ast.expr(left), ast::Expr::Literal { kind: LiteralKind::Number, .. })
+            && self.names_output(ast, left, output)
             && let Some(name) = written_collation(ast, right)
         {
             return (ast::OrderItem { expr: left, ..item }, Some(name));
@@ -495,6 +520,22 @@ impl Binder<'_> {
 
     /// A sort key `expr` under the collation an `ORDER BY 1 COLLATE nocase` named, or else under
     /// the collation of `from`, the expression it sorts by.
+    /// Whether a sort term is a position or the name of a column of `output`.
+    fn names_output(&self, ast: &Ast, term: ast::ExprRef, output: &Scope) -> bool {
+        match ast.expr(term) {
+            ast::Expr::Literal { kind: LiteralKind::Number, .. } | ast::Expr::Positional { .. } => {
+                true
+            }
+            ast::Expr::Column { name } => {
+                let parts: Vec<&str> = ast.name(name).collect();
+                let compare = self.semantics.identifier_compare();
+                let [written] = parts.as_slice() else { return false };
+                output.position_of(compare, None, written).is_some()
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn order_key(
         &mut self,
         expr: ExprRef,
@@ -510,7 +551,7 @@ impl Binder<'_> {
 
     /// A sort key `expr` put through the collation of `from`, the expression it sorts by.
     pub(crate) fn collate_key(&mut self, expr: ExprRef, from: ExprRef) -> Result<ExprRef> {
-        if !self.pin_collated.active() || *self.plan().expr_type(expr) != LogicalType::Varchar {
+        if !self.pin_collated.active() || !collatable(self.plan().expr_type(expr)) {
             return Ok(expr);
         }
         match self.collation_of(from)? {
@@ -532,6 +573,21 @@ impl Binder<'_> {
 
     /// `expr` through the functions of the collation `name`.
     fn apply_collation(&mut self, mut expr: ExprRef, name: &str) -> Result<ExprRef> {
+        // A list goes through `list_transform` with a lambda that puts each element through the
+        // collation, as the pin's `PushNestedCollation` does.
+        if let LogicalType::List(element) = self.plan().expr_type(expr).clone() {
+            let table = self.fresh_index();
+            let parameter = self.plan_mut().intern("x");
+            let params = self.plan_mut().add_name_list(&[parameter]);
+            let value = self.add_expr(Expr::LambdaParam(ColumnBinding::new(table, 0)), *element);
+            let body = self.apply_collation(value, name)?;
+            let ty = self.plan().expr_type(body).clone();
+            let lambda = self.add_expr(Expr::Lambda { table, params, body }, ty.clone());
+            let args = self.plan_mut().add_expr_list(&[expr, lambda]);
+            let transform = self.plan_mut().intern(crate::lambda::TRANSFORM);
+            let function = Expr::Function { name: transform, args };
+            return Ok(self.add_expr(function, LogicalType::List(Box::new(ty))));
+        }
         for function in collation_functions(name)? {
             expr = self.call(function, vec![expr])?;
         }
@@ -546,9 +602,11 @@ impl Binder<'_> {
             return Ok(found.clone());
         }
         let plan = self.plan();
-        if *plan.expr_type(expr) != LogicalType::Varchar {
+        let ty = plan.expr_type(expr);
+        if !collatable(ty) {
             return Ok(None);
         }
+        let string = *ty == LogicalType::Varchar;
         let inputs: Vec<ExprRef> = match plan.expr(expr) {
             Expr::Column(binding) => {
                 let binding = *binding;
@@ -557,7 +615,9 @@ impl Binder<'_> {
                 return Ok(found);
             }
             Expr::Cast { input, .. } => vec![*input],
-            Expr::Function { args, .. } => plan.expr_list(*args).to_vec(),
+            Expr::Function { name, args } if string || makes_a_list(plan.string(*name)) => {
+                plan.expr_list(*args).to_vec()
+            }
             Expr::Aggregate { name, args, .. } | Expr::Window { name, args, .. } => {
                 if returns_its_argument(plan.string(*name)) {
                     plan.expr_list(*args).iter().take(1).copied().collect()

@@ -4107,7 +4107,7 @@ impl Binder<'_> {
         let left = self.checked_cast_to(left, &common, false)?;
         let right = self.checked_cast_to(right, &common, false)?;
         let (left, right) = (self.by_position(left), self.by_position(right));
-        let (left, right) = if common == LogicalType::Varchar {
+        let (left, right) = if crate::collation::collatable(&common) {
             self.collate_sides(left, right)?
         } else {
             (left, right)
