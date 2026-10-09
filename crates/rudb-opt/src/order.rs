@@ -182,13 +182,12 @@ fn implied(plan: &mut Plan) {
     }
 }
 
+/// Two bare columns a condition says are equal, each with the expression that reads it.
+type Equal = ((ColumnBinding, ExprRef), (ColumnBinding, ExprRef));
+
 /// The equalities of two bare columns every row `at` produces holds, as far as inner joins and
 /// filters say them.
-fn holds(
-    plan: &Plan,
-    at: NodeRef,
-    held: &mut Vec<((ColumnBinding, ExprRef), (ColumnBinding, ExprRef))>,
-) {
+fn holds(plan: &Plan, at: NodeRef, held: &mut Vec<Equal>) {
     match *plan.node(at) {
         Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } => {
             held.extend(
@@ -538,10 +537,7 @@ fn multiplies(
 }
 
 /// The two columns a condition says are equal, where it is `=` between two bare columns of one type.
-fn equated(
-    plan: &Plan,
-    condition: ExprRef,
-) -> Option<((ColumnBinding, ExprRef), (ColumnBinding, ExprRef))> {
+fn equated(plan: &Plan, condition: ExprRef) -> Option<Equal> {
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
         return None;
     };
