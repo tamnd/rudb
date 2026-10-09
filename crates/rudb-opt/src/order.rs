@@ -716,7 +716,17 @@ impl Search<'_> {
         let tree = self.best[set as usize].expect("a set the best tree is made of was solved");
         let left = self.place(tree.left, builds);
         let right = self.place(tree.right, builds);
-        let conditions = self.listed(self.crossing(tree.left, tree.right));
+        let mut conditions = self.listed(self.crossing(tree.left, tree.right));
+        // The key with the most values goes first, because the first key is the one a hash join
+        // hands the scan under its driving side, see `rudb_exec::sideways`. TPC-H q09 joins
+        // lineitem to partsupp on both the part and the supplier, and every supplier is on the
+        // gathered side while one part in twenty is, so the part key is the one that filters.
+        if conditions.len() > 1 {
+            conditions.sort_by_key(|&condition| {
+                let keys = estimate::keyspace_of(self.plan, &[condition], self.stats);
+                std::cmp::Reverse(keys.unwrap_or(0))
+            });
+        }
         builds.push(Build::Pair { left, right, conditions });
         builds.len() - 1
     }
@@ -1161,33 +1171,27 @@ mod tests {
         assert_eq!(ordered(text), text);
     }
 
-    /// TPC-H q05 written small. `w` is lineitem with its order and supplier keys, `t` is the
-    /// customers of those orders with their nation, `v` is supplier with its nation and `u` is the
-    /// nations of one region. The query says the customer's nation is the supplier's and the
-    /// supplier's is the region's, and never that the customer's is the region's, which is the join
-    /// that keeps a tenth of the customers before any lineitem row is read.
+    /// The shape TPC-H q05 has between customer, supplier and nation. The query says `u.b = w.d`
+    /// and `w.d = t.a` and never `u.b = t.a`, so the one row of `u` the filter keeps can only reach
+    /// `t` through the hundred thousand rows of `w`. The two conditions put the three columns in one
+    /// class, which makes `u` joined to `t` a pair the search can take, and it is the cheapest first
+    /// join there is.
     #[test]
     fn a_join_two_equalities_imply_is_one_the_search_can_take() {
         let text = concat!(
-            "Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN, (#1.1::BIGINT = #2.1::BIGINT)::BOOLEAN]\n",
-            "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-            "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
-            "    Get memory.main.t AS t #1 [a::BIGINT, f::BIGINT]\n",
-            "  Join INNER on=[(#2.1::BIGINT = #3.0::BIGINT)::BOOLEAN]\n",
-            "    Get memory.main.v AS v #2 [c::BIGINT, g::BIGINT]\n",
-            "    Filter (#3.1::BIGINT = 3::BIGINT)::BOOLEAN\n",
-            "      Get memory.main.u AS u #3 [b::BIGINT, r::BIGINT]\n",
+            "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+            "  Join INNER on=[(#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+            "    Filter (#1.1::BIGINT = 3::BIGINT)::BOOLEAN\n",
+            "      Get memory.main.u AS u #1 [b::BIGINT, r::BIGINT]\n",
+            "  Get memory.main.t AS t #2 [a::BIGINT]\n",
         );
-        let columns = [
-            ("w", "d", 1_000),
-            ("w", "e", 100),
-            ("t", "a", 1_000),
-            ("t", "f", 10),
-            ("v", "c", 100),
-            ("v", "g", 10),
-            ("u", "b", 10),
-            ("u", "r", 10),
-        ];
-        assert_eq!(counted(text, &columns), "");
+        let columns = [("w", "d", 10), ("u", "b", 10), ("u", "r", 10), ("t", "a", 1_000)];
+        let ordered = counted(text, &columns);
+        assert!(
+            ordered.contains("(#1.0::BIGINT = #2.0::BIGINT)")
+                || ordered.contains("(#2.0::BIGINT = #1.0::BIGINT)"),
+            "{ordered}"
+        );
     }
 }
