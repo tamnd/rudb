@@ -252,7 +252,6 @@ impl Transform<'_> {
                 None => return clause("CommonTableExpr"),
             };
             let declared = self.names(&cte.aliascolnames)?;
-            self.defined.push(name.to_string());
             let definition = if with.recursive {
                 self.recursive_definition(cte, select, declared)?
             } else {
@@ -264,11 +263,10 @@ impl Transform<'_> {
                     query,
                     slot: NONE,
                     recursive: false,
-                    logged: 0,
                     reads: Vec::new(),
                 }
             };
-            self.scope.push(Definition { logged: self.defined.len(), ..definition });
+            self.scope.push(definition);
         }
         Ok(())
     }
@@ -299,7 +297,6 @@ impl Transform<'_> {
             query: NONE,
             slot,
             recursive: true,
-            logged: 0,
             reads: Vec::new(),
         });
         let reads = self.self_reads.len();
@@ -326,7 +323,6 @@ impl Transform<'_> {
             query,
             slot,
             recursive,
-            logged: 0,
             reads: Vec::new(),
         })
     }
@@ -427,11 +423,11 @@ impl Transform<'_> {
     /// the query carries.
     ///
     /// A held definition runs once and each read of it reads its rows. Any other definition is put
-    /// into each place that reads it. The rule is the one of the DuckDB transform, so the two
-    /// dialects plan a query the same way. A definition is held when `MATERIALIZED` asks for it,
-    /// when it reads itself, or when it is read more than once by the statement's own query and no
-    /// definition after it takes its name. `NOT MATERIALIZED` puts a definition in place even when
-    /// it is read more than once.
+    /// into each place that reads it. The rule is the one of `inline_cte` in `subselect.c`: a
+    /// definition is held when `MATERIALIZED` asks for it, when it reads itself, or when it is
+    /// read more than once, at any depth. A definition written in a subquery can read a column of
+    /// the query around it, and the held rows are then made again for each row of that query.
+    /// `NOT MATERIALIZED` puts a definition in place even when it is read more than once.
     pub(super) fn settle(&mut self, mark: usize) -> Vec<u32> {
         let definitions = self.scope.split_off(mark);
         let mut once = Vec::new();
@@ -439,9 +435,7 @@ impl Transform<'_> {
             let reads = definition.reads.len();
             let asked = definition.materialized == CTEMaterialize::CTEMaterializeAlways;
             let refused = definition.materialized == CTEMaterialize::CTEMaterializeNever;
-            let hidden = self.defined[definition.logged..].contains(&definition.name);
-            let worth = self.depth == 1 && !hidden && reads > 1;
-            let held = (definition.recursive && reads > 0) || asked || (!refused && worth);
+            let held = (definition.recursive && reads > 0) || asked || (!refused && reads > 1);
             if !held {
                 continue;
             }

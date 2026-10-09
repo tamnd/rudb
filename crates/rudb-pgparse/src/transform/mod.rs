@@ -166,9 +166,6 @@ struct Definition {
     slot: u32,
     /// The definition reads itself, which only a definition under `WITH RECURSIVE` can do.
     recursive: bool,
-    /// The place in [`Transform::defined`] after the definition and its query. The names that are
-    /// defined after this place are the ones that can hide this definition.
-    logged: usize,
     /// Each read of the definition: the source that was put in its place, and the alias and the
     /// column names written on the read.
     reads: Vec<(SourceRef, StrRef, Slice)>,
@@ -190,9 +187,6 @@ struct Transform<'a> {
     windows: Vec<(String, WindowRef, bool)>,
     /// The `WITH` definitions in scope, innermost last.
     scope: Vec<Definition>,
-    /// Every `WITH` name in the order the definitions were found, which tells whether a name is
-    /// defined again after a definition.
-    defined: Vec<String>,
     /// How many queries deep the query being transformed is, counting itself.
     depth: usize,
     /// The slots of the recursive definitions whose own query is being transformed, each with the
@@ -216,7 +210,6 @@ impl<'a> Transform<'a> {
             span: Span::new(0, 0),
             windows: Vec::new(),
             scope: Vec::new(),
-            defined: Vec::new(),
             depth: 0,
             recursing: Vec::new(),
             self_reads: Vec::new(),
@@ -555,6 +548,21 @@ mod tests {
                 "recursive reference to query \"x\" must not appear within a subquery".to_string(),
                 Some(135)
             )
+        );
+    }
+
+    /// PostgreSQL holds a definition that is read more than once wherever it is written, so that
+    /// a volatile function in it gives each read the same rows.
+    #[test]
+    fn a_definition_read_twice_is_held_at_any_depth() {
+        let held = |sql: &str| transform(sql).map(|ast| ast.ctes.len()).ok();
+        let nested = "select count(*) from (with q as (select random()) select * from q union select * from q) s";
+        assert_eq!(held(nested), Some(1));
+        assert_eq!(held("select (with q as (select 1) select count(*) from q, q q2)"), Some(1));
+        assert_eq!(held("select (with q as (select 1) select count(*) from q)"), Some(0));
+        assert_eq!(
+            held("select (with q as not materialized (select 1) select count(*) from q, q q2)"),
+            Some(0)
         );
     }
 
