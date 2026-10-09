@@ -4686,6 +4686,9 @@ pub fn call_values(
     if let Some(answer) = bitstring::value(name, args) {
         return answer;
     }
+    if let Some(answer) = crate::binning::value(name, args, returns) {
+        return answer;
+    }
     if let Some(answer) = lists::value(name, args, returns) {
         return answer;
     }

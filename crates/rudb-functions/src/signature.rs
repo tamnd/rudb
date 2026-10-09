@@ -293,6 +293,10 @@ enum Shape {
     /// with any other number read as a DOUBLE and a DATE as a TIMESTAMP_NS, the y axis a FLOAT or a
     /// DOUBLE, and the count is taken the way [`Shape::Topped`] takes it.
     Plotted,
+    /// `equi_width_bins(min, max, bin_count, nice_rounding)`, worked out over a BIGINT, a DOUBLE
+    /// or a TIMESTAMP by what the two ends are, and a list of the type of `max`, with a decimal
+    /// read as a double. Any other type is refused with the pin's sentence for it.
+    Binned,
     /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
     /// included, and a value as given over anything else.
     Median,
@@ -1664,6 +1668,13 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Boolean),
         numeric_only: false,
     },
+    Entry {
+        name: "equi_width_bins",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(4),
+        shape: Shape::Binned,
+        numeric_only: false,
+    },
     // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
     Entry {
         name: "is_histogram_other_bin",
@@ -2490,6 +2501,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             LogicalType::list(arguments[0].clone()),
         ),
         Shape::Plotted => plotted(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
+        Shape::Binned => binned(arguments).ok_or_else(|| no_match(entry.name, arguments))??,
         Shape::Topped => return Err(no_match(entry.name, arguments)),
         Shape::Extreme => match arguments {
             [_] => {
@@ -3284,6 +3296,56 @@ fn counted(ty: &LogicalType) -> bool {
             | LogicalType::Varchar
             | LogicalType::Null
     )
+}
+
+/// The argument types and answer of `equi_width_bins`, `None` when the count or the flag is not
+/// one the pin casts, and the pin's refusal when the two ends are not a number or a timestamp.
+///
+/// The ends meet at a BIGINT when both fit one, at a DOUBLE when either is a wider number, and at
+/// a TIMESTAMP when both are a date or a timestamp without a zone. The answer is a list of the type
+/// of `max`, so `equi_width_bins(1.5, 10, ...)` is an INTEGER[], and a null anywhere is a null.
+fn binned(arguments: &[LogicalType]) -> Option<Result<(Vec<LogicalType>, LogicalType)>> {
+    let flag =
+        matches!(arguments[3], LogicalType::Boolean | LogicalType::Varchar | LogicalType::Null);
+    if !counted(&arguments[2]) || !flag {
+        return None;
+    }
+    let reads = |ty: &LogicalType| match ty {
+        LogicalType::Null => Some(None),
+        LogicalType::UBigInt
+        | LogicalType::HugeInt
+        | LogicalType::UHugeInt
+        | LogicalType::Float
+        | LogicalType::Double
+        | LogicalType::Decimal { .. } => Some(Some(LogicalType::Double)),
+        LogicalType::Date
+        | LogicalType::Timestamp
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => Some(Some(LogicalType::Timestamp)),
+        ty if ty.is_integer() => Some(Some(LogicalType::BigInt)),
+        _ => None,
+    };
+    let refused =
+        || Error::binder(format!("Unsupported type \"{}\" for equi_width_bins", arguments[0]));
+    let met = match (reads(&arguments[0]), reads(&arguments[1])) {
+        (Some(None), Some(None)) => LogicalType::BigInt,
+        (Some(Some(one)), Some(None)) | (Some(None), Some(Some(one))) => one,
+        (Some(Some(left)), Some(Some(right))) if left == right => left,
+        (Some(Some(left)), Some(Some(right)))
+            if [&left, &right].iter().all(|ty| ty.is_numeric()) =>
+        {
+            LogicalType::Double
+        }
+        _ => return Some(Err(refused())),
+    };
+    let cast_to = vec![met.clone(), met, LogicalType::BigInt, LogicalType::Boolean];
+    let returns = match &arguments[1] {
+        _ if arguments.contains(&LogicalType::Null) => LogicalType::Null,
+        LogicalType::Decimal { .. } => LogicalType::list(LogicalType::Double),
+        max => LogicalType::list(max.clone()),
+    };
+    Some(Ok((cast_to, returns)))
 }
 
 /// The argument types and answer of `lttb`, or `None` when the pin has no overload for the call.
@@ -5218,6 +5280,15 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
     ("can_cast_implicitly", &["can_cast_implicitly(col0 ANY, col1 ANY) -> BOOLEAN"]),
+    (
+        "equi_width_bins",
+        &[
+            "equi_width_bins(col0 BIGINT, col1 BIGINT, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+            "equi_width_bins(col0 DOUBLE, col1 DOUBLE, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+            "equi_width_bins(col0 TIMESTAMP, col1 TIMESTAMP, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+            "equi_width_bins(col0 ANY, col1 ANY, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+        ],
+    ),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("getvariable", &["getvariable(variable_name VARCHAR) -> ANY"]),
     ("in_search_path", &["in_search_path(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
@@ -5743,6 +5814,7 @@ impl Shape {
             Self::Digested => (vec![ANY, "FLOAT"], ANY),
             Self::Topped => (vec![ANY, "BIGINT"], ANY_LIST),
             Self::Plotted => (vec!["DOUBLE", "DOUBLE", "BIGINT"], ANY_LIST),
+            Self::Binned => (vec!["BIGINT", "BIGINT", "BIGINT", "BOOLEAN"], ANY_LIST),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Extreme if count == 2 => (vec![ANY, "BIGINT"], ANY_LIST),
@@ -6324,6 +6396,14 @@ mod tests {
                     Shape::Plotted => {
                         arguments =
                             vec![LogicalType::Double, LogicalType::Double, LogicalType::BigInt];
+                    }
+                    Shape::Binned => {
+                        arguments = vec![
+                            LogicalType::Double,
+                            LogicalType::Double,
+                            LogicalType::BigInt,
+                            LogicalType::Boolean,
+                        ];
                     }
                     Shape::Sampled => {
                         arguments = vec![LogicalType::Double; count];

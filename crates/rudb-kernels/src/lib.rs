@@ -61,6 +61,7 @@
 pub mod advisory;
 pub mod aggregate;
 mod arg_extreme;
+mod binning;
 mod bits;
 mod bitstring;
 mod bytes;
