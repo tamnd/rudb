@@ -864,7 +864,14 @@ const DENSE_WORD: u32 = 8;
 pub fn mask_selection(words: &[u64], kept: usize) -> Selection {
     let mut out = Vec::with_capacity(kept + 64);
     for (block, &word) in words.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
         let base = (block * 64) as u32;
+        if word == u64::MAX {
+            out.extend(base..base + 64);
+            continue;
+        }
         // A word that keeps most of its rows is walked by the rows it drops. Each run between two
         // of them is written as a whole 64 rows and cut back to its own, so it is a copy of fixed
         // width with no tail to finish a row at a time, and what it writes past its rows is
