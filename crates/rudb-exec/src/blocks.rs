@@ -110,11 +110,6 @@ impl<T: Copy> Blocks<T> {
 
     /// The value at `within` of block `block`, for a caller walking a position it already located.
     #[inline]
-    pub(crate) fn slot(&self, block: usize, within: usize) -> &T {
-        if block < self.full.len() { &self.full[block][within] } else { &self.tail[within] }
-    }
-
-    #[inline]
     pub(crate) fn slot_mut(&mut self, block: usize, within: usize) -> &mut T {
         if block < self.full.len() { &mut self.full[block][within] } else { &mut self.tail[within] }
     }
@@ -172,8 +167,9 @@ mod tests {
             let (block, within) = super::locate(at);
             assert_eq!(super::start(block) + within, at);
             assert!(within < super::size(block) && within < 1 << super::WITHIN_BITS);
-            assert_eq!(blocks.slot(block, within)[0], at as u64);
-            blocks.slot_mut(block, within)[1] = 1;
+            let slot = blocks.slot_mut(block, within);
+            assert_eq!(slot[0], at as u64);
+            slot[1] = 1;
         }
         let read: Vec<[u64; 3]> = blocks.into_blocks().flatten().collect();
         assert_eq!(read.len(), 100_000);
