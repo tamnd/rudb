@@ -3564,6 +3564,122 @@ fn the_roles_of_postgres() {
 }
 
 #[test]
+fn alter_database_set_and_alter_role_set_keep_values_for_later_sessions() {
+    let dirs = Dirs::new("db-role-settings");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut admin = Client::unix(&server);
+    connect(&mut admin, PROTOCOL_3_0);
+    for (sql, expected) in [
+        ("create role ru login", "CZ"),
+        ("create database dt owner ru", "CZ"),
+        ("alter database dt set work_mem = '5MB'", "CZ"),
+        ("alter role ru set work_mem = '6MB'", "CZ"),
+        ("alter role all set statement_timeout = '7s'", "CZ"),
+        ("alter role ru in database dt set datestyle = sql, dmy", "CZ"),
+        ("alter role ru in database dt set my.thing to 1", "CZ"),
+        ("alter role ru set role = 'nosuch'", "NCZ"),
+        ("alter role ru reset role", "CZ"),
+        ("alter role ru set role = 'nosuch'", "NCZ"),
+    ] {
+        assert_eq!(tags(&admin.query(sql)), expected, "{sql}");
+    }
+    let error = |messages: &[Message]| {
+        let error = messages.iter().find(|m| m.tag == b'E').unwrap();
+        (error.field(b'C').unwrap(), error.field(b'M').unwrap())
+    };
+    let pair = |sqlstate: &str, message: &str| (sqlstate.to_owned(), message.to_owned());
+    for (sql, sqlstate, message) in [
+        ("alter database nope set work_mem = '1MB'", "3D000", "database \"nope\" does not exist"),
+        (
+            "alter database dt set nonexistent = 1",
+            "42704",
+            "unrecognized configuration parameter \"nonexistent\"",
+        ),
+        (
+            "alter database dt reset nonexistent",
+            "42704",
+            "unrecognized configuration parameter \"nonexistent\"",
+        ),
+        (
+            "alter database dt set transaction isolation level serializable",
+            "42704",
+            "unrecognized configuration parameter \"TRANSACTION\"",
+        ),
+        (
+            "alter database dt set work_mem = 'x'",
+            "22023",
+            "invalid value for parameter \"work_mem\": \"x\"",
+        ),
+        ("alter database dt set work_mem = 1, 2", "22023", "SET work_mem takes only one argument"),
+        (
+            "alter database dt set log_connections = on",
+            "55P02",
+            "parameter \"log_connections\" cannot be set after connection start",
+        ),
+        ("alter database dt set catalog 'x'", "0A000", "current database cannot be changed"),
+        (
+            "alter role all in database nope set work_mem = '1MB'",
+            "3D000",
+            "database \"nope\" does not exist",
+        ),
+        ("alter role nope set work_mem = '1MB'", "42704", "role \"nope\" does not exist"),
+        ("alter role pg_x set work_mem = '1MB'", "42939", "role name \"pg_x\" is reserved"),
+    ] {
+        assert_eq!(error(&admin.query(sql)), pair(sqlstate, message), "{sql}");
+    }
+
+    // A session of the role in the database starts with the most specific value of each
+    // parameter, after a WARNING for a value that does not apply.
+    let mut user = Client::unix(&server);
+    user.startup_as(PROTOCOL_3_0, "ru", "dt");
+    let messages = user.until_ready();
+    let warning = messages.iter().find(|m| m.tag == b'N').unwrap();
+    assert_eq!(warning.field(b'S').as_deref(), Some("WARNING"));
+    assert_eq!(warning.field(b'M').as_deref(), Some("role \"nosuch\" does not exist"));
+    assert!(statuses(&messages).contains(&"DateStyle=SQL, DMY".to_owned()));
+    assert_eq!(scalar(&mut user, "show work_mem"), "6MB");
+    assert_eq!(scalar(&mut user, "show statement_timeout"), "7s");
+    assert_eq!(scalar(&mut user, "show my.thing"), "1");
+    user.query("set work_mem = '1MB'");
+    user.query("reset work_mem");
+    assert_eq!(scalar(&mut user, "show work_mem"), "6MB", "RESET goes to the stored value");
+
+    // The checks of who may keep a value.
+    for (sql, sqlstate, message) in [
+        ("alter role all set work_mem = '1MB'", "42501", "permission denied to alter setting"),
+        ("alter role rpg set work_mem = '1MB'", "42501", "permission denied to alter role"),
+        (
+            "alter database postgres set work_mem = '1MB'",
+            "42501",
+            "must be owner of database postgres",
+        ),
+        (
+            "alter database dt set log_min_messages = 'debug1'",
+            "42501",
+            "permission denied to set parameter \"log_min_messages\"",
+        ),
+        (
+            "alter database dt set my.other = 1",
+            "42501",
+            "permission denied to set parameter \"my.other\"",
+        ),
+    ] {
+        assert_eq!(error(&user.query(sql)), pair(sqlstate, message), "{sql}");
+    }
+    assert_eq!(tags(&user.query("alter role ru set work_mem = '2MB'")), "CZ");
+    assert_eq!(tags(&user.query("alter database dt reset all")), "CZ");
+
+    // A dropped database and a dropped role take their values with them.
+    drop(user);
+    for sql in ["drop database dt with (force)", "drop role ru"] {
+        assert_eq!(tags(&admin.query(sql)), "CZ", "{sql}");
+    }
+    let file = std::fs::read_to_string(dirs.root.join("data/global/db_role_settings")).unwrap();
+    assert_eq!(file, "rudb db_role_settings 1\nsetting\t0\t0\tstatement_timeout=7s\n");
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_databases_of_postgres() {
     let dirs = Dirs::new("databases");
     let server = Server::start(dirs.config()).unwrap();

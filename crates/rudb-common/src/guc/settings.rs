@@ -19,7 +19,9 @@ use crate::error::{Error, ErrorCode};
 use crate::sqlstate::SqlState;
 
 /// Where a value came from, which `RESET ALL` reads to find the values that a statement set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The order is the order of `GucSource`: a value from a later source takes the place of a value
+/// from an earlier one, and not the other way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
     /// The boot value or a value that the server set.
     Default,
@@ -27,8 +29,19 @@ pub enum Source {
     File,
     /// A value of the command line of the server.
     Argument,
+    /// A value of `ALTER ROLE ALL SET`, `PGC_S_GLOBAL`.
+    Global,
+    /// A value of `ALTER DATABASE SET`, `PGC_S_DATABASE`.
+    Database,
+    /// A value of `ALTER ROLE SET`, `PGC_S_USER`.
+    User,
+    /// A value of `ALTER ROLE IN DATABASE SET`, `PGC_S_DATABASE_USER`.
+    DatabaseUser,
     /// A value of the startup packet.
     Client,
+    /// A value that the server sets for the session, which no stored value takes the place of,
+    /// `PGC_S_OVERRIDE`.
+    Override,
     /// A value that a statement set.
     Session,
 }
@@ -266,6 +279,12 @@ impl Settings {
         self.superuser = superuser;
     }
 
+    /// Whether the session counts as a superuser for the parameters that only a superuser can set.
+    #[must_use]
+    pub const fn superuser(&self) -> bool {
+        self.superuser
+    }
+
     /// A number that changes each time a value changes, so that a reader can keep what it made
     /// from the values until the next change.
     #[must_use]
@@ -280,10 +299,24 @@ impl Settings {
     ///
     /// A name that is not a parameter, or a value that the parameter does not take.
     pub fn set_internal(&mut self, name: &str, text: &str) -> Result<(), Error> {
+        self.set_server(name, text, Source::Default)
+    }
+
+    /// Sets a value that the server takes from the session, as `InitializeSessionUserId` sets
+    /// `session_authorization` with `PGC_S_OVERRIDE`, so that a value of `ALTER ROLE SET` does
+    /// not take its place. There is no check of the context.
+    ///
+    /// # Errors
+    ///
+    /// A name that is not a parameter, or a value that the parameter does not take.
+    pub fn set_override(&mut self, name: &str, text: &str) -> Result<(), Error> {
+        self.set_server(name, text, Source::Override)
+    }
+
+    fn set_server(&mut self, name: &str, text: &str, source: Source) -> Result<(), Error> {
         let parameter = find(name).ok_or_else(|| unrecognized(name))?;
         let setting = self.parse(parameter, text)?;
-        let value = Value { setting, source: Source::Default };
-        self.store_reset(parameter, value);
+        self.store_reset(parameter, Value { setting, source });
         Ok(())
     }
 
@@ -357,6 +390,91 @@ impl Settings {
         };
         let setting = self.parse(parameter, text)?;
         self.store_reset(parameter, Value { setting, source: Source::Argument });
+        Ok(())
+    }
+
+    /// The check of `ALTER DATABASE SET` and `ALTER ROLE SET`, which keep a value for later
+    /// sessions: `validate_option_array_item`, which checks the value as `SET` would with the
+    /// source `PGC_S_TEST`. `None` is `RESET name`. The result is the name to keep: the name of
+    /// the parameter in its own case, or the placeholder name.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `SET` for the name and the value.
+    pub fn check_stored(&self, name: &str, text: Option<&str>) -> Result<String, Error> {
+        let Some(parameter) = find(name) else {
+            placeholder_name(name)?;
+            // A placeholder can become a parameter that only a superuser may set, so only a
+            // superuser may keep a value for it.
+            if !self.superuser {
+                return Err(Error::new(
+                    ErrorCode::Settings,
+                    format!("permission denied to set parameter \"{name}\""),
+                )
+                .state(SqlState::INSUFFICIENT_PRIVILEGE));
+            }
+            return Ok(name.to_owned());
+        };
+        self.allowed(parameter, Origin::Statement)?;
+        match text {
+            Some(text) => {
+                self.parse(parameter, text)?;
+            }
+            None if parameter.has(flag::NO_RESET) => {
+                return Err(Error::new(
+                    ErrorCode::Settings,
+                    format!("parameter \"{}\" cannot be reset", parameter.name),
+                )
+                .state(SqlState::FEATURE_NOT_SUPPORTED));
+            }
+            None => {}
+        }
+        Ok(parameter.name.to_owned())
+    }
+
+    /// Whether `RESET ALL` of `ALTER DATABASE` or `ALTER ROLE` drops the kept value of `name`:
+    /// `GUCArrayReset` keeps the values that the user may not set.
+    pub fn stored_resettable(&self, name: &str) -> bool {
+        match find(name) {
+            Some(parameter) => match parameter.context {
+                Context::User => true,
+                Context::Superuser => self.superuser,
+                _ => false,
+            },
+            None => self.superuser,
+        }
+    }
+
+    /// A value of `pg_db_role_setting`, as `ApplySetting` sets it at the start of a session with
+    /// the context `PGC_SUSET`. The value becomes the reset value and the current value, unless a
+    /// later source, such as the client, set them. There is no check of who may set it, because
+    /// `ALTER DATABASE SET` and `ALTER ROLE SET` checked that when they kept it.
+    ///
+    /// # Errors
+    ///
+    /// A name that is not a parameter and not a valid placeholder name, a parameter that cannot
+    /// change after the start of a session, or a value that the parameter does not take.
+    pub fn set_stored(&mut self, name: &str, text: &str, source: Source) -> Result<(), Error> {
+        let (key, parameter, setting) = match find(name) {
+            Some(parameter) => {
+                permitted(parameter, false, true)?;
+                (lower(parameter.name), Some(parameter), self.parse(parameter, text)?)
+            }
+            None => {
+                placeholder_name(name)?;
+                (Cow::Owned(name.to_ascii_lowercase()), None, Setting::String(text.to_owned()))
+            }
+        };
+        let value = Value { setting, source };
+        let slot = self.slot(&key, parameter, parameter.map_or(name, |parameter| parameter.name));
+        if slot.reset.source > source {
+            return Ok(());
+        }
+        slot.reset = value.clone();
+        if slot.current != value {
+            slot.current = value;
+            self.changed(parameter);
+        }
         Ok(())
     }
 
@@ -459,28 +577,7 @@ impl Settings {
 
     /// The check of the context of a parameter in `set_config_with_handle`.
     fn allowed(&self, parameter: &Parameter, origin: Origin) -> Result<(), Error> {
-        let name = parameter.name;
-        let cannot = |what: &str| {
-            Err(Error::new(ErrorCode::Settings, format!("parameter \"{name}\" {what}"))
-                .state(SqlState::CANT_CHANGE_RUNTIME_PARAM))
-        };
-        let denied = || {
-            Err(Error::new(
-                ErrorCode::Settings,
-                format!("permission denied to set parameter \"{name}\""),
-            )
-            .state(SqlState::INSUFFICIENT_PRIVILEGE))
-        };
-        match (parameter.context, origin) {
-            (Context::Internal, _) => cannot("cannot be changed"),
-            (Context::Postmaster, _) => cannot("cannot be changed without restarting the server"),
-            (Context::Sighup, _) => cannot("cannot be changed now"),
-            (Context::SuperuserBackend | Context::Backend, Origin::Statement) => {
-                cannot("cannot be set after connection start")
-            }
-            (Context::SuperuserBackend | Context::Superuser, _) if !self.superuser => denied(),
-            _ => Ok(()),
-        }
+        permitted(parameter, origin == Origin::Startup, self.superuser)
     }
 
     /// Reads a value with the type rules and the check hook of the parameter.
@@ -698,6 +795,33 @@ impl Settings {
             }
         }
         reports
+    }
+}
+
+/// The check of the context of a parameter in `set_config_with_handle`, for a value of the
+/// client at the start of a session when `startup` is true, and for a later value otherwise.
+fn permitted(parameter: &Parameter, startup: bool, superuser: bool) -> Result<(), Error> {
+    let name = parameter.name;
+    let cannot = |what: &str| {
+        Err(Error::new(ErrorCode::Settings, format!("parameter \"{name}\" {what}"))
+            .state(SqlState::CANT_CHANGE_RUNTIME_PARAM))
+    };
+    let denied = || {
+        Err(Error::new(
+            ErrorCode::Settings,
+            format!("permission denied to set parameter \"{name}\""),
+        )
+        .state(SqlState::INSUFFICIENT_PRIVILEGE))
+    };
+    match (parameter.context, startup) {
+        (Context::Internal, _) => cannot("cannot be changed"),
+        (Context::Postmaster, _) => cannot("cannot be changed without restarting the server"),
+        (Context::Sighup, _) => cannot("cannot be changed now"),
+        (Context::SuperuserBackend | Context::Backend, false) => {
+            cannot("cannot be set after connection start")
+        }
+        (Context::SuperuserBackend | Context::Superuser, _) if !superuser => denied(),
+        _ => Ok(()),
     }
 }
 
@@ -930,5 +1054,83 @@ mod tests {
         assert_eq!(one.get("my.option").unwrap(), "x");
         assert_eq!(one.get("statement_timeout").unwrap(), "0");
         assert_eq!(two.slots.len(), 0);
+    }
+
+    #[test]
+    fn stored_values_and_their_order() {
+        let mut settings = Settings::new(false);
+        settings.set("work_mem", Some("11MB"), Action::Set, Origin::Startup).unwrap();
+        // `process_settings` comes after the client and takes the most specific value first.
+        settings.set_stored("work_mem", "3MB", Source::DatabaseUser).unwrap();
+        settings.set_stored("DateStyle", "SQL", Source::DatabaseUser).unwrap();
+        settings.set_stored("datestyle", "German", Source::Database).unwrap();
+        settings.set_stored("log_min_messages", "debug1", Source::User).unwrap();
+        settings.set_stored("my.thing", "1", Source::Global).unwrap();
+        settings.set_override("session_authorization", "u").unwrap();
+        settings.set_stored("session_authorization", "v", Source::DatabaseUser).unwrap();
+        assert_eq!(settings.get("session_authorization").unwrap(), "u");
+        assert_eq!(settings.get("work_mem").unwrap(), "11MB");
+        assert_eq!(settings.get("DateStyle").unwrap(), "SQL, MDY");
+        assert_eq!(settings.get("log_min_messages").unwrap(), "debug1");
+        assert_eq!(settings.get("my.thing").unwrap(), "1");
+        set(&mut settings, "DateStyle", "ISO").unwrap();
+        settings.set("DateStyle", None, Action::Set, Origin::Statement).unwrap();
+        settings.end(true);
+        assert_eq!(
+            settings.get("DateStyle").unwrap(),
+            "SQL, MDY",
+            "RESET goes to the stored value"
+        );
+
+        let error = |result: Result<(), Error>| result.unwrap_err().message().to_owned();
+        assert_eq!(
+            error(settings.set_stored("work_mem", "x", Source::Database)),
+            "invalid value for parameter \"work_mem\": \"x\""
+        );
+        assert_eq!(
+            error(settings.set_stored("log_connections", "on", Source::Database)),
+            "parameter \"log_connections\" cannot be set after connection start"
+        );
+    }
+
+    #[test]
+    fn the_check_of_a_stored_value() {
+        let user = Settings::new(false);
+        assert_eq!(user.check_stored("timezone", Some("UTC")).unwrap(), "TimeZone");
+        assert_eq!(user.check_stored("work_mem", None).unwrap(), "work_mem");
+        let error = |result: Result<String, Error>| {
+            let error = result.unwrap_err();
+            (error.reported_state().as_str().to_owned(), error.message().to_owned())
+        };
+        assert_eq!(
+            error(user.check_stored("nonexistent", Some("1"))),
+            ("42704".to_owned(), "unrecognized configuration parameter \"nonexistent\"".to_owned())
+        );
+        assert_eq!(
+            error(user.check_stored("log_min_messages", Some("debug1"))),
+            (
+                "42501".to_owned(),
+                "permission denied to set parameter \"log_min_messages\"".to_owned()
+            )
+        );
+        assert_eq!(
+            error(user.check_stored("shared_buffers", Some("1MB"))).1,
+            "parameter \"shared_buffers\" cannot be changed without restarting the server"
+        );
+        assert_eq!(
+            error(user.check_stored("work_mem", Some("x"))),
+            ("22023".to_owned(), "invalid value for parameter \"work_mem\": \"x\"".to_owned())
+        );
+        assert_eq!(
+            error(user.check_stored("my.thing", Some("1"))),
+            ("42501".to_owned(), "permission denied to set parameter \"my.thing\"".to_owned())
+        );
+        let superuser = Settings::new(true);
+        assert!(superuser.check_stored("log_min_messages", Some("debug1")).is_ok());
+        assert_eq!(superuser.check_stored("my.thing", Some("1")).unwrap(), "my.thing");
+        assert!(user.stored_resettable("work_mem"));
+        assert!(!user.stored_resettable("log_min_messages"));
+        assert!(!user.stored_resettable("my.thing"));
+        assert!(superuser.stored_resettable("my.thing"));
     }
 }

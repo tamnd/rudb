@@ -20,6 +20,7 @@ mod conf;
 mod config;
 mod crypto;
 mod databases;
+mod db_role_settings;
 mod hba;
 mod locale;
 mod poll;

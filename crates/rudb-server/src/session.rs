@@ -45,6 +45,7 @@ use setting::Command;
 use zone::Zone;
 
 use crate::conf;
+use crate::db_role_settings;
 use crate::poll;
 use crate::roles::{Catalog, Roles};
 use crate::server::{Defaults, Refusal, Shared, log};
@@ -467,10 +468,8 @@ fn session_settings(
 ) -> Result<Settings, Refusal> {
     let mut settings = defaults.base.clone();
     settings.set_superuser(superuser);
-    let mut own = vec![
-        ("is_superuser", if superuser { "on" } else { "off" }),
-        ("session_authorization", start.user.as_str()),
-    ];
+    settings.set_override("session_authorization", &start.user).map_err(|e| refusal(&e))?;
+    let mut own = vec![("is_superuser", if superuser { "on" } else { "off" })];
     if !defaults.ssl_given {
         own.push(("ssl", if ssl { "on" } else { "off" }));
     }
@@ -485,6 +484,71 @@ fn session_settings(
         settings.set(name, Some(value), Action::Set, Origin::Startup).map_err(|e| refusal(&e))?;
     }
     Ok(settings)
+}
+
+/// `process_settings`: the values of `ALTER DATABASE SET` and `ALTER ROLE SET` for the role in the
+/// database, the most specific row first, after the values of the client. A value that fails gives
+/// a `WARNING`, with its SQLSTATE and its message, and the session goes on, as `ApplySetting` does.
+fn stored_settings(
+    shared: &Shared,
+    database: u32,
+    login: u32,
+    guc: &mut Settings,
+) -> Vec<(String, String)> {
+    let rows = shared.db_role_settings.snapshot();
+    let catalog = shared.roles.snapshot();
+    let mut warnings = Vec::new();
+    for (item, source) in rows.session(database, login) {
+        let Some((name, value)) = db_role_settings::split(item) else { continue };
+        let refused = match name.to_ascii_lowercase().as_str() {
+            "role" if value != "none" => match catalog.find(value) {
+                None => Some(("22023", format!("role \"{value}\" does not exist"))),
+                Some(role) if !catalog.can_set(login, role.oid) => {
+                    Some(("42501", format!("permission denied to set role \"{value}\"")))
+                }
+                Some(_) => None,
+            },
+            "session_authorization" => match catalog.find(value) {
+                None => Some(("22023", format!("role \"{value}\" does not exist"))),
+                Some(role) if role.oid != login && !catalog.superuser(login) => Some((
+                    "42501",
+                    format!("permission denied to set session authorization \"{value}\""),
+                )),
+                Some(_) => None,
+            },
+            _ => None,
+        };
+        let result = match refused {
+            Some((state, message)) => Err((state.to_owned(), message)),
+            None => guc
+                .set_stored(name, value, source)
+                .map_err(|e| (e.reported_state().as_str().to_owned(), e.message().to_owned())),
+        };
+        if let Err(warning) = result {
+            warnings.push(warning);
+        }
+    }
+    let superuser = catalog.superuser(current_user(guc, &catalog, login));
+    if superuser != guc.superuser() {
+        let _ = guc.set_internal("is_superuser", if superuser { "on" } else { "off" });
+        guc.set_superuser(superuser);
+    }
+    warnings
+}
+
+/// The session user: the role of `SET SESSION AUTHORIZATION`, or the user that logged in.
+fn session_user(guc: &Settings, catalog: &Catalog, login: u32) -> u32 {
+    let name = guc.get("session_authorization").unwrap_or_default();
+    catalog.find(&name).map_or(login, |role| role.oid)
+}
+
+/// The current user: the role of `SET ROLE`, or the session user.
+fn current_user(guc: &Settings, catalog: &Catalog, login: u32) -> u32 {
+    let name = guc.get("role").unwrap_or_default();
+    match catalog.find(&name) {
+        Some(role) if name != "none" => role.oid,
+        _ => session_user(guc, catalog, login),
+    }
 }
 
 /// The values that every session starts with: the values that the server owns, then the values
@@ -585,6 +649,14 @@ fn serve(
         Ok(guc) => guc,
         Err(refusal) => return wire.fatal(refusal),
     };
+    for (state, message) in stored_settings(shared, oid, role.oid, &mut guc) {
+        wire.out.notice_response(&[
+            (b'S', b"WARNING"),
+            (b'V', b"WARNING"),
+            (b'C', state.as_bytes()),
+            (b'M', message.as_bytes()),
+        ]);
+    }
     let connection = database.connect();
     shared.attach(pid, connection.clone());
     // `EmitConnectionWarnings`, after the settings of the startup packet.
@@ -1200,17 +1272,12 @@ impl Runner {
 
     /// The session user, from `session_authorization`.
     fn session_oid(&self, catalog: &Catalog) -> u32 {
-        let name = self.guc.get("session_authorization").unwrap_or_default();
-        catalog.find(&name).map_or(self.login, |role| role.oid)
+        session_user(&self.guc, catalog, self.login)
     }
 
     /// The current user: the role of `SET ROLE`, or the session user.
     fn current_oid(&self, catalog: &Catalog) -> u32 {
-        let name = self.guc.get("role").unwrap_or_default();
-        match catalog.find(&name) {
-            Some(role) if name != "none" => role.oid,
-            _ => self.session_oid(catalog),
-        }
+        current_user(&self.guc, catalog, self.login)
     }
 
     /// Makes `is_superuser` follow the current user.
@@ -1319,6 +1386,7 @@ impl Runner {
                     session: self.session_oid(&catalog),
                     guc: &self.guc,
                     databases: &self.shared.databases.snapshot(),
+                    settings: &self.shared.db_role_settings,
                     datetime: DateTimeInput {
                         order: self.format.date_format.order,
                         zone: &self.zone,
@@ -1341,6 +1409,7 @@ impl Runner {
                     session: self.session_oid(&catalog),
                     block: state != Transaction::Idle,
                     sql,
+                    guc: &self.guc,
                 };
                 database::execute(parsed, offset, &cx, out)?
             }
