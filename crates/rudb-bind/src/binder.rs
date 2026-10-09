@@ -970,10 +970,7 @@ impl<'a> Binder<'a> {
             }
         }
         if !all && self.semantics.recursive_union() == RecursiveUnion::Postgres {
-            let hashable = |field: &Field| {
-                crate::pgcalls::exact_oid(&field.ty).is_none_or(rudb_pgtypes::hashable)
-            };
-            if !table.iter().all(hashable) {
+            if !table.iter().all(|field| hashable(&field.ty)) {
                 return Err(Error::not_implemented("could not implement recursive UNION")
                     .state(SqlState::FEATURE_NOT_SUPPORTED)
                     .detail("All column datatypes must be hashable."));
@@ -6849,6 +6846,18 @@ fn postgres_clause(clause: &str) -> Option<&'static str> {
         "table function arguments" => "functions in FROM",
         _ => return None,
     })
+}
+
+/// Whether a hash table can hold the values of a type, which the rows of a PostgreSQL recursive
+/// `UNION` need, as `rudb_pgtypes::hashable` says for the PostgreSQL type of it.
+fn hashable(ty: &LogicalType) -> bool {
+    match ty {
+        // `bit` and `bit varying`, which have no PostgreSQL type here yet. Their equality is the
+        // one of a btree and not of a hash.
+        LogicalType::Bit => false,
+        LogicalType::List(element) | LogicalType::Array(element, _) => hashable(element),
+        ty => crate::pgcalls::exact_oid(ty).is_none_or(rudb_pgtypes::hashable),
+    }
 }
 
 /// The place of the first column that a query writes, or the place of the query when it writes no
