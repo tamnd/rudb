@@ -1000,25 +1000,27 @@ mod tests {
         // The cross product of `w` and `u` is what lets the search act at all, and the order it
         // builds has to take that one out without putting `u` and `v` together instead. Joining
         // `t` to `v` first and joining it to `u` first score the same, and the search keeps the
-        // first of the two it reaches.
+        // first of the two it reaches. Each condition reads its own column of `t`, as the two
+        // nation keys of q7 are two columns, since one column equal to both copies would make the
+        // copies equal to each other and a join rather than a cross product.
         assert_eq!(
             ordered(concat!(
-                "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "Join INNER on=[(#0.2::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
                 "  Join INNER on=[(#3.0::BIGINT = #0.0::BIGINT)::BOOLEAN, ",
-                "(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
                 "    CrossProduct\n",
                 "      Get memory.main.w AS w #3 [d::BIGINT]\n",
                 "      Get memory.main.u AS u #1 [b::BIGINT]\n",
-                "    Get memory.main.t AS t #0 [a::BIGINT]\n",
+                "    Get memory.main.t AS t #0 [a::BIGINT, e::BIGINT, f::BIGINT]\n",
                 "  Get memory.main.v AS v #2 [c::BIGINT]\n",
             )),
             concat!(
                 "Join INNER on=[(#3.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
                 "  Get memory.main.w AS w #3 [d::BIGINT]\n",
-                "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "  Join INNER on=[(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
                 "    Get memory.main.u AS u #1 [b::BIGINT]\n",
-                "    Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
-                "      Get memory.main.t AS t #0 [a::BIGINT]\n",
+                "    Join INNER on=[(#0.2::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "      Get memory.main.t AS t #0 [a::BIGINT, e::BIGINT, f::BIGINT]\n",
                 "      Get memory.main.v AS v #2 [c::BIGINT]\n",
             )
         );
@@ -1122,20 +1124,21 @@ mod tests {
         // product. `u` is the supplier side, which every row of `w` matches, and the filtered `v`
         // is the part side, which a fifth of them match. Reading the filter through the join is
         // what tells the two apart, because containment alone calls both of them a hundred
-        // thousand rows and then the tie breaks on the smaller input, which is `u`.
+        // thousand rows and then the tie breaks on the smaller input, which is `u`. The two joins
+        // read two columns of `w`, as lineitem's supplier and part keys are two columns.
         assert_eq!(
             ordered(concat!(
-                "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
                 "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-                "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+                "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
                 "    Get memory.main.u AS u #1 [b::BIGINT]\n",
                 "  Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
                 "    Get memory.main.v AS v #2 [c::BIGINT]\n",
             )),
             concat!(
                 "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-                "  Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
-                "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+                "  Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
                 "    Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
                 "      Get memory.main.v AS v #2 [c::BIGINT]\n",
                 "  Get memory.main.u AS u #1 [b::BIGINT]\n",
@@ -1149,12 +1152,42 @@ mod tests {
         // there is nothing to prefer and the order the query was written in stands. This is the
         // half of the previous test that says the new reading is the filter and not the shape.
         let text = concat!(
-            "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+            "Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
             "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-            "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+            "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
             "    Get memory.main.u AS u #1 [b::BIGINT]\n",
             "  Get memory.main.v AS v #2 [c::BIGINT]\n",
         );
         assert_eq!(ordered(text), text);
+    }
+
+    /// TPC-H q05 written small. `w` is lineitem with its order and supplier keys, `t` is the
+    /// customers of those orders with their nation, `v` is supplier with its nation and `u` is the
+    /// nations of one region. The query says the customer's nation is the supplier's and the
+    /// supplier's is the region's, and never that the customer's is the region's, which is the join
+    /// that keeps a tenth of the customers before any lineitem row is read.
+    #[test]
+    fn a_join_two_equalities_imply_is_one_the_search_can_take() {
+        let text = concat!(
+            "Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN, (#1.1::BIGINT = #2.1::BIGINT)::BOOLEAN]\n",
+            "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
+            "    Get memory.main.t AS t #1 [a::BIGINT, f::BIGINT]\n",
+            "  Join INNER on=[(#2.1::BIGINT = #3.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.v AS v #2 [c::BIGINT, g::BIGINT]\n",
+            "    Filter (#3.1::BIGINT = 3::BIGINT)::BOOLEAN\n",
+            "      Get memory.main.u AS u #3 [b::BIGINT, r::BIGINT]\n",
+        );
+        let columns = [
+            ("w", "d", 1_000),
+            ("w", "e", 100),
+            ("t", "a", 1_000),
+            ("t", "f", 10),
+            ("v", "c", 100),
+            ("v", "g", 10),
+            ("u", "b", 10),
+            ("u", "r", 10),
+        ];
+        assert_eq!(counted(text, &columns), "");
     }
 }
