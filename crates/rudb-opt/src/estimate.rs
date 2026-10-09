@@ -1819,18 +1819,30 @@ fn follow(
 
 /// How many pairs of values the conditions of a join can match on, where every one is understood.
 ///
-/// The product over the conditions of the larger of the two sides' distinct counts, which is the
-/// standard reading of an equijoin: the two columns draw from a shared set of values, the larger
-/// count is how big that set is, and the values are assumed to be spread evenly over it. `None`
-/// unless every condition is an equality between two base columns that both have a count, because a
-/// condition nobody understood could be the one doing all the work and a divisor that left it out
-/// would claim more rows than the join can produce.
+/// The conditions make classes of columns that are all equal to each other, and this is the product
+/// over the classes of the largest distinct count in each. That is the standard reading of an
+/// equijoin: the columns of a class draw from a shared set of values, the largest count is how big
+/// that set is, and the values are assumed to be spread evenly over it. `None` unless every
+/// condition is an equality between two base columns that both have a count, because a condition
+/// nobody understood could be the one doing all the work and a divisor that left it out would claim
+/// more rows than the join can produce.
+///
+/// A class and not a condition, because a query that names one key several times names one key.
+/// JOB 19d joins `movie_companies` to a side holding `title`, `movie_info` and `cast_info` on
+/// `t.id = mc.movie_id`, `mc.movie_id = mi.movie_id` and `mc.movie_id = ci.movie_id`, and the three
+/// columns on the left are already equal to each other. Read a condition at a time, that was two
+/// and a half million movies cubed, which does not fit in a `u64`, so the counts were dropped and
+/// the join was taken to be as tall as its larger side, when every movie on the left meets every
+/// one of its companies. The estimate was 805 rows where the join made 1.76 million.
+///
+/// The flag beside the count says whether any column in it was counted, rather than standing in
+/// for a count with its table's rows.
 fn keyspace(
     plan: &Plan,
     conditions: Slice,
     stats: &Facts,
     reads: &mut Vec<Stat<u64>>,
-) -> Option<u64> {
+) -> Option<(u64, bool)> {
     keyspace_into(plan, plan.expr_list(conditions), stats, reads)
 }
 
@@ -1843,7 +1855,7 @@ fn keyspace(
 /// every discarded candidate would say more about the search than about the plan.
 #[must_use]
 pub fn keyspace_of(plan: &Plan, conditions: &[ExprRef], stats: &Facts) -> Option<u64> {
-    keyspace_into(plan, conditions, stats, &mut Vec::new())
+    keyspace_into(plan, conditions, stats, &mut Vec::new()).map(|(keys, _)| keys)
 }
 
 /// [`keyspace_of`] with the distinct counts it read collected as it goes.
@@ -1852,11 +1864,14 @@ fn keyspace_into(
     conditions: &[ExprRef],
     stats: &Facts,
     reads: &mut Vec<Stat<u64>>,
-) -> Option<u64> {
+) -> Option<(u64, bool)> {
     if conditions.is_empty() {
         return None;
     }
-    let mut product: u64 = 1;
+    // Each column the conditions read with its count, and the column its class is named by.
+    let mut columns: Vec<(ColumnBinding, u64)> = Vec::new();
+    let mut class: Vec<usize> = Vec::new();
+    let mut counted = false;
     for &condition in conditions {
         let Expr::Compare { op: CompareOp::Equal | CompareOp::NotDistinctFrom, left, right } =
             *plan.expr(condition)
@@ -1869,15 +1884,55 @@ fn keyspace_into(
         };
         // Both sides are recorded before either is read, so that a condition one side of which
         // nobody counted still shows up as two reads rather than one.
-        let (left, right) = (distinct(plan, left, stats), distinct(plan, right, stats));
-        reads.push(left);
-        reads.push(right);
-        let pair = (*left.read(DISTINCT)?).max(*right.read(DISTINCT)?);
-        product = product.checked_mul(pair)?;
+        let counts = (distinct(plan, left, stats), distinct(plan, right, stats));
+        reads.push(counts.0);
+        reads.push(counts.1);
+        let known = |column| matches!(stated(plan, column, stats), Stat::Known { .. });
+        counted |= known(left) || known(right);
+        let counts = (*counts.0.read(DISTINCT)?, *counts.1.read(DISTINCT)?);
+        let one = column_at(&mut columns, &mut class, left, counts.0);
+        let two = column_at(&mut columns, &mut class, right, counts.1);
+        let (one, two) = (named_by(&mut class, one), named_by(&mut class, two));
+        class[one.max(two)] = one.min(two);
+    }
+    let mut largest = vec![0u64; columns.len()];
+    for (at, &(_, count)) in columns.iter().enumerate() {
+        let name = named_by(&mut class, at);
+        largest[name] = largest[name].max(count);
+    }
+    let mut product: u64 = 1;
+    for (at, &count) in largest.iter().enumerate() {
+        if class[at] == at {
+            product = product.checked_mul(count)?;
+        }
     }
     // A column with no distinct values at all is an empty column or a column of nothing but nulls,
     // and neither is something to divide by.
-    (product > 0).then_some(product)
+    (product > 0).then_some((product, counted))
+}
+
+/// Where `column` is in `columns`, added with its count and in a class of its own if it is new.
+fn column_at(
+    columns: &mut Vec<(ColumnBinding, u64)>,
+    class: &mut Vec<usize>,
+    column: ColumnBinding,
+    count: u64,
+) -> usize {
+    if let Some(at) = columns.iter().position(|&(held, _)| held == column) {
+        return at;
+    }
+    columns.push((column, count));
+    class.push(class.len());
+    class.len() - 1
+}
+
+/// The column that names the class `at` is in, which is the first of its columns to be added.
+fn named_by(class: &mut [usize], mut at: usize) -> usize {
+    while class[at] != at {
+        class[at] = class[class[at]];
+        at = class[at];
+    }
+    at
 }
 
 /// How many rows an equijoin of two sides of these sizes over that many key values produces.
@@ -2082,7 +2137,7 @@ fn join(
     right: Both,
     kind: JoinKind,
     conditions: usize,
-    keys: Option<u64>,
+    keys: Option<(u64, bool)>,
     named: (Option<(f64, Provenance)>, Option<(f64, Provenance)>),
 ) -> Stat<u64> {
     let (left, right, bases) = (left.rows, right.rows, (left.base, right.base));
@@ -2135,7 +2190,7 @@ fn join(
                 named.0.map_or(sides.0.share(), |(share, _)| share),
                 named.1.map_or(sides.1.share(), |(share, _)| share),
             );
-            let matched = matched_shares(sides.0, sides.1, keys, shares).rows;
+            let matched = matched_shares(sides.0, sides.1, keys.map(|(keys, _)| keys), shares).rows;
             let value = match kind {
                 // An outer join emits every row of the preserved side whether it matched or not,
                 // so the estimate cannot fall below that side.
@@ -2148,8 +2203,12 @@ fn join(
             // were. Two counted tables joined on a column nobody has a distinct count for is the
             // single most common way a plan goes wrong, and a class saying exact here would hide
             // exactly that. Where a side's share was counted on the other side, the count is where
-            // the number came from.
-            let provenance = named.0.or(named.1).map_or(FROM_A_CONSTANT, |(_, from)| from);
+            // the number came from, and where a key was counted the number came from the arithmetic
+            // over that count. A key standing in for its count with its table's rows is the
+            // containment guess again, and a join with nothing better is the constant.
+            let counted = keys.and_then(|(_, counted)| counted.then_some(Provenance::Propagation));
+            let provenance = named.0.or(named.1).map(|(_, from)| from).or(counted);
+            let provenance = provenance.unwrap_or(FROM_A_CONSTANT);
             Stat::Known { value, class: both.combine(GUESSED), provenance }
         }
     }
@@ -2936,6 +2995,28 @@ mod tests {
         let tables = &[("l", 1_000_000), ("r", 1_000_000)];
         let counts = &[("l", "a", 10), ("l", "b", 10), ("r", "a", 10), ("r", "b", 10)];
         assert_eq!(counted(text, tables, counts), Some(10_000_000_000));
+    }
+
+    #[test]
+    fn conditions_that_name_one_key_several_times_divide_by_it_once() {
+        // The shape of JOB 19d, where the right side is equal to two columns on the left that are
+        // already equal to each other. One class of a hundred values, and not a hundred squared.
+        let text = concat!(
+            "Join INNER on=[(#0.0::INTEGER = #2.0::INTEGER)::BOOLEAN, ",
+            "(#1.0::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+            "  Join INNER on=[(#0.0::INTEGER = #1.0::INTEGER)::BOOLEAN]\n",
+            "    Get memory.main.t AS t #0 [a::INTEGER]\n",
+            "    Get memory.main.u AS u #1 [a::INTEGER]\n",
+            "  Get memory.main.v AS v #2 [a::INTEGER]\n"
+        );
+        let tables = &[("t", 1000), ("u", 1000), ("v", 1000)];
+        let counts = &[("t", "a", 100), ("u", "a", 100), ("v", "a", 100)];
+        assert_eq!(counted(text, tables, counts), Some(100_000));
+        // Counted keys make a number that came from the counts, and not from a constant.
+        assert_eq!(
+            counted_stat(text, tables, counts),
+            Stat::estimated(100_000, Provenance::Propagation)
+        );
     }
 
     #[test]
