@@ -3273,6 +3273,33 @@ fn like_run<A: Fn(usize) -> usize>(
         wanted[..head].copy_from_slice(&prefix[..head]);
         keep[..head].fill(u8::MAX);
         let (wanted, keep) = (u32::from_ne_bytes(wanted), u32::from_ne_bytes(keep));
+        // With no null to skip the length and the first four bytes are one pass with no branch in
+        // it, and the arena is read in a second pass only at the rows they agree with. The loop
+        // below asked both of every row with the arena read between them, so a row was a call and
+        // a few branches, and on the parts of q20 that was about thirty cycles a row where this is
+        // a few.
+        if matches!(base, Validity::AllValid) && !prefix.is_empty() {
+            for (index, slot) in out.iter_mut().enumerate() {
+                *slot = views.get(at(index)).is_some_and(|view| {
+                    (view.len() >= prefix.len())
+                        & (u32::from_ne_bytes(view.prefix()) & keep == wanted)
+                });
+            }
+            if prefix.len() > 4 {
+                for (index, slot) in out.iter_mut().enumerate() {
+                    if *slot {
+                        *slot =
+                            column.bytes(at(index)).is_some_and(|text| text.starts_with(prefix));
+                    }
+                }
+            }
+            if like.negated {
+                for slot in &mut out {
+                    *slot = !*slot;
+                }
+            }
+            return finish(returns, Data::Bool(out.into()), base);
+        }
         let validity = over_valid(rows, base, |index| {
             let at = at(index);
             let held = views.get(at).is_some_and(|view| {
