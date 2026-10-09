@@ -6722,6 +6722,49 @@ impl NativeText {
         if ends.contains(&u32::MAX) { None } else { Some(ends) }
     }
 
+    /// Every length of the column, out of the ends a run at a time.
+    ///
+    /// The same lengths [`lengths_of`] takes out of [`Self::unpack_ends`], without the table of
+    /// every end in between. That table is four bytes a value held while the lengths are made, and
+    /// on q28 it was 10 MB of `URL` ends beside the 5 MB of lengths, at the query's peak. `None`
+    /// for the same columns that gets `None` there.
+    fn unpack_lens(&self) -> Option<Lengths> {
+        let mut narrow = Vec::with_capacity(self.values);
+        let mut wide: Option<Vec<u32>> = None;
+        let mut ends = [0_u32; TEXT_OFFSET_RUN];
+        let mut start = 0_u32;
+        for (run, first) in (0..self.values).step_by(TEXT_OFFSET_RUN).enumerate() {
+            let into = &mut ends[..TEXT_OFFSET_RUN.min(self.values - first)];
+            let bytes = self.packed().get(run * TEXT_OFFSET_RUN / 8 * self.offset_bits..)?;
+            bitpack::unpack_tail_into(bytes, self.offset_bits, into, |bits| {
+                u32::try_from(bits).unwrap_or(u32::MAX)
+            })
+            .ok()?;
+            for (index, &end) in (first..).zip(into.iter()) {
+                if end == u32::MAX {
+                    return None;
+                }
+                if index % TEXT_PAYLOAD_VALUES == 0 {
+                    start = 0;
+                }
+                let len = end.checked_sub(start)?;
+                start = end;
+                if let Some(wide) = &mut wide {
+                    wide.push(len);
+                } else if let Ok(len) = u16::try_from(len) {
+                    narrow.push(len);
+                } else {
+                    let mut lens = Vec::with_capacity(self.values);
+                    lens.extend(narrow.iter().copied().map(u32::from));
+                    lens.push(len);
+                    narrow = Vec::new();
+                    wide = Some(lens);
+                }
+            }
+        }
+        Some(wide.map_or(Lengths::Narrow(narrow), Lengths::Wide))
+    }
+
     /// The packed offsets, which is the index past its header.
     fn packed(&self) -> &[u8] {
         self.offsets.bytes().get(DICTIONARY_HEADER..).unwrap_or_default()
@@ -7036,10 +7079,9 @@ impl TextSource for NativeText {
         let asked = self.ends_asked.fetch_add(indices.len(), Atomic::Relaxed) + indices.len();
         let lens = match self.value_ends.get() {
             Some(Some(ends)) => self.value_lens.get_or_init(|| lengths_of(ends)).as_ref(),
-            _ if asked >= self.ends_worth_unpacking() => self
-                .value_lens
-                .get_or_init(|| self.unpack_ends().and_then(|ends| lengths_of(&ends)))
-                .as_ref(),
+            _ if asked >= self.ends_worth_unpacking() => {
+                self.value_lens.get_or_init(|| self.unpack_lens()).as_ref()
+            }
             _ => None,
         };
         if let Some(lens) = lens {
@@ -20823,6 +20865,47 @@ mod tests {
         }
         // The lengths a vector at a time, twice over, because the first pass is what makes the
         // table of ends worth building and the second is read out of the lengths worked out of it.
+        for _ in 0..2 {
+            for part in 0..rows / 1_000 {
+                let chunk = reader.read(part, &[0]).expect("a part");
+                let mut lens = vec![0_i64; 1_000];
+                let column = chunk.column(0).expect("one column");
+                assert!(column.try_bytes_lens(&mut lens).expect("lengths"), "a stored column");
+                for (row, &len) in lens.iter().enumerate() {
+                    let row = part * 1_000 + row;
+                    assert_eq!(len as usize, value(row).len(), "the length of value {row}");
+                }
+            }
+        }
+        fs::remove_file(path).expect("remove scratch file");
+    }
+
+    /// A value longer than sixteen bits turns the lengths built a run at a time to four bytes from
+    /// that value on, and the ones before it keep their lengths.
+    #[test]
+    fn a_long_value_widens_the_lengths_a_stored_column_reads() {
+        let path = path("dictionary-long-lengths");
+        let value = |row: usize| {
+            let row = row % 3_000;
+            if row == 2_500 {
+                "y".repeat(70_000)
+            } else {
+                "x".repeat(row % 61) + &format!("{row:04}")
+            }
+        };
+        let rows = 4_000;
+        let mut writer =
+            Writer::create(&path, "items", vec![Field::required("text", LogicalType::Varchar)])
+                .expect("new file");
+        let values = (0..rows).map(|row| Value::Varchar(value(row))).collect::<Vec<_>>();
+        for part in values.chunks(1_000) {
+            let chunk =
+                Chunk::new(vec![Vector::from_values(LogicalType::Varchar, part).expect("strings")])
+                    .expect("matching rows");
+            writer.append(&chunk).expect("a part");
+        }
+        writer.finish().expect("commit");
+        let reader = Reader::open(&path).expect("reopen from disk");
         for _ in 0..2 {
             for part in 0..rows / 1_000 {
                 let chunk = reader.read(part, &[0]).expect("a part");
