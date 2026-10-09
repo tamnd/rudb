@@ -1444,6 +1444,17 @@ fn a_recursive_union_of_columns_that_hash_runs() {
         let messages = client.query(sql);
         assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(rows)), "{sql}");
     }
+    // `bit varying` compares with a btree only, so PostgreSQL refuses the query before it runs,
+    // which here would never end.
+    let messages = client.query(
+        "with recursive t(n) as (values ('01'::varbit) union select n || '10'::varbit from t \
+         where n < '100'::varbit) select n from t",
+    );
+    assert_eq!(tags(&messages), "EZ");
+    let error = |code: u8| messages[0].field(code);
+    assert_eq!(error(b'C').as_deref(), Some("0A000"));
+    assert_eq!(error(b'M').as_deref(), Some("could not implement recursive UNION"));
+    assert_eq!(error(b'D').as_deref(), Some("All column datatypes must be hashable."));
     server.stop().unwrap();
 }
 
