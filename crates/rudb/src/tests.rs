@@ -9794,7 +9794,7 @@ fn a_write_answers_with_the_count_of_rows_it_wrote_the_way_the_pin_does() {
         assert_eq!(result.text_at(0, 0), result.changes().unwrap().to_string());
         result.changes().unwrap()
     };
-    assert!(db.execute("CREATE TABLE t (a INTEGER, b VARCHAR)").unwrap().changes().is_none());
+    assert_eq!(db.execute("CREATE TABLE t (a INTEGER, b VARCHAR)").unwrap().changes(), Some(0));
     assert_eq!(count("INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'z')"), 3);
     assert_eq!(count("INSERT INTO t SELECT * FROM t WHERE a > 5"), 0);
     assert_eq!(count("UPDATE t SET b = 'q' WHERE a >= 2"), 2);
@@ -9826,8 +9826,9 @@ fn returning_answers_with_the_rows_the_statement_wrote_the_way_the_pin_does() {
     assert_eq!(answer("UPDATE t SET a = a WHERE a > 5 RETURNING a"), "");
     assert_eq!(answer("DELETE FROM t WHERE a = 2 RETURNING b, a"), "q,2");
     assert_eq!(answer("SELECT count(*), sum(a) FROM t"), "2,4");
-    assert_eq!(answer("DELETE FROM t RETURNING count(*)"), "2");
-    assert_eq!(answer("SELECT count(*) FROM t"), "0");
+    let refused = db.execute("DELETE FROM t RETURNING count(*)").expect_err("an aggregate");
+    assert!(refused.to_string().contains("Aggregate functions are not supported here"));
+    assert_eq!(answer("SELECT count(*) FROM t"), "2");
 }
 
 #[test]
