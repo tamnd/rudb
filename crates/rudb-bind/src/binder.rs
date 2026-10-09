@@ -2636,7 +2636,7 @@ impl<'a> Binder<'a> {
                     });
                     sorted.push(Sorted { position, written: item.expr, extra: held.is_none() });
                     let ty = self.plan.expr_type(exprs[position]).clone();
-                    self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+                    let item = self.sort_operators(ast, item, &ty)?;
                     let expr = self.column(project, position, ty);
                     let expr = self.collate_key(expr, exprs[position])?;
                     keys.push(self.sort_key(expr, item));
@@ -2663,7 +2663,7 @@ impl<'a> Binder<'a> {
             };
             sorted.push(Sorted { position, written: item.expr, extra });
             let ty = self.plan.expr_type(exprs[position]).clone();
-            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+            let item = self.sort_operators(ast, item, &ty)?;
             let expr = self.column(project, position, ty);
             let expr = self.order_key(expr, exprs[position], ordinal.as_deref())?;
             keys.push(self.sort_key(expr, item));
@@ -2689,7 +2689,7 @@ impl<'a> Binder<'a> {
             if let Some(expanded) = self.bind_star_each(ast, item.expr, output)? {
                 for expr in expanded {
                     let ty = self.plan.expr_type(expr).clone();
-                    self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+                    let item = self.sort_operators(ast, item, &ty)?;
                     let expr = self.collate_key(expr, expr)?;
                     keys.push(self.sort_key(expr, item));
                 }
@@ -2708,7 +2708,7 @@ impl<'a> Binder<'a> {
                 }
             };
             let ty = self.plan.expr_type(expr).clone();
-            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+            let item = self.sort_operators(ast, item, &ty)?;
             let expr = self.order_key(expr, expr, ordinal.as_deref())?;
             keys.push(self.sort_key(expr, item));
         }
@@ -2749,14 +2749,21 @@ impl<'a> Binder<'a> {
         Ok(keys)
     }
 
-    /// A sort key with the session defaults filled in.
-    fn sort_key(&mut self, expr: ExprRef, item: ast::OrderItem) -> SortKey {
-        let expr = self.by_position(expr);
-        let descending = match item.order {
+    /// Whether a sort direction is descending, with the session default for none. `USING op` is
+    /// made `ASC` or `DESC` by [`Binder::sort_operators`] once the type of the key is known.
+    pub(crate) fn descending(&self, order: Order) -> bool {
+        match order {
             Order::Unstated => self.semantics.default_descending(),
             Order::Ascending => false,
             Order::Descending => true,
-        };
+            Order::Using { .. } => unreachable!("sort_operators resolves USING before a sort"),
+        }
+    }
+
+    /// A sort key with the session defaults filled in.
+    fn sort_key(&mut self, expr: ExprRef, item: ast::OrderItem) -> SortKey {
+        let expr = self.by_position(expr);
+        let descending = self.descending(item.order);
         let nulls_first = match item.nulls {
             Nulls::First => true,
             Nulls::Last => false,
@@ -5781,13 +5788,6 @@ impl<'a> Binder<'a> {
         let (ordered_set, taken) = ordered_set(name, args.len(), sorted);
         let injected = sorted.iter().map(|item| item.expr).take(usize::from(taken));
         let args: Vec<ast::ExprRef> = injected.chain(args.iter().copied()).collect();
-        let from_top = ordered_set
-            && sorted.len() == 1
-            && match sorted[0].order {
-                Order::Unstated => self.semantics.default_descending(),
-                Order::Ascending => false,
-                Order::Descending => true,
-            };
 
         self.in_aggregate = true;
         let mut bound = Vec::with_capacity(args.len());
@@ -5812,10 +5812,13 @@ impl<'a> Binder<'a> {
             return Err(error);
         }
         let keys = bound.split_off(args.len());
-        for (&key, item) in keys.iter().zip(sorted) {
+        let mut resolved = Vec::with_capacity(sorted.len());
+        for (&key, &item) in keys.iter().zip(sorted) {
             let ty = self.plan.expr_type(key).clone();
-            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+            resolved.push(self.sort_operators(ast, item, &ty)?);
         }
+        let sorted = &resolved[..];
+        let from_top = ordered_set && sorted.len() == 1 && self.descending(sorted[0].order);
         // A distinct aggregate sees each value once, and a key that is not one of the values would
         // have more than one of them to sort that value by.
         if distinct && !keys.iter().all(|&key| bound.iter().any(|&arg| self.same_expr(arg, key))) {
@@ -6183,11 +6186,7 @@ impl<'a> Binder<'a> {
             if !exporting && matches!(fold::value_of(&self.plan, key), Ok(Some(_))) {
                 continue;
             }
-            let descending = match item.order {
-                Order::Unstated => self.semantics.default_descending(),
-                Order::Ascending => false,
-                Order::Descending => true,
-            };
+            let descending = self.descending(item.order);
             let nulls_first = match item.nulls {
                 Nulls::First => true,
                 Nulls::Last => false,
@@ -6477,7 +6476,7 @@ impl<'a> Binder<'a> {
             let expr = self.bind_expr(ast, item.expr, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
             let ty = self.plan.expr_type(expr).clone();
-            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+            let item = self.sort_operators(ast, item, &ty)?;
             let expr = self.collate_key(expr, expr)?;
             inner.push(self.sort_key(expr, item));
         }
@@ -6494,7 +6493,7 @@ impl<'a> Binder<'a> {
             let expr = self.bind_expr(ast, item.expr, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
             let ty = self.plan.expr_type(expr).clone();
-            self.sort_group_operators(&ty, true, ast.leftmost_span(item.expr))?;
+            let item = self.sort_operators(ast, item, &ty)?;
             let expr = self.collate_key(expr, expr)?;
             order.push(self.sort_key(expr, item));
         }

@@ -591,6 +591,73 @@ impl Binder<'_> {
         self.operator_kernel(ast, operator, &oids, written, bound)
     }
 
+    /// An `ORDER BY` item over a key of type `ty` with the direction it sorts in, after the check
+    /// of its operators that `addTargetToSortList` makes. `USING op` is the operator PostgreSQL
+    /// finds with `compatible_oper_opid` for the type on both sides, which must be the `<` or the
+    /// `>` of a btree operator family, and it sorts ascending or descending as that member does.
+    pub(crate) fn sort_operators(
+        &self,
+        ast: &Ast,
+        item: ast::OrderItem,
+        ty: &LogicalType,
+    ) -> Result<ast::OrderItem> {
+        use rudb_pgtypes::OperatorResolution;
+        let ast::Order::Using { operator, span } = item.order else {
+            self.sort_group_operators(ty, true, ast.leftmost_span(item.expr))?;
+            return Ok(item);
+        };
+        let symbol = ast.string(operator);
+        let Some(oid) = exact_oid(ty) else {
+            let message =
+                format!("ORDER BY USING {symbol} over a value of type {ty} is not supported yet");
+            return Err(Error::not_implemented(message.clone())
+                .state(SqlState::FEATURE_NOT_SUPPORTED)
+                .pg(message)
+                .with_span(span));
+        };
+        let name = rudb_pgtypes::format_type(oid);
+        let signature = format!("{name} {symbol} {name}");
+        let failed = |state: SqlState, message: String| {
+            Error::binder(message.clone()).state(state).pg(message).with_span(span)
+        };
+        let found = match rudb_pgtypes::resolve_operator(symbol, &[oid, oid]) {
+            OperatorResolution::Found(found) => found,
+            OperatorResolution::Ambiguous => {
+                return Err(failed(
+                    SqlState::AMBIGUOUS_FUNCTION,
+                    format!("operator is not unique: {signature}"),
+                )
+                .detail("Could not choose a best candidate operator.")
+                .hint("You might need to add explicit type casts."));
+            }
+            OperatorResolution::NotFound => {
+                return Err(failed(
+                    SqlState::UNDEFINED_FUNCTION,
+                    format!("operator does not exist: {signature}"),
+                )
+                .detail("No operator of that name accepts the given argument types.")
+                .hint("You might need to add explicit type casts."));
+            }
+        };
+        if !found.args.iter().all(|&arg| rudb_pgtypes::binary_coercible(oid, arg)) {
+            return Err(failed(
+                SqlState::UNDEFINED_FUNCTION,
+                format!("operator requires run-time type coercion: {signature}"),
+            ));
+        }
+        let Some((_, descending)) = rudb_pgtypes::equality_for_ordering(found.oid) else {
+            return Err(failed(
+                SqlState::WRONG_OBJECT_TYPE,
+                format!("operator {symbol} is not a valid ordering operator"),
+            )
+            .hint(
+                "Ordering operators must be \"<\" or \">\" members of btree operator families.",
+            ));
+        };
+        let order = if descending { ast::Order::Descending } else { ast::Order::Ascending };
+        Ok(ast::OrderItem { order, ..item })
+    }
+
     /// The prefix operator `symbol` over `bound`, as the operator of `pg_operator` that
     /// PostgreSQL finds for it with `left_oper`. The engine has no operator of these, such as `@`
     /// for the absolute value, so the operator is always the kernel of its function. No operator,
