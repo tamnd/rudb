@@ -3,15 +3,52 @@
 //!
 //! Every function here is strict, so the caller gives a null for a null argument and the
 //! functions see only values.
+//!
+//! `extract` over a `timestamptz` reads the wall clock in the session time zone, so it is called
+//! with the zone by [`zoned_call`], and [`call`] gives it the clock at UTC.
 
-use rudb_common::{Error, Result, SqlState, Value};
+use rudb_common::{Error, Result, SessionTimeZone, SqlState, Value, time_tz};
+use rudb_pgtypes::{Interval, Numeric, TypeError, date_from_unix, timestamp_from_unix};
 
 /// The C functions of this module, sorted.
-pub(crate) const SOURCES: &[&str] = &["make_interval"];
+pub(crate) const SOURCES: &[&str] = &[
+    "extract_date",
+    "extract_interval",
+    "extract_time",
+    "extract_timestamp",
+    "extract_timestamptz",
+    "extract_timetz",
+    "make_interval",
+];
+
+/// The C functions of this module that read the session time zone.
+pub(crate) const ZONED: &[&str] = &["extract_timestamptz"];
 
 /// The value of the C function `src` over `args`, or `None` for another function.
 pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
+    if ZONED.contains(&src) {
+        return zoned_call(src, args, SessionTimeZone::default()).map(Some);
+    }
     let value = match (src, args) {
+        ("extract_date", [Value::Varchar(units), Value::Date(days)]) => {
+            let date = date_from_unix(*days).map_err(placed)?;
+            numeric(rudb_pgtypes::extract_date(units, date))?
+        }
+        ("extract_time", [Value::Varchar(units), Value::Time(micros)]) => {
+            numeric(rudb_pgtypes::extract_time(units, *micros).map(Some))?
+        }
+        ("extract_timetz", [Value::Varchar(units), Value::TimeTz(key)]) => {
+            let (time, zone) = (time_tz::micros(*key), -time_tz::offset(*key));
+            numeric(rudb_pgtypes::extract_timetz(units, time, zone).map(Some))?
+        }
+        ("extract_timestamp", [Value::Varchar(units), Value::Timestamp(micros)]) => {
+            let ts = timestamp_from_unix(*micros).map_err(placed)?;
+            numeric(rudb_pgtypes::extract_timestamp(units, ts))?
+        }
+        ("extract_interval", [Value::Varchar(units), Value::Interval { months, days, micros }]) => {
+            let interval = Interval { time: *micros, day: *days, month: *months };
+            numeric(rudb_pgtypes::extract_interval(units, &interval))?
+        }
         (
             "make_interval",
             [
@@ -70,6 +107,27 @@ fn make_interval(parts: [i32; 6], secs: f64) -> Result<Value> {
         return Err(out_of_range());
     }
     Ok(Value::Interval { months, days, micros: time })
+}
+
+/// The value of the C function `src` of [`ZONED`] over `args`, in the time zone `zone`.
+pub(crate) fn zoned_call(src: &str, args: &[Value], zone: SessionTimeZone) -> Result<Value> {
+    match (src, args) {
+        ("extract_timestamptz", [Value::Varchar(units), Value::TimestampTz(micros)]) => {
+            let ts = timestamp_from_unix(*micros).map_err(placed)?;
+            numeric(rudb_pgtypes::extract_timestamptz(units, ts, &zone))
+        }
+        _ => Err(Error::internal(format!("{src} over {args:?}"))),
+    }
+}
+
+/// A `numeric` answer, or a null for `None`.
+fn numeric(answer: std::result::Result<Option<Numeric>, TypeError>) -> Result<Value> {
+    Ok(answer.map_err(placed)?.map_or(Value::Null, |number| Value::Numeric(number.to_bytes())))
+}
+
+/// An error of PostgreSQL that has no position, as the errors of a function that runs have.
+fn placed(error: TypeError) -> Error {
+    Error::from(error).unplaced()
 }
 
 fn out_of_range() -> Error {

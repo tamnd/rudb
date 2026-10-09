@@ -50,6 +50,12 @@ pub fn call_in_time_zone<V: AsRef<Vector>>(
     if crate::pgformat::formats(name) {
         return Some(crate::pgformat::call_vectors(name, &args, returns, zone));
     }
+    // The kernels of `pg_proc` that read the wall clock of an instant, in any zone.
+    if let Some(src) = name.strip_prefix(crate::pgproc::PREFIX)
+        && crate::pgdatetime::ZONED.contains(&src)
+    {
+        return Some(rows(&args, returns, |row| crate::pgdatetime::zoned_call(src, row, zone)));
+    }
     if !args.iter().any(|arg| zoned(arg)) {
         return None;
     }

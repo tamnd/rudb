@@ -14,6 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 use rudb_common::SqlState;
 
+use super::part::Unit;
 use super::{
     AbbrevMeaning, DATE_END_JULIAN, DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateOrder,
     END_TIMESTAMP, Interval, IntervalStyle, MIN_TIMESTAMP, POSTGRES_EPOCH_JDATE,
@@ -412,6 +413,42 @@ fn delta_token(key: &[u8]) -> Option<(i32, i32)> {
         _ => return None,
     };
     Some((UNITS, unit))
+}
+
+/// The unit of `extract` and `date_part` that a lowercased token names, as `DecodeUnits` and then
+/// `DecodeSpecial` find it. `None` for a token that is neither a unit nor a reserved word.
+pub(super) fn part_unit(lowtoken: &[u8]) -> Option<Unit> {
+    let (kind, value) = delta_token(lowtoken).or_else(|| date_token(lowtoken))?;
+    match kind {
+        RESERV if value == DTK_EPOCH => return Some(Unit::Epoch),
+        RESERV => return Some(Unit::Reserved),
+        UNITS => {}
+        _ => return None,
+    }
+    Some(match value {
+        DTK_MICROSEC => Unit::Microsecond,
+        DTK_MILLISEC => Unit::Millisecond,
+        DTK_SECOND => Unit::Second,
+        DTK_MINUTE => Unit::Minute,
+        DTK_HOUR => Unit::Hour,
+        DTK_DAY => Unit::Day,
+        DTK_WEEK => Unit::Week,
+        DTK_MONTH => Unit::Month,
+        DTK_QUARTER => Unit::Quarter,
+        DTK_YEAR => Unit::Year,
+        DTK_DECADE => Unit::Decade,
+        DTK_CENTURY => Unit::Century,
+        DTK_MILLENNIUM => Unit::Millennium,
+        DTK_JULIAN => Unit::Julian,
+        DTK_ISOYEAR => Unit::IsoYear,
+        DTK_DOW => Unit::Dow,
+        DTK_ISODOW => Unit::IsoDow,
+        DTK_DOY => Unit::Doy,
+        DTK_TZ_VALUE => Unit::Tz,
+        DTK_TZ_HOUR => Unit::TzHour,
+        DTK_TZ_MINUTE => Unit::TzMinute,
+        _ => return None,
+    })
 }
 
 /// The byte at `i`, or 0 at the end, as a C string reads.

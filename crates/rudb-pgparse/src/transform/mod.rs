@@ -348,15 +348,6 @@ impl<'a> Transform<'a> {
         }
     }
 
-    /// The kind of the token at a location, and the kind of the token after it.
-    fn token_at(&self, location: i32) -> Option<(u16, u16)> {
-        let location = u32::try_from(location).ok()?;
-        let tokens = self.tokens();
-        let index = tokens.binary_search_by_key(&location, |&(start, _, _)| start).ok()?;
-        let next = tokens.get(index + 1).map_or(0, |&(_, _, kind)| kind);
-        Some((tokens[index].2, next))
-    }
-
     fn intern(&mut self, text: &str) -> StrRef {
         self.interned.intern(&mut self.ast, text)
     }

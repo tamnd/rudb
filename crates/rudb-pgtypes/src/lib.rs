@@ -146,11 +146,12 @@ pub use datetime::{
     DateTemplate, DateTimeInput, FixedZone, Interval, IntervalStyle, NoZones, POSTGRES_EPOCH_JDATE,
     SessionZones, TIMESTAMP_INFINITY, TIMESTAMP_NEGATIVE_INFINITY, TimeZone, UNIX_EPOCH_JDATE,
     UNIX_TO_POSTGRES_DAYS, UNIX_TO_POSTGRES_USECS, USECS_PER_DAY, USECS_PER_SEC, ZoneAbbrevs,
-    ZoneLookup, date_from_unix, date_in, date_out, date_recv, date2j, interval_in, interval_out,
-    interval_recv, interval_send, interval_to_char, j2date, time_in, time_out, time_recv,
-    timestamp_from_unix, timestamp_in, timestamp_out, timestamp_recv, timestamp_to_char,
-    timestamp_to_unix, timestamptz_in, timestamptz_out, timestamptz_to_char, timetz_in, timetz_out,
-    timetz_recv, to_date, to_timestamp,
+    ZoneLookup, date_from_unix, date_in, date_out, date_recv, date2j, extract_date,
+    extract_interval, extract_time, extract_timestamp, extract_timestamptz, extract_timetz,
+    interval_in, interval_out, interval_recv, interval_send, interval_to_char, j2date, time_in,
+    time_out, time_recv, timestamp_from_unix, timestamp_in, timestamp_out, timestamp_recv,
+    timestamp_to_char, timestamp_to_unix, timestamptz_in, timestamptz_out, timestamptz_to_char,
+    timetz_in, timetz_out, timetz_recv, to_date, to_timestamp,
 };
 pub use declared::{declared_type, session_type, type_name};
 pub use error::TypeError;

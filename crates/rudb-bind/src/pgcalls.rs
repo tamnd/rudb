@@ -33,6 +33,8 @@ pub(crate) struct Written<'a> {
     pub(crate) names: &'a [&'a str],
     /// The call has `VARIADIC` before its last argument.
     pub(crate) variadic: bool,
+    /// The name with the schema written in front of it, which the errors give as it was written.
+    pub(crate) qualified: Option<&'a str>,
 }
 
 /// The PostgreSQL type of a value of `ty` when that type binds back as `ty`, so that the rules for
@@ -319,7 +321,7 @@ impl Binder<'_> {
                 matches!(ast.expr(argument), ast::Expr::Literal { kind: LiteralKind::String, .. })
             })
             .collect();
-        let how = Written { names: &names, variadic: ast.variadic(call) };
+        let how = Written { names: &names, variadic: ast.variadic(call), qualified: None };
         let found = self.pg_proc_call(ast, written, &arguments, &bound, &untyped, how, scope)?;
         found.ok_or_else(|| {
             let message = format!("named arguments and VARIADIC in a call of {written}");
@@ -383,7 +385,8 @@ impl Binder<'_> {
         let candidate = match rudb_pgtypes::resolve_call(written, call) {
             Resolution::Found(candidate) => candidate,
             Resolution::NotFound(failure) => {
-                let call = spelled_call(written, &types, untyped, how.names);
+                let call =
+                    spelled_call(how.qualified.unwrap_or(written), &types, untyped, how.names);
                 let message = format!("function {call} does not exist");
                 let mut error =
                     Error::binder(message.clone()).state(SqlState::UNDEFINED_FUNCTION).pg(message);
@@ -396,7 +399,8 @@ impl Binder<'_> {
                 return Err(error.with_span(self.current_span));
             }
             Resolution::Ambiguous => {
-                let call = spelled_call(written, &types, untyped, how.names);
+                let call =
+                    spelled_call(how.qualified.unwrap_or(written), &types, untyped, how.names);
                 let message = format!("function {call} is not unique");
                 return Err(Error::binder(message.clone())
                     .state(SqlState::AMBIGUOUS_FUNCTION)
