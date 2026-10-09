@@ -1198,6 +1198,10 @@ impl Binder<'_> {
         {
             return Ok(done);
         }
+        if self.semantics.operator_rules() == OperatorRules::Postgres {
+            [left, right] =
+                self.pg_numeric_operands(ast, &operator_name(ast, op), &written, [left, right])?;
+        }
         if matches!(
             op,
             BinaryOp::Add
