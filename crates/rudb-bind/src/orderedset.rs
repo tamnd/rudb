@@ -301,7 +301,7 @@ fn not_ordered_set(
 
 /// PostgreSQL's error for a function it does not find over these arguments, with the detail of
 /// `func_lookup_failure_details`.
-fn undefined(
+pub(crate) fn undefined(
     ast: &Ast,
     call: ast::ExprRef,
     written: &str,

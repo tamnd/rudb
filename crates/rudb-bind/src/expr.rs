@@ -274,6 +274,7 @@ impl Binder<'_> {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 let listed = ast.expr_list(args).to_vec();
                 let call = WindowCall {
+                    call: expr,
                     name: &written,
                     args: &listed,
                     distinct,
@@ -299,7 +300,11 @@ impl Binder<'_> {
                 match self.semantics.function_rules() {
                     FunctionRules::Postgres => {
                         let written = ast.name(name).last().unwrap_or_default();
-                        Ok(self.postgres_result(written, bound?))
+                        let bound = bound?;
+                        if ast.null_treated(expr) {
+                            return Err(crate::overcall::treated_call(written));
+                        }
+                        Ok(self.postgres_result(written, bound))
                     }
                     FunctionRules::Pin => bound,
                 }
@@ -308,6 +313,7 @@ impl Binder<'_> {
                 let written = ast.name(name).last().unwrap_or_default().to_string();
                 let args = ast.expr_list(args).to_vec();
                 let call = WindowCall {
+                    call: expr,
                     name: &written,
                     args: &args,
                     distinct,
@@ -1682,6 +1688,9 @@ impl Binder<'_> {
         // the same way and it is not an arity mistake, which is what the signature table would
         // otherwise say about a `count` given no arguments.
         if rudb_catalog::same_name(&written, "count") && arguments.is_empty() {
+            if postgres {
+                return Err(crate::overcall::parameterless(&written));
+            }
             return self.bind_aggregate(ast, "count_star", &[], false, filter, &[], scope);
         }
         // `TRY(1, 2)` is not the grammar's `TryExpression`, so it arrives as a call, and the pin's
@@ -1747,7 +1756,9 @@ impl Binder<'_> {
         // missing, because the name is there and it is the place it was written that is wrong:
         // `row_number()` has no answer until something says which rows it is counting through.
         if kind_of(&written) == Some(FunctionKind::Window) {
-            return Err(Error::binder("Window functions are not supported here"));
+            return Err(Error::binder("Window functions are not supported here")
+                .state(SqlState::WRONG_OBJECT_TYPE)
+                .pg(crate::overcall::unwindowed(&written)));
         }
         // Upstream's sentence, which names all three modifiers whichever one was written, and which
         // it reaches only once the name has resolved: `nosuch(DISTINCT x)` is a catalog error there

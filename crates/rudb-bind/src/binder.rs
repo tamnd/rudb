@@ -39,6 +39,7 @@ use rudb_plan::{
 use crate::expr::{describe, postgres_oid, written_oid};
 use crate::fold;
 use crate::ordinality::unnumbered;
+use crate::overcall;
 use crate::parameters::{Parameters, Written};
 use crate::scope::{Joined, Scope, Visible};
 
@@ -223,6 +224,8 @@ pub(crate) struct AggregateCall<'a> {
 /// These six travel together from the parser all the way to the run they end up filed under, and
 /// carrying them as one thing keeps the call that binds them readable.
 pub(crate) struct WindowCall<'a> {
+    /// The call, which errors are placed at.
+    pub(crate) call: ast::ExprRef,
     /// The function name, as written and not yet resolved.
     pub(crate) name: &'a str,
     /// The arguments, which may include a star that only `count` is allowed to be given.
@@ -6406,7 +6409,8 @@ impl<'a> Binder<'a> {
         written: &WindowCall<'_>,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let WindowCall { name, args, distinct, filter, ignore_nulls, spec, .. } = *written;
+        let WindowCall { call, name, args, distinct, filter, ignore_nulls, spec, .. } = *written;
+        let postgres = self.semantics.function_rules() == FunctionRules::Postgres;
         if self.in_aggregate {
             return Err(Error::binder(
                 "aggregate function calls cannot contain window function calls",
@@ -6415,9 +6419,7 @@ impl<'a> Binder<'a> {
         if self.in_window {
             return Err(Error::binder("window function calls cannot be nested"));
         }
-        if self.semantics.function_rules() == FunctionRules::Postgres
-            && let Some(error) = self.within_group_required(name, args.len())
-        {
+        if postgres && let Some(error) = self.within_group_required(name, args.len()) {
             return Err(error);
         }
         let clause = pin_clause(self.clause);
@@ -6445,6 +6447,9 @@ impl<'a> Binder<'a> {
         } else if same_name(name, "count") && args.is_empty() {
             // `count()` with nothing in it is upstream's other spelling of `count(*)`. It counts
             // rows the same way and it is not an arity mistake.
+            if postgres {
+                return Err(overcall::parameterless(name));
+            }
             ("count_star", &[])
         } else {
             (name, args)
@@ -6483,13 +6488,25 @@ impl<'a> Binder<'a> {
         let types: Vec<LogicalType> =
             parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         // Upstream refuses this once the arguments are bound and before it looks for an overload,
-        // so it is said even of an aggregate the arguments do not fit.
-        if ignore_nulls && kind_of(name) == Some(FunctionKind::Aggregate) {
+        // so it is said even of an aggregate the arguments do not fit. PostgreSQL looks for the
+        // function first, and refuses `RESPECT NULLS` too.
+        if !postgres && ignore_nulls && kind_of(name) == Some(FunctionKind::Aggregate) {
             return Err(Error::binder(
                 "RESPECT/IGNORE NULLS is not supported for windowed aggregates",
             ));
         }
-        let resolved = window_signature(name, &types)?;
+        let resolved = match window_signature(name, &types) {
+            Err(error) if postgres => {
+                return Err(overcall::not_windowed(ast, call, name, args, &types, error));
+            }
+            resolved => resolved?,
+        };
+        if postgres
+            && (ignore_nulls || ast.null_treated(call))
+            && let Some(error) = overcall::treated_window(name)
+        {
+            return Err(error);
+        }
         // `fill` reads the sort key rather than the frame, so what it needs from the query is not
         // what any other window needs and it is refused on its own terms. An `ORDER BY` inside
         // its brackets is the key it reads in place of the one in the `OVER`.

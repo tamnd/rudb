@@ -37,7 +37,8 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{
-    Error, Field, LogicalType, Memory, Reservation, Result, Session, SqlState, TieOrder, Value,
+    Error, Field, FunctionRules, LogicalType, Memory, Reservation, Result, Session, SqlState,
+    TieOrder, Value,
 };
 use rudb_functions::resolve;
 use rudb_kernels::Accumulator;
@@ -314,6 +315,9 @@ pub(crate) struct Window {
     sorting: Vec<SortKey>,
     /// What order the rows that tie are left in, from the session.
     ties: TieOrder,
+    /// Whose rules the functions follow, from the session. PostgreSQL refuses an `nth_value`
+    /// count that is not positive, where the pin answers it with a null.
+    functions: FunctionRules,
     /// How PostgreSQL holds the first key of `sorting`, when it compares as an integer.
     leading: Option<Leading>,
     calls: Vec<Call>,
@@ -350,6 +354,7 @@ impl Window {
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.values = self.values.in_session(session);
         self.ties = session.semantics().tie_order();
+        self.functions = session.semantics().function_rules();
         self
     }
 
@@ -459,6 +464,7 @@ impl Window {
             order,
             sorting,
             ties: TieOrder::Pin,
+            functions: FunctionRules::Pin,
             leading,
             calls,
             frame,
@@ -1102,7 +1108,8 @@ impl Window {
     ///
     /// A count that does not reach a row is null and not an error. `nth_value(i, 10)` over a frame
     /// of five rows is null upstream, and so are `nth_value(i, 0)`, `nth_value(i, -1)` and
-    /// `nth_value(i, NULL)`, which is three different reasons for the same answer.
+    /// `nth_value(i, NULL)`, which is three different reasons for the same answer. PostgreSQL
+    /// answers a null count with a null too, and refuses a count that is not positive.
     fn picked(
         &self,
         pick: Picks,
@@ -1125,6 +1132,12 @@ impl Window {
                 let count = written.as_i64().ok_or_else(|| {
                     Error::invalid_input("Argument for nth_value must be a number")
                 })?;
+                if count <= 0 && self.functions == FunctionRules::Postgres {
+                    let message = "argument of nth_value must be greater than zero";
+                    return Err(Error::invalid_input(message)
+                        .state(SqlState::INVALID_ARGUMENT_FOR_NTH_VALUE)
+                        .unplaced());
+                }
                 if count <= 0 {
                     return Ok(Value::Null);
                 }
