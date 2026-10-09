@@ -1447,6 +1447,30 @@ fn a_recursive_union_of_columns_that_hash_runs() {
     server.stop().unwrap();
 }
 
+/// A query reads the catalog beside the queries of other sessions, so a long one keeps no other
+/// query waiting, whether it comes in as a simple or as an extended query.
+#[test]
+fn a_long_query_keeps_no_query_of_another_session_waiting() {
+    let dirs = Dirs::new("pglong");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut long = Client::unix(&server);
+    connect(&mut long, PROTOCOL_3_0);
+    let mut other = Client::unix(&server);
+    connect(&mut other, PROTOCOL_3_0);
+    long.send(&Frontend::Query(b"select pg_sleep(3)"));
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    assert_eq!(scalar(&mut other, "select 1"), "1");
+    assert_eq!(scalar(&mut other, "select count(*) from (values (1), (2)) v(x)"), "2");
+    other.parse("", "select $1::int4 + 1", &[]);
+    other.bind("", "", &[], &[Some(b"41")]);
+    other.execute("", 0);
+    assert_eq!(tags(&other.sync()), "12DCZ");
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert_eq!(tags(&long.until_ready()), "TDCZ");
+    server.stop().unwrap();
+}
+
 /// A temporary table, view or sequence belongs to the session that made it, and goes when that
 /// session ends. One made inside a transaction that rolled back was never there.
 #[test]
