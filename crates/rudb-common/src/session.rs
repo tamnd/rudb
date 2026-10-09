@@ -213,6 +213,7 @@ pub struct Semantics {
     order_by_non_integer_literal: bool,
     pivot_limit: u64,
     plan_errors: PlanErrors,
+    recursive_union: RecursiveUnion,
     regex_match_full: bool,
     regex_rules: RegexRules,
     row_fields: RowFields,
@@ -269,6 +270,7 @@ impl Default for Semantics {
             order_by_non_integer_literal: false,
             pivot_limit: 100_000,
             plan_errors: PlanErrors::Pin,
+            recursive_union: RecursiveUnion::Pin,
             regex_match_full: false,
             regex_rules: RegexRules::Pin,
             scalar_subquery_error_on_multiple_rows: true,
@@ -366,6 +368,11 @@ impl Semantics {
     #[must_use]
     pub fn plan_errors(self) -> PlanErrors {
         self.plan_errors
+    }
+    /// How a recursive `UNION` without `ALL` finds the rows it has made.
+    #[must_use]
+    pub fn recursive_union(self) -> RecursiveUnion {
+        self.recursive_union
     }
     /// How an explicit cast reads a string.
     #[must_use]
@@ -730,6 +737,18 @@ pub enum PlanErrors {
     Pin,
     /// As in PostgreSQL: the planner folds each call whose arguments are all constants, and an
     /// error there fails the statement before it makes a row.
+    Postgres,
+}
+
+/// How a recursive `UNION` without `ALL` finds the rows it has made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecursiveUnion {
+    /// As in DuckDB: a column of each type can take part, because the engine compares the values
+    /// it has kept.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the rows go in a hash table, so a column whose type does not hash, such
+    /// as `bit varying`, is `0A000 could not implement recursive UNION`.
     Postgres,
 }
 
@@ -1353,6 +1372,7 @@ impl Session {
             self.semantics.error_texts = ErrorTexts::Postgres;
             self.semantics.function_rules = FunctionRules::Postgres;
             self.semantics.plan_errors = PlanErrors::Postgres;
+            self.semantics.recursive_union = RecursiveUnion::Postgres;
             self.semantics.cast_input = CastInput::Postgres;
             self.semantics.number_casts = NumberCasts::Postgres;
             self.semantics.cast_output = CastOutput::Postgres;

@@ -3,7 +3,7 @@
 
 use crate::generated::operators::OPERATORS;
 use crate::procs::{Proc, procs};
-use crate::types::Oid;
+use crate::types::{Oid, TypeInfo};
 
 /// A row of `pg_operator`, with the columns that the rules for an operator read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +19,19 @@ pub struct Operator {
     pub result: Oid,
     /// `oprcode`: the name of the function that the operator calls.
     pub code: &'static str,
+    /// `oprcanmerge`: the operator is the equality of a btree operator family, so a merge join
+    /// and a sort can use it.
+    pub merges: bool,
+    /// `oprcanhash`: the operator is the equality of a hash operator family, so a hash join and a
+    /// hash table can use it.
+    pub hashes: bool,
 }
+
+/// The flags of a row of the generated table: neither, `oprcanmerge`, `oprcanhash`, or both.
+pub(crate) const N: u8 = 0;
+pub(crate) const M: u8 = 1;
+pub(crate) const H: u8 = 2;
+pub(crate) const MH: u8 = M | H;
 
 /// The row constructor of the generated table, short so that each row fits on one line.
 pub(crate) const fn o(
@@ -29,8 +41,9 @@ pub(crate) const fn o(
     args: &'static [Oid],
     result: Oid,
     code: &'static str,
+    flags: u8,
 ) -> Operator {
-    Operator { oid, name, kind, args, result, code }
+    Operator { oid, name, kind, args, result, code, merges: flags & M != 0, hashes: flags & H != 0 }
 }
 
 impl Operator {
@@ -54,6 +67,20 @@ pub fn operators_of(proc: &Proc) -> impl Iterator<Item = &'static Operator> {
     OPERATORS.iter().filter(move |operator| operator.code == name && operator.args == args)
 }
 
+/// Whether a hash table can hold the values of the type, as `op_hashjoinable` finds for the
+/// equality that sorts and groups them. This is false when the type has an equality of its own that
+/// a btree can use but a hash cannot, such as `bit` and `money`, and for an array of such a type,
+/// whose equality hashes only when the equality of the element hashes. A type with no equality of
+/// its own, such as `varchar`, reads as the type that it can be read as without a change, so it is
+/// taken as hashable here.
+pub fn hashable(oid: Oid) -> bool {
+    if let Some(info) = TypeInfo::get(oid).filter(|info| info.is_array()) {
+        return hashable(info.elem);
+    }
+    let own = |operator: &&Operator| operator.args == [oid, oid] && operator.merges;
+    operators("=", b'b').find(own).is_none_or(|equality| equality.hashes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +98,15 @@ mod tests {
         assert!(!negate.is_empty() && negate.iter().all(|&count| count == 1));
         assert!(OPERATORS.iter().all(|operator| operator.proc().is_some()));
         assert_eq!(operators("nosuchop", b'b').count(), 0);
+    }
+
+    #[test]
+    fn a_type_is_hashable_when_its_equality_hashes() {
+        for hashes in [oid::INT4, oid::TEXT, oid::VARCHAR, oid::NUMERIC, oid::INT4_ARRAY] {
+            assert!(hashable(hashes), "{hashes}");
+        }
+        for sorts_only in [oid::BIT, oid::VARBIT, oid::MONEY, oid::VARBIT_ARRAY] {
+            assert!(!hashable(sorts_only), "{sorts_only}");
+        }
     }
 }

@@ -166,7 +166,7 @@ pub use numeric::{
     Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_out_sci,
     numeric_recv, numeric_send,
 };
-pub use operators::{Operator, operators, operators_of};
+pub use operators::{Operator, hashable, operators, operators_of};
 pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,
     soft_input_error,

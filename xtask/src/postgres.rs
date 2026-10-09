@@ -1205,7 +1205,14 @@ fn pgoperator(types: &str, operators: &str, procs: &str) -> Result<String, Strin
                 "pg_operator.dat: {name} calls {code}, which is not one function of its types"
             ));
         }
-        rows.push((name.to_string(), oid, kind, operands, result, code.to_string()));
+        // `oprcanmerge` and `oprcanhash` as the flags `M` and `H` of the table.
+        let flags = match (field("oprcanmerge") == Some("t"), field("oprcanhash") == Some("t")) {
+            (false, false) => "N",
+            (true, false) => "M",
+            (false, true) => "H",
+            (true, true) => "MH",
+        };
+        rows.push((name.to_string(), oid, kind, operands, result, code.to_string(), flags));
     }
     rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
     if rows.windows(2).any(|w| w[0].1 == w[1].1) {
@@ -1219,19 +1226,22 @@ fn pgoperator(types: &str, operators: &str, procs: &str) -> Result<String, Strin
          //! `crates/rudb-pgtypes/vendor/pg_proc.dat`. Do not edit. `cargo xtask pg-check` runs in\n\
          //! the gate and fails if this file and the vendored files disagree.\n\
          \n\
-         use crate::operators::{Operator, o};\n\
+         use crate::operators::{H, M, MH, N, Operator, o};\n\
          \n",
     );
     let _ = writeln!(
         out,
         "/// Every operator in the order of the name and the OID: the OID, `oprname`, `oprkind`, the\n\
-         /// types of the operands, `oprresult` and `oprcode`.\n\
+         /// types of the operands, `oprresult`, `oprcode`, and the flags of `oprcanmerge` and\n\
+         /// `oprcanhash`.\n\
          pub(crate) static OPERATORS: [Operator; {}] = [",
         rows.len()
     );
-    for (name, oid, kind, operands, result, code) in &rows {
-        let _ =
-            writeln!(out, "    o({oid}, {name:?}, b'{kind}', &{operands:?}, {result}, {code:?}),");
+    for (name, oid, kind, operands, result, code, flags) in &rows {
+        let _ = writeln!(
+            out,
+            "    o({oid}, {name:?}, b'{kind}', &{operands:?}, {result}, {code:?}, {flags}),"
+        );
     }
     out.push_str("];\n");
     Ok(out)
