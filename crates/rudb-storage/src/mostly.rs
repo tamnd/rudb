@@ -189,6 +189,19 @@ pub struct WriteGuard<'a, T> {
     _held: MutexGuard<'a, ()>,
 }
 
+impl<'a, T> WriteGuard<'a, T> {
+    /// Turns the write into a read with no writer between them, for a statement that changes the
+    /// value only before it runs a long read. The reader is counted in while the flag is still up
+    /// and the mutex still held, so a writer waiting on the mutex then waits for this reader too.
+    pub fn downgrade(this: Self) -> ReadGuard<'a, T> {
+        let lock = this.lock;
+        let slot = &lock.slots[mine() & (lock.slots.len() - 1)];
+        slot.0.fetch_add(1, Ordering::SeqCst);
+        drop(this);
+        ReadGuard { lock, slot }
+    }
+}
+
 impl<T> Deref for WriteGuard<'_, T> {
     type Target = T;
 
@@ -296,5 +309,35 @@ mod tests {
         let mut lock = Arc::try_unwrap(lock).expect("the only handle");
         *lock.get_mut() += 1;
         assert_eq!(lock.into_inner(), 8);
+    }
+
+    #[test]
+    fn a_downgraded_write_lets_readers_in_and_keeps_writers_out() {
+        let lock = Arc::new(ReadMostly::new(0));
+        let mut held = lock.write();
+        *held = 1;
+        let read = super::WriteGuard::downgrade(held);
+        // Another reader comes in beside the downgraded one.
+        let reader = {
+            let lock = Arc::clone(&lock);
+            std::thread::spawn(move || *lock.read())
+        };
+        assert_eq!(reader.join().expect("the reader finished"), 1);
+        // A writer waits until the downgraded read is gone.
+        let wrote = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let lock = Arc::clone(&lock);
+            let wrote = Arc::clone(&wrote);
+            std::thread::spawn(move || {
+                *lock.write() = 2;
+                wrote.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!wrote.load(Ordering::SeqCst), "a writer came in beside a read");
+        assert_eq!(*read, 1);
+        drop(read);
+        writer.join().expect("the writer finished");
+        assert_eq!(*lock.read(), 2);
     }
 }

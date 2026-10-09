@@ -107,6 +107,13 @@ impl Counter {
         self.lock().durable = uses;
     }
 
+    /// Whether the counter handed out a value the last log record does not cover, so the next
+    /// commit stages a record for it, see [`Counter::ahead`].
+    pub fn moved(&self) -> bool {
+        let state = self.lock();
+        state.uses > state.durable
+    }
+
     /// The `setval` that a log record must carry so that a replay of the log starts the counter
     /// after every value it has handed out, or `None` when the last record still covers them.
     ///

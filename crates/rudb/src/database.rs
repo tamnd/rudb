@@ -4283,7 +4283,7 @@ impl Shared {
             if let Some(answer) = self.cached_native_aggregate(sql, cancel)? {
                 return Ok(answer);
             }
-            kept(sql, 0, |noted| self.query_mirrored(sql, cancel, true, noted))
+            kept(sql, 0, |noted| self.query_mirrored(sql, cancel, noted))
         })
     }
 
@@ -5636,6 +5636,13 @@ impl Shared {
             && !self.transacting()
     }
 
+    /// Whether `ast` is one query outside a transaction, which reads its rows under the catalog
+    /// and changes none, so it needs no writer lock while it runs. A `WITH` that changes rows, a
+    /// pivot and a trigger take their own paths before this is asked.
+    fn reading_statement(&self, ast: &Ast) -> bool {
+        matches!(ast.statements.as_slice(), [ast::Statement::Query(_)]) && !self.transacting()
+    }
+
     /// Reuse a simple native aggregate plan while the table and settings are unchanged.
     /// Execution still runs for every call, producing a fresh answer and metrics document.
     fn cached_native_aggregate(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
@@ -5787,15 +5794,29 @@ impl Shared {
         simple.push(held);
     }
 
-    /// [`Shared::query`], asking for the Parquet mirrors the statement wants when `mirror` is set.
+    /// [`Shared::query`]: parses the text and runs it as [`Shared::read_mirrored`] does.
+    fn query_mirrored(&self, sql: &str, cancel: &Cancel, noted: &mut Noted) -> Result<QueryResult> {
+        let session = self.session();
+        let (ast, parse_ns) = timed(|| parse_statement(&session, sql))?;
+        noted.parse_ns = parse_ns;
+        self.read_mirrored(&ast, sql, &Parameters::new(), cancel, parse_ns, true, noted)
+    }
+
+    /// Binds and runs a query, or an `EXPLAIN` of one, under the read lock of the catalog, so
+    /// queries run beside each other and only a writer waits for one. A caller's `query` comes
+    /// here, and so does a statement that is one query.
     ///
-    /// A statement that wanted one is bound again once the mirrors are in, and not a third time,
-    /// so a mirror that cannot be had costs one extra bind and leaves the statement reading the
-    /// file.
-    fn query_mirrored(
+    /// With `mirror` set it asks for the Parquet mirrors the statement wants. A statement that
+    /// wanted one is bound again once the mirrors are in, and not a third time, so a mirror that
+    /// cannot be had costs one extra bind and leaves the statement reading the file.
+    #[allow(clippy::too_many_arguments)]
+    fn read_mirrored(
         &self,
+        ast: &Ast,
         sql: &str,
+        parameters: &Parameters,
         cancel: &Cancel,
+        parse_ns: u64,
         mirror: bool,
         noted: &mut Noted,
     ) -> Result<QueryResult> {
@@ -5803,18 +5824,15 @@ impl Shared {
         let seams = self.seams(sql)?;
         let context = self.optimizer(&catalog)?;
         let session = self.session();
-        // The second pass reads the text that the first pass read, whose notices are raised.
-        let (ast, parse_ns) =
-            timed(|| if mirror { parse_statement(&session, sql) } else { parse(&session, sql) })?;
         let outlined = mirror && self.inner.settings.config().parquet_mirror();
         let (bound, bind_ns) = timed(|| {
             if outlined {
-                rudb_bind::bind_statement_outlined(&ast, &catalog, &Parameters::new(), &session)
+                rudb_bind::bind_statement_outlined(ast, &catalog, parameters, &session)
             } else {
-                rudb_bind::bind_statement_with(&ast, &catalog, &Parameters::new(), &session)
+                rudb_bind::bind_statement_with(ast, &catalog, parameters, &session)
             }
         })?;
-        *noted = Noted { parse_ns, bind_ns };
+        noted.bind_ns = bind_ns;
         if mirror {
             let wanted = self.wanted_mirrors(&bound);
             // An outlined plan that asked for a mirror is bound again whether or not it gets one,
@@ -5825,18 +5843,26 @@ impl Shared {
                 drop(bound);
                 drop(catalog);
                 self.mirror(&wanted);
-                return self.query_mirrored(sql, cancel, false, noted);
+                return self.read_mirrored(ast, sql, parameters, cancel, parse_ns, false, noted);
             }
         }
         match bound {
             Bound::Query(mut plan) => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
-                self.remember_native_aggregate(sql, &ast, &plan, &catalog);
-                self.remember_simple(sql, &ast, &plan, &catalog, &session);
+                if parameters.is_empty() {
+                    self.remember_native_aggregate(sql, ast, &plan, &catalog);
+                    self.remember_simple(sql, ast, &plan, &catalog, &session);
+                }
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
-                let result = self.answer(sql, &plan, &catalog, cancel, under)?;
+                // A plan with parameters in it is left to the first engine, which the compiled one
+                // has never been asked to take.
+                let result = if parameters.is_empty() {
+                    self.answer(sql, &plan, &catalog, cancel, under)?
+                } else {
+                    run(sql, &plan, &catalog, cancel, under)?
+                };
                 Ok(result.with_origins(plan.origins()))
             }
             Bound::Explain { mut plan, analyze, statistics, codegen, postgres } => {
@@ -6944,6 +6970,20 @@ impl Shared {
             settled?;
             return Ok(result);
         }
+        if self.reading_statement(ast) {
+            // A query runs without the writer lock, as a caller's `query` does, so a long one
+            // keeps no writer and no other query waiting on it. It settles only what it moved,
+            // which is the counters of a `nextval`, because settling writes the catalog and so
+            // waits for every query still reading it.
+            let result = kept(sql, parse_ns, |noted| {
+                self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
+            });
+            let moved = self.read().sequences().any(|held| held.counter().moved());
+            let settled = if moved { self.settle(self.writing()) } else { Ok(()) };
+            let result = result?;
+            settled?;
+            return Ok(result);
+        }
         let writing = self.writing();
         let result = kept(sql, parse_ns, |noted| {
             self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
@@ -6966,6 +7006,9 @@ impl Shared {
         mirror: bool,
         noted: &mut Noted,
     ) -> Result<QueryResult> {
+        if matches!(ast.statements.as_slice(), [ast::Statement::Query(_)]) {
+            return self.read_mirrored(ast, sql, parameters, cancel, parse_ns, mirror, noted);
+        }
         let seams = self.seams(sql)?;
         let mut catalog = self.write();
         let context = self.optimizer(&catalog)?;
@@ -7035,6 +7078,9 @@ impl Shared {
         *self.conn.making.lock().unwrap_or_else(PoisonError::into_inner) = temporary_made(&bound);
         match bound {
             Bound::Query(mut plan) => {
+                // A query only reads the catalog from here, so other sessions read it while the
+                // query runs, and a writer waits for the query as it waits for any other reader.
+                let catalog = WriteGuard::downgrade(catalog);
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if parameters.is_empty() {
                     self.remember_native_aggregate(sql, ast, &plan, &catalog);
@@ -7053,6 +7099,8 @@ impl Shared {
                 Ok(result.with_origins(plan.origins()))
             }
             Bound::Explain { mut plan, analyze, statistics, codegen, postgres } => {
+                // As for a query, which `EXPLAIN ANALYZE` runs.
+                let catalog = WriteGuard::downgrade(catalog);
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
                 if codegen {
                     return explained_codegen(&plan, &catalog, cancel, self.qc_options());
