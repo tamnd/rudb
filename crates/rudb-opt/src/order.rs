@@ -91,7 +91,8 @@ use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result};
 use rudb_plan::{
-    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+    BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
+    Plan,
 };
 
 use crate::estimate::{self, Facts, Side};
@@ -120,6 +121,96 @@ pub fn reorder(plan: &mut Plan, stats: &Facts) {
     let mut tables = Tables::new();
     let root = rebuild(plan, plan.root(), &mut tables, stats);
     plan.set_root(root);
+    implied(plan);
+}
+
+/// Drops each equality of an inner join that the equalities under it already imply.
+///
+/// JOB writes a key three ways, `an.person_id = n.id AND n.id = ci.person_id AND ci.person_id =
+/// an.person_id`, and a join that brings `an` to the other two then tests two of them, though
+/// `n.id` and `ci.person_id` are equal on every row under it. A hash join on two keys is a slower
+/// table to build than one on one key, and in 16b with the consistent rule off it was 310 ms of a
+/// 390 ms query, over the same 2.8 million rows the join under it put in a table of one key in
+/// 110 ms. So the equalities the inputs already hold are read into classes, and a condition is
+/// kept only when it equates two columns that are not yet in one class. A condition that is not an
+/// equality of two bare columns is always kept, and the first condition of a class is the one that
+/// stays, which is the one `Search::place` put first for having the most values.
+fn implied(plan: &mut Plan) {
+    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        let Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } = *plan.node(at)
+        else {
+            continue;
+        };
+        let listed = plan.expr_list(conditions).to_vec();
+        if listed.len() < 2 {
+            continue;
+        }
+        let mut held = Vec::new();
+        holds(plan, left, &mut held);
+        holds(plan, right, &mut held);
+        let mut columns = Vec::new();
+        let mut parent = Vec::new();
+        for (one, other) in held {
+            let one = numbered(&mut columns, &mut parent, one);
+            let other = numbered(&mut columns, &mut parent, other);
+            let top = root(&mut parent, one);
+            let under = root(&mut parent, other);
+            parent[top] = under;
+        }
+        let mut kept = Vec::with_capacity(listed.len());
+        for &condition in &listed {
+            // `x = x` is kept, since it is the test that `x` is not null and no class holds that.
+            if let Some((one, other)) = equated(plan, condition)
+                && one.0 != other.0
+            {
+                let one = numbered(&mut columns, &mut parent, one);
+                let other = numbered(&mut columns, &mut parent, other);
+                let (top, under) = (root(&mut parent, one), root(&mut parent, other));
+                if top == under {
+                    continue;
+                }
+                parent[top] = under;
+            }
+            kept.push(condition);
+        }
+        if kept.len() < listed.len() {
+            let kept = plan.add_expr_list(&kept);
+            if let Node::Join { conditions, .. } = plan.node_mut(at) {
+                *conditions = kept;
+            }
+        }
+    }
+}
+
+/// The equalities of two bare columns every row `at` produces holds, as far as inner joins and
+/// filters say them.
+fn holds(
+    plan: &Plan,
+    at: NodeRef,
+    held: &mut Vec<((ColumnBinding, ExprRef), (ColumnBinding, ExprRef))>,
+) {
+    match *plan.node(at) {
+        Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } => {
+            held.extend(
+                plan.expr_list(conditions).iter().filter_map(|&condition| equated(plan, condition)),
+            );
+            holds(plan, left, held);
+            holds(plan, right, held);
+        }
+        Node::Filter { input, predicate } => {
+            let mut ands = vec![predicate];
+            while let Some(expr) = ands.pop() {
+                match *plan.expr(expr) {
+                    Expr::Conjunction { op: ConjunctionOp::And, children } => {
+                        ands.extend_from_slice(plan.expr_list(children));
+                    }
+                    _ => held.extend(equated(plan, expr)),
+                }
+            }
+            holds(plan, input, held);
+        }
+        _ => {}
+    }
 }
 
 /// One part of a region as the search has it so far, which starts as a leaf and ends as the region.
@@ -1235,5 +1326,35 @@ mod tests {
                 || ordered.contains("(#2.0::BIGINT = #1.0::BIGINT)"),
             "{ordered}"
         );
+    }
+
+    /// JOB's way of writing one key three times. Whatever order the three tables end up in, the
+    /// join that comes last has both of the others' columns already equal under it, so it tests one
+    /// equality and not two.
+    #[test]
+    fn an_equality_the_rows_under_a_join_already_hold_is_not_tested_again() {
+        let text = concat!(
+            "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN, ",
+            "(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+            "  Get memory.main.w AS w #0 [d::BIGINT]\n",
+            "  Join INNER on=[(#2.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.u AS u #1 [b::BIGINT]\n",
+            "    Get memory.main.t AS t #2 [a::BIGINT]\n",
+        );
+        let ordered = ordered(text);
+        assert_eq!(ordered.matches(" = ").count(), 2, "{ordered}");
+    }
+
+    /// Two equalities that say different things are both tested.
+    #[test]
+    fn two_equalities_over_different_columns_are_both_kept() {
+        let text = concat!(
+            "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN, ",
+            "(#0.1::BIGINT = #1.1::BIGINT)::BOOLEAN]\n",
+            "  Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
+            "  Get memory.main.u AS u #1 [b::BIGINT, c::BIGINT]\n",
+        );
+        let ordered = ordered(text);
+        assert_eq!(ordered.matches(" = ").count(), 2, "{ordered}");
     }
 }
