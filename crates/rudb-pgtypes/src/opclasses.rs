@@ -21,8 +21,7 @@ pub struct Opclass {
 /// itself comes first. Else the one class whose input type the type is binary coercible to, or
 /// the one such class whose input type is the preferred type of the category of the type.
 pub fn default_opclass(oid: Oid, method: &str) -> Option<&'static Opclass> {
-    let defaults =
-        || OPCLASSES.iter().filter(move |class| class.method == method && class.default);
+    let defaults = || OPCLASSES.iter().filter(move |class| class.method == method && class.default);
     if let Some(exact) = defaults().find(|class| class.input == oid) {
         return Some(exact);
     }
@@ -101,7 +100,10 @@ mod tests {
     fn a_type_finds_its_default_class() {
         assert_eq!(default_opclass(oid::INT4, "btree").map(|class| class.name), Some("int4_ops"));
         // `varchar` is binary coercible to `text`, and `cidr` to `inet`.
-        assert_eq!(default_opclass(oid::VARCHAR, "btree").map(|class| class.name), Some("text_ops"));
+        assert_eq!(
+            default_opclass(oid::VARCHAR, "btree").map(|class| class.name),
+            Some("text_ops")
+        );
         assert_eq!(default_opclass(oid::CIDR, "hash").map(|class| class.name), Some("inet_ops"));
         assert_eq!(
             default_opclass(oid::INT4_ARRAY, "btree").map(|class| class.name),
