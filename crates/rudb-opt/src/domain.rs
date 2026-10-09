@@ -601,6 +601,7 @@ fn held(
             key,
             aggregates,
             folds,
+            ..
         } => {
             // The rounds run once for every outer row at the same time. The anchor gives each of
             // its rows the outer row it belongs to, every round reads the rows the one before made
@@ -637,6 +638,9 @@ fn held(
                 key,
                 aggregates,
                 folds,
+                // A bound counts the rows of one outer row, and here every outer row's rows are
+                // produced together.
+                wanted: None,
             });
             let carried =
                 (0..keys.len()).map(|position| self::at(at_index, width + position)).collect();

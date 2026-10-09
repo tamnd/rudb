@@ -559,6 +559,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             key,
             aggregates,
             folds,
+            wanted,
         } => {
             let rebuilt_anchor = node(plan, anchor, Vec::new(), tables);
             let rebuilt_recursive = node(plan, recursive, Vec::new(), tables);
@@ -577,6 +578,7 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
                     key,
                     aggregates,
                     folds,
+                    wanted,
                 })
             };
             filter(plan, above, pending)

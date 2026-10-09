@@ -610,6 +610,11 @@ pub enum Node {
         /// Two positions per aggregate, into the position pool: the column its answer lands in and
         /// how many argument columns it reads.
         folds: Slice,
+        /// How many of the rows produced the query reads, when a limit says so, see
+        /// `rudb_opt::limit`. The rounds stop once this many rows are produced, and only the
+        /// first this many are kept, so a recursion that never ends on its own ends here, as it
+        /// does in PostgreSQL and on the pin, which make the rows as they are read.
+        wanted: Option<u64>,
     },
     /// A MIN or MAX over an acyclic chain of inner equi-joins, answered without running the join.
     ///

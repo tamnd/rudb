@@ -3895,6 +3895,7 @@ impl<'a> Building<'a, '_> {
                 key,
                 aggregates,
                 folds,
+                wanted,
                 ..
             } => {
                 // The anchor ends here, and the rounds run in this node's finish, each one a query
@@ -3937,8 +3938,9 @@ impl<'a> Building<'a, '_> {
                     let width = working.len();
                     working.clone_from_slice(&below.schema.types()[..width]);
                 }
+                let wanted = wanted.map(|wanted| usize::try_from(wanted).unwrap_or(usize::MAX));
                 let (fixpoint, out) =
-                    Fixpoint::new(round, schema.clone(), all, key, folds, working);
+                    Fixpoint::new(round, schema.clone(), all, key, folds, working, wanted);
                 let counters = self.watch(reference, id, pipeline, "RecursiveCTE", None);
                 let reading = Arc::clone(&counters);
                 self.close(below, pipeline, Arc::new(Watched::new(fixpoint, counters)));

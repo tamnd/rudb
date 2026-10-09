@@ -545,6 +545,7 @@ mod tests {
             key: Slice::EMPTY,
             aggregates: Slice::EMPTY,
             folds: Slice::EMPTY,
+            wanted: None,
         });
         plan.set_root(node);
         assert!(root(&plan).is_empty());

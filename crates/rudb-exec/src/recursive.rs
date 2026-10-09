@@ -12,7 +12,9 @@
 //!
 //! Without `ALL` a row that any round already produced is not produced again, and that is also what
 //! ends a walk over a graph with a cycle in it. With `ALL` nothing is checked and a cycle runs until
-//! the query is cancelled or out of memory, which is what the pinned build does.
+//! the query is cancelled or out of memory, unless a limit reads only so many of the rows. Then the
+//! rounds stop once that many are produced, which is where PostgreSQL and the pin stop too, since
+//! they make the rows as the limit reads them.
 //!
 //! With `USING KEY` the rows produced are a table keyed on the key columns rather than a list. A
 //! row whose key is there already replaces the row that had it, in the order the rows came, so the
@@ -57,6 +59,9 @@ pub(crate) struct Fixpoint<'a> {
     /// The types of the rows a round reads, which are the anchor's with `ALL` and aggregates, and
     /// the table's otherwise.
     working: Vec<LogicalType>,
+    /// How many rows the query reads, when a limit says so. The rounds stop once this many are
+    /// produced and the rest are dropped. Never set with a key.
+    wanted: Option<usize>,
     /// The anchor's rows, as every instance gathered them.
     anchor: Mutex<Vec<Vec<Value>>>,
     /// What the anchor's rows are charged, given back once the finished chunks are charged instead.
@@ -75,6 +80,7 @@ impl<'a> Fixpoint<'a> {
         key: Vec<usize>,
         folds: Vec<Fold>,
         working: Vec<LogicalType>,
+        wanted: Option<usize>,
     ) -> (Self, Buffered) {
         let out = Buffered::new();
         let held = Mutex::new(round.memory.reservation());
@@ -85,6 +91,7 @@ impl<'a> Fixpoint<'a> {
             key,
             folds,
             working,
+            wanted,
             anchor: Mutex::new(Vec::new()),
             charged: Mutex::new(Vec::new()),
             held,
@@ -166,7 +173,8 @@ impl Fixpoint<'_> {
             working.retain(|row| seen.insert(Key(row.clone())));
         }
         let mut out = working.clone();
-        while !working.is_empty() {
+        let enough = |out: &Vec<Vec<Value>>| self.wanted.is_some_and(|wanted| out.len() >= wanted);
+        while !working.is_empty() && !enough(&out) {
             self.round.cancel.check()?;
             let mut made = self.round(&working, &out, threads)?;
             if !self.all {
@@ -174,6 +182,9 @@ impl Fixpoint<'_> {
             }
             out.extend(made.iter().cloned());
             working = made;
+        }
+        if let Some(wanted) = self.wanted {
+            out.truncate(wanted);
         }
         Ok(out)
     }

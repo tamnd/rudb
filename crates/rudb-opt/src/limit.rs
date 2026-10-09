@@ -25,6 +25,17 @@
 //! filter pushdown, where copying a volatile call into two places means the row that passed the test
 //! is not the row that comes out.
 //!
+//! # A limit over a recursion
+//!
+//! A limit that is all the query reads of a recursive `WITH` tells the recursion how many rows it
+//! has to make. PostgreSQL and the pin make the rows of a recursion as the query reads them, so
+//! `WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM t) SELECT * FROM t LIMIT 10`
+//! ends there with ten rows. Here a recursion runs every round before the query reads a row, so
+//! the pass gives it the number instead, and the rounds stop once that many rows are produced.
+//! That holds only when the query reads the recursion once, and nothing but projections stands
+//! between that read and the limit, since a filter or a join reads an unknown number of rows. What
+//! stands over the limit can only read the rows the limit lets through, so it does not matter.
+//!
 //! # Swapping two slots
 //!
 //! The rewrite cannot append. An expression or a node may only point at one behind it in the arena,
@@ -42,7 +53,7 @@
 //! rather than a worse one.
 
 use rudb_common::Result;
-use rudb_plan::{Node, NodeRef, Plan};
+use rudb_plan::{Bound, Node, NodeRef, Plan};
 
 use crate::pass::{Context, Pass, top_down};
 use crate::walk;
@@ -58,7 +69,78 @@ impl Pass for LimitPushdown {
 
     fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
         push(plan);
+        bound_recursions(plan);
         Ok(())
+    }
+}
+
+/// Gives each recursive `WITH` that the query reads only through a limit the number of rows that
+/// limit reads, see the module.
+pub fn bound_recursions(plan: &mut Plan) {
+    for node in top_down(plan) {
+        let Node::MaterializedCte { definition, body, cte, .. } = *plan.node(node) else {
+            continue;
+        };
+        let Some(read) = limit_over(plan, body, cte) else { continue };
+        // A recursion with a key replaces rows it already made, so the first rows produced are
+        // not the rows it ends with.
+        if let Node::RecursiveCte { key, wanted, .. } = plan.node_mut(definition)
+            && key.is_empty()
+        {
+            *wanted = Some(read);
+        }
+    }
+}
+
+/// How many rows of the materialisation `cte` the query `body` reads, when it reads it once,
+/// through a limit with only projections between the two. That is the count and the offset
+/// together. What stands over the limit does not matter, since it can only read what the limit
+/// lets through.
+fn limit_over(plan: &Plan, body: NodeRef, cte: u32) -> Option<u64> {
+    // Each node under `body` with the nodes that read it, as many times as they read it.
+    let mut parents: Vec<(NodeRef, Vec<NodeRef>)> = vec![(body, Vec::new())];
+    let mut pending = vec![body];
+    while let Some(node) = pending.pop() {
+        for child in plan.node(node).children().into_iter().flatten() {
+            match parents.iter_mut().find(|(seen, _)| *seen == child) {
+                Some((_, readers)) => readers.push(node),
+                None => {
+                    parents.push((child, vec![node]));
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    let mut scans = parents.iter().filter(
+        |(node, _)| matches!(*plan.node(*node), Node::CteScan { cte: read, .. } if read == cte),
+    );
+    let (scan, _) = scans.next()?;
+    if scans.next().is_some() {
+        return None;
+    }
+    let reader = |node: NodeRef| match parents.iter().find(|(seen, _)| *seen == node) {
+        Some((_, readers)) if readers.len() == 1 => Some(readers[0]),
+        _ => None,
+    };
+    let mut at = reader(*scan)?;
+    loop {
+        match *plan.node(at) {
+            // A projection under the limit has to make one row of each row it reads.
+            Node::Project { exprs, .. }
+                if plan.expr_list(exprs).iter().all(|&expr| walk::elementwise(plan, expr)) =>
+            {
+                at = reader(at)?;
+            }
+            Node::Limit { count, offset, .. } => {
+                let skipped = match offset {
+                    Bound::All => 0,
+                    Bound::Rows(rows) => rows,
+                    Bound::Read(_) => return None,
+                };
+                return count.rows()?.checked_add(skipped);
+            }
+            _ => return None,
+        }
     }
 }
 

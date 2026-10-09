@@ -442,6 +442,7 @@ impl Reader<'_> {
                 }
                 let aggregates = plan.add_fields(&calls);
                 let folds = plan.add_positions(&into);
+                let wanted = if c.eat_word("WANTED") { Some(read_count(c)?) } else { None };
                 let index = read_table_index(c)?;
                 let columns = read_schema(plan, c)?;
                 Ok(Built {
@@ -458,6 +459,7 @@ impl Reader<'_> {
                         key,
                         aggregates,
                         folds,
+                        wanted,
                     }),
                 })
             }
