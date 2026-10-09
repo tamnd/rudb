@@ -7326,7 +7326,11 @@ mod tests {
                             Value::Null
                         } else {
                             let width = if step > 1 << 40 { 38 } else { 15 };
-                            Value::Decimal { unscaled: -500 + ((row * 31) % 977) * step, width, scale: 2 }
+                            Value::Decimal {
+                                unscaled: -500 + ((row * 31) % 977) * step,
+                                width,
+                                scale: 2,
+                            }
                         }
                     })
                     .collect();
@@ -7342,7 +7346,12 @@ mod tests {
                         _ => panic!("a total"),
                     };
                     assert_eq!(whole(&packed), whole(&flat), "{ty:?} {with_nulls} {at}");
-                    let real = |input: &Vector| match gather(input, len, &nulls, Want::Real { scale: 2, from: 0.5 }) {
+                    let real = |input: &Vector| match gather(
+                        input,
+                        len,
+                        &nulls,
+                        Want::Real { scale: 2, from: 0.5 },
+                    ) {
                         Some(Contribution::Real { total, seen }) => (total, seen),
                         _ => panic!("a total"),
                     };
@@ -7350,10 +7359,12 @@ mod tests {
                     assert_eq!(seen, flat_seen);
                     assert!((ours - theirs).abs() <= theirs.abs() * 1e-12, "{ours} {theirs}");
                     for least in [true, false] {
-                        let row = |input: &Vector| match gather(input, len, &nulls, Want::Extreme(least)) {
-                            Some(Contribution::Extreme(row)) => row,
-                            _ => panic!("a row"),
-                        };
+                        let row =
+                            |input: &Vector| match gather(input, len, &nulls, Want::Extreme(least))
+                            {
+                                Some(Contribution::Extreme(row)) => row,
+                                _ => panic!("a row"),
+                            };
                         let (ours, theirs) = (row(&packed), row(&flat));
                         let value = |row: Option<usize>| row.map(|row| flat.value_at(row));
                         assert_eq!(value(ours), value(theirs), "{ty:?} {with_nulls} {at} {least}");
