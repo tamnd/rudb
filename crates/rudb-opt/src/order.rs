@@ -50,6 +50,13 @@
 //! many pairs. Both are scored by the same measure, so the search only ever finds an order greedy
 //! would have scored the same way or a cheaper one.
 //!
+//! The search is given the edges an equality between columns implies as well as the ones written.
+//! Columns that a chain of equalities joins are one equivalence class, and two columns of a class in
+//! different leaves are an edge whether or not a condition compares them directly. Joining two sets
+//! that each hold a column of the class then tests one of the class's conditions and not all of
+//! them, since inside each set the class's columns are already equal. [`classed`] is where that is
+//! and why it is the same query.
+//!
 //! # What it refuses
 //!
 //! A region where any leaf has no row estimate. Two sides cannot be compared when one of them is
@@ -82,8 +89,10 @@
 
 use std::collections::HashMap;
 
-use rudb_common::Result;
-use rudb_plan::{BuildSide, ExprRef, JoinKind, Node, NodeRef, Plan};
+use rudb_common::{LogicalType, Result};
+use rudb_plan::{
+    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+};
 
 use crate::estimate::{self, Facts, Side};
 use crate::pass::{Context, Pass};
@@ -247,7 +256,8 @@ fn order(
         pending.push((condition, reads));
     }
     let (_, before, was) = cost(plan, at, stats)?;
-    if let Some((top, after)) = searched(plan, &parts, &pending, stats, &mut builds) {
+    let (searchable, classes) = classed(plan, &parts, &pending, stats);
+    if let Some((top, after)) = searched(plan, &parts, &searchable, &classes, stats, &mut builds) {
         // The search builds no cross product, so it wins outright over an order that builds one,
         // and otherwise the sum decides. Greedy has nothing to add either way: the order it would
         // find is one of the orders the search already scored.
@@ -292,6 +302,188 @@ fn order(
     Some(put(plan, &builds, parts[0].build))
 }
 
+/// The conditions [`searched`] is given, and the equivalence class of columns each one belongs to.
+///
+/// The region's own conditions come first and in their order. After them comes one condition for
+/// every two columns that a chain of equalities says are equal and no condition compares directly.
+/// TPC-H q05 is why. It writes `c_nationkey = s_nationkey` and `s_nationkey = n_nationkey`, which
+/// say that customer's nation is nation's key as well, and without that edge the search could not
+/// join customer to the five nations of Asia before supplier was in. It never saw the thirty
+/// thousand customers that join keeps, chose orders, lineitem and supplier first, and built all
+/// 150,000 customers into the last join.
+///
+/// The class is what keeps an edge from being tested twice. Joining two sets that each hold a
+/// column of a class needs one of the class's conditions between them and not all of them, provided
+/// the class's columns inside each set are already equal, so [`Search::crossing`] takes the first
+/// condition of each class and leaves the rest. Inside a set they are equal because every edge of the
+/// class is there: any two sets holding a column of it each have a condition of it between them, so
+/// every join that brought two of its columns together tested one. That fails where a leaf holds two
+/// columns of one class, since nothing inside the leaf compared them, and where the edges would not
+/// fit in the sixty four conditions the search counts in, and then no condition is given a class and
+/// none is added.
+///
+/// Only `=` between two bare columns of the same type makes a class. A null matches nothing under
+/// it, so a row whose column is null is dropped by the written conditions and by the implied one
+/// alike, and the region is inner joins, so a row dropped earlier is a row that would have been
+/// dropped later.
+fn classed(
+    plan: &mut Plan,
+    parts: &[Part],
+    pending: &[(ExprRef, TableSet)],
+    stats: &Facts,
+) -> (Vec<(ExprRef, TableSet)>, Vec<Option<usize>>) {
+    // Each column the equalities read, the expression that reads it, and its parent in the union.
+    let mut columns: Vec<(ColumnBinding, ExprRef)> = Vec::new();
+    let mut parent: Vec<usize> = Vec::new();
+    let mut edges: Vec<Option<(usize, usize)>> = Vec::with_capacity(pending.len());
+    for &(condition, _) in pending {
+        let Some(pair) = equated(plan, condition) else {
+            edges.push(None);
+            continue;
+        };
+        let one = numbered(&mut columns, &mut parent, pair.0);
+        let other = numbered(&mut columns, &mut parent, pair.1);
+        let (top, under) = (root(&mut parent, one), root(&mut parent, other));
+        parent[top] = under;
+        edges.push(Some((one, other)));
+    }
+    let leaf = |at: usize| parts.iter().position(|part| part.tables.contains(columns[at].0.table));
+    // The classes by their root, each with its columns, and whether a leaf holds two of them.
+    let mut members: Vec<(usize, Vec<usize>)> = Vec::new();
+    for at in 0..columns.len() {
+        let top = root(&mut parent, at);
+        match members.iter_mut().find(|(held, _)| *held == top) {
+            Some((_, list)) => list.push(at),
+            None => members.push((top, vec![at])),
+        }
+    }
+    let mut usable: Vec<usize> = Vec::new();
+    let mut added: Vec<(ExprRef, ExprRef, TableSet, usize)> = Vec::new();
+    for (top, list) in &members {
+        let leaves: Vec<Option<usize>> = list.iter().map(|&at| leaf(at)).collect();
+        let shared = leaves
+            .iter()
+            .enumerate()
+            .any(|(at, one)| one.is_none() || leaves[at + 1..].iter().any(|other| other == one));
+        if shared || !multiplies(plan, parts, pending, stats, &edges, list, &leaves) {
+            continue;
+        }
+        let class = usable.len();
+        usable.push(*top);
+        for (place, &one) in list.iter().enumerate() {
+            for &other in &list[place + 1..] {
+                let direct = edges
+                    .iter()
+                    .flatten()
+                    .any(|&(a, b)| (a, b) == (one, other) || (a, b) == (other, one));
+                if !direct {
+                    let mut reads = TableSet::of(columns[one].0.table);
+                    reads.insert(columns[other].0.table);
+                    added.push((columns[one].1, columns[other].1, reads, class));
+                }
+            }
+        }
+    }
+    if pending.len() + added.len() > 64 {
+        return (pending.to_vec(), vec![None; pending.len()]);
+    }
+    let mut classes: Vec<Option<usize>> = edges
+        .iter()
+        .map(|edge| {
+            let (one, _) = (*edge)?;
+            let top = root(&mut parent, one);
+            usable.iter().position(|&held| held == top)
+        })
+        .collect();
+    let mut searchable = pending.to_vec();
+    for (left, right, reads, class) in added {
+        let condition = plan
+            .add_expr(Expr::Compare { op: CompareOp::Equal, left, right }, LogicalType::Boolean);
+        searchable.push((condition, reads));
+        classes.push(Some(class));
+    }
+    (searchable, classes)
+}
+
+/// Whether two of a class's leaves meet on conditions that join one row of either to more than one
+/// of the other, by the same arithmetic the search scores a pair with.
+///
+/// That is the class whose implied edges are worth something. On TPC-H q05 customer and supplier
+/// meet only on the nation, which is a hundred and fifty thousand rows times ten thousand over
+/// twenty five, so the search never takes that join first and nation's region never reaches
+/// customer without the edge the two equalities imply. On TPC-H q09 every table the part key and
+/// the supplier key join meets lineitem on a key, partsupp on the two together, so no pair
+/// multiplies. The implied edges there let part, partsupp and supplier be joined among themselves
+/// first, which the rows say is cheaper, and it ran twice as long, because the plan without them
+/// reaches partsupp and orders through stored links from the rows of lineitem part keeps.
+fn multiplies(
+    plan: &Plan,
+    parts: &[Part],
+    pending: &[(ExprRef, TableSet)],
+    stats: &Facts,
+    edges: &[Option<(usize, usize)>],
+    list: &[usize],
+    leaves: &[Option<usize>],
+) -> bool {
+    let leaf = |column: usize| list.iter().position(|&at| at == column).and_then(|at| leaves[at]);
+    edges.iter().flatten().any(|&(one, other)| {
+        let (Some(one), Some(other)) = (leaf(one), leaf(other)) else { return false };
+        let (one, other) = (&parts[one], &parts[other]);
+        let mut both = one.tables.clone();
+        both.extend(&other.tables);
+        let between: Vec<ExprRef> = pending
+            .iter()
+            .filter(|(_, reads)| {
+                reads.is_subset_of(&both)
+                    && !reads.is_subset_of(&one.tables)
+                    && !reads.is_subset_of(&other.tables)
+            })
+            .map(|(condition, _)| *condition)
+            .collect();
+        let keys = estimate::keyspace_of(plan, &between, stats);
+        let (left, right) = (one.side.base, other.side.base);
+        estimate::matched(left, right, keys) > left.max(right)
+    })
+}
+
+/// The two columns a condition says are equal, where it is `=` between two bare columns of one type.
+fn equated(
+    plan: &Plan,
+    condition: ExprRef,
+) -> Option<((ColumnBinding, ExprRef), (ColumnBinding, ExprRef))> {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+        return None;
+    };
+    let (&Expr::Column(one), &Expr::Column(other)) = (plan.expr(left), plan.expr(right)) else {
+        return None;
+    };
+    (plan.expr_type(left) == plan.expr_type(right)).then_some(((one, left), (other, right)))
+}
+
+/// Where a column is in the list of columns the equalities read, adding it as its own class if it
+/// is not there yet.
+fn numbered(
+    columns: &mut Vec<(ColumnBinding, ExprRef)>,
+    parent: &mut Vec<usize>,
+    (binding, expr): (ColumnBinding, ExprRef),
+) -> usize {
+    if let Some(found) = columns.iter().position(|&(held, _)| held == binding) {
+        return found;
+    }
+    columns.push((binding, expr));
+    parent.push(parent.len());
+    columns.len() - 1
+}
+
+/// The root of a column's class in the union, halving the path on the way.
+fn root(parent: &mut [usize], mut at: usize) -> usize {
+    while parent[at] != at {
+        parent[at] = parent[parent[at]];
+        at = parent[at];
+    }
+    at
+}
+
 /// The most leaves a region may have for [`searched`] to look at every order of it.
 ///
 /// Fourteen, which covers all but the four largest JOB queries. The pairs the search scores grow
@@ -323,6 +515,7 @@ fn searched(
     plan: &Plan,
     parts: &[Part],
     pending: &[(ExprRef, TableSet)],
+    classes: &[Option<usize>],
     stats: &Facts,
     builds: &mut Vec<Build>,
 ) -> Option<(usize, u64)> {
@@ -353,6 +546,7 @@ fn searched(
         stats,
         parts,
         pending,
+        classes,
         reads,
         neighbours,
         best: vec![None; 1 << count],
@@ -407,6 +601,8 @@ struct Search<'a> {
     stats: &'a Facts,
     parts: &'a [Part],
     pending: &'a [(ExprRef, TableSet)],
+    /// The equivalence class of columns each condition is an edge of, from [`classed`].
+    classes: &'a [Option<usize>],
     /// The leaves each condition reads, as a set.
     reads: Vec<u32>,
     /// The leaves a condition joins each leaf to.
@@ -478,12 +674,20 @@ impl Search<'_> {
         subsets(next).all(|more| self.extend(set, other | more, out | next))
     }
 
-    /// The conditions that become testable when `left` and `right` are joined.
+    /// The conditions that become testable when `left` and `right` are joined, with one condition
+    /// of each equivalence class rather than all of them, for the reason at [`classed`].
     fn crossing(&self, left: u32, right: u32) -> u64 {
         let both = left | right;
         let mut found = 0u64;
+        let mut taken = 0u64;
         for (at, &read) in self.reads.iter().enumerate() {
             if read & !both == 0 && read & !left != 0 && read & !right != 0 {
+                if let Some(class) = self.classes[at] {
+                    if taken & 1 << class != 0 {
+                        continue;
+                    }
+                    taken |= 1 << class;
+                }
                 found |= 1 << at;
             }
         }
@@ -554,7 +758,17 @@ impl Search<'_> {
         let tree = self.best[set as usize].expect("a set the best tree is made of was solved");
         let left = self.place(tree.left, builds);
         let right = self.place(tree.right, builds);
-        let conditions = self.listed(self.crossing(tree.left, tree.right));
+        let mut conditions = self.listed(self.crossing(tree.left, tree.right));
+        // The key with the most values goes first, because the first key is the one a hash join
+        // hands the scan under its driving side, see `rudb_exec::sideways`. TPC-H q09 joins
+        // lineitem to partsupp on both the part and the supplier, and every supplier is on the
+        // gathered side while one part in twenty is, so the part key is the one that filters.
+        if conditions.len() > 1 {
+            conditions.sort_by_key(|&condition| {
+                let keys = estimate::keyspace_of(self.plan, &[condition], self.stats);
+                std::cmp::Reverse(keys.unwrap_or(0))
+            });
+        }
         builds.push(Build::Pair { left, right, conditions });
         builds.len() - 1
     }
@@ -838,25 +1052,27 @@ mod tests {
         // The cross product of `w` and `u` is what lets the search act at all, and the order it
         // builds has to take that one out without putting `u` and `v` together instead. Joining
         // `t` to `v` first and joining it to `u` first score the same, and the search keeps the
-        // first of the two it reaches.
+        // first of the two it reaches. Each condition reads its own column of `t`, as the two
+        // nation keys of q7 are two columns, since one column equal to both copies would make the
+        // copies equal to each other and a join rather than a cross product.
         assert_eq!(
             ordered(concat!(
-                "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "Join INNER on=[(#0.2::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
                 "  Join INNER on=[(#3.0::BIGINT = #0.0::BIGINT)::BOOLEAN, ",
-                "(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
                 "    CrossProduct\n",
                 "      Get memory.main.w AS w #3 [d::BIGINT]\n",
                 "      Get memory.main.u AS u #1 [b::BIGINT]\n",
-                "    Get memory.main.t AS t #0 [a::BIGINT]\n",
+                "    Get memory.main.t AS t #0 [a::BIGINT, e::BIGINT, f::BIGINT]\n",
                 "  Get memory.main.v AS v #2 [c::BIGINT]\n",
             )),
             concat!(
                 "Join INNER on=[(#3.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
                 "  Get memory.main.w AS w #3 [d::BIGINT]\n",
-                "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
+                "  Join INNER on=[(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
                 "    Get memory.main.u AS u #1 [b::BIGINT]\n",
-                "    Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
-                "      Get memory.main.t AS t #0 [a::BIGINT]\n",
+                "    Join INNER on=[(#0.2::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "      Get memory.main.t AS t #0 [a::BIGINT, e::BIGINT, f::BIGINT]\n",
                 "      Get memory.main.v AS v #2 [c::BIGINT]\n",
             )
         );
@@ -960,20 +1176,21 @@ mod tests {
         // product. `u` is the supplier side, which every row of `w` matches, and the filtered `v`
         // is the part side, which a fifth of them match. Reading the filter through the join is
         // what tells the two apart, because containment alone calls both of them a hundred
-        // thousand rows and then the tie breaks on the smaller input, which is `u`.
+        // thousand rows and then the tie breaks on the smaller input, which is `u`. The two joins
+        // read two columns of `w`, as lineitem's supplier and part keys are two columns.
         assert_eq!(
             ordered(concat!(
-                "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
                 "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-                "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+                "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
                 "    Get memory.main.u AS u #1 [b::BIGINT]\n",
                 "  Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
                 "    Get memory.main.v AS v #2 [c::BIGINT]\n",
             )),
             concat!(
                 "Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-                "  Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
-                "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+                "  Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+                "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
                 "    Filter (#2.0::BIGINT = 3::BIGINT)::BOOLEAN\n",
                 "      Get memory.main.v AS v #2 [c::BIGINT]\n",
                 "  Get memory.main.u AS u #1 [b::BIGINT]\n",
@@ -987,12 +1204,36 @@ mod tests {
         // there is nothing to prefer and the order the query was written in stands. This is the
         // half of the previous test that says the new reading is the filter and not the shape.
         let text = concat!(
-            "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+            "Join INNER on=[(#0.1::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
             "  Join INNER on=[(#0.0::BIGINT = #1.0::BIGINT)::BOOLEAN]\n",
-            "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+            "    Get memory.main.w AS w #0 [d::BIGINT, e::BIGINT]\n",
             "    Get memory.main.u AS u #1 [b::BIGINT]\n",
             "  Get memory.main.v AS v #2 [c::BIGINT]\n",
         );
         assert_eq!(ordered(text), text);
+    }
+
+    /// The shape TPC-H q05 has between customer, supplier and nation. The query says `u.b = w.d`
+    /// and `w.d = t.a` and never `u.b = t.a`, so the one row of `u` the filter keeps can only reach
+    /// `t` through the hundred thousand rows of `w`, and `w` and `t` meet on a column of ten values,
+    /// which multiplies. The two conditions put the three columns in one class, which makes `u`
+    /// joined to `t` a pair the search can take, and it is the cheapest first join there is.
+    #[test]
+    fn a_join_two_equalities_imply_is_one_the_search_can_take() {
+        let text = concat!(
+            "Join INNER on=[(#0.0::BIGINT = #2.0::BIGINT)::BOOLEAN]\n",
+            "  Join INNER on=[(#1.0::BIGINT = #0.0::BIGINT)::BOOLEAN]\n",
+            "    Get memory.main.w AS w #0 [d::BIGINT]\n",
+            "    Filter (#1.1::BIGINT = 3::BIGINT)::BOOLEAN\n",
+            "      Get memory.main.u AS u #1 [b::BIGINT, r::BIGINT]\n",
+            "  Get memory.main.t AS t #2 [a::BIGINT]\n",
+        );
+        let columns = [("w", "d", 10), ("u", "b", 10), ("u", "r", 10), ("t", "a", 10)];
+        let ordered = counted(text, &columns);
+        assert!(
+            ordered.contains("(#1.0::BIGINT = #2.0::BIGINT)")
+                || ordered.contains("(#2.0::BIGINT = #1.0::BIGINT)"),
+            "{ordered}"
+        );
     }
 }
