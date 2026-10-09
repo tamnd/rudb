@@ -1101,6 +1101,9 @@ impl Binder<'_> {
             }
             UnaryOp::BitNot => self.call("~", vec![bound]),
             UnaryOp::Factorial => self.call("factorial", vec![bound]),
+            UnaryOp::Named(symbol) => {
+                self.pg_prefix_operator(ast, ast.string(symbol), operand, bound)
+            }
         }
     }
 
@@ -4595,6 +4598,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 UnaryOp::Plus => format!("+({inner})"),
                 UnaryOp::BitNot => format!("~({inner})"),
                 UnaryOp::Factorial => format!("factorial({inner})"),
+                UnaryOp::Named(symbol) => format!("{}({inner})", ast.string(symbol)),
                 UnaryOp::IsNull => format!("({inner} IS NULL)"),
                 UnaryOp::IsNotNull => format!("({inner} IS NOT NULL)"),
                 UnaryOp::IsTrue => format!("(CAST({inner} AS BOOLEAN) IS NOT DISTINCT FROM true)"),
@@ -5690,7 +5694,7 @@ fn number_cast_can_fail(from: &LogicalType, to: &LogicalType) -> bool {
     }
 }
 
-fn postgres_type_name(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
+pub(crate) fn postgres_type_name(ast: &Ast, arg: ast::ExprRef, ty: &LogicalType) -> String {
     match ast.expr(arg) {
         ast::Expr::Literal { kind: LiteralKind::String, .. } => "unknown".into(),
         _ if *ty == LogicalType::Null => "unknown".into(),
