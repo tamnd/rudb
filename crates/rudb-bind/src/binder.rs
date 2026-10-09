@@ -982,7 +982,8 @@ impl<'a> Binder<'a> {
         {
             return Err(Error::not_implemented("could not implement recursive UNION")
                 .state(SqlState::FEATURE_NOT_SUPPORTED)
-                .detail("All column datatypes must be hashable."));
+                .detail("All column datatypes must be hashable.")
+                .unplaced());
         }
         let mut args = Vec::with_capacity(args.len());
         for fold in &folds {
