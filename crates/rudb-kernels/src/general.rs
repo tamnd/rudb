@@ -29,6 +29,7 @@ use crate::hash::Sketch;
 use crate::histogram::Binned;
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
+use crate::pgvariance::{ExactSpread, FloatSpread};
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
 use crate::tally::Tally;
@@ -110,6 +111,10 @@ pub(crate) enum General {
     Paired(Paired),
     /// `skewness`, `kurtosis` and `kurtosis_pop`, in [`crate::statistics`].
     Powers(Powers),
+    /// The variance family of a PostgreSQL session over an exact type, in [`crate::pgvariance`].
+    ExactSpread(Box<ExactSpread>),
+    /// The variance family of a PostgreSQL session over a double, in [`crate::pgvariance`].
+    FloatSpread(FloatSpread),
     /// `fsum` and `favg`, a sum with Kahan's running error, in the pin's steps.
     Kahan { value: f64, err: f64, count: u64, average: bool },
     /// `count_if`, the rows that were true, and whether any row was not null.
@@ -209,6 +214,12 @@ impl General {
         }
         if let Some(measure) = Moment::named(name) {
             return Some(Self::Powers(Powers::new(measure)));
+        }
+        if let Some(state) = ExactSpread::named(name) {
+            return Some(Self::ExactSpread(Box::new(state)));
+        }
+        if let Some(state) = FloatSpread::named(name) {
+            return Some(Self::FloatSpread(state));
         }
         if name == "avg" {
             return Timed::new(returns).map(Self::Timed);
@@ -315,6 +326,8 @@ impl General {
             Self::Powers(state) => {
                 state.add(approximate(value).ok_or_else(|| unexpected("skewness", value))?);
             }
+            Self::ExactSpread(state) => state.update(value)?,
+            Self::FloatSpread(state) => state.update(value)?,
             Self::Holistic { values, fraction, .. } => {
                 if fraction.is_none() {
                     *fraction = args.get(1).cloned().map(Box::new);
@@ -495,7 +508,10 @@ impl General {
     /// Whether this state takes `arguments` columns of doubles through [`Self::push_reals`], which
     /// is a pair statistic over two of them or a moment statistic over one.
     pub(crate) const fn takes_reals(&self, arguments: usize) -> bool {
-        matches!((self, arguments), (Self::Paired(_), 2) | (Self::Powers(_), 1))
+        matches!(
+            (self, arguments),
+            (Self::Paired(_), 2) | (Self::Powers(_) | Self::FloatSpread(_), 1)
+        )
     }
 
     /// Adds one row of doubles, none of them null, for a state [`Self::takes_reals`] says yes to.
@@ -503,6 +519,7 @@ impl General {
         match (self, row) {
             (Self::Paired(state), [y, x]) => state.add(*y, *x),
             (Self::Powers(state), [input]) => state.add(*input),
+            (Self::FloatSpread(state), [input]) => state.add(*input),
             _ => {}
         }
     }
@@ -735,6 +752,8 @@ impl General {
             }
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
+            (Self::ExactSpread(state), Self::ExactSpread(theirs)) => state.combine(theirs)?,
+            (Self::FloatSpread(state), Self::FloatSpread(theirs)) => state.combine(theirs)?,
             (
                 Self::Kahan { value, err, count, .. },
                 Self::Kahan { value: theirs, err: their_err, count: more, .. },
@@ -882,6 +901,8 @@ impl General {
             Self::Plotted { plot, returns } => plot.finish(returns),
             Self::Paired(state) => state.finish(),
             Self::Powers(state) => state.finish()?,
+            Self::ExactSpread(state) => state.finish()?,
+            Self::FloatSpread(state) => state.finish()?,
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
             Self::Ordered { .. }

@@ -700,6 +700,43 @@ impl Numeric {
         let right = other.to_bytes();
         rudb_common::numeric::key(&left).cmp(rudb_common::numeric::key(&right))
     }
+
+    /// `numeric_stddev_internal`: the variance, or with `variance` not set the standard deviation,
+    /// of `count` values with the exact sum `sum` and the exact sum of squares `squares`, of the
+    /// sample or of the population. `None` is the null of no values, and of one value for a
+    /// sample. A NaN or an infinity among the values makes a sum not finite, and the answer NaN.
+    pub fn stddev(
+        count: i64,
+        sum: &Numeric,
+        squares: &Numeric,
+        variance: bool,
+        sample: bool,
+    ) -> Result<Option<Numeric>, TypeError> {
+        if count == 0 || (sample && count == 1) {
+            return Ok(None);
+        }
+        if !sum.sign.is_finite() || !squares.sign.is_finite() {
+            return Ok(Some(Numeric::NAN));
+        }
+        let n = Var::integer(count);
+        let (sum, squares) = (Var::from(sum), Var::from(squares));
+        let rscale = sum.dscale * 2;
+        let square_of_sum = sum.mul_scaled(&sum, rscale);
+        let mut numerator = n.mul_scaled(&squares, rscale);
+        numerator = numerator.add(&Var { sign: flip(square_of_sum.sign), ..square_of_sum });
+        // A numerator that is zero, or below zero by an error of rounding, is a variance of zero.
+        if numerator.sign == NumericSign::Negative || numerator.digits.iter().all(|&d| d == 0) {
+            return Ok(Some(Numeric::from_integer(0)));
+        }
+        let other = if sample { Var::integer(count - 1) } else { n.clone() };
+        let denominator = n.mul_scaled(&other, 0);
+        let rscale = select_div_scale(&numerator, &denominator);
+        let mut result = numerator.div_scaled(&denominator, rscale, true, true);
+        if !variance {
+            result = result.sqrt(rscale)?;
+        }
+        result.make().map(Some)
+    }
 }
 
 fn division_by_zero() -> TypeError {

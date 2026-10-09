@@ -1240,6 +1240,24 @@ fn the_functions_of_postgres_have_its_result_types() {
              -123456789012345678902,123456789012345678901.555,5.0,5",
             vec![1700, 1700, 1700, 1700, 1700, 1700, 701],
         ),
+        (
+            "select var_pop(x), var_samp(x), stddev_pop(x), stddev_samp(x) \
+             from (values (1), (2), (4)) t(x)",
+            "1.5555555555555556,2.3333333333333333,1.2472191289246471,1.5275252316519467",
+            vec![1700, 1700, 1700, 1700],
+        ),
+        (
+            "select variance(x::float8), stddev(x::float4), var_samp(7) \
+             from (values (1.5), (2.25), (4)) t(x)",
+            "1.6458333333333333,1.282900359861721,0",
+            vec![701, 701, 1700],
+        ),
+        (
+            "select var_pop(x) over (order by x rows 1 preceding), stddev(x::float8) over () \
+             from (values (4), (1)) t(x)",
+            "0,2.1213203435596424",
+            vec![1700, 701],
+        ),
     ];
     for (sql, expected, oids) in cases {
         let messages = client.query(sql);

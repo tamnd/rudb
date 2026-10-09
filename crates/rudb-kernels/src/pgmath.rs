@@ -320,7 +320,7 @@ pub(crate) fn float_unary(src: &str) -> Option<fn(f64) -> Result<f64>> {
 const RADIANS_PER_DEGREE: f64 = 0.017_453_292_519_943_295;
 
 /// `float_overflow_error`.
-fn overflow() -> Error {
+pub(crate) fn overflow() -> Error {
     Error::out_of_range("value out of range: overflow")
         .state(SqlState::NUMERIC_VALUE_OUT_OF_RANGE)
         .unplaced()
