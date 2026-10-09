@@ -257,6 +257,9 @@ impl Parser {
 /// alias types such as `regtype` are `UINTEGER` too, and `int2vector` and `oidvector` are lists of
 /// `SMALLINT` and of `UINTEGER`. A `numeric` with no precision is the `numeric` of PostgreSQL. The
 /// same is true for an array of them.
+///
+/// Any other type with no modifier is the rudb type that goes back to the same PostgreSQL type. So
+/// `float`, which the grammar makes `float8`, is `DOUBLE`, where DuckDB reads `FLOAT` as `REAL`.
 pub fn session_type(declared: DeclaredType) -> Option<LogicalType> {
     let unbounded = declared.typmod < 0;
     let of = |oid| match oid {
@@ -268,9 +271,14 @@ pub fn session_type(declared: DeclaredType) -> Option<LogicalType> {
         oid if RegKind::from_oid(oid).is_some() => Some(LogicalType::UInteger),
         _ => None,
     };
-    of(declared.oid).or_else(|| {
+    let special = of(declared.oid).or_else(|| {
         let info = TypeInfo::get(declared.oid).filter(|info| info.is_array())?;
         Some(LogicalType::List(Box::new(of(info.elem)?)))
+    });
+    special.or_else(|| {
+        let ty = crate::logical_type(declared.oid)?;
+        let back = crate::pg_type(&ty);
+        (back.oid == declared.oid && back.typmod == declared.typmod).then_some(ty)
     })
 }
 
@@ -1026,6 +1034,21 @@ mod tests {
         for &(text, oid, typmod) in cases {
             assert_eq!(declared_type(text), Some(DeclaredType { oid, typmod }), "{text}");
         }
+    }
+
+    #[test]
+    fn a_declared_type_is_the_rudb_type_of_postgresql() {
+        let session = |text| declared_type(text).and_then(session_type);
+        assert_eq!(session("float"), Some(LogicalType::Double));
+        assert_eq!(session("float(53)"), Some(LogicalType::Double));
+        assert_eq!(session("float(24)"), Some(LogicalType::Float));
+        assert_eq!(session("float[]"), Some(LogicalType::List(Box::new(LogicalType::Double))));
+        assert_eq!(session("integer"), Some(LogicalType::Integer));
+        assert_eq!(session("numeric"), Some(LogicalType::Numeric));
+        // A modifier, or a type whose rudb type is another PostgreSQL type, is the binder's.
+        assert_eq!(session("numeric(10, 2)"), None);
+        assert_eq!(session("varchar"), None);
+        assert_eq!(session("name"), None);
     }
 
     #[test]
