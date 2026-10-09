@@ -5169,6 +5169,87 @@ pub fn attach(
     Ok(held)
 }
 
+/// Drops every section whose kind `picked` picks from every table in a file, without rewriting a page,
+/// and says how many it dropped.
+///
+/// This is how a file is checked against the promise in spec/graph/03-the-file-format.md section
+/// 3.1, that deleting a graph section changes no answer, and the same promise the statistics
+/// document makes for its own. The settings that turn the graph layer and the statistics off only
+/// stop a plan from using a section, and a reader can still look at one, so a file that does not
+/// hold them is the only way to see what an answer is without them.
+///
+/// It commits the way [`attach`] does: a new directory for each table that lost a section and a new
+/// catalog go on the end of the file, and the last write is the header slot. The payloads stay where
+/// they were with nothing naming them. A file nothing was dropped from is not written at all.
+///
+/// # Errors
+///
+/// If the file has no valid committed directory, is older than format 30, or a table's directory
+/// does not checksum.
+pub fn strip_sections(path: impl AsRef<Path>, picked: impl Fn(&[u8; 8]) -> bool) -> Result<usize> {
+    let file = RealFilesystem::new().open(path.as_ref(), OpenMode::ReadWrite)?;
+    let file = &*file;
+    let size = file.len()?;
+    let mut version = [0; 4];
+    read_at(file, 8, &mut version)?;
+    let version = u32::from_le_bytes(version);
+    if version != FORMAT && version != 30 {
+        return Err(invalid(&format!(
+            "the file is format {version} and only a format {FORMAT} or 30 file has sections"
+        )));
+    }
+    let (slot, bytes, _) = committed_slot(file, size)?;
+    let (mut entries, views, card, anchor) = decode_catalog(&bytes, size)?;
+    let card = card_for(path.as_ref(), card);
+    let mut cursor = size;
+    let mut dropped = 0;
+    for entry in &mut entries {
+        let mut directory = vec![0; entry.directory.length as usize];
+        read_at(file, entry.directory.offset, &mut directory)?;
+        if checksum(&directory) != entry.directory.hash {
+            return Err(invalid(&format!(
+                "the directory of table {} does not checksum",
+                entry.name
+            )));
+        }
+        let mut held = decode_directory(&directory, size)?;
+        let before = held.sections.len();
+        held.sections.retain(|section| !picked(&section.kind));
+        if held.sections.len() == before {
+            continue;
+        }
+        dropped += before - held.sections.len();
+        let encoded = encode_directory(&held)?;
+        let offset = append(file, &mut cursor, &encoded)?;
+        entry.directory = Page {
+            offset,
+            length: u32::try_from(encoded.len())
+                .map_err(|_| invalid("directory length overflow"))?,
+            hash: checksum(&encoded),
+        };
+    }
+    if dropped == 0 {
+        return Ok(0);
+    }
+    let catalog = encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref())?;
+    if catalog.len() > MAX_DIRECTORY {
+        return Err(invalid("catalog exceeds the configured bound"));
+    }
+    let offset = append(file, &mut cursor, &catalog)?;
+    file.sync()?;
+    let generation =
+        slot.generation.checked_add(1).ok_or_else(|| invalid("native file generation overflow"))?;
+    let committed = Slot {
+        offset,
+        length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
+        generation,
+        hash: checksum(&catalog),
+    };
+    file.write_at(slot_offset(generation), &committed.bytes())?;
+    file.sync()?;
+    Ok(dropped)
+}
+
 /// Writes what a table committed in a file is declared with, its keys, defaults, checks, indexes
 /// and which columns refuse nulls, without rewriting a page, the way [`attach`] writes a section.
 ///

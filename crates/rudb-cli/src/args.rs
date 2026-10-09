@@ -73,6 +73,9 @@ pub struct Options {
     /// specialization for, and the counters behind it are process wide, so it is one table for the
     /// run rather than one per statement.
     pub fallbacks: bool,
+    /// What `--strip-sections` asked to drop from the database file, which is done in place of
+    /// opening it.
+    pub strip: Option<String>,
     /// How results are printed, and everything that goes with it.
     pub settings: crate::format::Settings,
 }
@@ -90,10 +93,14 @@ impl Default for Options {
             sets: Vec::new(),
             metrics: None,
             fallbacks: false,
+            strip: None,
             settings: crate::format::Settings::default(),
         }
     }
 }
+
+/// The names `--strip-sections` takes, separated by commas.
+pub const SECTION_KINDS: [&str; 3] = ["graph", "statistics", "all"];
 
 /// Reads the command line.
 ///
@@ -161,6 +168,20 @@ pub fn parse(arguments: &[String]) -> Action {
             },
             // Two dashes for the same reason the two above have them.
             "--fallbacks" => options.fallbacks = true,
+            // Two dashes as well. It drops sections from the file rather than opening it, so a run
+            // can be timed and checked against a file that holds no graph or statistics section.
+            "--strip-sections" => match next(argument) {
+                Ok(kinds) if kinds.split(',').all(|kind| SECTION_KINDS.contains(&kind)) => {
+                    options.strip = Some(kinds);
+                }
+                Ok(kinds) => {
+                    return Action::Wrong(format!(
+                        "--strip-sections takes {}, not {kinds}",
+                        SECTION_KINDS.join(", ")
+                    ));
+                }
+                Err(why) => return Action::Wrong(why),
+            },
             "-separator" => match next(argument) {
                 Ok(value) => options.settings.separator = value,
                 Err(why) => return Action::Wrong(why),
@@ -217,6 +238,15 @@ mod tests {
             Action::Run(options) => *options,
             other => panic!("expected a run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn strip_sections_takes_the_kinds_it_knows() {
+        let parsed = options(&["--strip-sections", "graph,statistics", "job.rudb"]);
+        assert_eq!(parsed.strip.as_deref(), Some("graph,statistics"));
+        assert_eq!(parsed.database, "job.rudb");
+        let owned = ["--strip-sections".to_string(), "graphs".to_string()];
+        assert!(matches!(parse(&owned), Action::Wrong(_)));
     }
 
     #[test]
