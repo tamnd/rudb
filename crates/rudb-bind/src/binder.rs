@@ -17,10 +17,10 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error,
-    ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin, RecursiveUnion, Result,
-    Semantics, Session, ShowBehavior, SortOperators, Span, SqlState, Stat, StateKey, TableNames,
-    UnknownTypes, Value, ValuesNames, WindowOrder,
+    AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder,
+    EmptyTargets, Error, ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin,
+    RecursiveUnion, Result, Semantics, Session, ShowBehavior, SortOperators, Span, SqlState, Stat,
+    StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -1992,7 +1992,7 @@ impl<'a> Binder<'a> {
         self.alias_clause(AliasClause::None);
 
         let targets = ast.target_list(written.targets).to_vec();
-        if targets.is_empty() {
+        if targets.is_empty() && self.semantics.empty_targets() == EmptyTargets::Pin {
             return Err(Error::binder("a SELECT needs at least one expression to select"));
         }
 
@@ -2555,7 +2555,7 @@ impl<'a> Binder<'a> {
                 ast.string(target.alias).to_string()
             });
         }
-        if exprs.is_empty() {
+        if exprs.is_empty() && self.semantics.empty_targets() == EmptyTargets::Pin {
             return Err(Error::binder("SELECT list is empty after resolving * expressions!"));
         }
         origins.resize(exprs.len(), None);

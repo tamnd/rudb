@@ -62,12 +62,13 @@ pub use memory::{ALLOCATION, Memory, Reservation, human};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};
 pub use session::{
     AggregateTypes, CastInput, CastOutput, CharacterTypes, Collations, ColumnNames, CommonTypes,
-    ConditionTypes, ConflictArbiter, CountTypes, DefaultNullOrder, DistinctOrder, ErrorTexts,
-    ExplainOutput, FloatRange, FromFunctions, FunctionRules, IdentifierCase, IdentifierCompare,
-    InsertColumns, JoinColumns, Maintenance, NumberCasts, NumberLiterals, OperatorRules,
-    PlanErrors, PreparedStatement, QueryColumns, RecursiveUnion, RegexRules, RowFields, RowNulls,
-    Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions, ShowBehavior, SortOperators,
-    Subscripts, TableNames, TieOrder, TypeNames, UnknownTypes, ValuesNames, Variable, WindowOrder,
+    ConditionTypes, ConflictArbiter, CountTypes, DefaultNullOrder, DistinctOrder, EmptyTargets,
+    ErrorTexts, ExplainOutput, FloatRange, FromFunctions, FunctionRules, IdentifierCase,
+    IdentifierCompare, InsertColumns, JoinColumns, Maintenance, NumberCasts, NumberLiterals,
+    OperatorRules, PlanErrors, PreparedStatement, QueryColumns, RecursiveUnion, RegexRules,
+    RowFields, RowNulls, Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions,
+    ShowBehavior, SortOperators, Subscripts, TableNames, TieOrder, TypeNames, UnknownTypes,
+    ValuesNames, Variable, WindowOrder,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

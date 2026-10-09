@@ -7190,3 +7190,43 @@ fn an_index_with_no_name_is_named_as_postgres_names_it() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_select_with_no_targets_gives_rows_with_no_columns() {
+    let dirs = Dirs::new("pgnotargets");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("select from generate_series(1, 3)");
+    assert_eq!(tags(&messages), "TDDDCZ");
+    assert!(row_shape(&messages[0]).is_empty());
+    assert!(data_row(&messages[1]).is_empty());
+    assert_eq!(tags(&client.query("select")), "TDCZ");
+    // The counts are the ones that PostgreSQL 19 gives.
+    for (sql, count) in [
+        ("select union select", "1"),
+        ("select intersect select", "1"),
+        ("select except select", "0"),
+        ("select from generate_series(1, 5) union all select from generate_series(1, 3)", "8"),
+        ("select from generate_series(1, 5) intersect all select from generate_series(1, 3)", "3"),
+        ("select from generate_series(1, 5) except all select from generate_series(1, 3)", "2"),
+        ("select from generate_series(1, 5) except select from generate_series(1, 3)", "0"),
+        ("select from generate_series(1, 4) s where s > 2", "2"),
+        ("select from generate_series(1, 4) s group by s % 2", "2"),
+        ("select from generate_series(1, 6) limit 2", "2"),
+    ] {
+        let wrapped = format!("select count(*)::text from ({sql}) t");
+        assert_eq!(scalar(&mut client, &wrapped), count, "{sql}");
+    }
+    assert_eq!(
+        scalar(&mut client, "select exists (select from generate_series(1, 2))::text"),
+        "true"
+    );
+    let messages = client.query("select from generate_series(1, 2) order by 1");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(
+        messages[0].field(b'M').as_deref(),
+        Some("ORDER BY position 1 is not in select list")
+    );
+    server.stop().unwrap();
+}
