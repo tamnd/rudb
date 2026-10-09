@@ -65,10 +65,30 @@ fn the_batches_can_be_taken_rather_than_copied() {
     assert_eq!(chunks[0].value_at(1, 0), Value::BigInt(1));
 }
 
+/// The pin answers every `CREATE TABLE` with a `Count` column, which holds a row only when a query
+/// ran and wrote the table.
 #[test]
-fn a_statement_that_writes_hands_back_nothing_rather_than_a_count() {
+fn a_create_table_answers_with_the_count_column_of_the_pin() {
     let db = Database::new();
     let result = db.execute("CREATE TABLE t (a INTEGER)").expect("creates");
+    assert!(result.is_empty());
+    assert_eq!(result.names(), ["Count"]);
+    assert_eq!(result.types(), [LogicalType::BigInt]);
+    assert_eq!(result.changes(), Some(0));
+    let result = db.execute("CREATE TABLE u AS SELECT * FROM range(3)").expect("creates");
+    assert_eq!(result.names(), ["Count"]);
+    assert_eq!(result.value_at(0, 0), Value::BigInt(3));
+    assert_eq!(result.changes(), Some(3));
+    let result = db.execute("CREATE TABLE IF NOT EXISTS u AS SELECT 1").expect("skips");
+    assert_eq!((result.len(), result.width()), (0, 1));
+    let result = db.execute("CREATE OR REPLACE TABLE u AS SELECT 1 WHERE false").expect("replaces");
+    assert_eq!(result.value_at(0, 0), Value::BigInt(0));
+}
+
+#[test]
+fn a_statement_that_writes_no_rows_hands_back_nothing_rather_than_a_count() {
+    let db = Database::new();
+    let result = db.execute("CREATE VIEW v AS SELECT 1").expect("creates");
     assert!(result.is_empty());
     assert_eq!(result.width(), 0);
     assert_eq!(result.chunk_count(), 0);

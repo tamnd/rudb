@@ -231,13 +231,31 @@ impl QueryResult {
 
     /// A result of no columns and no rows, which is what a statement that writes hands back.
     ///
-    /// Distinct from a query that produced no rows only by its width. DuckDB answers a `CREATE
-    /// TABLE` with a `Count` column holding zero, and copying that would mean every caller checking
-    /// whether a column is the real answer or the acknowledgement. `RETURNING` is the shape that
+    /// Distinct from a query that produced no rows only by its width. `RETURNING` is the shape that
     /// makes a writing statement produce rows, and when it lands it produces them here.
     #[must_use]
     pub(crate) fn empty() -> Self {
         Self::new(Vec::new(), Vec::new(), Vec::new(), Memory::unlimited().reservation())
+    }
+
+    /// What a `CREATE TABLE` answers, which on the pin is one `Count` column, holding how many rows
+    /// the query wrote when there was a query that ran and no row at all otherwise.
+    ///
+    /// A table that `IF NOT EXISTS` found already there runs no query, so it has no row either.
+    /// [`Self::changes`] is set either way, so a caller that skips the count of an `INSERT` skips
+    /// this one as well.
+    pub(crate) fn created(rows: Option<usize>) -> Result<Self> {
+        if let Some(rows) = rows {
+            return Self::counted(rows);
+        }
+        let mut result = Self::new(
+            vec!["Count".to_owned()],
+            vec![LogicalType::BigInt],
+            Vec::new(),
+            Memory::unlimited().reservation(),
+        );
+        result.changes = Some(0);
+        Ok(result)
     }
 
     /// What an `INSERT`, `UPDATE` or `DELETE` answers, which on the pin is one `Count` column of
@@ -305,8 +323,8 @@ impl QueryResult {
         Ok(result)
     }
 
-    /// How many rows the statement wrote, when it was an `INSERT`, `UPDATE` or `DELETE`, and
-    /// `None` when the rows are the answer to a query.
+    /// How many rows the statement wrote, when it was an `INSERT`, `UPDATE`, `DELETE` or `CREATE
+    /// TABLE`, and `None` when the rows are the answer to a query.
     #[must_use]
     pub fn changes(&self) -> Option<usize> {
         self.changes

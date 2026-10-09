@@ -7347,13 +7347,14 @@ impl Shared {
                         let mut catalog = self.write();
                         catalog.create_table(create.name.clone(), create.columns)?;
                         catalog.table_mut(&create.name)?.commit_native(reader)?;
-                        return Ok(QueryResult::empty());
+                        let written = catalog.table(&create.name)?.rows().len();
+                        return QueryResult::created(Some(written));
                     }
                 }
                 let name = create.name.clone();
                 let skipped = create.if_not_exists && catalog.entry(&name).is_ok();
                 self.creating(&name)?;
-                create_table(
+                let written = create_table(
                     sql,
                     create,
                     &mut catalog,
@@ -7370,7 +7371,7 @@ impl Shared {
                 };
                 self.created(name);
                 self.stage_ddl(ddl, sql);
-                Ok(QueryResult::empty().noting(notices))
+                Ok(QueryResult::created(written)?.noting(notices))
             }
             Bound::CreateView(create) => {
                 create_view(create, &mut catalog)?;
@@ -9830,7 +9831,8 @@ fn create_view(create: rudb_bind::CreateView, catalog: &mut Catalog) -> Result<(
     ))
 }
 
-/// The `CREATE TABLE` half of a statement.
+/// The `CREATE TABLE` half of a statement, which answers how many rows its query wrote, or `None`
+/// when there was no query or the table was there already.
 #[allow(clippy::too_many_arguments)]
 fn create_table(
     sql: &str,
@@ -9841,9 +9843,9 @@ fn create_table(
     context: &rudb_opt::pass::Context,
     seams: &rudb_seam::Settings,
     session: &Session,
-) -> Result<()> {
+) -> Result<Option<usize>> {
     if create.if_not_exists && catalog.entry(&create.name).is_ok() {
-        return Ok(());
+        return Ok(None);
     }
     // A name something already has is refused before the query runs, as the pin does, so a `CREATE
     // TABLE t AS` over a `t` that is there does not read a billion rows to say so.
@@ -9915,10 +9917,10 @@ fn create_table(
     if !create.foreign.is_empty() {
         catalog.table_mut(&create.name)?.set_foreign(create.foreign);
     }
-    if let Some(rows) = rows {
-        catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;
-    }
-    Ok(())
+    let Some(rows) = rows else { return Ok(None) };
+    let written = rows.len();
+    catalog.table_mut(&create.name)?.append_all(rows.into_chunks(), budget.pool.threads())?;
+    Ok(Some(written))
 }
 
 #[cfg(test)]
