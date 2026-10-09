@@ -265,7 +265,7 @@ impl Chunk {
         marked_twice(self.marked.as_ref())?;
         // See `below` for why this is not the largest position, and every filtered chunk comes
         // through here.
-        if !crate::vector::below(selection.indices(), self.rows) {
+        if !selection.below(self.rows) {
             let bad = selection.indices().iter().max().copied().unwrap_or_default();
             return Err(Error::internal(format!(
                 "a selection keeps row {bad} of a chunk that has {} rows",
@@ -273,6 +273,11 @@ impl Chunk {
             )));
         }
         let rows = selection.len();
+        // A chunk with no columns left is only its count of rows, so a selection a filter made out
+        // of a mask is never listed for it. That is a `count(*)` behind a filter.
+        if self.columns.is_empty() {
+            return Self::with_rows(Vec::new(), rows);
+        }
         let codes = selection.indices();
         let mut columns = Vec::with_capacity(self.columns.len());
         for column in self.columns {

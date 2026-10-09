@@ -9,15 +9,37 @@
 //! copied five columns to save the next operator a redirection. On a query that filters and then
 //! projects two of those columns, three of the copies were free work.
 
+use std::sync::OnceLock;
+
 /// Which positions of a vector are still in play, as indices into it.
 ///
 /// An empty selection means nothing survived, which is different from no selection at all. The
 /// distinction is why this is a type rather than an `Option<Vec<u32>>` that everybody interprets
 /// slightly differently.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// A filter that compares a column with a literal works out a mask word for every 64 rows, and a
+/// selection made from one keeps the words and lists the positions only when something asks for
+/// them. Plenty of readers never do. A `count(*)` behind a filter wants how many rows were kept, and
+/// a chunk with no columns left to cut wants nothing else either. On `SELECT count(*) FROM lineitem
+/// WHERE l_shipdate` in a year, listing the rows of the mask was 28% of the query.
+#[derive(Debug, Clone, Default)]
 pub struct Selection {
-    indices: Vec<u32>,
+    /// The positions, worked out of `mask` the first time they are asked for when there is one.
+    list: OnceLock<Vec<u32>>,
+    /// A bit for each position, position `i` in bit `i % 64` of word `i / 64`, for a selection a
+    /// filter made out of a mask. It goes once the positions are changed one at a time.
+    mask: Option<Box<[u64]>>,
+    /// How many bits of `mask` are set.
+    kept: usize,
 }
+
+impl PartialEq for Selection {
+    fn eq(&self, other: &Self) -> bool {
+        self.indices() == other.indices()
+    }
+}
+
+impl Eq for Selection {}
 
 impl Selection {
     /// A selection of nothing.
@@ -29,7 +51,7 @@ impl Selection {
     /// A selection of nothing, with room for `capacity` positions.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { indices: Vec::with_capacity(capacity) }
+        Self::from_indices(Vec::with_capacity(capacity))
     }
 
     /// A selection of the first `len` positions in order.
@@ -39,7 +61,7 @@ impl Selection {
     /// carries no selection at all, which is cheaper and is the common case.
     #[must_use]
     pub fn identity(len: usize) -> Self {
-        Self { indices: (0..len as u32).collect() }
+        Self::from_indices((0..len as u32).collect())
     }
 
     /// A selection from positions a caller has already worked out, in order.
@@ -50,7 +72,49 @@ impl Selection {
     /// and a conversion on a loop whose whole point is that it has neither.
     #[must_use]
     pub fn from_indices(indices: Vec<u32>) -> Self {
-        Self { indices }
+        Self { list: OnceLock::from(indices), mask: None, kept: 0 }
+    }
+
+    /// A selection of the positions whose bits are set in `words`, `kept` of them, with position
+    /// `i` in bit `i % 64` of word `i / 64`.
+    ///
+    /// The positions are not listed until something asks for them, see [`Selection`].
+    #[must_use]
+    pub fn from_mask(words: Vec<u64>, kept: usize) -> Self {
+        debug_assert_eq!(
+            words.iter().map(|word| word.count_ones() as usize).sum::<usize>(),
+            kept,
+            "a mask and its count disagree"
+        );
+        Self { list: OnceLock::new(), mask: Some(words.into_boxed_slice()), kept }
+    }
+
+    /// The mask this selection was made from, when it was made from one.
+    #[must_use]
+    pub fn mask(&self) -> Option<&[u64]> {
+        self.mask.as_deref()
+    }
+
+    /// Whether every position is below `len`, which a mask answers from its words past `len`
+    /// without listing the positions.
+    #[must_use]
+    pub fn below(&self, len: usize) -> bool {
+        match (&self.mask, self.list.get()) {
+            (Some(words), None) => {
+                let (whole, part) = (len / 64, len % 64);
+                words.iter().enumerate().skip(whole).all(|(at, &word)| {
+                    if at == whole { word >> part == 0 } else { word == 0 }
+                })
+            }
+            _ => crate::vector::below(self.indices(), len),
+        }
+    }
+
+    /// The positions as a list the caller owns.
+    #[must_use]
+    pub fn into_indices(self) -> Vec<u32> {
+        let _ = self.indices();
+        self.list.into_inner().unwrap_or_default()
     }
 
     /// A selection of the positions a predicate accepts.
@@ -74,7 +138,7 @@ impl Selection {
             kept += usize::from(keep(index));
         }
         indices.truncate(kept);
-        Self { indices }
+        Self::from_indices(indices)
     }
 
     /// Adds a position to the end.
@@ -84,36 +148,46 @@ impl Selection {
     /// If the index does not fit in a `u32`. A vector holds 1024 values and a row group holds
     /// 122,880, so an index that large is a bug several layers up rather than a large query.
     pub fn push(&mut self, index: usize) {
-        self.indices.push(u32::try_from(index).expect("a position past four billion"));
+        let index = u32::try_from(index).expect("a position past four billion");
+        if self.mask.is_some() {
+            let _ = self.indices();
+            self.mask = None;
+        }
+        match self.list.get_mut() {
+            Some(list) => list.push(index),
+            None => self.list = OnceLock::from(vec![index]),
+        }
     }
 
     /// How many positions survived.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.indices.len()
+        self.list.get().map_or(self.kept, Vec::len)
     }
 
     /// Whether nothing survived.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.len() == 0
     }
 
     /// The position at `slot`, where `slot` counts through the survivors.
     #[must_use]
     pub fn get(&self, slot: usize) -> Option<usize> {
-        self.indices.get(slot).map(|&index| index as usize)
+        self.indices().get(slot).map(|&index| index as usize)
     }
 
     /// The positions, in order.
     #[must_use]
     pub fn indices(&self) -> &[u32] {
-        &self.indices
+        self.list.get_or_init(|| {
+            self.mask.as_deref().map_or_else(Vec::new, |words| listed(words, self.kept))
+        })
     }
 
     /// The positions as `usize`, in order.
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.indices.iter().map(|&index| index as usize)
+        self.indices().iter().map(|&index| index as usize)
     }
 
     /// What fraction of `len` positions survived.
@@ -135,8 +209,8 @@ impl Selection {
     #[must_use]
     pub fn compose(&self, earlier: &Self) -> Self {
         let indices =
-            self.indices.iter().filter_map(|&slot| earlier.indices.get(slot as usize).copied());
-        Self { indices: indices.collect() }
+            self.indices().iter().filter_map(|&slot| earlier.indices().get(slot as usize).copied());
+        Self::from_indices(indices.collect())
     }
 
     /// The positions this selection holds that `taken` does not.
@@ -155,9 +229,9 @@ impl Selection {
     /// was the membership kernel reading a packed column a value at a time.
     #[must_use]
     pub fn without(&self, taken: &Self) -> Self {
-        let mut indices = Vec::with_capacity(self.indices.len().saturating_sub(taken.len()));
-        let mut next = taken.indices.iter().copied().peekable();
-        for &index in &self.indices {
+        let mut indices = Vec::with_capacity(self.len().saturating_sub(taken.len()));
+        let mut next = taken.indices().iter().copied().peekable();
+        for &index in self.indices() {
             while next.peek().is_some_and(|&other| other < index) {
                 next.next();
             }
@@ -167,7 +241,7 @@ impl Selection {
                 indices.push(index);
             }
         }
-        Self { indices }
+        Self::from_indices(indices)
     }
 
     /// The positions either selection holds, each once and in order.
@@ -176,7 +250,7 @@ impl Selection {
     /// can hold the same position. Both are in ascending order, as for [`Self::without`].
     #[must_use]
     pub fn union(&self, other: &Self) -> Self {
-        let (mut left, mut right) = (self.indices.as_slice(), other.indices.as_slice());
+        let (mut left, mut right) = (self.indices(), other.indices());
         let mut indices = Vec::with_capacity(left.len() + right.len());
         while let (Some(&a), Some(&b)) = (left.first(), right.first()) {
             indices.push(a.min(b));
@@ -189,7 +263,7 @@ impl Selection {
         }
         indices.extend_from_slice(left);
         indices.extend_from_slice(right);
-        Self { indices }
+        Self::from_indices(indices)
     }
 
     /// The positions below `len` that this selection does not hold.
@@ -201,8 +275,8 @@ impl Selection {
     /// per row, is the same idea as above and measured the same way, so it is not here either.
     #[must_use]
     pub fn complement(&self, len: usize) -> Self {
-        let mut indices = Vec::with_capacity(len.saturating_sub(self.indices.len()));
-        let mut next = self.indices.iter().copied().peekable();
+        let mut indices = Vec::with_capacity(len.saturating_sub(self.len()));
+        let mut next = self.indices().iter().copied().peekable();
         for index in 0..len as u32 {
             while next.peek().is_some_and(|&held| held < index) {
                 next.next();
@@ -213,13 +287,88 @@ impl Selection {
                 indices.push(index);
             }
         }
-        Self { indices }
+        Self::from_indices(indices)
     }
+}
+
+/// How many dropped rows a word may have and still be walked by the rows it drops.
+const DENSE_WORD: u32 = 8;
+
+/// The positions whose bits are set in `words`, `kept` of them, in order.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a mask is over a chunk, whose rows fit in a u32"
+)]
+fn listed(words: &[u64], kept: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(kept + 64);
+    for (block, &word) in words.iter().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        let base = (block * 64) as u32;
+        if word == u64::MAX {
+            out.extend(base..base + 64);
+            continue;
+        }
+        // A word that keeps most of its rows is walked by the rows it drops. Each run between two
+        // of them is written as a whole 64 rows and cut back to its own, so it is a copy of fixed
+        // width with no tail to finish a row at a time, and what it writes past its rows is
+        // written over by the next run. A filter that keeps nearly every row would otherwise pay
+        // a step for every row it keeps.
+        if word.count_zeros() <= DENSE_WORD {
+            let mut dropped = !word;
+            let mut from = 0;
+            loop {
+                let at = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
+                let listed = out.len() + (at - from) as usize;
+                out.extend(base + from..base + from + 64);
+                out.truncate(listed);
+                if dropped == 0 {
+                    break;
+                }
+                from = at + 1;
+                dropped &= dropped - 1;
+            }
+            continue;
+        }
+        let mut word = word;
+        while word != 0 {
+            out.push(base + word.trailing_zeros());
+            word &= word - 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::Selection;
+
+    /// A selection made from a mask lists the same positions a list of them would, counts them
+    /// without listing them, and turns into a list when one is pushed onto it.
+    #[test]
+    fn a_selection_made_from_a_mask_is_the_positions_its_bits_set() {
+        let words = vec![u64::MAX, 0, !1, !(1 << 63), !0xff, !0x1ff, 0x8000_0000_0000_0001, 0x0f0f];
+        let kept = words.iter().map(|word| word.count_ones() as usize).sum();
+        let wanted: Vec<u32> = (0..words.len() * 64)
+            .filter(|&at| words[at / 64] >> (at % 64) & 1 == 1)
+            .map(|at| at as u32)
+            .collect();
+        let selection = Selection::from_mask(words.clone(), kept);
+        assert_eq!(selection.len(), wanted.len());
+        assert_eq!(selection.mask(), Some(words.as_slice()));
+        assert!(selection.below(words.len() * 64 - 52));
+        assert!(!selection.below(words.len() * 64 - 53));
+        assert!(Selection::from_mask(vec![1, 0, 0], 1).below(1));
+        assert!(!Selection::from_mask(vec![1, 0, 2], 2).below(129));
+        assert_eq!(selection.indices(), wanted.as_slice());
+        assert_eq!(selection, Selection::from_indices(wanted.clone()));
+        let mut pushed = selection.clone();
+        pushed.push(4096);
+        assert_eq!(pushed.mask(), None);
+        assert_eq!(pushed.len(), wanted.len() + 1);
+        assert_eq!(selection.into_indices(), wanted);
+    }
 
     #[test]
     fn nothing_selected_is_not_the_same_as_no_selection() {
