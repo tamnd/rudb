@@ -9,11 +9,11 @@
 
 use rudb_common::Fields;
 use rudb_common::guc::Settings;
-use rudb_pgwire::{CommandTag, OutBuf};
+use rudb_pgwire::CommandTag;
 
-use super::Failure;
-use super::role::{Invalid, Parser, Spec, failure, notice, truncate, with_detail};
+use super::role::{Invalid, Notices, Parser, Spec, failure, notice, truncate, with_detail};
 use super::setting::{self, Clause, Keep, Token, spanned};
+use super::{Failure, Severity};
 use crate::databases::{self, Catalog, Row, UTF8, encoding_name};
 use crate::locale::{self, Codeset};
 use crate::roles::{self, BOOTSTRAP_SUPERUSER, FIRST_NORMAL_OID};
@@ -320,10 +320,10 @@ pub(in crate::session) fn execute(
     parsed: &Parsed,
     offset: usize,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<CommandTag, Failure> {
     for text in &parsed.notices {
-        notice(out, "NOTICE", "42622", text, &[]);
+        notice(out, Severity::Notice, "42622", text, &[]);
     }
     let statement = match &parsed.statement {
         Ok(statement) => statement,
@@ -568,7 +568,7 @@ fn actual_version(provider: char) -> Option<String> {
 
 /// `pg_get_encoding_from_locale` with its warning: the name of the encoding, or `None` when any
 /// encoding goes with the locale.
-fn locale_encoding(name: &str, out: &mut OutBuf) -> Option<&'static str> {
+fn locale_encoding(name: &str, out: &mut Notices<'_>) -> Option<&'static str> {
     match locale::encoding(name) {
         Codeset::Any => None,
         Codeset::Encoding(encoding) => Some(encoding),
@@ -576,7 +576,7 @@ fn locale_encoding(name: &str, out: &mut OutBuf) -> Option<&'static str> {
             let message = format!(
                 "could not determine encoding for locale \"{name}\": codeset is \"{codeset}\""
             );
-            notice(out, "WARNING", "01000", &message, &[]);
+            notice(out, Severity::Warning, "01000", &message, &[]);
             None
         }
     }
@@ -588,7 +588,7 @@ fn encoding_matches(
     collate: &str,
     ctype: &str,
     superuser: bool,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<(), Failure> {
     let name = encoding_name(encoding);
     let ctype_encoding = locale_encoding(ctype, out);
@@ -667,7 +667,7 @@ fn create(
     list: &[Opt],
     offset: usize,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<(), Failure> {
     has_newline(name)?;
     let mut found = Found(Vec::new());
@@ -684,7 +684,7 @@ fn create(
                 let position = super::position(cx.sql, offset + opt.at);
                 notice(
                     out,
-                    "WARNING",
+                    Severity::Warning,
                     "0A000",
                     "LOCATION is not supported anymore",
                     &[(b'H', "Consider using tablespaces instead."), (b'P', &position)],
@@ -1019,13 +1019,13 @@ fn drop(
     missing_ok: bool,
     force: bool,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<(), Failure> {
     let catalog = cx.shared.databases.snapshot();
     let Some(row) = catalog.find(name) else {
         if missing_ok {
             let message = format!("database \"{name}\" does not exist, skipping");
-            notice(out, "NOTICE", "00000", &message, &[]);
+            notice(out, Severity::Notice, "00000", &message, &[]);
             return Ok(());
         }
         return Err(missing(name));
@@ -1062,7 +1062,7 @@ fn drop(
         written,
     )?;
     if let Err(error) = cx.shared.remove_database(oid) {
-        notice(out, "WARNING", "01000", &error, &[]);
+        notice(out, Severity::Warning, "01000", &error, &[]);
     }
     Ok(())
 }
@@ -1166,7 +1166,7 @@ fn alter_set(
     name: &str,
     clause: &Clause,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<(), Failure> {
     let row = cx.shared.databases.snapshot().find(name).map(|row| (row.oid, row.owner));
     let (oid, owner) = row.ok_or_else(|| missing(name))?;
@@ -1269,13 +1269,13 @@ fn move_database(name: &str, space: &str, cx: &Context<'_>) -> Result<(), Failur
 }
 
 /// `AlterDatabaseRefreshColl`. The versions of rudb do not change.
-fn refresh(name: &str, cx: &Context<'_>, out: &mut OutBuf) -> Result<(), Failure> {
+fn refresh(name: &str, cx: &Context<'_>, out: &mut Notices<'_>) -> Result<(), Failure> {
     let catalog: std::sync::Arc<Catalog> = cx.shared.databases.snapshot();
     let row = catalog.find(name).ok_or_else(|| missing(name))?;
     if !cx.shared.roles.snapshot().has_privs(cx.current, row.owner) {
         return Err(not_owner(name));
     }
-    notice(out, "NOTICE", "00000", "version has not changed", &[]);
+    notice(out, Severity::Notice, "00000", "version has not changed", &[]);
     Ok(())
 }
 

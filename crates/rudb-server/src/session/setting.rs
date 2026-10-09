@@ -8,10 +8,9 @@
 
 use rudb_common::guc::{self, Arg, Settings};
 use rudb_pgtypes::keywords::{Category, category};
-use rudb_pgwire::OutBuf;
 
-use super::role::{Invalid, failure, notice};
-use super::{Failure, database, role};
+use super::role::{Invalid, Notices, failure, notice};
+use super::{Failure, Severity, database, role};
 use crate::db_role_settings::{DbRoleSettings, split};
 use crate::roles;
 
@@ -847,7 +846,7 @@ pub(super) fn keep(
     database: u32,
     role: u32,
     cx: &Keep<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<(), Failure> {
     let engine = |e: rudb::Error| Failure::engine(&e, 0);
     let written = |e: String| failure("XX000", e);
@@ -883,10 +882,16 @@ pub(super) fn keep(
     };
     match key.as_str() {
         "role" if text != "none" => match cx.roles.find(&text) {
-            None => notice(out, "NOTICE", "42704", &format!("role \"{text}\" does not exist"), &[]),
+            None => notice(
+                out,
+                Severity::Notice,
+                "42704",
+                &format!("role \"{text}\" does not exist"),
+                &[],
+            ),
             Some(target) if !cx.roles.can_set(cx.session, target.oid) => notice(
                 out,
-                "NOTICE",
+                Severity::Notice,
                 "42501",
                 &format!("permission will be denied to set role \"{text}\""),
                 &[],
@@ -894,7 +899,7 @@ pub(super) fn keep(
             Some(_) => {}
         },
         "session_authorization" if cx.roles.find(&text).is_none() => {
-            notice(out, "NOTICE", "42704", &format!("role \"{text}\" does not exist"), &[]);
+            notice(out, Severity::Notice, "42704", &format!("role \"{text}\" does not exist"), &[]);
         }
         _ => {}
     }

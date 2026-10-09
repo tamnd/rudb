@@ -11,8 +11,8 @@ use rudb_common::guc::Settings;
 use rudb_pgtypes::{DateTimeInput, timestamptz_in};
 use rudb_pgwire::{CommandTag, OutBuf, PasswordType, md5_encrypt, verify_password};
 
-use super::Failure;
 use super::setting::{self, Clause, Keep, Token, spanned};
+use super::{Failure, Severity};
 use crate::crypto::Provider;
 use crate::db_role_settings::DbRoleSettings;
 use crate::roles::{BOOTSTRAP_SUPERUSER, Catalog, Member, Role, Roles, scram};
@@ -621,22 +621,32 @@ pub(in crate::session) fn with_detail(sqlstate: &str, message: &str, detail: Str
     Failure { fields: Some(Box::new(fields)), ..failure(sqlstate, message) }
 }
 
+/// The way of the notices of a statement to the client. A notice below `client_min_messages` does
+/// not go out, as `errstart` decides `output_to_client` in PostgreSQL.
+pub(in crate::session) struct Notices<'a> {
+    pub(in crate::session) out: &'a mut OutBuf,
+    pub(in crate::session) least: Severity,
+}
+
 /// A `NOTICE` or a `WARNING` to the client.
 pub(in crate::session) fn notice(
-    out: &mut OutBuf,
-    severity: &str,
+    out: &mut Notices<'_>,
+    severity: Severity,
     sqlstate: &str,
     message: &str,
     more: &[(u8, &str)],
 ) {
+    if severity < out.least {
+        return;
+    }
     let mut fields: Vec<(u8, &[u8])> = vec![
-        (b'S', severity.as_bytes()),
-        (b'V', severity.as_bytes()),
+        (b'S', severity.word()),
+        (b'V', severity.word()),
         (b'C', sqlstate.as_bytes()),
         (b'M', message.as_bytes()),
     ];
     fields.extend(more.iter().map(|(code, text)| (*code, text.as_bytes())));
-    out.notice_response(&fields);
+    out.out.notice_response(&fields);
 }
 
 /// Runs a statement. `offset` is the place of the statement in the query, for the position of an
@@ -645,10 +655,10 @@ pub(in crate::session) fn execute(
     parsed: &Parsed,
     offset: usize,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<CommandTag, Failure> {
     for text in &parsed.notices {
-        notice(out, "NOTICE", "42622", text, &[]);
+        notice(out, Severity::Notice, "42622", text, &[]);
     }
     let statement = match &parsed.statement {
         Ok(statement) => statement,
@@ -712,12 +722,16 @@ impl Options<'_> {
     }
 }
 
-fn options<'a>(list: &'a [Opt], offset: usize, out: &mut OutBuf) -> Result<Options<'a>, Failure> {
+fn options<'a>(
+    list: &'a [Opt],
+    offset: usize,
+    out: &mut Notices<'_>,
+) -> Result<Options<'a>, Failure> {
     let mut seen: Vec<&'static str> = Vec::new();
     let mut found = Options::default();
     for opt in list {
         if opt.value == Value::Sysid {
-            notice(out, "NOTICE", "00000", "SYSID can no longer be specified", &[]);
+            notice(out, Severity::Notice, "00000", "SYSID can no longer be specified", &[]);
             continue;
         }
         if seen.contains(&opt.key()) {
@@ -779,7 +793,7 @@ fn secret(
     name: &str,
     password: &str,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<Option<String>, Failure> {
     let kind = PasswordType::of(password.as_bytes());
     if password.is_empty()
@@ -788,7 +802,7 @@ fn secret(
     {
         notice(
             out,
-            "NOTICE",
+            Severity::Notice,
             "00000",
             "empty string is not a valid password, clearing password",
             &[],
@@ -815,7 +829,7 @@ fn secret(
     {
         notice(
             out,
-            "WARNING",
+            Severity::Warning,
             "01P01",
             "setting an MD5-encrypted password",
             &[
@@ -847,7 +861,7 @@ fn create(
     list: &[Opt],
     offset: usize,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<CommandTag, Failure> {
     has_newline(name)?;
     let options = options(list, offset, out)?;
@@ -966,7 +980,7 @@ fn alter_set(
     database: Option<&str>,
     clause: &Clause,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<(), Failure> {
     let catalog = cx.roles.snapshot();
     let me = cx.current;
@@ -1028,7 +1042,7 @@ fn alter(
     list: &[Opt],
     offset: usize,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<CommandTag, Failure> {
     if let Spec::Name(name) = spec
         && name.starts_with("pg_")
@@ -1131,7 +1145,7 @@ fn rename(
     from: &str,
     to: &str,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<CommandTag, Failure> {
     has_newline(to)?;
     let role = catalog
@@ -1182,7 +1196,7 @@ fn rename(
         .is_some_and(|p| PasswordType::of(p.as_bytes()) == PasswordType::Md5)
     {
         target.password = None;
-        notice(out, "NOTICE", "00000", "MD5 password cleared because of role rename", &[]);
+        notice(out, Severity::Notice, "00000", "MD5 password cleared because of role rename", &[]);
     }
     Ok(CommandTag::AlterRole)
 }
@@ -1193,7 +1207,7 @@ fn drop(
     specs: &[Spec],
     missing_ok: bool,
     cx: &Context<'_>,
-    out: &mut OutBuf,
+    out: &mut Notices<'_>,
 ) -> Result<CommandTag, Failure> {
     let me = cx.current;
     if !catalog.createrole(me) {
@@ -1215,7 +1229,7 @@ fn drop(
             }
             notice(
                 out,
-                "NOTICE",
+                Severity::Notice,
                 "00000",
                 &format!("role \"{name}\" does not exist, skipping"),
                 &[],
