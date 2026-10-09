@@ -34,8 +34,19 @@ pub struct Cancel {
     stopped: Arc<AtomicBool>,
     started: Instant,
     limit: Option<Duration>,
-    /// Whether the limit is the session's `max_execution_time`, which the pin words its own way.
-    setting: bool,
+    /// Where the limit came from, which decides the words of the error.
+    source: Limit,
+}
+
+/// Where the time limit of a statement came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limit {
+    /// The query timeout the database was opened with, or a limit a caller gave.
+    Given,
+    /// The session's `max_execution_time`, which the pin words its own way.
+    MaxExecutionTime,
+    /// The `statement_timeout` of a PostgreSQL session.
+    StatementTimeout,
 }
 
 impl Default for Cancel {
@@ -52,7 +63,7 @@ impl Cancel {
             stopped: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
             limit: None,
-            setting: false,
+            source: Limit::Given,
         }
     }
 
@@ -63,7 +74,7 @@ impl Cancel {
             stopped: Arc::new(AtomicBool::new(false)),
             started: Instant::now(),
             limit: Some(timeout),
-            setting: false,
+            source: Limit::Given,
         }
     }
 
@@ -84,7 +95,7 @@ impl Cancel {
             stopped: Arc::clone(&self.stopped),
             started: Instant::now(),
             limit: timeout,
-            setting: false,
+            source: Limit::Given,
         }
     }
 
@@ -95,7 +106,14 @@ impl Cancel {
     /// opened with is still told how many milliseconds that limit was.
     #[must_use]
     pub fn from_setting(self) -> Self {
-        Self { setting: true, ..self }
+        Self { source: Limit::MaxExecutionTime, ..self }
+    }
+
+    /// The same token with its limit said to be the `statement_timeout` of a PostgreSQL session,
+    /// so that a query it stops gets `57014 canceling statement due to statement timeout`.
+    #[must_use]
+    pub fn from_statement_timeout(self) -> Self {
+        Self { source: Limit::StatementTimeout, ..self }
     }
 
     /// Stop whatever is running on this token.
@@ -138,17 +156,17 @@ impl Cancel {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(Error::interrupt("Interrupted!"));
         }
-        if self.expired() && self.setting {
-            return Err(Error::interrupt("Query exceeded maximum execution time"));
+        if !self.expired() {
+            return Ok(());
         }
-        if self.expired() {
-            let limit = self.limit.unwrap_or_default();
-            return Err(Error::interrupt(format!(
+        Err(Error::interrupt(match self.source {
+            Limit::MaxExecutionTime => "Query exceeded maximum execution time".to_owned(),
+            Limit::StatementTimeout => "canceling statement due to statement timeout".to_owned(),
+            Limit::Given => format!(
                 "query took longer than the {} millisecond limit it was given",
-                limit.as_millis()
-            )));
-        }
-        Ok(())
+                self.limit.unwrap_or_default().as_millis()
+            ),
+        }))
     }
 
     /// Whether the clock has run out, which is false when there is no clock.
@@ -211,6 +229,14 @@ mod tests {
         let cancel = Cancel::new().restart(Some(Duration::from_millis(0))).from_setting();
         let error = cancel.check().expect_err("the time is up");
         assert_eq!(error.to_string(), "INTERRUPT Error: Query exceeded maximum execution time");
+    }
+
+    #[test]
+    fn a_limit_from_statement_timeout_is_worded_the_way_postgres_words_it() {
+        let cancel = Cancel::new().restart(Some(Duration::from_millis(0))).from_statement_timeout();
+        let error = cancel.check().expect_err("the time is up");
+        assert_eq!(error.message(), "canceling statement due to statement timeout");
+        assert_eq!(error.reported_state().as_str(), "57014");
     }
 
     #[test]

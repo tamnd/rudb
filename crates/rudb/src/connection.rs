@@ -206,7 +206,8 @@ impl Connection {
     /// execution rather than here, because a parameter has no type until it has a value.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
         drop(rudb_common::notice::take());
-        Prepared::new(self.shared.clone(), sql).map_err(|error| self.shared.process_error(error))
+        Prepared::new(self.shared.clone(), sql, self.cancel.clone())
+            .map_err(|error| self.shared.process_error(error))
     }
 
     /// The table `parts` names, for [`Connection::load`].
