@@ -26,7 +26,7 @@ use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Pla
 
 use crate::binder::{AliasClause, Binder, PendingSubquery, WindowCall};
 use crate::fold;
-use crate::pgcalls::Written;
+use crate::pgcalls::{Operator, Written};
 use crate::scope::Scope;
 
 /// The pin's list macros over `list_concat`: the name, its parameters as the pin prints them, which
@@ -1119,11 +1119,7 @@ impl Binder<'_> {
             return self.bind_pin_collate(ast, left, right, scope);
         }
         let symbol = op;
-        let op = if op == BinaryOp::Divide && self.semantics.integer_division() {
-            BinaryOp::IntegerDivide
-        } else {
-            op
-        };
+        let op = self.division_of(op);
         if let BinaryOp::And | BinaryOp::Or = op {
             let connective =
                 if op == BinaryOp::And { ConjunctionOp::And } else { ConjunctionOp::Or };
@@ -1154,6 +1150,37 @@ impl Binder<'_> {
             true => undefined_operator(ast, error, symbol, &written, &types),
             false => error,
         })
+    }
+
+    /// `/` is an integer division when the semantics say so, and the other operators are as they
+    /// are.
+    fn division_of(&self, op: BinaryOp) -> BinaryOp {
+        match op == BinaryOp::Divide && self.semantics.integer_division() {
+            true => BinaryOp::IntegerDivide,
+            false => op,
+        }
+    }
+
+    /// A call of the function of an operator, such as `booleq(a, b)`, as the operator over the
+    /// arguments of the call, which the caller has cast to the declared types of the function.
+    pub(crate) fn operator_call(
+        &mut self,
+        ast: &Ast,
+        operator: Operator,
+        written: &[ast::ExprRef],
+        args: &[ExprRef],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        match (operator, written, args) {
+            (Operator::Infix(op), &[left, right], &[a, b]) => {
+                let op = self.division_of(op);
+                self.bind_operator(ast, op, [left, right], [a, b], scope)
+            }
+            (Operator::Prefix(UnaryOp::Negate), _, &[a]) => self.call("-", vec![a]),
+            (Operator::Prefix(UnaryOp::Plus), _, &[a]) => self.call("+", vec![a]),
+            (Operator::Prefix(UnaryOp::BitNot), _, &[a]) => self.call("~", vec![a]),
+            _ => Err(Error::internal(format!("{operator:?} over {} arguments", args.len()))),
+        }
     }
 
     /// The operator of `bind_binary` over its bound operands.

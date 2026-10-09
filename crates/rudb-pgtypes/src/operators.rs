@@ -48,6 +48,12 @@ pub fn operators(name: &str, kind: u8) -> impl Iterator<Item = &'static Operator
     OPERATORS[start..end].iter().filter(move |operator| operator.kind == kind)
 }
 
+/// The built-in operators that call the function `proc`, in the order of the name and the OID.
+pub fn operators_of(proc: &Proc) -> impl Iterator<Item = &'static Operator> {
+    let (name, args) = (proc.name, proc.args);
+    OPERATORS.iter().filter(move |operator| operator.code == name && operator.args == args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,6 +65,8 @@ mod tests {
             operators("+", b'b').filter(|o| o.args == [oid::INT4, oid::INT4]).collect();
         assert_eq!(plus.len(), 1);
         assert_eq!(plus[0].proc().map(|proc| proc.src), Some("int4pl"));
+        let proc = plus[0].proc().unwrap();
+        assert_eq!(operators_of(proc).map(|o| o.oid).collect::<Vec<_>>(), [plus[0].oid]);
         let negate: Vec<_> = operators("-", b'l').map(|o| o.args.len()).collect();
         assert!(!negate.is_empty() && negate.iter().all(|&count| count == 1));
         assert!(OPERATORS.iter().all(|operator| operator.proc().is_some()));

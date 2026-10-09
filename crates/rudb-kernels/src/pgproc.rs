@@ -38,6 +38,12 @@ pub fn collated(src: &str) -> bool {
     pgunicode::COLLATED.contains(&src)
 }
 
+/// Whether an operator whose function is the C function `src` is the kernel of the function,
+/// because the operator of the engine with the same name answers in another way.
+pub fn operator(src: &str) -> bool {
+    pgmath::OPERATORS.contains(&src)
+}
+
 /// Whether the C function `src` has a kernel.
 pub fn has(src: &str) -> bool {
     SOURCES.iter().any(|sources| sources.binary_search(&src).is_ok())
@@ -100,6 +106,13 @@ mod tests {
     fn the_sources_are_sorted() {
         for sources in SOURCES {
             assert!(sources.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn an_operator_that_is_a_kernel_has_one() {
+        for src in pgmath::OPERATORS {
+            assert!(has(src), "{src}");
         }
     }
 
