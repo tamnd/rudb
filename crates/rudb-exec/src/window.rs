@@ -37,7 +37,7 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{
-    Error, Field, LogicalType, Memory, Reservation, Result, Session, SqlState, Value,
+    Error, Field, LogicalType, Memory, Reservation, Result, Session, SqlState, TieOrder, Value,
 };
 use rudb_functions::resolve;
 use rudb_kernels::Accumulator;
@@ -53,6 +53,7 @@ use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::schema::Schema;
 use crate::sort::{Arrival, Place, compare};
+use crate::ties::{self, Leading};
 
 /// What a call reads to answer, which is five entirely different things.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +312,10 @@ pub(crate) struct Window {
     order: Vec<SortKey>,
     /// What the gathered rows are sorted by: the partition keys ascending, then the order keys.
     sorting: Vec<SortKey>,
+    /// What order the rows that tie are left in, from the session.
+    ties: TieOrder,
+    /// How PostgreSQL holds the first key of `sorting`, when it compares as an integer.
+    leading: Option<Leading>,
     calls: Vec<Call>,
     frame: WindowFrame,
     offsets: Offsets,
@@ -344,6 +349,7 @@ impl Window {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.values = self.values.in_session(session);
+        self.ties = session.semantics().tie_order();
         self
     }
 
@@ -445,12 +451,15 @@ impl Window {
             Ranged::default()
         };
 
+        let leading = sorting.first().and_then(|&key| Leading::of(plan.expr_type(key.expr), key));
         let out = Buffered::new();
         let window = Self {
             values: Prepared::new(plan, &gathered, input)?,
             partitions,
             order,
             sorting,
+            ties: TieOrder::Pin,
+            leading,
             calls,
             frame,
             offsets,
@@ -622,6 +631,9 @@ impl Sink for Window {
         if let Some(error) = failure {
             return Err(error);
         }
+        if self.ties == TieOrder::Postgres && keys > 0 {
+            gathered = self.tied(gathered)?;
+        }
 
         let mut answers: Vec<Vec<Value>> =
             self.calls.iter().map(|_| Vec::with_capacity(gathered.len())).collect();
@@ -652,6 +664,43 @@ impl Sink for Window {
 }
 
 impl Window {
+    /// The sorted rows with the rows that tie put where PostgreSQL's sort puts them. See
+    /// [`crate::ties`].
+    ///
+    /// # Errors
+    ///
+    /// If two keys cannot be compared.
+    fn tied(&self, gathered: Vec<Windowed>) -> Result<Vec<Windowed>> {
+        let keys = self.sorting.len();
+        let mut failure = None;
+        let groups = ties::groups(&gathered, |left, right| {
+            compare(&self.sorting, &left.0[..keys], &right.0[..keys], &mut failure)
+                == Ordering::Equal
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let arrivals: Vec<Arrival> = gathered.iter().map(|row| row.2).collect();
+        let first = match self.leading {
+            Some(leading) if gathered.len() >= ties::RADIX => {
+                Some(leading.datums(gathered.iter().map(|row| &row.0[0])))
+            }
+            _ => None,
+        };
+        let Some(arranged) = ties::arrangement(&groups, &arrivals, first.as_ref()) else {
+            return Ok(gathered);
+        };
+        let mut rows: Vec<Option<Windowed>> = gathered.into_iter().map(Some).collect();
+        arranged
+            .into_iter()
+            .map(|at| {
+                rows.get_mut(at)
+                    .and_then(Option::take)
+                    .ok_or_else(|| Error::internal("a window row arranged twice"))
+            })
+            .collect()
+    }
+
     /// The output in chunks, in the order the rows were sorted into: each input column read back
     /// out of the chunk the row came in, then one column per call.
     ///

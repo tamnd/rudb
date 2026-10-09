@@ -1825,6 +1825,43 @@ fn distinct_on_keeps_the_first_row_in_the_order_of_order_by() {
     server.stop().unwrap();
 }
 
+/// The rows whose keys tie come out of a sort and a window in the order PostgreSQL's sort leaves
+/// them in: a quicksort under forty rows, and a radix sort from forty rows on when the first key is
+/// an integer.
+#[test]
+fn rows_that_tie_are_in_the_order_postgres_sorts_them_into() {
+    let dirs = Dirs::new("pgties");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "create temp table tt as select x, x % 4 as k, (x % 5)::text as s, case when x % 7 = 0 then null else x % 3 end as n from generate_series(1, 60) x",
+    );
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, value) in [
+        (
+            "select string_agg(x::text, ',') from (select x from generate_series(1, 10) x order by x % 3) s",
+            "9,6,3,10,4,7,1,8,5,2",
+        ),
+        (
+            "select string_agg(x::text, ',') from (select x from tt order by k) s",
+            "4,8,12,20,24,28,40,44,56,60,48,32,36,52,16,1,5,9,13,21,25,29,41,45,57,49,37,17,33,53,2,6,10,14,22,26,30,38,42,54,58,46,34,18,50,3,7,11,15,23,27,39,43,55,59,19,51,35,31,47",
+        ),
+        (
+            "select string_agg(x::text, ',') from (select x from tt order by n) s",
+            "3,6,9,12,15,18,30,33,36,39,54,57,60,27,51,45,48,24,1,4,10,13,16,19,31,34,37,40,52,55,58,46,22,43,25,2,5,8,11,17,20,29,32,38,53,59,26,41,47,50,23,44,7,28,49,56,35,14,21,42",
+        ),
+        (
+            "select string_agg(x::text || ':' || r, ',') from (select x, row_number() over (partition by s order by k) r from tt) s",
+            "60:1,40:2,20:3,5:4,45:5,25:6,30:7,50:8,10:9,55:10,35:11,15:12,16:1,56:2,36:3,41:4,21:5,1:6,46:7,6:8,26:9,11:10,51:11,31:12,12:1,52:2,32:3,57:4,17:5,37:6,42:7,22:8,2:9,27:10,47:11,7:12,28:1,8:2,48:3,53:4,33:5,13:6,18:7,58:8,38:9,3:10,43:11,23:12,4:1,24:2,44:3,49:4,29:5,9:6,54:7,34:8,14:9,59:10,39:11,19:12",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// The name, the type and the type modifier of each column of a row description.
 fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
     let bytes = message.decoded();

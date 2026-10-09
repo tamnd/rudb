@@ -109,7 +109,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
 use std::sync::{Arc, Mutex, RwLock};
 
-use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, Value};
+use rudb_common::{Error, LogicalType, Memory, Reservation, Result, Session, TieOrder, Value};
 use rudb_pipeline::{Lease, Progress, Sink};
 use rudb_plan::{Plan, Slice, SortKey};
 use rudb_vector::{
@@ -125,6 +125,7 @@ use crate::prepared::{Prepared, Scratch};
 use crate::rows;
 use crate::runs::Runs;
 use crate::schema::Schema;
+use crate::ties::{self, Leading};
 
 /// One row on its way through a sort: the values of its keys, where it arrived, and where it is.
 ///
@@ -173,6 +174,10 @@ pub(crate) struct Sort {
     ranked: Option<Vec<(usize, bool)>>,
     /// The key expressions, evaluated against the input's schema.
     exprs: Prepared,
+    /// What order the rows that tie are left in, from the session.
+    ties: TieOrder,
+    /// How PostgreSQL holds the first key, when it compares as an integer. See [`crate::ties`].
+    leading: Option<Leading>,
     /// The input's types, which are also the output's, since a sort changes no column.
     types: Vec<LogicalType>,
     memory: Memory,
@@ -720,6 +725,7 @@ impl Sort {
     #[must_use]
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.exprs = self.exprs.in_session(session);
+        self.ties = session.semantics().tie_order();
         self
     }
 
@@ -740,10 +746,13 @@ impl Sort {
         let widths = normal::layout(&types);
         let ranked = if widths.is_some() { None } else { normal::ranked_layout(&types) };
         let rows = keyed(widths.as_ref(), ranked.as_ref());
+        let leading = keys.first().zip(types.first()).and_then(|(&key, ty)| Leading::of(ty, key));
         let sort = Self {
             widths,
             ranked,
             exprs: Prepared::new(plan, &exprs, input)?,
+            ties: TieOrder::Pin,
+            leading,
             keys,
             types: input.types(),
             memory: memory.clone(),
@@ -1014,6 +1023,10 @@ impl Sink for Sort {
                 order(&chunks, &rows)?
             }
         };
+        let order = match self.ties {
+            TieOrder::Pin => order,
+            TieOrder::Postgres => self.tied(&chunks, &rows, &sorted, order)?,
+        };
         // The rows have said everything they had to say. Holding them through the assembly is
         // holding a key and an arrival a row for the sake of a number that is already in `order`.
         let taken = rows.footprint()
@@ -1027,6 +1040,93 @@ impl Sink for Sort {
         let out = gathered(&self.types, chunks, order, total, &mut held, &mut charged, threads)?;
         self.out.hold(out)?;
         Ok(())
+    }
+}
+
+impl Sort {
+    /// The sorted answer with the rows that tie put where PostgreSQL's sort puts them.
+    ///
+    /// `order` is the answer as positions in the chunks laid end to end, and `rows` and `sorted`
+    /// are the rows it was worked out from, still holding the keys and where each row arrived. See
+    /// [`crate::ties`].
+    ///
+    /// # Errors
+    ///
+    /// If a row points outside the chunks, or if a key cannot be evaluated or compared again.
+    fn tied(
+        &self,
+        chunks: &[Chunk],
+        rows: &Keyed,
+        sorted: &[(u32, Vec<Normalized>)],
+        order: Vec<usize>,
+    ) -> Result<Vec<usize>> {
+        let outside = || Error::internal("a sorted row pointing outside the chunks it came from");
+        let (groups, arrivals) = match rows {
+            Keyed::Normal(held) => {
+                // The merge gave positions and not rows, so each position is looked up in the
+                // runs it came from.
+                let starts = starts(chunks);
+                let mut laid: Vec<Option<&Normalized>> = vec![None; order.len()];
+                let runs = sorted.iter().map(|(base, run)| (*base, run.as_slice()));
+                for (base, run) in runs.chain(std::iter::once((0, held.as_slice()))) {
+                    for row in run {
+                        let (chunk, at) = row.2;
+                        let start = starts.get(chunk.saturating_add(base) as usize);
+                        let slot = start.and_then(|start| laid.get_mut(start + at as usize));
+                        *slot.ok_or_else(outside)? = Some(row);
+                    }
+                }
+                let along: Vec<&Normalized> = order
+                    .iter()
+                    .map(|&at| laid.get(at).copied().flatten().ok_or_else(outside))
+                    .collect::<Result<_>>()?;
+                let groups = ties::groups(&along, |left, right| {
+                    normal::compare(&left.0, &right.0) == Ordering::Equal
+                });
+                (groups, along.iter().map(|row| row.1).collect::<Vec<_>>())
+            }
+            Keyed::Ranked(ranked) => {
+                let groups = ties::groups(&ranked.rows, |left, right| {
+                    normal::compare(&left.0, &right.0) == Ordering::Equal
+                });
+                (groups, ranked.rows.iter().map(|row| row.1).collect())
+            }
+            Keyed::Valued(held) => {
+                let mut failure = None;
+                let groups = ties::groups(held, |left, right| {
+                    compare(&self.keys, &left.0, &right.0, &mut failure) == Ordering::Equal
+                });
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                (groups, held.iter().map(|row| row.1).collect())
+            }
+        };
+        // The first key again, for the radix sort, which reads it as PostgreSQL holds it rather
+        // than as this sort wrote it.
+        let first = match self.leading {
+            Some(leading) if order.len() >= ties::RADIX => {
+                let mut scratch = self.exprs.scratch();
+                let mut keys = Vec::with_capacity(self.keys.len());
+                let mut values = Vec::with_capacity(order.len());
+                for chunk in chunks {
+                    keys.clear();
+                    self.exprs.evaluate(chunk, &mut scratch, &mut keys)?;
+                    let key = keys.first().ok_or_else(mismatched)?;
+                    for row in 0..chunk.len() {
+                        values.push(key.try_value_at(row)?);
+                    }
+                }
+                let along = order.iter().map(|&at| values.get(at).ok_or_else(outside));
+                let along: Vec<&Value> = along.collect::<Result<_>>()?;
+                Some(leading.datums(along.into_iter()))
+            }
+            _ => None,
+        };
+        Ok(match ties::arrangement(&groups, &arrivals, first.as_ref()) {
+            Some(arranged) => arranged.into_iter().map(|at| order[at]).collect(),
+            None => order,
+        })
     }
 }
 
