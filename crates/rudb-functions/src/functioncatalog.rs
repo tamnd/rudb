@@ -464,6 +464,7 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("normalized_interval", &["interval"]),
     ("regexp_split_to_array", &["string", "regex"]),
     ("regexp_split_to_array", &["string", "regex", "options"]),
+    ("replace_type", &["param", "type1", "type2"]),
     ("split", &["string", "separator"]),
     ("str_split", &["string", "separator"]),
     ("str_split_regex", &["string", "regex"]),

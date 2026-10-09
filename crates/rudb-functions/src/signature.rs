@@ -1692,6 +1692,15 @@ const TABLE: &[Entry] = &[
         shape: Shape::Retyped,
         numeric_only: false,
     },
+    // A value cast to its own type with one type inside it replaced by another. The binder makes
+    // it the cast, as it does `cast_to_type`.
+    Entry {
+        name: "replace_type",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(3),
+        shape: Shape::Retyped,
+        numeric_only: false,
+    },
     // The number a zoned time sorts by, which is the number it is held in.
     Entry {
         name: "timetz_byte_comparable",
@@ -5316,6 +5325,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
         ],
     ),
     ("cast_to_type", &["cast_to_type(col0 ANY, col1 ANY) -> ANY"]),
+    ("replace_type", &["replace_type(col0 ANY, col1 ANY, col2 ANY) -> ANY"]),
     ("timetz_byte_comparable", &["timetz_byte_comparable(col0 TIME WITH TIME ZONE) -> UBIGINT"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("getvariable", &["getvariable(variable_name VARCHAR) -> ANY"]),
