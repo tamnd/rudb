@@ -2624,7 +2624,7 @@ impl<'a> Binder<'a> {
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
-            let (item, ordinal) = self.ordinal_collation(ast, item);
+            let (item, ordinal) = self.ordinal_collation(ast, item, output);
             if let Some(expanded) = self.bind_star_each(ast, item.expr, input)? {
                 for bound in expanded {
                     let bound = self.over_aggregate(bound, input)?;
@@ -2685,7 +2685,7 @@ impl<'a> Binder<'a> {
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
-            let (item, ordinal) = self.ordinal_collation(ast, item);
+            let (item, ordinal) = self.ordinal_collation(ast, item, output);
             if let Some(expanded) = self.bind_star_each(ast, item.expr, output)? {
                 for expr in expanded {
                     let ty = self.plan.expr_type(expr).clone();
@@ -2781,16 +2781,13 @@ impl<'a> Binder<'a> {
                 let position: usize = written.parse().map_err(|_| {
                     Error::binder(format!("ORDER BY term {written} is not a column"))
                 })?;
-                if position == 0 || position > output.len() {
-                    return Err(Error::binder(format!(
-                        "ORDER BY term out of range - should be between 1 and {}",
-                        output.len()
-                    ))
-                    .state(SqlState::INVALID_COLUMN_REFERENCE)
-                    .pg(format!("ORDER BY position {position} is not in select list"))
-                    .with_span(ast.expr_span(item)));
-                }
-                Ok(Some(position - 1))
+                Self::output_ordinal(ast, item, position, output).map(Some)
+            }
+            // `#2` in an `ORDER BY` is the second column of the select list, not of the `FROM`
+            // clause, as the pin's `OrderBinder` reads it.
+            ast::Expr::Positional { index } => {
+                let position = usize::try_from(index).unwrap_or(usize::MAX);
+                Self::output_ordinal(ast, item, position, output).map(Some)
             }
             ast::Expr::Column { name } => {
                 let parts: Vec<&str> = ast.name(name).collect();
@@ -2799,6 +2796,25 @@ impl<'a> Binder<'a> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The place in `output` of the column at `position`, counted from one.
+    fn output_ordinal(
+        ast: &Ast,
+        item: ast::ExprRef,
+        position: usize,
+        output: &Scope,
+    ) -> Result<usize> {
+        if position == 0 || position > output.len() {
+            return Err(Error::binder(format!(
+                "ORDER term out of range - should be between 1 and {}",
+                output.len()
+            ))
+            .state(SqlState::INVALID_COLUMN_REFERENCE)
+            .pg(format!("ORDER BY position {position} is not in select list"))
+            .with_span(ast.expr_span(item)));
+        }
+        Ok(position - 1)
     }
 
     /// Refuses a literal sort key unless the session explicitly accepts its no-op behavior.
@@ -3849,8 +3865,7 @@ impl<'a> Binder<'a> {
                 bound.push(expr);
             } else {
                 let name = ast.string(argument.alias).to_string();
-                let (parameter, value) = self.named_argument(called, function_name, &name, expr)?;
-                written_options.push((parameter, value, expr));
+                written_options.push(self.named_argument(called, function_name, &name, expr)?);
             }
         }
         self.clause = previous;
@@ -4327,13 +4342,9 @@ impl<'a> Binder<'a> {
 
     /// One named parameter of a table function call, folded into what the call was given.
     ///
-    /// The value has to be a constant of the type the parameter wants. It has to be constant
-    /// because an option can decide what the columns are and the columns are settled here, and it
-    /// has to be already of the type because there is no constant folding in front of the binder
-    /// yet. DuckDB folds first, so `binary_as_string=1` and `binary_as_string='yes'` are both true
-    /// there and both are turned away here, which is a gap that closes on its own the day the
-    /// optimizer runs before the plan is finished. `binary_as_string=True` is what the ClickBench
-    /// entry writes and is what has to work.
+    /// The value has to be a constant, because an option can decide what the columns are and the
+    /// columns are settled here. It is folded and cast to the type the parameter wants, so
+    /// `header=2` and `header='true'` are both true, as they are on the pin.
     ///
     /// A name that is not a parameter of this function is the binary's sentence followed by what it
     /// could have been. The binary puts the candidates on their own indented lines and this puts
@@ -4344,7 +4355,7 @@ impl<'a> Binder<'a> {
         spelled: &str,
         name: &str,
         expr: ExprRef,
-    ) -> Result<(&'static str, Value)> {
+    ) -> Result<(&'static str, Value, ExprRef)> {
         // The JSON readers name the function as it was called, `_auto` and all, and list a
         // parameter that takes any value as `ANY`.
         let called = if function.json().is_some() {
@@ -4401,7 +4412,7 @@ impl<'a> Binder<'a> {
         // The JSON readers cast what they are given to the parameter's type themselves, and say
         // so in their own words when it does not cast.
         if function.json().is_some() {
-            return Ok((parameter, value));
+            return Ok((parameter, value, expr));
         }
         let given = self.plan.expr_type(expr).clone();
         // `nullstr` takes one string or a list of them, which is the one parameter so far that
@@ -4412,12 +4423,25 @@ impl<'a> Binder<'a> {
                 "CSV Reader function option \"nullstr\" requires a string or a list as input",
             ));
         }
-        if given != *wanted && !listed {
-            return Err(Error::not_implemented(format!(
-                "the named parameter {parameter} given a {given} where a {wanted} was wanted"
-            )));
+        if given == *wanted || listed {
+            return Ok((parameter, value, expr));
         }
-        Ok((parameter, value))
+        // Anything else is cast to the type the parameter wants, so `header=0` is false and
+        // `delim=1` is the string `1`, as the pin casts it.
+        match rudb_kernels::cast_value(&value, wanted, false) {
+            Ok(value) => {
+                let at = self.plan.add_value(value.clone());
+                let cast = self.plan.add_expr(Expr::Constant(at), wanted.clone());
+                Ok((parameter, value, cast))
+            }
+            Err(_) if self.copy_into.is_some() => Err(Error::invalid_input(format!(
+                "Copy option \"{parameter}\" expected an argument of type {wanted} - the argument \
+                 \"{value}\" of type {given} could not be cast as this type"
+            ))),
+            Err(error) => {
+                Err(Error::invalid_input(format!("Failed to cast value: {}", error.message())))
+            }
+        }
     }
 
     /// A file where a table name goes, which is what DuckDB calls a replacement scan.
