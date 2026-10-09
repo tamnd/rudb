@@ -1458,6 +1458,50 @@ fn a_recursive_union_of_columns_that_hash_runs() {
     server.stop().unwrap();
 }
 
+/// PostgreSQL refuses an aggregate in a block of the recursive side that reads the definition,
+/// at the first aggregate, so a query that would never end gives an error. An aggregate in a
+/// block that does not read it is allowed.
+#[test]
+fn an_aggregate_over_the_recursive_side_is_refused() {
+    let dirs = Dirs::new("pgrecagg");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, at) in [
+        (
+            "with recursive x(n) as (select 1 union all select count(*) from x) select * from x",
+            "count",
+        ),
+        (
+            "with recursive x(n) as (select 1 union all select n + 1 from x where n < 3 \
+             group by n having sum(n) > 0) select * from x",
+            "sum",
+        ),
+        (
+            "with recursive x(n) as (select 1 union all select c from (select count(*) as c \
+             from x) s where c < 3) select * from x",
+            "count",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = |code: u8| messages[0].field(code);
+        assert_eq!(error(b'C').as_deref(), Some("42P19"), "{sql}");
+        assert_eq!(
+            error(b'M').as_deref(),
+            Some("aggregate functions are not allowed in a recursive query's recursive term")
+        );
+        let position = sql.find(at).map(|found| (found + 1).to_string());
+        assert_eq!(error(b'P'), position, "{sql}");
+    }
+    let messages = client.query(
+        "with recursive x(n) as (select 1 union all select n + 1 from x \
+         where n < (select count(*) + 2 from (values (1)) v(a))) select * from x",
+    );
+    assert_eq!(tags(&messages), "TDDDCZ");
+    server.stop().unwrap();
+}
+
 /// A query reads the catalog beside the queries of other sessions, so a long one keeps no other
 /// query waiting, whether it comes in as a simple or as an extended query.
 #[test]
