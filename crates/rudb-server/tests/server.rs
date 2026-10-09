@@ -1275,6 +1275,110 @@ fn the_functions_of_postgres_have_its_result_types() {
 }
 
 #[test]
+fn the_ordered_set_aggregates_of_postgres_give_its_values_and_its_errors() {
+    let dirs = Dirs::new("orderedset");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The values and the type OIDs are the ones that PostgreSQL 19 gives.
+    let cases = [
+        (
+            "select percentile_cont(0.1) within group (order by x), \
+             percentile_disc(0.25) within group (order by x desc), \
+             mode() within group (order by x % 3) from generate_series(1, 5) x",
+            "1.4|4|1",
+            vec![701, 23, 23],
+        ),
+        (
+            "select percentile_cont(array[0, 0.25, 1]) within group (order by x), \
+             percentile_disc(array[null, 0.5]) within group (order by x::text) \
+             from generate_series(1, 6) x",
+            "{1,2.25,6}|{NULL,3}",
+            vec![1022, 1009],
+        ),
+        (
+            "select rank(3) within group (order by x), dense_rank(3) within group (order by x), \
+             percent_rank(3) within group (order by x), cume_dist(3) within group (order by x) \
+             from (values (1), (1), (2), (2), (3), (3), (4)) v(x)",
+            "5|3|0.5714285714285714|0.875",
+            vec![20, 20, 701, 701],
+        ),
+        (
+            "select percentile_cont(0.5) within group (order by x) \
+             from (values (interval '1 day'), (interval '2 days 3 hours')) v(x)",
+            "1 day 13:30:00",
+            vec![1186],
+        ),
+    ];
+    for (sql, expected, oids) in cases {
+        let messages = client.query(sql);
+        let shape: Vec<u32> = row_shape(&messages[0]).into_iter().map(|(_, oid, _)| oid).collect();
+        assert_eq!(shape, oids, "{sql}");
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    for (sql, code, message, place) in [
+        (
+            "select percentile_cont(1.5) within group (order by x) from generate_series(1, 3) x",
+            "22003",
+            "percentile value 1.5 is not between 0 and 1",
+            None,
+        ),
+        (
+            "select sum() within group (order by x::float8) from generate_series(1, 3) x",
+            "42809",
+            "sum is not an ordered-set aggregate, so it cannot have WITHIN GROUP",
+            Some("8"),
+        ),
+        (
+            "select percentile_cont(0.5, 0.5) from generate_series(1, 3) x",
+            "42809",
+            "WITHIN GROUP is required for ordered-set aggregate percentile_cont",
+            Some("8"),
+        ),
+        (
+            "select rank(x) within group (order by x) from generate_series(1, 5) x",
+            "42803",
+            "column \"x.x\" must appear in the GROUP BY clause or be used in an aggregate function",
+            Some("13"),
+        ),
+        (
+            "select rank(3) within group (order by x) from (values ('fred'), ('jim')) v(x)",
+            "42804",
+            "WITHIN GROUP types text and integer cannot be matched",
+            Some("13"),
+        ),
+        (
+            "select rank(3) within group (order by x, x) from generate_series(1, 5) x",
+            "42883",
+            "function rank(integer, integer, integer) does not exist",
+            Some("8"),
+        ),
+        (
+            "select percentile_cont(0.5) within group (order by x) over () \
+             from generate_series(1, 3) x",
+            "0A000",
+            "OVER is not supported for ordered-set aggregate percentile_cont",
+            Some("8"),
+        ),
+    ] {
+        // A percentile out of range is found as the group finishes, after the row description.
+        let messages = client.query(sql);
+        assert!(tags(&messages).ends_with("EZ"), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), place, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("pgmath");
     let server = Server::start(dirs.config()).unwrap();

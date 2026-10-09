@@ -5830,8 +5830,20 @@ impl<'a> Binder<'a> {
         written: &AggregateCall<'_>,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let AggregateCall { name, args, distinct, filter, sorted } = *written;
+        let filter = written.filter;
         let exporting = std::mem::take(&mut self.exporting);
+        self.aggregate_allowed()?;
+        // The predicate goes first, which is the order the messages come out in upstream: a call
+        // whose argument and whose filter both name columns that are not there is refused over the
+        // filter. It is bound as if it were inside the call, so an aggregate in it is caught, and a
+        // window in it is refused with the words a window inside an aggregate is refused with.
+        let filter = self.aggregate_filter(ast, filter, scope)?;
+        self.bind_aggregate_after_filter(ast, written, filter, exporting, scope)
+    }
+
+    /// Refuses an aggregate where the query cannot compute one: inside another aggregate, inside a
+    /// `FILTER`, or in a clause that is evaluated before the rows are grouped.
+    pub(crate) fn aggregate_allowed(&self) -> Result<()> {
         if self.in_filter {
             return Err(Error::binder("aggregate functions are not allowed in FILTER")
                 .state(SqlState::GROUPING_ERROR));
@@ -5853,17 +5865,33 @@ impl<'a> Binder<'a> {
                 None => error,
             });
         }
-        // The predicate goes first, which is the order the messages come out in upstream: a call
-        // whose argument and whose filter both name columns that are not there is refused over the
-        // filter. It is bound as if it were inside the call, so an aggregate in it is caught, and a
-        // window in it is refused with the words a window inside an aggregate is refused with.
+        Ok(())
+    }
+
+    /// The `FILTER` of an aggregate call, bound as if it were inside the call.
+    pub(crate) fn aggregate_filter(
+        &mut self,
+        ast: &Ast,
+        filter: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<Option<ExprRef>> {
         self.in_aggregate = true;
         self.in_filter = true;
         let filter = self.bind_filter(ast, filter, scope);
         self.in_filter = false;
         self.in_aggregate = false;
-        let filter = filter?;
+        filter
+    }
 
+    fn bind_aggregate_after_filter(
+        &mut self,
+        ast: &Ast,
+        written: &AggregateCall<'_>,
+        filter: Option<ExprRef>,
+        exporting: bool,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let AggregateCall { name, args, distinct, sorted, .. } = *written;
         // The ordered-set aggregates take the value they read from their `ORDER BY` when the call
         // does not write it, which is what `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` is
         // parsed into, and a descending order counts their fractions from the top.
@@ -6387,6 +6415,11 @@ impl<'a> Binder<'a> {
         }
         if self.in_window {
             return Err(Error::binder("window function calls cannot be nested"));
+        }
+        if self.semantics.function_rules() == FunctionRules::Postgres
+            && let Some(error) = self.within_group_required(name, args.len())
+        {
+            return Err(error);
         }
         // A join condition is part of the `WHERE` clause as far as this one sentence is concerned,
         // which is upstream's wording and not a simplification: `ON sum(a.i) OVER () = b.i` is

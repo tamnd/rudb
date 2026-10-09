@@ -1857,6 +1857,13 @@ pub struct Ast {
     /// [`OrderItem`] beside the call it belongs to. Kept to one side for the reason the named
     /// arguments are: few calls have one and every call would carry the field.
     pub aggregate_orders: Vec<(ExprRef, Slice)>,
+    /// The `WITHIN GROUP (ORDER BY ...)` of an ordered-set aggregate as PostgreSQL reads it,
+    /// `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`, beside the call. The call keeps its
+    /// written name and its direct arguments, and the order is the aggregated arguments.
+    pub within_groups: Vec<(ExprRef, Slice)>,
+    /// The `WITHIN GROUP` calls written with an `OVER` after them, which PostgreSQL refuses once
+    /// it knows the name is an ordered-set aggregate.
+    pub windowed_within_groups: Vec<ExprRef>,
     /// The aggregate calls written with `EXPORT_STATE` after them, which answer with the state
     /// they reached rather than with their result.
     pub exported: Vec<ExprRef>,
@@ -2139,6 +2146,20 @@ impl Ast {
             .iter()
             .find(|(held, _)| *held == call)
             .map_or(&[], |&(_, slice)| self.order_list(slice))
+    }
+
+    /// The `WITHIN GROUP` order of an ordered-set call as PostgreSQL reads it, or `None` for a
+    /// call written without one.
+    pub fn within_group(&self, call: ExprRef) -> Option<&[OrderItem]> {
+        self.within_groups
+            .iter()
+            .find(|(held, _)| *held == call)
+            .map(|&(_, slice)| self.order_list(slice))
+    }
+
+    /// Whether a `WITHIN GROUP` call was written with an `OVER` after it.
+    pub fn within_group_over(&self, call: ExprRef) -> bool {
+        self.windowed_within_groups.contains(&call)
     }
 
     /// The `EXCLUDE` and `RENAME` lists of a star, both empty for a star written with neither.
