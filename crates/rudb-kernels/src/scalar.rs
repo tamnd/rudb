@@ -3276,8 +3276,8 @@ fn like_run<A: Fn(usize) -> usize>(
         // With no null to skip the length and the first four bytes are one pass with no branch in
         // it, and the arena is read in a second pass only at the rows they agree with. The loop
         // below asked both of every row with the arena read between them, so a row was a call and
-        // a few branches, and on the parts of q20 that was about thirty cycles a row where this is
-        // a few.
+        // a few branches, and q20, which asks this of all 200,000 parts twice at SF1, spent about
+        // forty instructions a row more than it does here.
         if matches!(base, Validity::AllValid) && !prefix.is_empty() {
             for (index, slot) in out.iter_mut().enumerate() {
                 *slot = views.get(at(index)).is_some_and(|view| {
