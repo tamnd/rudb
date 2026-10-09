@@ -1447,6 +1447,46 @@ fn a_recursive_union_of_columns_that_hash_runs() {
     server.stop().unwrap();
 }
 
+/// A temporary table, view or sequence belongs to the session that made it, and goes when that
+/// session ends. One made inside a transaction that rolled back was never there.
+#[test]
+fn the_temporary_objects_of_a_session_go_when_it_ends() {
+    let dirs = Dirs::new("tempclose");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut first = Client::unix(&server);
+    connect(&mut first, PROTOCOL_3_0);
+    for sql in [
+        "create temp table temptest (tcol int)",
+        "create temp table counted (id serial, v int)",
+        "create temp view seen as select * from temptest",
+        "create temp sequence numbers",
+        "begin",
+        "create temp table undone (a int)",
+        "rollback",
+    ] {
+        let messages = first.query(sql);
+        assert!(messages.iter().all(|message| message.tag != b'E'), "{sql}");
+    }
+    first.send(&Frontend::Terminate);
+    assert!(first.rest().is_empty());
+
+    let mut second = Client::unix(&server);
+    connect(&mut second, PROTOCOL_3_0);
+    let left = "select count(*)::text from pg_class \
+        where relname in ('temptest', 'counted', 'counted_id_seq', 'seen', 'numbers', 'undone')";
+    // The session that ended can still be closing for a moment.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while scalar(&mut second, left) != "0" && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(scalar(&mut second, left), "0");
+    for sql in ["create table temptest (col int)", "create index temptest_col on temptest (col)"] {
+        let messages = second.query(sql);
+        assert!(messages.iter().all(|message| message.tag != b'E'), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn an_operator_between_numbers_is_the_operator_postgres_finds() {
     let dirs = Dirs::new("pgnumops");
