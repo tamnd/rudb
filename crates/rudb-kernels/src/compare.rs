@@ -852,6 +852,9 @@ pub fn mask_within(
     )
 }
 
+/// How many dropped rows a word may have and still be walked by the rows it drops.
+const DENSE_WORD: u32 = 8;
+
 /// The rows a mask [`mask_within`] filled keeps, in order.
 #[must_use]
 #[expect(
@@ -864,6 +867,21 @@ pub fn mask_selection(words: &[u64], kept: usize) -> Selection {
         let base = (block * 64) as u32;
         if word == u64::MAX {
             out.extend(base..base + 64);
+            continue;
+        }
+        // A word that keeps most of its rows is walked by the rows it drops, each run between
+        // two dropped rows copied whole, since a filter that keeps nearly every row would
+        // otherwise pay a step for every row it keeps.
+        if word.count_zeros() <= DENSE_WORD {
+            let mut dropped = !word;
+            let mut from = 0;
+            while dropped != 0 {
+                let at = dropped.trailing_zeros();
+                out.extend(base + from..base + at);
+                from = at + 1;
+                dropped &= dropped - 1;
+            }
+            out.extend(base + from..base + 64);
             continue;
         }
         let mut word = word;
@@ -3580,6 +3598,27 @@ mod tests {
     /// A mask keeps the rows its bounds keep, flat and bit packed, written fresh and anded into one
     /// that already has rows out, for every kind of bound it takes and for ends past the values,
     /// over rows that do not fill the last block.
+    #[test]
+    fn a_mask_lists_its_rows_whether_its_words_are_dense_or_sparse() {
+        let words = [
+            u64::MAX,
+            0,
+            !1,
+            !(1 << 63),
+            !((1 << 5) | (1 << 6) | (1 << 40)),
+            !0xff,
+            !0x1ff,
+            0x8000_0000_0000_0001,
+            0x0f0f_0f0f_0f0f_0f0f,
+        ];
+        let expected: Vec<u32> = (0..words.len() * 64)
+            .filter(|&row| words[row / 64] >> (row % 64) & 1 == 1)
+            .map(|row| u32::try_from(row).expect("a small mask"))
+            .collect();
+        let selection = mask_selection(&words, expected.len());
+        assert_eq!(selection, Selection::from_indices(expected));
+    }
+
     #[test]
     fn a_mask_keeps_the_rows_its_bounds_keep() {
         let rows: usize = 1000;
