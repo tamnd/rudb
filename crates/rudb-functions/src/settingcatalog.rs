@@ -634,7 +634,7 @@ pub static SETTINGS: &[SettingEntry] = &[
         input_type: "VARCHAR",
         scope: GLOBAL,
         aliases: &[],
-        behaviour: Behaviour::DefaultOnly(""),
+        behaviour: Behaviour::Honoured,
     },
     SettingEntry {
         name: "default_null_order",

@@ -201,6 +201,8 @@ pub(crate) struct Settings {
     dialect_compatibility_mode: RwLock<String>,
     /// The null placement mode used when an order item does not state one.
     default_null_order: RwLock<String>,
+    /// The collation strings with none of their own compare under, as written, or empty for none.
+    default_collation: RwLock<String>,
     /// Whether casts from local timestamps to zoned timestamps are refused.
     disable_timestamptz_casts: RwLock<bool>,
     /// Whether errors are returned as structured JSON.
@@ -361,6 +363,7 @@ impl Settings {
             allow_parser_override_extension: RwLock::new("DEFAULT".to_string()),
             dialect_compatibility_mode: RwLock::new("NONE".to_string()),
             default_null_order: RwLock::new("NULLS_LAST".to_string()),
+            default_collation: RwLock::new(String::new()),
             disable_timestamptz_casts: RwLock::new(false),
             errors_as_json: RwLock::new(false),
             ieee_floating_point_ops: RwLock::new(true),
@@ -819,6 +822,11 @@ impl Settings {
                 };
                 *self.default_order.write().unwrap_or_else(|held| held.into_inner()) =
                     normalized.to_string();
+            }
+            "default_collation" => {
+                let written = value.map_or(String::new(), text_of);
+                rudb_bind::check_collation(&written)?;
+                *self.default_collation.write().unwrap_or_else(|held| held.into_inner()) = written;
             }
             "default_null_order" => {
                 let written = value.map_or("NULLS_LAST".to_string(), text_of);
@@ -1279,6 +1287,9 @@ impl Settings {
             "default_null_order" => {
                 Ok(self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone())
             }
+            "default_collation" => {
+                Ok(self.default_collation.read().unwrap_or_else(|held| held.into_inner()).clone())
+            }
             "disabled_optimizers" => Ok(self.disabled_optimizers()),
             "disable_timestamptz_casts" => Ok(self
                 .disable_timestamptz_casts
@@ -1411,6 +1422,8 @@ impl Settings {
             self.dialect_compatibility_mode.read().unwrap_or_else(|held| held.into_inner()).clone();
         let default_null_order =
             self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let default_collation =
+            self.default_collation.read().unwrap_or_else(|held| held.into_inner()).clone();
         let disable_timestamptz_casts =
             *self.disable_timestamptz_casts.read().unwrap_or_else(|held| held.into_inner());
         let errors_as_json = *self.errors_as_json.read().unwrap_or_else(|held| held.into_inner());
@@ -1490,6 +1503,7 @@ impl Settings {
                     "dialect_compatibility_mode" => dialect_compatibility_mode.clone(),
                     "default_order" => default_order.clone(),
                     "default_null_order" => default_null_order.clone(),
+                    "default_collation" => default_collation.clone(),
                     "disabled_optimizers" => disabled.clone(),
                     "disable_timestamptz_casts" => disable_timestamptz_casts.to_string(),
                     "errors_as_json" => errors_as_json.to_string(),

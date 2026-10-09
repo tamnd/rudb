@@ -12,10 +12,12 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Collations, Error, LogicalType, Result};
+use rudb_common::{Collations, Error, LogicalType, Result, Session};
 use rudb_parse::ast::{self, BinaryOp, LiteralKind};
 use rudb_parse::{Ast, NONE};
-use rudb_plan::{ColumnBinding, Expr, ExprRef, Node};
+use rudb_plan::{
+    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, SetOpKind,
+};
 
 use crate::binder::Binder;
 use crate::scope::Scope;
@@ -29,13 +31,40 @@ pub(crate) struct PinCollated {
     columns: HashMap<ColumnBinding, String>,
     /// The collation each expression took from its inputs, kept so that each one is found once.
     derived: HashMap<ExprRef, Option<String>>,
+    /// The groups of a grouping that sorts under a collation, each with the column of the `first`
+    /// aggregate that gives the value as it was rather than as the collation made it, and the
+    /// index of the grouping.
+    grouped: Vec<(u32, ExprRef, ExprRef)>,
+    /// The session's `default_collation`, which a comparison or a sort of strings that have no
+    /// collation of their own goes by, or none when it is not set.
+    default: Option<String>,
 }
 
 impl PinCollated {
+    /// The collations of a statement bound in `session`, which has met none yet.
+    pub(crate) fn for_session(session: &Session) -> PinCollated {
+        let default = match session.semantics().collations() {
+            Collations::Pin => session.get("default_collation").filter(|name| !name.is_empty()),
+            Collations::Postgres => None,
+        };
+        PinCollated { default: default.map(str::to_string), ..PinCollated::default() }
+    }
+
     /// Whether the statement has met no collation at all, which is nearly always.
     fn is_empty(&self) -> bool {
         self.written.is_empty() && self.columns.is_empty()
     }
+
+    /// Whether a comparison or a sort of strings can need a collation, which it cannot when the
+    /// statement has met none and the session has no default.
+    fn active(&self) -> bool {
+        !self.is_empty() || self.default.is_some()
+    }
+}
+
+/// Refuses a name that is not a collation, for `SET default_collation`.
+pub fn check_collation(name: &str) -> Result<()> {
+    collation_functions(name).map(drop)
 }
 
 /// The functions a collation puts a string through before it is compared, in the order they
@@ -189,15 +218,200 @@ impl Binder<'_> {
         left: ExprRef,
         right: ExprRef,
     ) -> Result<(ExprRef, ExprRef)> {
-        if self.pin_collated.is_empty() {
+        if !self.pin_collated.active() {
             return Ok((left, right));
         }
-        let name = match (self.derive_pin(left)?, self.derive_pin(right)?) {
+        let name = match (self.collation_of(left)?, self.collation_of(right)?) {
             (Some(first), Some(second)) if first != second => return Err(mixed()),
             (Some(name), _) | (None, Some(name)) => name,
-            (None, None) => return Ok((left, right)),
+            (None, None) => match &self.pin_collated.default {
+                Some(name) => name.clone(),
+                None => return Ok((left, right)),
+            },
         };
         Ok((self.apply_collation(left, &name)?, self.apply_collation(right, &name)?))
+    }
+
+    /// Puts each group of a grouping through its collation, so that `GROUP BY s` over a `nocase`
+    /// column makes one group of `a` and `A`. The groups as they were come back with where they
+    /// sit, for [`Binder::first_of_groups`].
+    pub(crate) fn collate_groups(
+        &mut self,
+        groups: &mut [ExprRef],
+    ) -> Result<Vec<(usize, ExprRef)>> {
+        let mut uncollated = Vec::new();
+        if !self.pin_collated.active() {
+            return Ok(uncollated);
+        }
+        for (at, group) in groups.iter_mut().enumerate() {
+            let keyed = self.collate_key(*group, *group)?;
+            if keyed != *group {
+                uncollated.push((at, *group));
+                *group = keyed;
+            }
+        }
+        Ok(uncollated)
+    }
+
+    /// The `first` aggregate the pin adds for each group that sorts under a collation, which is
+    /// what a read of the group in the select list gets: the first value of the group as it was
+    /// written, `A` rather than `a`.
+    pub(crate) fn first_of_groups(&mut self, uncollated: Vec<(usize, ExprRef)>) -> Result<()> {
+        let Some(index) = self.aggregation.as_ref().map(|aggregation| aggregation.index) else {
+            return Ok(());
+        };
+        for (_, group) in uncollated {
+            let ty = self.plan().expr_type(group).clone();
+            let first = self.aggregate_call("first", &[group], false, None, ty)?;
+            self.pin_collated.grouped.push((index, group, first));
+        }
+        Ok(())
+    }
+
+    /// The `first` aggregate of the group `expr` is, when it is a group of the grouping bound now
+    /// that sorts under a collation.
+    pub(crate) fn collated_group(&self, expr: ExprRef) -> Option<ExprRef> {
+        let index = self.aggregation.as_ref()?.index;
+        self.pin_collated
+            .grouped
+            .iter()
+            .find(|(at, group, _)| *at == index && self.same_expr(expr, *group))
+            .map(|&(_, _, first)| first)
+    }
+
+    /// The keys of a `DISTINCT`, each put through its collation. A plain `DISTINCT` over a column
+    /// with one becomes a `DISTINCT ON` every column, so that one row of `a` and `A` is kept as it
+    /// was written.
+    pub(crate) fn collate_distinct(
+        &mut self,
+        on: Vec<ExprRef>,
+        columns: &[crate::scope::Visible],
+    ) -> Result<Vec<ExprRef>> {
+        if !self.pin_collated.active() {
+            return Ok(on);
+        }
+        let whole = on.is_empty();
+        let keys: Vec<ExprRef> = match whole {
+            true => columns
+                .iter()
+                .map(|column| {
+                    let (binding, ty) = (column.binding, column.ty.clone());
+                    self.plan_mut().add_expr(Expr::Column(binding), ty)
+                })
+                .collect(),
+            false => on,
+        };
+        let mut collated = Vec::with_capacity(keys.len());
+        let mut changed = false;
+        for key in keys {
+            let keyed = self.collate_key(key, key)?;
+            changed |= keyed != key;
+            collated.push(keyed);
+        }
+        if whole && !changed {
+            return Ok(Vec::new());
+        }
+        Ok(collated)
+    }
+
+    /// A set operation that removes duplicates under the collations of its columns, or `None` when
+    /// it has none and the plain operator does.
+    ///
+    /// A column of the operation takes the collation of the right side when it has one and of the
+    /// left side when not, which is how the pin combines two collated types, and that is the
+    /// collation the duplicates are removed under. `EXCEPT` and `INTERSECT` match a row of the
+    /// left side with one of the right side under the left side's collation, since the pin joins
+    /// the two by the types of the left side. So `UNION` is a `UNION ALL` under a `DISTINCT ON`
+    /// the collated columns, and the other two are an anti or a semi join under one. The forms
+    /// with `ALL` are left to the plain operator.
+    pub(crate) fn collated_set_op(
+        &mut self,
+        op: SetOpKind,
+        all: bool,
+        index: u32,
+        sides: [(NodeRef, Vec<ColumnBinding>); 2],
+        columns: &[(String, LogicalType)],
+    ) -> Result<Option<NodeRef>> {
+        if all || !self.pin_collated.active() {
+            return Ok(None);
+        }
+        let [(left, left_columns), (right, right_columns)] = sides;
+        let mut made = Vec::with_capacity(columns.len());
+        let mut matched = Vec::with_capacity(columns.len());
+        for at in 0..columns.len() {
+            let held = self.column_collation(left_columns[at])?;
+            let other = self.column_collation(right_columns[at])?;
+            made.push(other.or_else(|| held.clone()));
+            matched.push(held);
+        }
+        let default = self.pin_collated.default.clone();
+        let strings: Vec<bool> =
+            columns.iter().map(|(_, ty)| *ty == LogicalType::Varchar).collect();
+        let under = |names: &[Option<String>]| -> Vec<Option<String>> {
+            let fallback = |name: &Option<String>| name.clone().or_else(|| default.clone());
+            names
+                .iter()
+                .zip(&strings)
+                .map(|(name, &string)| fallback(name).filter(|_| string))
+                .collect()
+        };
+        let (keyed, matched) = (under(&made), under(&matched));
+        let input = match op {
+            SetOpKind::Union => {
+                if keyed.iter().all(Option::is_none) {
+                    return Ok(None);
+                }
+                self.add_node(Node::SetOp { left, right, kind: op, all: true, index })
+            }
+            SetOpKind::Except | SetOpKind::Intersect => {
+                if matched.iter().all(Option::is_none) {
+                    return Ok(None);
+                }
+                let mut conditions = Vec::with_capacity(columns.len());
+                for (at, name) in matched.iter().enumerate() {
+                    let ty = &columns[at].1;
+                    let mut one =
+                        self.plan_mut().add_expr(Expr::Column(left_columns[at]), ty.clone());
+                    let mut other =
+                        self.plan_mut().add_expr(Expr::Column(right_columns[at]), ty.clone());
+                    if let Some(name) = name {
+                        one = self.apply_collation(one, name)?;
+                        other = self.apply_collation(other, name)?;
+                    }
+                    let compare =
+                        Expr::Compare { op: CompareOp::NotDistinctFrom, left: one, right: other };
+                    conditions.push(self.plan_mut().add_expr(compare, LogicalType::Boolean));
+                }
+                let conditions = self.plan_mut().add_expr_list(&conditions);
+                let kind = if op == SetOpKind::Except { JoinKind::Anti } else { JoinKind::Semi };
+                let build = BuildSide::default();
+                let join = self.add_node(Node::Join { left, right, kind, conditions, build });
+                let mut exprs = Vec::with_capacity(columns.len());
+                let mut names = Vec::with_capacity(columns.len());
+                for (at, (name, ty)) in columns.iter().enumerate() {
+                    exprs
+                        .push(self.plan_mut().add_expr(Expr::Column(left_columns[at]), ty.clone()));
+                    names.push(self.plan_mut().intern(name));
+                }
+                let exprs = self.plan_mut().add_expr_list(&exprs);
+                let names = self.plan_mut().add_name_list(&names);
+                self.add_node(Node::Project { input: join, index, exprs, names })
+            }
+        };
+        let mut keys = Vec::with_capacity(columns.len());
+        for (at, name) in keyed.iter().enumerate() {
+            let binding = ColumnBinding::new(index, at as u32);
+            if let Some(name) = &made[at] {
+                self.pin_collated.columns.insert(binding, name.clone());
+            }
+            let key = self.plan_mut().add_expr(Expr::Column(binding), columns[at].1.clone());
+            keys.push(match name {
+                Some(name) => self.apply_collation(key, name)?,
+                None => key,
+            });
+        }
+        let on = self.plan_mut().add_expr_list(&keys);
+        Ok(Some(self.add_node(Node::Distinct { input, on })))
     }
 
     /// Gives every string of `values` the collation one of them has, for `IN` and `BETWEEN`, which
@@ -296,13 +510,24 @@ impl Binder<'_> {
 
     /// A sort key `expr` put through the collation of `from`, the expression it sorts by.
     pub(crate) fn collate_key(&mut self, expr: ExprRef, from: ExprRef) -> Result<ExprRef> {
-        if self.pin_collated.is_empty() || *self.plan().expr_type(expr) != LogicalType::Varchar {
+        if !self.pin_collated.active() || *self.plan().expr_type(expr) != LogicalType::Varchar {
             return Ok(expr);
         }
-        match self.derive_pin(from)? {
+        match self.collation_of(from)? {
             Some(name) => self.apply_collation(expr, &name),
-            None => Ok(expr),
+            None => match self.pin_collated.default.clone() {
+                Some(name) => self.apply_collation(expr, &name),
+                None => Ok(expr),
+            },
         }
+    }
+
+    /// The collation `expr` has, which is none without a look when the statement has met none.
+    fn collation_of(&mut self, expr: ExprRef) -> Result<Option<String>> {
+        if self.pin_collated.is_empty() {
+            return Ok(None);
+        }
+        self.derive_pin(expr)
     }
 
     /// `expr` through the functions of the collation `name`.
@@ -402,9 +627,10 @@ impl Binder<'_> {
                 .iter()
                 .filter_map(|&row| plan.expr_list(row).get(column).copied())
                 .collect(),
-            // A set operation takes the collation either side has.
+            // A set operation takes the collation of the right side, or of the left side when the
+            // right side has none.
             Node::SetOp { left, right, .. } => {
-                for side in [left, right] {
+                for side in [right, left] {
                     if let Some(output) = self.output_index(side)
                         && let Some(name) =
                             self.pin_produced(ColumnBinding::new(output, binding.column))?
