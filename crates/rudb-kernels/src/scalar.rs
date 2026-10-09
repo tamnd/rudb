@@ -4679,11 +4679,18 @@ pub fn call_values(
     if args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
+    // A zoned time is held in its sort key already, and the key is never negative.
+    if let ("timetz_byte_comparable", [Value::TimeTz(key)]) = (name, args) {
+        return Ok(Value::UBigInt(key.cast_unsigned()));
+    }
     if let ("is_histogram_other_bin", [value]) = (name, args) {
         let other = histogram::other_bin(&value.logical_type());
         return Ok(Value::Boolean(other.as_ref() == Some(value)));
     }
     if let Some(answer) = bitstring::value(name, args) {
+        return answer;
+    }
+    if let Some(answer) = crate::binning::value(name, args, returns) {
         return answer;
     }
     if let Some(answer) = lists::value(name, args, returns) {

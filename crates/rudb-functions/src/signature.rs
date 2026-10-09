@@ -257,6 +257,13 @@ enum Shape {
     /// argument has to be a type arithmetic can reach is the binder's rather than this table's,
     /// since it is the sort key and not just the argument that has to satisfy it.
     AsGiven,
+    /// Two arguments, and the first is cast to the type of the second. `cast_to_type`.
+    ///
+    /// The binder turns the call into the cast before it asks this table anything, since the type
+    /// is all it wants from the second argument and its value is never read. The row is here for
+    /// the arity error and for `duckdb_functions()`, which the pin fills with `ANY` all the way
+    /// through.
+    Retyped,
     /// Every argument promotes to one type and the result is a list of that type. `list_value`.
     ///
     /// The one shape whose result is not a type any of the arguments had, which is why it cannot be
@@ -293,6 +300,10 @@ enum Shape {
     /// with any other number read as a DOUBLE and a DATE as a TIMESTAMP_NS, the y axis a FLOAT or a
     /// DOUBLE, and the count is taken the way [`Shape::Topped`] takes it.
     Plotted,
+    /// `equi_width_bins(min, max, bin_count, nice_rounding)`, worked out over a BIGINT, a DOUBLE
+    /// or a TIMESTAMP by what the two ends are, and a list of the type of `max`, with a decimal
+    /// read as a double. Any other type is refused with the pin's sentence for it.
+    Binned,
     /// `median(x)`, which is [`Shape::Continuous`] over anything that interpolates, an INTERVAL
     /// included, and a value as given over anything else.
     Median,
@@ -1664,6 +1675,31 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Boolean),
         numeric_only: false,
     },
+    // The upper boundaries of bins of equal width between two ends.
+    Entry {
+        name: "equi_width_bins",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(4),
+        shape: Shape::Binned,
+        numeric_only: false,
+    },
+    // A value cast to the type of another. The binder makes it the cast, so this row only answers
+    // a call with the wrong number of arguments and the catalog.
+    Entry {
+        name: "cast_to_type",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Retyped,
+        numeric_only: false,
+    },
+    // The number a zoned time sorts by, which is the number it is held in.
+    Entry {
+        name: "timetz_byte_comparable",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::TimeTz, Fixed::UBigInt),
+        numeric_only: false,
+    },
     // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
     Entry {
         name: "is_histogram_other_bin",
@@ -2490,6 +2526,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             LogicalType::list(arguments[0].clone()),
         ),
         Shape::Plotted => plotted(arguments).ok_or_else(|| no_match(entry.name, arguments))?,
+        Shape::Binned => binned(arguments).ok_or_else(|| no_match(entry.name, arguments))??,
         Shape::Topped => return Err(no_match(entry.name, arguments)),
         Shape::Extreme => match arguments {
             [_] => {
@@ -2727,6 +2764,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (cast_to, first)
         }
         Shape::AsGiven => (vec![arguments[0].clone()], arguments[0].clone()),
+        Shape::Retyped => (arguments.to_vec(), arguments[1].clone()),
         Shape::PromotedToFirst => {
             let common = promote_all(name, arguments)?;
             // An untyped null keeps nothing to hand back, so it takes the promoted type the way
@@ -3284,6 +3322,56 @@ fn counted(ty: &LogicalType) -> bool {
             | LogicalType::Varchar
             | LogicalType::Null
     )
+}
+
+/// The argument types and answer of `equi_width_bins`, `None` when the count or the flag is not
+/// one the pin casts, and the pin's refusal when the two ends are not a number or a timestamp.
+///
+/// The ends meet at a BIGINT when both fit one, at a DOUBLE when either is a wider number, and at
+/// a TIMESTAMP when both are a date or a timestamp without a zone. The answer is a list of the type
+/// of `max`, so `equi_width_bins(1.5, 10, ...)` is an INTEGER[], and a null anywhere is a null.
+fn binned(arguments: &[LogicalType]) -> Option<Result<(Vec<LogicalType>, LogicalType)>> {
+    let flag =
+        matches!(arguments[3], LogicalType::Boolean | LogicalType::Varchar | LogicalType::Null);
+    if !counted(&arguments[2]) || !flag {
+        return None;
+    }
+    let reads = |ty: &LogicalType| match ty {
+        LogicalType::Null => Some(None),
+        LogicalType::UBigInt
+        | LogicalType::HugeInt
+        | LogicalType::UHugeInt
+        | LogicalType::Float
+        | LogicalType::Double
+        | LogicalType::Decimal { .. } => Some(Some(LogicalType::Double)),
+        LogicalType::Date
+        | LogicalType::Timestamp
+        | LogicalType::TimestampS
+        | LogicalType::TimestampMs
+        | LogicalType::TimestampNs => Some(Some(LogicalType::Timestamp)),
+        ty if ty.is_integer() => Some(Some(LogicalType::BigInt)),
+        _ => None,
+    };
+    let refused =
+        || Error::binder(format!("Unsupported type \"{}\" for equi_width_bins", arguments[0]));
+    let met = match (reads(&arguments[0]), reads(&arguments[1])) {
+        (Some(None), Some(None)) => LogicalType::BigInt,
+        (Some(Some(one)), Some(None)) | (Some(None), Some(Some(one))) => one,
+        (Some(Some(left)), Some(Some(right))) if left == right => left,
+        (Some(Some(left)), Some(Some(right)))
+            if [&left, &right].iter().all(|ty| ty.is_numeric()) =>
+        {
+            LogicalType::Double
+        }
+        _ => return Some(Err(refused())),
+    };
+    let cast_to = vec![met.clone(), met, LogicalType::BigInt, LogicalType::Boolean];
+    let returns = match &arguments[1] {
+        _ if arguments.contains(&LogicalType::Null) => LogicalType::Null,
+        LogicalType::Decimal { .. } => LogicalType::list(LogicalType::Double),
+        max => LogicalType::list(max.clone()),
+    };
+    Some(Ok((cast_to, returns)))
 }
 
 /// The argument types and answer of `lttb`, or `None` when the pin has no overload for the call.
@@ -5218,6 +5306,17 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
     ("can_cast_implicitly", &["can_cast_implicitly(col0 ANY, col1 ANY) -> BOOLEAN"]),
+    (
+        "equi_width_bins",
+        &[
+            "equi_width_bins(col0 BIGINT, col1 BIGINT, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+            "equi_width_bins(col0 DOUBLE, col1 DOUBLE, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+            "equi_width_bins(col0 TIMESTAMP, col1 TIMESTAMP, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+            "equi_width_bins(col0 ANY, col1 ANY, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
+        ],
+    ),
+    ("cast_to_type", &["cast_to_type(col0 ANY, col1 ANY) -> ANY"]),
+    ("timetz_byte_comparable", &["timetz_byte_comparable(col0 TIME WITH TIME ZONE) -> UBIGINT"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("getvariable", &["getvariable(variable_name VARCHAR) -> ANY"]),
     ("in_search_path", &["in_search_path(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
@@ -5693,7 +5792,7 @@ impl Shape {
             }
             // One `ANY` in and one `ANY` out, which is the pin's row for `fill` and is the whole of
             // what it declares.
-            Self::AsGiven => (all(ANY), ANY),
+            Self::AsGiven | Self::Retyped => (all(ANY), ANY),
             // One overload with an `ANY` return, which is the pin's row for it. The name decides
             // the type and a name is not something a signature can hold.
             Self::Setting => (all(Fixed::Varchar.name()), ANY),
@@ -5743,6 +5842,7 @@ impl Shape {
             Self::Digested => (vec![ANY, "FLOAT"], ANY),
             Self::Topped => (vec![ANY, "BIGINT"], ANY_LIST),
             Self::Plotted => (vec!["DOUBLE", "DOUBLE", "BIGINT"], ANY_LIST),
+            Self::Binned => (vec!["BIGINT", "BIGINT", "BIGINT", "BOOLEAN"], ANY_LIST),
             Self::Median | Self::Deviation => (all(ANY), ANY),
             Self::Picked => (leading(2, ANY, "BIGINT"), ANY),
             Self::Extreme if count == 2 => (vec![ANY, "BIGINT"], ANY_LIST),
@@ -6324,6 +6424,14 @@ mod tests {
                     Shape::Plotted => {
                         arguments =
                             vec![LogicalType::Double, LogicalType::Double, LogicalType::BigInt];
+                    }
+                    Shape::Binned => {
+                        arguments = vec![
+                            LogicalType::Double,
+                            LogicalType::Double,
+                            LogicalType::BigInt,
+                            LogicalType::Boolean,
+                        ];
                     }
                     Shape::Sampled => {
                         arguments = vec![LogicalType::Double; count];

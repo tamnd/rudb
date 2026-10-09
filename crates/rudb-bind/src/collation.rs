@@ -563,6 +563,26 @@ impl Binder<'_> {
         }
     }
 
+    /// `cast`, which `cast_to_type` made of a value, with the collation of `target`, the value it
+    /// took its type from.
+    ///
+    /// The pin's type carries the collation, so the answer has the collation of the type it was
+    /// cast to in place of the one the value had, and keeps the value's when that type has none.
+    /// The cast is a copy, since a value already of the type is not cast and the value itself keeps
+    /// its own collation.
+    pub(crate) fn collated_like(&mut self, cast: ExprRef, target: ExprRef) -> Result<ExprRef> {
+        if self.pin_collated.is_empty() {
+            return Ok(cast);
+        }
+        let Some(name) = self.derive_pin(target)? else { return Ok(cast) };
+        let copy = self.plan().expr(cast).clone();
+        let ty = self.plan().expr_type(cast).clone();
+        let span = self.plan().expr_span(cast);
+        let collated = self.plan_mut().add_expr_at(copy, ty, span);
+        self.pin_collated.written.insert(collated, name);
+        Ok(collated)
+    }
+
     /// The collation `expr` has, which is none without a look when the statement has met none.
     fn collation_of(&mut self, expr: ExprRef) -> Result<Option<String>> {
         if self.pin_collated.is_empty() {
