@@ -37,9 +37,14 @@ pub(crate) struct Written<'a> {
 
 /// The PostgreSQL type of a value of `ty` when that type binds back as `ty`, so that the rules for
 /// a call see the type that the value has. A DECIMAL is a `numeric` with a typmod, and a list of
-/// DECIMAL values is a `numeric[]`.
+/// DECIMAL values is a `numeric[]`. A UINTEGER is an `oid`: it is how `oid` and its alias types
+/// are held, and PostgreSQL has no other type for it, so an `oid` that a subquery or a `VALUES`
+/// gives keeps the functions of an `oid`.
 pub(crate) fn exact_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
-    let oid = rudb_pgtypes::pg_type(ty).oid;
+    let oid = match ty {
+        LogicalType::UInteger => rudb_pgtypes::oid::OID,
+        ty => rudb_pgtypes::pg_type(ty).oid,
+    };
     let back = rudb_pgtypes::logical_type(oid)?;
     let decimal = |ty: &LogicalType| matches!(ty, LogicalType::Decimal { .. });
     let exact =

@@ -633,6 +633,36 @@ fn an_oid_alias_type_and_a_vector_type_read_and_print_as_in_postgresql() {
     server.stop().unwrap();
 }
 
+/// `format_type` names a type by its PostgreSQL OID, with the modifier written the way the type
+/// writes it, as psql asks for it in `\gdesc` and `\d`. An `oid` from a `VALUES` keeps the function.
+#[test]
+fn format_type_names_a_type_by_its_oid() {
+    let dirs = Dirs::new("formattype");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, name) in [
+        ("select format_type(26, null)", "oid"),
+        ("select format_type(1042, null)", "character"),
+        ("select format_type(1042, -1)", "bpchar"),
+        ("select format_type(1043, 14)", "character varying(10)"),
+        ("select format_type(1186, 458751)", "interval year to month"),
+        ("select format_type(1007, 5)", "integer[]"),
+        ("select format_type(999999, null)", "???"),
+        (
+            "select string_agg(name || ' ' || pg_catalog.format_type(tp, tpm), ', ') \
+             from (values ('a', '16'::pg_catalog.oid, -1), ('b', '1700'::pg_catalog.oid, 655366)) \
+             s(name, tp, tpm)",
+            "a boolean, b numeric(10,2)",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), name, "{sql}");
+    }
+    let messages = client.query("select format_type(1186, 0)");
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("invalid INTERVAL typmod: 0x0"));
+    server.stop().unwrap();
+}
+
 /// The row description of a message.
 fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
     let bytes = message.decoded();

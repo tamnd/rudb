@@ -95,6 +95,7 @@ mod peel;
 pub mod pgarray;
 mod pgdatetime;
 mod pgformat;
+mod pgformattype;
 pub mod pginput;
 pub mod pgjson;
 mod pgmath;

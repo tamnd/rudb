@@ -2,8 +2,16 @@
 
 use std::borrow::Cow;
 
+use rudb_common::SqlState;
+
+use crate::error::TypeError;
 use crate::generated::oids::TYPES;
+use crate::keywords::quote_identifier;
 use crate::oid;
+use crate::typmod::{
+    INTERVAL_FULL_PRECISION, INTERVAL_FULL_RANGE, IntervalField, char_length,
+    interval_precision_range, interval_range, numeric_precision_scale,
+};
 
 /// The object ID of a type, as in `pg_type.oid`.
 pub type Oid = u32;
@@ -142,39 +150,115 @@ pub fn format_type(oid: Oid) -> Cow<'static, str> {
     Cow::Borrowed(name)
 }
 
-/// The name of a type as `format_type(oid, typmod)` gives it, which is [`format_type`] with the
-/// modifier written the way the type's `typmodout` writes it.
-///
-/// A modifier of -1 is no modifier, with the one exception PostgreSQL makes: `bpchar` with no
-/// length is not `character`, which means `character(1)`, so it keeps its own name. An array has
-/// the modifier of its element.
+/// The name of a type as `format_type_with_typemod` gives it, which is the name of
+/// [`format_type_extended`] with the modifier given. An interval modifier that has no meaning,
+/// for which PostgreSQL fails, gives the name with no modifier.
 pub fn format_type_with_typmod(oid: Oid, typmod: i32) -> String {
+    format_type_extended(oid, typmod, true).unwrap_or_else(|_| format_type(oid).into_owned())
+}
+
+/// `format_type_extended` in `format_type.c` for a built-in type, with `FORMAT_TYPE_ALLOW_INVALID`:
+/// OID 0 is `-` and an OID that is no type is `???`. `given` is `FORMAT_TYPE_TYPEMOD_GIVEN`, which
+/// `format_type(oid, typmod)` sets when the modifier is not null.
+///
+/// A modifier of 0 or more is written the way the `typmodout` of the type writes it, or as `(n)`
+/// for a type with no `typmodout`. A modifier of -1 that was given is no modifier, with one
+/// exception: `bpchar` and `bit` with no length are not `character` and `bit`, which mean a length
+/// of 1, so they keep their own names. An array has the modifier of its element.
+pub fn format_type_extended(oid: Oid, typmod: i32, given: bool) -> Result<String, TypeError> {
     if let Some(info) = TypeInfo::get(oid).filter(|info| info.is_array()) {
-        return format!("{}[]", format_type_with_typmod(info.elem, typmod));
+        return Ok(format!("{}[]", format_type_extended(info.elem, typmod, given)?));
     }
-    if typmod < 0 {
-        return match oid {
-            oid::BPCHAR => "bpchar".to_owned(),
-            _ => format_type(oid).into_owned(),
-        };
-    }
-    let precision = |rest: &str| format!("({typmod}){rest}");
-    match oid {
-        oid::BPCHAR => format!("character({})", typmod - 4),
-        oid::VARCHAR => format!("character varying({})", typmod - 4),
-        oid::NUMERIC => {
-            let packed = typmod - 4;
-            let scale = ((packed & 0x7ff) ^ 1024) - 1024;
-            format!("numeric({},{scale})", (packed >> 16) & 0xffff)
+    let with = given && typmod >= 0;
+    let sql = match oid {
+        oid::BOOL | oid::INT2 | oid::INT4 | oid::INT8 | oid::FLOAT4 | oid::FLOAT8 => {
+            return Ok(format_type(oid).into_owned());
         }
-        oid::BIT => format!("bit({typmod})"),
-        oid::VARBIT => format!("bit varying({typmod})"),
-        oid::TIME => format!("time{}", precision(" without time zone")),
-        oid::TIMETZ => format!("time{}", precision(" with time zone")),
-        oid::TIMESTAMP => format!("timestamp{}", precision(" without time zone")),
-        oid::TIMESTAMPTZ => format!("timestamp{}", precision(" with time zone")),
-        _ => format_type(oid).into_owned(),
+        oid::BIT => "bit",
+        oid::BPCHAR => "character",
+        oid::NUMERIC => "numeric",
+        oid::INTERVAL => "interval",
+        oid::TIME | oid::TIMETZ => "time",
+        oid::TIMESTAMP | oid::TIMESTAMPTZ => "timestamp",
+        oid::VARBIT => "bit varying",
+        oid::VARCHAR => "character varying",
+        _ => {
+            // The row types of the catalogs are not in the table, and [`format_type`] has their
+            // names.
+            let name = match TypeInfo::get(oid) {
+                Some(info) => quote_identifier(info.name).into_owned(),
+                None => format_type(oid).into_owned(),
+            };
+            if matches!(name.as_str(), "-" | "???") {
+                return Ok(name);
+            }
+            return print_typmod(name, oid, typmod, with);
+        }
+    };
+    match oid {
+        _ if with => print_typmod(sql.to_owned(), oid, typmod, true),
+        oid::BIT => Ok(if given { "\"bit\"" } else { sql }.to_owned()),
+        oid::BPCHAR => Ok(if given { "bpchar" } else { sql }.to_owned()),
+        _ => Ok(format_type(oid).into_owned()),
     }
+}
+
+/// `printTypmod` in `format_type.c`: the name and the text of the `typmodout` of the type, or the
+/// modifier in parentheses for a type that has no `typmodout`.
+fn print_typmod(name: String, oid: Oid, typmod: i32, with: bool) -> Result<String, TypeError> {
+    if !with {
+        return Ok(name);
+    }
+    let zone = |zoned: bool| if zoned { " with time zone" } else { " without time zone" };
+    let out = match oid {
+        oid::BPCHAR | oid::VARCHAR => {
+            char_length(typmod).map(|length| format!("({length})")).unwrap_or_default()
+        }
+        oid::NUMERIC => numeric_precision_scale(typmod)
+            .map(|(precision, scale)| format!("({precision},{scale})"))
+            .unwrap_or_default(),
+        oid::BIT | oid::VARBIT => format!("({typmod})"),
+        oid::TIME | oid::TIMESTAMP => format!("({typmod}){}", zone(false)),
+        oid::TIMETZ | oid::TIMESTAMPTZ => format!("({typmod}){}", zone(true)),
+        oid::INTERVAL => interval_typmod_out(typmod)?,
+        _ => format!("({typmod})"),
+    };
+    Ok(name + &out)
+}
+
+/// `intervaltypmodout` in `timestamp.c`: the fields of the range and the precision.
+fn interval_typmod_out(typmod: i32) -> Result<String, TypeError> {
+    use IntervalField::{Day, Hour, Minute, Month, Second, Year};
+    let (precision, range) = interval_precision_range(typmod).unwrap_or((0, 0));
+    let fields = [
+        (&[Year][..], " year"),
+        (&[Month], " month"),
+        (&[Day], " day"),
+        (&[Hour], " hour"),
+        (&[Minute], " minute"),
+        (&[Second], " second"),
+        (&[Year, Month], " year to month"),
+        (&[Day, Hour], " day to hour"),
+        (&[Day, Hour, Minute], " day to minute"),
+        (&[Day, Hour, Minute, Second], " day to second"),
+        (&[Hour, Minute], " hour to minute"),
+        (&[Hour, Minute, Second], " hour to second"),
+        (&[Minute, Second], " minute to second"),
+    ];
+    let text = match fields.iter().find(|(fields, _)| interval_range(fields) == range) {
+        Some((_, text)) => *text,
+        None if range == INTERVAL_FULL_RANGE => "",
+        None => {
+            return Err(TypeError::new(
+                SqlState::INTERNAL_ERROR,
+                format!("invalid INTERVAL typmod: {typmod:#x}"),
+            ));
+        }
+    };
+    Ok(match precision {
+        INTERVAL_FULL_PRECISION => text.to_owned(),
+        _ => format!("{text}({precision})"),
+    })
 }
 
 #[cfg(test)]
@@ -258,5 +342,45 @@ mod tests {
         ] {
             assert_eq!(format_type_with_typmod(oid, typmod), name);
         }
+    }
+
+    /// The answers of `format_type(oid, typmod)` of PostgreSQL 19, with `None` for a null typmod.
+    #[test]
+    fn format_type_gives_the_names_of_postgres() {
+        for (oid, typmod, name) in [
+            (oid::BPCHAR, None, "character"),
+            (oid::BPCHAR, Some(-1), "bpchar"),
+            (oid::BPCHAR, Some(0), "character"),
+            (oid::BPCHAR, Some(5), "character(1)"),
+            (oid::BIT, None, "bit"),
+            (oid::BIT, Some(-1), "\"bit\""),
+            (oid::BIT, Some(0), "bit(0)"),
+            (oid::CHAR, Some(5), "\"char\"(5)"),
+            (oid::ANY, Some(0), "\"any\"(0)"),
+            (oid::TEXT, Some(5), "text(5)"),
+            (oid::INT4, Some(5), "integer"),
+            (oid::INT4_ARRAY, Some(0), "integer[]"),
+            (oid::NUMERIC, Some(0), "numeric"),
+            (oid::NUMERIC, Some(65543), "numeric(1,3)"),
+            (oid::VARCHAR_ARRAY, Some(5), "character varying(1)[]"),
+            (oid::DATE, Some(0), "date(0)"),
+            (oid::TIME, Some(0), "time(0) without time zone"),
+            (oid::TIMESTAMPTZ, None, "timestamp with time zone"),
+            (oid::INTERVAL, None, "interval"),
+            (oid::INTERVAL, Some(-1), "interval"),
+            (oid::INTERVAL, Some(327679), "interval year"),
+            (oid::INTERVAL, Some(458751), "interval year to month"),
+            (oid::INTERVAL, Some(470286338), "interval day to second(2)"),
+            (oid::INTERVAL, Some(2147418115), "interval(3)"),
+            (oid::INTERVAL, Some(268435460), "interval second(4)"),
+            (0, Some(5), "-"),
+            (999999, None, "???"),
+        ] {
+            let given = typmod.is_some();
+            let found = format_type_extended(oid, typmod.unwrap_or(-1), given);
+            assert_eq!(found.as_deref(), Ok(name), "{oid} {typmod:?}");
+        }
+        let error = format_type_extended(oid::INTERVAL, 0, true).unwrap_err();
+        assert_eq!(error.message, "invalid INTERVAL typmod: 0x0");
     }
 }
