@@ -74,11 +74,11 @@ fn a_named_parameter_is_matched_without_regard_to_case() {
 #[test]
 fn the_column_is_named_after_the_parameter_rather_than_after_the_value() {
     let db = Database::new();
-    let statement = db.prepare("SELECT $1, $name").expect("prepares");
+    let statement = db.prepare("SELECT $first, $name").expect("prepares");
     let result = statement
-        .execute_named(&[("1", Value::Integer(1)), ("name", Value::Integer(2))])
+        .execute_named(&[("first", Value::Integer(1)), ("name", Value::Integer(2))])
         .expect("runs");
-    assert_eq!(result.names(), ["$1", "$name"]);
+    assert_eq!(result.names(), ["$first", "$name"]);
 }
 
 #[test]
@@ -110,14 +110,28 @@ fn a_value_for_a_parameter_that_is_not_there_says_which_one() {
 }
 
 #[test]
-fn a_parameter_in_a_plain_statement_says_to_prepare_it_first() {
+fn a_parameter_in_a_plain_statement_says_it_has_no_value() {
     let db = Database::new();
-    let refused = db.query("SELECT $1").expect_err("there is no value for it");
-    assert!(
-        refused.message().starts_with("Prepared statement parameters cannot be used directly"),
-        "{}",
-        refused.message()
-    );
+    let refused = db.query("SELECT $2, $1").expect_err("there is no value for them");
+    assert_eq!(refused.message(), "Values were not provided for the following parameters: 1, 2");
+}
+
+#[test]
+fn a_named_parameter_in_a_plain_statement_reads_the_variable_of_its_name() {
+    let db = Database::new();
+    db.execute("SET VARIABLE animal = 'duck'").expect("sets it");
+    let answer = db.query("SELECT $Animal").expect("reads the variable");
+    assert_eq!(answer.value_at(0, 0), Value::Varchar("duck".into()));
+    db.execute("SET VARIABLE \"1\" = 5").expect("sets it");
+    let refused = db.query("SELECT $1").expect_err("a number never reads a variable");
+    assert_eq!(refused.message(), "Values were not provided for the following parameters: 1");
+}
+
+#[test]
+fn named_and_positional_parameters_do_not_mix() {
+    let db = Database::new();
+    let refused = db.execute("PREPARE q AS SELECT $1, $param").expect_err("both kinds");
+    assert_eq!(refused.message(), "Mixing named and positional parameters is not supported yet");
 }
 
 #[test]

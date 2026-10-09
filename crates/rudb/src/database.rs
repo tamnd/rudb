@@ -5799,7 +5799,8 @@ impl Shared {
         let session = self.session();
         let (ast, parse_ns) = timed(|| parse_statement(&session, sql))?;
         noted.parse_ns = parse_ns;
-        self.read_mirrored(&ast, sql, &Parameters::new(), cancel, parse_ns, true, noted)
+        let parameters = plain_parameters(&session, &ast)?;
+        self.read_mirrored(&ast, sql, &parameters, cancel, parse_ns, true, noted)
     }
 
     /// Binds and runs a query, or an `EXPLAIN` of one, under the read lock of the catalog, so
@@ -6269,7 +6270,8 @@ impl Shared {
             {
                 return answer;
             }
-            self.execute_ast(&ast, sql, &Parameters::new(), cancel, parse_ns)
+            let parameters = plain_parameters(&session, &ast)?;
+            self.execute_ast(&ast, sql, &parameters, cancel, parse_ns)
         })
     }
 
@@ -6491,18 +6493,7 @@ impl Shared {
                 excess.join(", ")
             )));
         }
-        let missing: Vec<&str> = named
-            .names
-            .iter()
-            .filter(|name| parameters.get(name).is_none())
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "Values were not provided for the following parameters: {}",
-                missing.join(", ")
-            )));
-        }
+        supply_parameters(&self.session(), &named.names, &mut parameters)?;
         self.execute_ast(&named.ast, &named.sql, &parameters, cancel, 0)
     }
 
@@ -8967,6 +8958,58 @@ fn optimized(plan: &mut Plan, context: &rudb_opt::pass::Context) -> Result<(u64,
 ///
 /// The notices of the PostgreSQL grammar are dropped here. A text that the client sent is parsed
 /// by [`parse_statement`], which raises them.
+/// The values of the parameters of a statement sent with none, which are the variables of the
+/// named ones, as [`supply_parameters`] finds them.
+fn plain_parameters(session: &Session, ast: &Ast) -> Result<Parameters> {
+    let mut parameters = Parameters::new();
+    // PostgreSQL has no variables and says a parameter is missing the way its binder does.
+    if session.postgres().is_none() {
+        let names = ast.parameters();
+        if !names.is_empty() {
+            supply_parameters(session, &names, &mut parameters)?;
+        }
+    }
+    Ok(parameters)
+}
+
+/// Gives each named parameter with no value the variable `SET VARIABLE` left under its name, and
+/// refuses the statement when a parameter is still without one, which the pin does before it
+/// binds, so this error comes before any the binder would raise. A parameter that is a number
+/// never reads a variable, so `SET VARIABLE "1"` does not answer `$1`. The pin lists the missing
+/// ones by where each was declared, which for numbered ones is the order of their numbers.
+fn supply_parameters(
+    session: &Session,
+    names: &[impl AsRef<str>],
+    parameters: &mut Parameters,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    for name in names {
+        let name = name.as_ref();
+        if parameters.get(name).is_some() {
+            continue;
+        }
+        if name.starts_with(|first: char| !first.is_ascii_digit())
+            && let Some(variable) = session.variable(name)
+        {
+            // A null keeps the type of the expression it was set from, as `typeof` shows.
+            if variable.value.is_null() && variable.ty != LogicalType::Null {
+                parameters.type_null(name, variable.ty.clone());
+            }
+            parameters.set(name, variable.value.clone());
+            continue;
+        }
+        missing.push(name);
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_by_key(|name| name.parse::<u64>().ok());
+    Err(Error::invalid_input(format!(
+        "Values were not provided for the following parameters: {}",
+        missing.join(", ")
+    )))
+}
+
 pub(crate) fn parse(session: &Session, sql: &str) -> Result<Ast> {
     if session.postgres().is_some() {
         rudb_pgparse::transform::parse_ast(sql).map(|(ast, _)| ast)

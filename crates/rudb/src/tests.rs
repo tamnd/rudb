@@ -13973,7 +13973,8 @@ fn each_dialect_has_its_functions_errors_and_sequence_owners() {
     let db = Database::new();
     let connection = db.connect();
     setup(&connection);
-    assert!(failed(&connection, parameter).0.starts_with("Prepared statement parameters"));
+    let missing = "Values were not provided for the following parameters: 1";
+    assert_eq!(failed(&connection, parameter).0, missing);
     assert_eq!(failed(&connection, limit).0, "LIMIT/OFFSET cannot be negative");
     let every = failed(&connection, "SELECT every(true)");
     assert_eq!(every.0, "Scalar Function with name every does not exist!");
