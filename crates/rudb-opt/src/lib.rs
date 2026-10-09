@@ -2,7 +2,7 @@
 //!
 //! Rank 11 in the layer rule. See `xtask/layers.toml` and `spec/18-package-layout.md`.
 //!
-//! Forty passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
+//! Forty one passes so far. `spec/09-optimizer.md` section 9.1 describes a sequence and [`PASSES`]
 //! is the start of it. Column pruning came first, because it is the pass whose absence is measured
 //! in gigabytes: a scan that reads 105 columns to answer a question about three is the whole of the
 //! difference on ClickBench, and the Parquet reader has been able to read a subset since M1 with
@@ -139,7 +139,13 @@ pub const RANK: u8 = 11;
 /// output fires, which is the idempotence assertion below failing. Folding has no opinion about
 /// either spelling of an aggregate, so nothing is given up by putting it in front.
 ///
-/// Collapsing an aggregate onto its group key is fourth, immediately after the pass that takes
+/// Turning a plain `DISTINCT` into a grouping is third, right after the distinct aggregate rewrite, and in
+/// front of every pass that reads an aggregate. A distinct is one more operator for each of them to
+/// know about, and as a grouping it is one they already do: the grouping by the columns a key
+/// decides, the projection a grouping by its rows becomes and the semi join an inner join under a
+/// grouping that reads one side becomes all apply to it as written.
+///
+/// Collapsing an aggregate onto its group key is fifth, immediately after the pass that takes
 /// dependent expressions out of a group key. Both of them end up with a projection over an
 /// aggregate, and the order between them decides how much the second one sees: `GROUP BY c, f(c)` is
 /// a two key aggregate until dependent group keys have run and a one key aggregate afterwards, and
@@ -236,9 +242,10 @@ pub const RANK: u8 = 11;
 /// both of those are questions about a plan somebody is going to run rather than a draft of one.
 /// Running after the build side costs nothing, because the side a link join builds is neither of
 /// them.
-pub static PASSES: [&(dyn Pass + Sync); 40] = [
+pub static PASSES: [&(dyn Pass + Sync); 41] = [
     &fold::ExpressionRewriter,
     &distinct::DistinctAggregateRewrite,
+    &distinct::DistinctRows,
     &dependent::DependentGroupKeys,
     &fromkey::AnswersFromTheKey,
     &unique::RowsAreGroups,
@@ -389,7 +396,7 @@ pub fn optimize_with(plan: &mut Plan, context: &Context) -> Result<()> {
 /// searches, and everything after it is choosing how the plan runs, which is what somebody means by
 /// the optimizer. A test holds the index to the pass, so a pass added in front of join ordering
 /// moves the line with it or fails.
-pub const REWRITES: usize = 13;
+pub const REWRITES: usize = 14;
 
 /// [`optimize_with`], saying how many wall nanoseconds of it were the rewrites.
 ///
