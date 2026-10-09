@@ -1582,6 +1582,9 @@ pub enum UnaryOp {
     BitNot,
     /// `x!`.
     Factorial,
+    /// A prefix operator the dialect does not name, which PostgreSQL finds in `pg_operator`.
+    /// `@ x` is the shape.
+    Named(StrRef),
     /// `x IS NULL` or `x ISNULL`.
     IsNull,
     /// `x IS NOT NULL` or `x NOTNULL`.

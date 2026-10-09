@@ -261,7 +261,7 @@ impl Transform<'_> {
                         "-" => UnaryOp::Negate,
                         "+" => UnaryOp::Plus,
                         "~" => UnaryOp::BitNot,
-                        _ => return clause("PrefixOperator"),
+                        _ => UnaryOp::Named(self.intern(symbol)),
                     };
                     return self.unary(op, right, location);
                 };

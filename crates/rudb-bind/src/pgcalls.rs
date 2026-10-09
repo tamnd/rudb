@@ -585,13 +585,76 @@ impl Binder<'_> {
         };
         let Some(proc) = operator.proc() else { return Ok(None) };
         let polymorphic = operator.args.iter().any(|&oid| rudb_pgtypes::is_polymorphic(oid));
-        if !(polymorphic || rudb_kernels::pgproc::operator(proc.src))
-            || !matches!(proc.lang, b'i' | b'c')
-            || !rudb_kernels::pgproc::has(proc.src)
-        {
+        if !(polymorphic || rudb_kernels::pgproc::operator(proc.src)) {
             return Ok(None);
         }
-        let generic = rudb_pgtypes::enforce_generic_types(&oids, operator.args, operator.result)
+        self.operator_kernel(ast, operator, &oids, written, bound)
+    }
+
+    /// The prefix operator `symbol` over `bound`, as the operator of `pg_operator` that
+    /// PostgreSQL finds for it with `left_oper`. The engine has no operator of these, such as `@`
+    /// for the absolute value, so the operator is always the kernel of its function. No operator,
+    /// or more than one, is the error of PostgreSQL.
+    pub(crate) fn pg_prefix_operator(
+        &mut self,
+        ast: &Ast,
+        symbol: &str,
+        written: ast::ExprRef,
+        bound: ExprRef,
+    ) -> Result<ExprRef> {
+        use rudb_pgtypes::OperatorResolution;
+        let ty = self.plan().expr_type(bound).clone();
+        let oids = operand_oids(ast, &[written], std::slice::from_ref(&ty));
+        let resolution = oids.as_ref().map(|oids| rudb_pgtypes::resolve_operator(symbol, oids));
+        let operand = crate::expr::postgres_type_name(ast, written, &ty);
+        let (state, message, detail) = match (resolution, oids) {
+            (Some(OperatorResolution::Found(operator)), Some(oids)) => {
+                if let Some(call) =
+                    self.operator_kernel(ast, operator, &oids, &[written], &[bound])?
+                {
+                    return Ok(call);
+                }
+                let message = format!("the operator {symbol} {operand} is not supported yet");
+                return Err(Error::not_implemented(message.clone())
+                    .state(SqlState::FEATURE_NOT_SUPPORTED)
+                    .pg(message)
+                    .with_span(self.current_span));
+            }
+            (Some(OperatorResolution::Ambiguous), _) => (
+                SqlState::AMBIGUOUS_FUNCTION,
+                format!("operator is not unique: {symbol} {operand}"),
+                "Could not choose a best candidate operator.",
+            ),
+            _ => (
+                SqlState::UNDEFINED_FUNCTION,
+                format!("operator does not exist: {symbol} {operand}"),
+                "No operator of that name accepts the given argument type.",
+            ),
+        };
+        Err(Error::binder(message.clone())
+            .state(state)
+            .pg(message)
+            .detail(detail)
+            .hint("You might need to add an explicit type cast.")
+            .with_span(self.current_span))
+    }
+
+    /// The call of the kernel of the function of `operator` over the operands, each cast to the
+    /// actual type of its declared type, or `None` when there is no kernel for it or a type has no
+    /// rudb type.
+    fn operator_kernel(
+        &mut self,
+        ast: &Ast,
+        operator: &rudb_pgtypes::Operator,
+        oids: &[rudb_pgtypes::Oid],
+        written: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<Option<ExprRef>> {
+        let Some(proc) = operator.proc() else { return Ok(None) };
+        if !matches!(proc.lang, b'i' | b'c') || !rudb_kernels::pgproc::has(proc.src) {
+            return Ok(None);
+        }
+        let generic = rudb_pgtypes::enforce_generic_types(oids, operator.args, operator.result)
             .map_err(|error| Error::from(error).unplaced())?;
         let Some(returns) = rudb_pgtypes::logical_type(generic.result) else { return Ok(None) };
         let mut cast = Vec::with_capacity(bound.len());

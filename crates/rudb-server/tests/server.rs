@@ -1487,6 +1487,39 @@ fn the_temporary_objects_of_a_session_go_when_it_ends() {
     server.stop().unwrap();
 }
 
+/// A prefix operator of `pg_operator` that the grammar does not name, such as `@` for the absolute
+/// value, is the operator PostgreSQL finds for the type of its operand.
+#[test]
+fn a_prefix_operator_is_the_one_postgres_finds() {
+    let dirs = Dirs::new("pgprefix");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, value) in [
+        ("select (@ -5)::text", "5"),
+        ("select pg_typeof(@ -5::int2)::text", "smallint"),
+        ("select (@ '-5.5')::text", "5.5"),
+        ("select pg_typeof(@ '-5')::text", "double precision"),
+        ("select (|/ 16)::text", "4"),
+        ("select pg_typeof(|/ 16::int2)::text", "double precision"),
+        ("select (||/ 27.0)::text", "3"),
+        ("select coalesce((@ null)::text, 'null')", "null"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    for (sql, message) in [
+        ("select @ 'abc'::text", "operator does not exist: @ text"),
+        ("select @-@ 1", "operator does not exist: @-@ integer"),
+    ] {
+        let messages = client.query(sql);
+        let error = messages.iter().find(|message| message.tag == b'E').unwrap();
+        assert_eq!(error.field(b'C').unwrap(), "42883", "{sql}");
+        assert_eq!(error.field(b'M').unwrap(), message);
+        assert_eq!(error.field(b'P').unwrap(), "8", "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn an_operator_between_numbers_is_the_operator_postgres_finds() {
     let dirs = Dirs::new("pgnumops");

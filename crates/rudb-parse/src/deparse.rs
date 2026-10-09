@@ -757,6 +757,7 @@ fn unary(ast: &Ast, op: UnaryOp, operand: ExprRef) -> String {
         UnaryOp::BitNot => format!("~({written})"),
         // `x!` is a call to `factorial` by the time it is printed.
         UnaryOp::Factorial => format!("factorial({written})"),
+        UnaryOp::Named(symbol) => format!("{}({written})", ast.string(symbol)),
         UnaryOp::IsNull => format!("({written} IS NULL)"),
         UnaryOp::IsNotNull => format!("({written} IS NOT NULL)"),
         // `IS UNKNOWN` is `IS NULL` and nothing else, so it prints as the thing it means.
