@@ -86,16 +86,19 @@ pub(crate) fn rows_function(written: &str) -> bool {
         })
 }
 
-/// A function of `pg_proc` named `written` whose every form has a kernel here, so that a call of
-/// it in a PostgreSQL session is the kernel and not a macro of the pin with the same name.
+/// A function of `pg_proc` named `written` whose every form has a kernel here or is a body in
+/// SQL, with at least one kernel, so that a call of it in a PostgreSQL session is the kernel and
+/// not a macro of the pin with the same name. A body binds as the calls it makes, such as
+/// `date_part(text, date)`, which is `date_part` of the date as a timestamp.
 pub(crate) fn kernel_function(written: &str) -> bool {
     let procs = rudb_pgtypes::procs(written);
-    !procs.is_empty()
-        && procs.iter().all(|proc| {
-            proc.kind == b'f'
-                && matches!(proc.lang, b'i' | b'c')
-                && rudb_kernels::pgproc::has(proc.src)
-        })
+    let kernel = |proc: &rudb_pgtypes::Proc| {
+        proc.kind == b'f' && matches!(proc.lang, b'i' | b'c') && rudb_kernels::pgproc::has(proc.src)
+    };
+    let body = |proc: &rudb_pgtypes::Proc| {
+        proc.kind == b'f' && proc.lang == b's' && proc.src != "see system_functions.sql"
+    };
+    procs.iter().any(kernel) && procs.iter().all(|proc| kernel(proc) || body(proc))
 }
 
 /// The operator of the engine that calls the function `proc` of `pg_proc`: an infix operator that

@@ -4,8 +4,8 @@
 //! Every function here is strict, so the caller gives a null for a null argument and the
 //! functions see only values.
 //!
-//! `extract` over a `timestamptz` reads the wall clock in the session time zone, so it is called
-//! with the zone by [`zoned_call`], and [`call`] gives it the clock at UTC.
+//! `extract` and `date_part` over a `timestamptz` read the wall clock in the session time zone,
+//! so they are called with the zone by [`zoned_call`], and [`call`] gives them the clock at UTC.
 
 use rudb_common::{Error, Result, SessionTimeZone, SqlState, Value, time_tz};
 use rudb_pgtypes::{Interval, Numeric, TypeError, date_from_unix, timestamp_from_unix};
@@ -18,11 +18,16 @@ pub(crate) const SOURCES: &[&str] = &[
     "extract_timestamp",
     "extract_timestamptz",
     "extract_timetz",
+    "interval_part",
     "make_interval",
+    "time_part",
+    "timestamp_part",
+    "timestamptz_part",
+    "timetz_part",
 ];
 
 /// The C functions of this module that read the session time zone.
-pub(crate) const ZONED: &[&str] = &["extract_timestamptz"];
+pub(crate) const ZONED: &[&str] = &["extract_timestamptz", "timestamptz_part"];
 
 /// The value of the C function `src` over `args`, or `None` for another function.
 pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
@@ -37,17 +42,32 @@ pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
         ("extract_time", [Value::Varchar(units), Value::Time(micros)]) => {
             numeric(rudb_pgtypes::extract_time(units, *micros).map(Some))?
         }
+        ("time_part", [Value::Varchar(units), Value::Time(micros)]) => {
+            double(rudb_pgtypes::time_part(units, *micros).map(Some))?
+        }
         ("extract_timetz", [Value::Varchar(units), Value::TimeTz(key)]) => {
             let (time, zone) = (time_tz::micros(*key), -time_tz::offset(*key));
             numeric(rudb_pgtypes::extract_timetz(units, time, zone).map(Some))?
+        }
+        ("timetz_part", [Value::Varchar(units), Value::TimeTz(key)]) => {
+            let (time, zone) = (time_tz::micros(*key), -time_tz::offset(*key));
+            double(rudb_pgtypes::timetz_part(units, time, zone).map(Some))?
         }
         ("extract_timestamp", [Value::Varchar(units), Value::Timestamp(micros)]) => {
             let ts = timestamp_from_unix(*micros).map_err(placed)?;
             numeric(rudb_pgtypes::extract_timestamp(units, ts))?
         }
+        ("timestamp_part", [Value::Varchar(units), Value::Timestamp(micros)]) => {
+            let ts = timestamp_from_unix(*micros).map_err(placed)?;
+            double(rudb_pgtypes::timestamp_part(units, ts))?
+        }
         ("extract_interval", [Value::Varchar(units), Value::Interval { months, days, micros }]) => {
             let interval = Interval { time: *micros, day: *days, month: *months };
             numeric(rudb_pgtypes::extract_interval(units, &interval))?
+        }
+        ("interval_part", [Value::Varchar(units), Value::Interval { months, days, micros }]) => {
+            let interval = Interval { time: *micros, day: *days, month: *months };
+            double(rudb_pgtypes::interval_part(units, &interval))?
         }
         (
             "make_interval",
@@ -116,6 +136,10 @@ pub(crate) fn zoned_call(src: &str, args: &[Value], zone: SessionTimeZone) -> Re
             let ts = timestamp_from_unix(*micros).map_err(placed)?;
             numeric(rudb_pgtypes::extract_timestamptz(units, ts, &zone))
         }
+        ("timestamptz_part", [Value::Varchar(units), Value::TimestampTz(micros)]) => {
+            let ts = timestamp_from_unix(*micros).map_err(placed)?;
+            double(rudb_pgtypes::timestamptz_part(units, ts, &zone))
+        }
         _ => Err(Error::internal(format!("{src} over {args:?}"))),
     }
 }
@@ -123,6 +147,11 @@ pub(crate) fn zoned_call(src: &str, args: &[Value], zone: SessionTimeZone) -> Re
 /// A `numeric` answer, or a null for `None`.
 fn numeric(answer: std::result::Result<Option<Numeric>, TypeError>) -> Result<Value> {
     Ok(answer.map_err(placed)?.map_or(Value::Null, |number| Value::Numeric(number.to_bytes())))
+}
+
+/// A `float8` answer, or a null for `None`.
+fn double(answer: std::result::Result<Option<f64>, TypeError>) -> Result<Value> {
+    Ok(answer.map_err(placed)?.map_or(Value::Null, Value::Double))
 }
 
 /// An error of PostgreSQL that has no position, as the errors of a function that runs have.

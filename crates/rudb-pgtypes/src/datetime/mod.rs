@@ -29,7 +29,7 @@ pub use format::{
 };
 pub use part::{
     extract_date, extract_interval, extract_time, extract_timestamp, extract_timestamptz,
-    extract_timetz,
+    extract_timetz, interval_part, time_part, timestamp_part, timestamptz_part, timetz_part,
 };
 pub use session::SessionZones;
 
@@ -436,7 +436,7 @@ fn date_part(f: &Fields, format: DateFormat, out: &mut Vec<u8>) {
     year(f.year, out);
 }
 
-fn time_part(hour: u32, minute: u32, second: u32, usec: u32, out: &mut Vec<u8>) {
+fn clock_out(hour: u32, minute: u32, second: u32, usec: u32, out: &mut Vec<u8>) {
     zeropad(u64::from(hour), 2, out);
     out.push(b':');
     two(minute, out);
@@ -477,7 +477,7 @@ pub fn date_recv(recv: &mut Recv<'_>) -> Result<i32, TypeError> {
 /// The text output of `time`, microseconds since midnight. `24:00:00` is a valid time.
 pub fn time_out(time: i64, out: &mut Vec<u8>) {
     let (hour, minute, second, usec) = split_time(time);
-    time_part(hour, minute, second, usec, out);
+    clock_out(hour, minute, second, usec, out);
 }
 
 /// The text output of `timetz`. The zone is in seconds west of UTC, as PostgreSQL stores it.
@@ -534,7 +534,7 @@ fn date_time(f: &Fields, zone: Option<(i32, &str)>, format: DateFormat, out: &mu
         DateStyle::Iso => {
             date_part(f, format, out);
             out.push(b' ');
-            time_part(f.hour, f.minute, f.second, f.usec, out);
+            clock_out(f.hour, f.minute, f.second, f.usec, out);
             if let Some((offset, _)) = zone {
                 zone_offset(offset, out);
             }
@@ -542,7 +542,7 @@ fn date_time(f: &Fields, zone: Option<(i32, &str)>, format: DateFormat, out: &mu
         DateStyle::Sql | DateStyle::German => {
             date_part(f, format, out);
             out.push(b' ');
-            time_part(f.hour, f.minute, f.second, f.usec, out);
+            clock_out(f.hour, f.minute, f.second, f.usec, out);
             if let Some((_, name)) = zone {
                 abbrev(name, out);
             }
@@ -562,7 +562,7 @@ fn date_time(f: &Fields, zone: Option<(i32, &str)>, format: DateFormat, out: &mu
                 two(f.day, out);
             }
             out.push(b' ');
-            time_part(f.hour, f.minute, f.second, f.usec, out);
+            clock_out(f.hour, f.minute, f.second, f.usec, out);
             out.push(b' ');
             year(f.year, out);
             if let Some((_, name)) = zone {
