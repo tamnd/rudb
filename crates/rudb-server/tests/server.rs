@@ -1258,6 +1258,12 @@ fn the_functions_of_postgres_have_its_result_types() {
             "0,2.1213203435596424",
             vec![1700, 701],
         ),
+        (
+            "select ntile(2) over (order by x), lag(x, 1, 0.5) over (order by x) \
+             from (values (1), (2)) t(x)",
+            "1,0.5",
+            vec![23, 1700],
+        ),
     ];
     for (sql, expected, oids) in cases {
         let messages = client.query(sql);

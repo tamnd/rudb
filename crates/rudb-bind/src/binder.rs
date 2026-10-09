@@ -6025,7 +6025,7 @@ impl<'a> Binder<'a> {
         if exporting {
             return Ok(column);
         }
-        Ok(self.summed_as_postgres(resolved.name, &types, column))
+        Ok(self.typed_as_postgres(resolved.name, &types, column))
     }
 
     /// The variance family with the types PostgreSQL gives it, over a group or over a window.
@@ -6066,16 +6066,18 @@ impl<'a> Binder<'a> {
         Resolved { name, arguments: vec![argument], returns, ..resolved }
     }
 
-    /// A `sum` with the type PostgreSQL gives it, over a group or over a window. PostgreSQL sums an
+    /// A call with the type PostgreSQL gives it, over a group or over a window. PostgreSQL sums an
     /// `int2` or an `int4` into an `int8` and a `float4` into a `float4`, where the pin sums them
-    /// into a HUGEINT and a DOUBLE. Any other call is the column as it is.
-    fn summed_as_postgres(
-        &mut self,
-        name: &str,
-        types: &[LogicalType],
-        column: ExprRef,
-    ) -> ExprRef {
-        if self.semantics.aggregate_types() != AggregateTypes::Postgres || name != "sum" {
+    /// into a HUGEINT and a DOUBLE, and its `ntile` is an `int4` where the pin's is a BIGINT. Any
+    /// other call is the column as it is.
+    fn typed_as_postgres(&mut self, name: &str, types: &[LogicalType], column: ExprRef) -> ExprRef {
+        if self.semantics.aggregate_types() != AggregateTypes::Postgres {
+            return column;
+        }
+        if name == "ntile" {
+            return self.cast_to(column, &LogicalType::Integer);
+        }
+        if name != "sum" {
             return column;
         }
         match types.first() {
@@ -6423,8 +6425,18 @@ impl<'a> Binder<'a> {
         // the same rows and is answered.
         let filter = if parts.is_ok() { self.bind_filter(ast, filter, scope) } else { Ok(None) };
         self.in_window = false;
-        let parts = parts?;
+        let mut parts = parts?;
         let filter = filter?;
+        // PostgreSQL's `lag` and `lead` take the value and the default as `anycompatible`, so the
+        // two meet at their common type, where the pin casts the default to the type of the value.
+        if (same_name(name, "lag") || same_name(name, "lead"))
+            && let ([value, _, default], [bound_value, _, bound_default]) =
+                (args, &mut parts.args[..])
+        {
+            let mut pair = [*bound_value, *bound_default];
+            self.common_type(ast, &[*value, *default], &mut pair, None)?;
+            (*bound_value, *bound_default) = (pair[0], pair[1]);
+        }
         // Upstream's rule, in its words. A `RANGE` offset is a distance from the current row's sort
         // key, so there has to be exactly one sort key for it to be a distance from.
         let offsets = [parts.frame.start, parts.frame.end]
@@ -6545,7 +6557,7 @@ impl<'a> Binder<'a> {
         let index = self.windows.last().expect("the run was just filed").index;
         let column = self.column(index, at, ty);
         self.carry_collation(call, column)?;
-        Ok(self.summed_as_postgres(resolved.name, &types, column))
+        Ok(self.typed_as_postgres(resolved.name, &types, column))
     }
 
     /// Files a call under the run that matches it, or opens a new run, and says which column it is.
