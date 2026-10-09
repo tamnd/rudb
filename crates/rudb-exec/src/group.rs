@@ -5490,6 +5490,14 @@ impl Rows {
 
 /// One column of every piece laid end to end, or `None` when a piece lacks it or it has no flat
 /// layout.
+///
+/// A number or a date that is not flat is flattened first and then laid. Such a column is usually a
+/// probe side column passing through a join, still packed or still behind the selection its scan
+/// kept, and refusing it refused the whole batch, so every chunk was split sixty four ways on its
+/// own. On TPC-H q16 at six threads that was six thousand folds of about forty rows each, against
+/// a hundred folds of two thousand rows on one thread. Unpacking a few thousand integers is far
+/// cheaper than the fixed cost of the folds it saves. A string is still refused, because flattening
+/// one copies its bytes and then laying it copies them again.
 fn lay<'a>(
     pieces: &'a [Rows],
     column: impl Fn(&'a Rows) -> Option<&'a Vector>,
@@ -5499,7 +5507,17 @@ fn lay<'a>(
         let Some(vector) = column(piece) else { return Ok(None) };
         columns.push(vector);
     }
-    rudb_vector::concat(columns[0].logical_type(), &columns)
+    let ty = columns[0].logical_type();
+    if let Some(laid) = rudb_vector::concat(ty, &columns)? {
+        return Ok(Some(laid));
+    }
+    if !(ty.is_numeric() || ty.is_temporal() || ty == &LogicalType::Boolean) {
+        return Ok(None);
+    }
+    // flatten: a fixed width column in a form `concat` cannot lay, unpacked once for the batch so
+    // that the batch is split once rather than chunk by chunk.
+    let flat = columns.iter().map(|vector| vector.flatten()).collect::<Result<Vec<_>>>()?;
+    rudb_vector::concat(ty, &flat)
 }
 
 /// The groups a pushed down limit keeps, shared by every instance of the aggregate.
