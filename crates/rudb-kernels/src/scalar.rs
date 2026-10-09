@@ -578,6 +578,12 @@ fn coalesced<V: AsRef<Vector>>(
     if let [only] = args {
         return Ok(Some((*only).clone()));
     }
+    if let [column, fallback] = args
+        && let Some(value) = fallback.constant_value().filter(|value| !value.is_null())
+        && let Some(filled) = filled(column, value, returns, rows)?
+    {
+        return Ok(Some(filled));
+    }
     // A constant is one row that every row picks, and anything the pick cannot read is flattened
     // into a run it can.
     let mut held = Vec::with_capacity(args.len());
@@ -613,6 +619,69 @@ fn coalesced<V: AsRef<Vector>>(
         .collect();
     let sources: Vec<&Vector> = held.iter().collect();
     picked(returns, &sources, &picks)
+}
+
+/// `coalesce(column, constant)` over a column of fixed width values, as the column's values with
+/// the constant written over its nulls.
+///
+/// That is the shape nearly every `coalesce` has, a default for a value that may be missing, and
+/// q13's `coalesce(count, 0)` over the 150 thousand customers of a left join is one. The pick above
+/// asks each row which argument it reads and then copies one value at a time, 27 million
+/// instructions a run on q13. Here the values are copied whole and the mask is walked a word at a
+/// time, so a row costs nothing unless it is null, and the answer has no nulls left to carry.
+///
+/// `None` for a column of another form than flat or a gather, for a value that is not fixed width,
+/// and for a constant that does not lay out as one, which all go the way of the pick.
+fn filled(
+    column: &Vector,
+    value: &Value,
+    returns: &LogicalType,
+    rows: usize,
+) -> Result<Option<Vector>> {
+    if column.len() != rows || !matches!(column.form(), Form::Flat | Form::Gathered) {
+        return Ok(None);
+    }
+    let column = column.flatten()?;
+    let one = Vector::from_values(returns.clone(), std::slice::from_ref(value))?;
+    let words: &[u64] = match column.validity() {
+        Validity::AllValid => return Ok(Some(column)),
+        Validity::AllInvalid => &[],
+        Validity::Mask(mask) => mask.words(),
+    };
+    macro_rules! fill {
+        ($($variant:ident),*) => {
+            match (column.data(), one.data()) {
+                $((Some(Data::$variant(values)), Some(Data::$variant(one)))
+                    if values.len() >= rows && !one.is_empty() =>
+                {
+                    Data::$variant(written_over(&values[..rows], words, one[0]).into())
+                })*
+                _ => return Ok(None),
+            }
+        };
+    }
+    let data = fill!(
+        Bool, Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128, Float32,
+        Float64
+    );
+    Ok(Some(Vector::flat(returns.clone(), data)?.with_validity(Validity::AllValid)))
+}
+
+/// `values` with `one` in every row whose bit in `words` is clear, a row past the last word being a
+/// clear bit, which is how a mask reads one.
+fn written_over<T: Copy>(values: &[T], words: &[u64], one: T) -> Vec<T> {
+    let mut out = values.to_vec();
+    for (at, &word) in words.iter().enumerate() {
+        let mut nulls = !word;
+        while nulls != 0 {
+            let row = at * 64 + nulls.trailing_zeros() as usize;
+            let Some(slot) = out.get_mut(row) else { break };
+            *slot = one;
+            nulls &= nulls - 1;
+        }
+    }
+    out.iter_mut().skip(words.len() * 64).for_each(|slot| *slot = one);
+    out
 }
 
 /// `substring` over a column, with a start and a length that are the same on every row.
@@ -5587,6 +5656,37 @@ mod tests {
         assert_eq!(answer(&[&first, &codes]), expect(&[Some(1), Some(20), None, Some(4), None]));
         assert_eq!(answer(&[&null, &null]), expect(&[None, None, None, None, None]));
         assert_eq!(answer(&[&zero, &first]), expect(&[Some(0); 5]));
+    }
+
+    #[test]
+    fn coalesce_of_a_column_and_a_constant_writes_the_constant_over_the_nulls() {
+        let ty = LogicalType::BigInt;
+        let rows = 200;
+        let held: Vec<Option<i64>> =
+            (0..rows).map(|row| (row % 3 != 0 && row != 130).then_some(row)).collect();
+        let values: Vec<Value> =
+            held.iter().map(|v| v.map_or(Value::Null, Value::BigInt)).collect();
+        let column = Vector::from_values(ty.clone(), &values).unwrap();
+        let seven = Vector::constant(ty.clone(), Value::BigInt(7), rows as usize);
+        let expect: Vec<Value> = held.iter().map(|v| Value::BigInt(v.unwrap_or(7))).collect();
+        let answer = call("coalesce", &[&column, &seven], &ty, None).unwrap();
+        assert!(answer.never_null());
+        assert_eq!(answer.iter().collect::<Vec<_>>(), expect);
+
+        // A gather, with rows that are no row at all, and a column of nothing but nulls.
+        let rids: Vec<u32> =
+            (0..rows as u32).rev().map(|row| if row == 5 { NO_ROW } else { row }).collect();
+        let gathered = column.gather(&rids).unwrap();
+        let expect: Vec<Value> = rids
+            .iter()
+            .map(|&rid| Value::BigInt(held.get(rid as usize).copied().flatten().unwrap_or(7)))
+            .collect();
+        let answer = call("coalesce", &[&gathered, &seven], &ty, None).unwrap();
+        assert_eq!(answer.iter().collect::<Vec<_>>(), expect);
+        let nothing = Vector::from_values(ty.clone(), &vec![Value::Null; 70]).unwrap();
+        let seven = Vector::constant(ty.clone(), Value::BigInt(7), 70);
+        let answer = call("coalesce", &[&nothing, &seven], &ty, None).unwrap();
+        assert_eq!(answer.iter().collect::<Vec<_>>(), vec![Value::BigInt(7); 70]);
     }
 
     #[test]

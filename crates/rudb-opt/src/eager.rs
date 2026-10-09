@@ -89,7 +89,7 @@ use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef
 use crate::estimate::{self, Facts};
 use crate::link::Linked;
 use crate::pass::{Context, Pass};
-use crate::walk;
+use crate::{nonulls, walk};
 
 /// Moves a sum below the joins that only bring in columns to group by.
 #[derive(Debug, Clone, Copy)]
@@ -101,19 +101,32 @@ impl Pass for EagerAggregation {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        push(plan, context.facts(), context.links());
+        if pushed(plan, context.facts(), context.links()) {
+            // The partial aggregate is a new reader of B, put there after the pass that turns a
+            // `count` of a column with no nulls into a `count(*)` has run. Under a padded join that
+            // pass could not say the column has no nulls, and under the partial aggregate it can,
+            // so it is asked again. On q13 that is `count(o_orderkey)`, and the scan of orders
+            // stops reading the key at all.
+            nonulls::NoNulls.run(plan, context)?;
+        }
         Ok(())
     }
 }
 
 /// Rewrites every aggregate in `plan` that this applies to.
 pub fn push(plan: &mut Plan, stats: &Facts, links: &[Linked]) {
+    pushed(plan, stats, links);
+}
+
+/// [`push`], saying whether anything moved.
+fn pushed(plan: &mut Plan, stats: &Facts, links: &[Linked]) -> bool {
     let mut moved = false;
     let root =
         walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| split(plan, at, stats, links));
     if moved {
         plan.set_root(root);
     }
+    moved
 }
 
 /// One node on the way down from the aggregate to B.
