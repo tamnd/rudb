@@ -256,7 +256,7 @@ fn order(
         pending.push((condition, reads));
     }
     let (_, before, was) = cost(plan, at, stats)?;
-    let (searchable, classes) = classed(plan, &parts, &pending);
+    let (searchable, classes) = classed(plan, &parts, &pending, stats);
     if let Some((top, after)) = searched(plan, &parts, &searchable, &classes, stats, &mut builds) {
         // The search builds no cross product, so it wins outright over an order that builds one,
         // and otherwise the sum decides. Greedy has nothing to add either way: the order it would
@@ -330,6 +330,7 @@ fn classed(
     plan: &mut Plan,
     parts: &[Part],
     pending: &[(ExprRef, TableSet)],
+    stats: &Facts,
 ) -> (Vec<(ExprRef, TableSet)>, Vec<Option<usize>>) {
     // Each column the equalities read, the expression that reads it, and its parent in the union.
     let mut columns: Vec<(ColumnBinding, ExprRef)> = Vec::new();
@@ -364,7 +365,7 @@ fn classed(
             .iter()
             .enumerate()
             .any(|(at, one)| one.is_none() || leaves[at + 1..].iter().any(|other| other == one));
-        if shared {
+        if shared || !multiplies(plan, parts, pending, stats, &edges, list, &leaves) {
             continue;
         }
         let class = usable.len();
@@ -402,6 +403,47 @@ fn classed(
         classes.push(Some(class));
     }
     (searchable, classes)
+}
+
+/// Whether two of a class's leaves meet on conditions that join one row of either to more than one
+/// of the other, by the same arithmetic the search scores a pair with.
+///
+/// That is the class whose implied edges are worth something. On TPC-H q05 customer and supplier
+/// meet only on the nation, which is a hundred and fifty thousand rows times ten thousand over
+/// twenty five, so the search never takes that join first and nation's region never reaches
+/// customer without the edge the two equalities imply. On TPC-H q09 every table the part key and
+/// the supplier key join meets lineitem on a key, partsupp on the two together, so no pair
+/// multiplies. The implied edges there let part, partsupp and supplier be joined among themselves
+/// first, which the rows say is cheaper, and it ran twice as long, because the plan without them
+/// reaches partsupp and orders through stored links from the rows of lineitem part keeps.
+fn multiplies(
+    plan: &Plan,
+    parts: &[Part],
+    pending: &[(ExprRef, TableSet)],
+    stats: &Facts,
+    edges: &[Option<(usize, usize)>],
+    list: &[usize],
+    leaves: &[Option<usize>],
+) -> bool {
+    let leaf = |column: usize| list.iter().position(|&at| at == column).and_then(|at| leaves[at]);
+    edges.iter().flatten().any(|&(one, other)| {
+        let (Some(one), Some(other)) = (leaf(one), leaf(other)) else { return false };
+        let (one, other) = (&parts[one], &parts[other]);
+        let mut both = one.tables.clone();
+        both.extend(&other.tables);
+        let between: Vec<ExprRef> = pending
+            .iter()
+            .filter(|(_, reads)| {
+                reads.is_subset_of(&both)
+                    && !reads.is_subset_of(&one.tables)
+                    && !reads.is_subset_of(&other.tables)
+            })
+            .map(|(condition, _)| *condition)
+            .collect();
+        let keys = estimate::keyspace_of(plan, &between, stats);
+        let (left, right) = (one.side.base, other.side.base);
+        estimate::matched(left, right, keys) > left.max(right)
+    })
 }
 
 /// The two columns a condition says are equal, where it is `=` between two bare columns of one type.
@@ -1173,9 +1215,9 @@ mod tests {
 
     /// The shape TPC-H q05 has between customer, supplier and nation. The query says `u.b = w.d`
     /// and `w.d = t.a` and never `u.b = t.a`, so the one row of `u` the filter keeps can only reach
-    /// `t` through the hundred thousand rows of `w`. The two conditions put the three columns in one
-    /// class, which makes `u` joined to `t` a pair the search can take, and it is the cheapest first
-    /// join there is.
+    /// `t` through the hundred thousand rows of `w`, and `w` and `t` meet on a column of ten values,
+    /// which multiplies. The two conditions put the three columns in one class, which makes `u`
+    /// joined to `t` a pair the search can take, and it is the cheapest first join there is.
     #[test]
     fn a_join_two_equalities_imply_is_one_the_search_can_take() {
         let text = concat!(
@@ -1186,7 +1228,7 @@ mod tests {
             "      Get memory.main.u AS u #1 [b::BIGINT, r::BIGINT]\n",
             "  Get memory.main.t AS t #2 [a::BIGINT]\n",
         );
-        let columns = [("w", "d", 10), ("u", "b", 10), ("u", "r", 10), ("t", "a", 1_000)];
+        let columns = [("w", "d", 10), ("u", "b", 10), ("u", "r", 10), ("t", "a", 10)];
         let ordered = counted(text, &columns);
         assert!(
             ordered.contains("(#1.0::BIGINT = #2.0::BIGINT)")
