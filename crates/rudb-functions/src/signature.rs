@@ -1675,6 +1675,15 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Blob),
         numeric_only: false,
     },
+    // The key an ART index holds a row under. The binder finds the index, casts the keys and
+    // passes them alone with their types, so what reaches this entry is never the path and name.
+    Entry {
+        name: "index_key",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(2),
+        shape: Shape::AnyTo(Fixed::Blob),
+        numeric_only: false,
+    },
     // Whether a value of the first argument's type casts to the second's without being asked to.
     // The binder folds it from the two types, as the pin does, so the executor never sees it.
     Entry {
@@ -5324,6 +5333,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
     ("create_sort_key", &["create_sort_key(col0 ANY, [ANY...]) -> BLOB"]),
+    ("index_key", &["index_key(path STRUCT, \"name\" VARCHAR, [ANY...]) -> BLOB"]),
     ("can_cast_implicitly", &["can_cast_implicitly(col0 ANY, col1 ANY) -> BOOLEAN"]),
     (
         "equi_width_bins",

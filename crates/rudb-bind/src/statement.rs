@@ -2397,15 +2397,38 @@ fn create_index(
     session: &Session,
     at: ast::IndexRef,
 ) -> Result<Bound> {
+    create_typed_index(ast, catalog, parameters, session, at).map(|(bound, _)| bound)
+}
+
+/// The types of an index's key, one for each element, bound again from the statement it was made
+/// with. That is how `index_key` learns the key of an index over expressions, whose types the
+/// catalog does not keep.
+pub(crate) fn index_key_types(
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    sql: &str,
+) -> Result<Vec<LogicalType>> {
+    let ast = parse_ast(sql)?;
+    let Some(&ast::Statement::Index(at)) = ast.statements.first() else {
+        return Err(Error::internal(format!("an index made by something other than one: {sql}")));
+    };
+    create_typed_index(&ast, catalog, parameters, session, at).map(|(_, types)| types)
+}
+
+/// [`create_index`] and the type of each element of the index.
+fn create_typed_index(
+    ast: &Ast,
+    catalog: &Catalog,
+    parameters: &Parameters,
+    session: &Session,
+    at: ast::IndexRef,
+) -> Result<(Bound, Vec<LogicalType>)> {
     let written = ast.index(at);
     let parts: Vec<String> = ast.name(written.name).map(str::to_string).collect();
     if written.drop {
-        return Ok(Bound::Index(IndexChange {
-            table: None,
-            index: None,
-            name: parts,
-            quiet: written.quiet,
-        }));
+        let drop = IndexChange { table: None, index: None, name: parts, quiet: written.quiet };
+        return Ok((Bound::Index(drop), Vec::new()));
     }
     let written_table: Vec<&str> = ast.name(written.table).collect();
     let name = catalog.resolve_as(&written_table, Entry::Table)?;
@@ -2423,6 +2446,7 @@ fn create_index(
     let mut plain = true;
     let mut texts = Vec::new();
     let mut column_names = Vec::new();
+    let mut types = Vec::new();
     for &expr in ast.expr_list(written.elements) {
         if let ast::Expr::Column { name: column } = ast.exprs[expr as usize] {
             let path: Vec<&str> = ast.name(column).collect();
@@ -2463,6 +2487,7 @@ fn create_index(
                 "Invalid Type [{ty}]: Invalid type for index key."
             )));
         }
+        types.push(ty);
         let bare = match binder.plan_mut().expr(value) {
             Expr::Column(binding) => scope.columns.iter().position(|held| held.binding == *binding),
             _ => None,
@@ -2531,12 +2556,13 @@ fn create_index(
         sql,
         oid: 0,
     };
-    Ok(Bound::Index(IndexChange {
+    let change = IndexChange {
         table: Some(name),
         index: Some(index),
         name: Vec::new(),
         quiet: written.quiet,
-    }))
+    };
+    Ok((Bound::Index(change), types))
 }
 
 /// Whether a column is in one of its table's foreign keys, or is a column another table's foreign

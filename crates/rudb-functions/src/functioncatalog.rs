@@ -165,7 +165,10 @@ fn scalar(row: FunctionRow) -> FunctionEntry {
         alias_of: row.alias_of,
         return_type: Some(row.returns),
         parameters: named(row.alias_of.unwrap_or(row.name), row.types.len()),
-        parameter_types: row.types.iter().map(|name| (*name).to_string()).collect(),
+        parameter_types: match DECLARED.iter().find(|(name, _)| *name == row.name) {
+            Some((_, types)) => types.iter().map(|name| (*name).to_string()).collect(),
+            None => row.types.iter().map(|name| (*name).to_string()).collect(),
+        },
         varargs: row.varargs,
         has_side_effects: Some(MOVING.contains(&row.name)),
         stability: Some(if MOVING.contains(&row.name) { VOLATILE } else { CONSISTENT }),
@@ -432,6 +435,10 @@ fn named(name: &str, count: usize) -> Vec<String> {
     }
 }
 
+/// The scalar functions the binder takes apart itself, whose row says the types the pin declares
+/// rather than the ones the binder hands on.
+const DECLARED: &[(&str, &[&str])] = &[("index_key", &["STRUCT", "VARCHAR"])];
+
 /// The scalar functions whose arguments upstream gives real names rather than `col0`.
 ///
 /// Short on purpose. Upstream names the arguments of a few dozen functions and leaves the rest as
@@ -452,6 +459,7 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("can_cast_implicitly", &["source_type", "target_type"]),
     ("cast_to_type", &["param", "type"]),
     ("create_sort_key", &["parameters..."]),
+    ("index_key", &["path", "name"]),
     ("current_setting", &["setting_name"]),
     ("equi_width_bins", &["min", "max", "bin_count", "nice_rounding"]),
     ("error", &["message"]),

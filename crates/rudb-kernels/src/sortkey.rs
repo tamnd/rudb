@@ -42,12 +42,37 @@ impl Order {
     }
 }
 
-/// The answer of `create_sort_key` when `name` is it, or `None` for any other function.
+/// The answer of `create_sort_key` or `index_key` when `name` is one of them, or `None` for any
+/// other function.
 pub(crate) fn value(name: &str, args: &[Value], returns: &LogicalType) -> Option<Result<Value>> {
-    if name != "create_sort_key" {
-        return None;
+    match name {
+        "create_sort_key" => Some(create(args, returns)),
+        "index_key" => Some(index_key(args)),
+        _ => None,
     }
-    Some(create(args, returns))
+}
+
+/// `index_key(path, name, key, ...)`, the key the pin's ART index holds a row under.
+///
+/// The binder has found the index, cast each key to the type of its column and put the types last
+/// the way it does for a sort key, and passes the keys alone. A key is the bytes of each value one
+/// after another the way a sort key writes them, with no validity byte and nothing flipped, and a
+/// string is escaped and ended like a blob. A null anywhere makes the whole key null.
+fn index_key(args: &[Value]) -> Result<Value> {
+    let Some((Value::List { element: LogicalType::Struct(types), .. }, keys)) = args.split_last()
+    else {
+        return Err(Error::internal("index_key takes the types of its keys last"));
+    };
+    let mut out = Vec::new();
+    for (key, field) in keys.iter().zip(types) {
+        match (&field.ty, key) {
+            _ if key.is_null() => return Ok(Value::Null),
+            (LogicalType::Enum(_), _) => scalar(key, &field.ty, &mut out),
+            (_, Value::Varchar(text)) => payload(&Value::Blob(text.as_bytes().to_vec()), &mut out),
+            _ => scalar(key, &field.ty, &mut out),
+        }
+    }
+    Ok(Value::Blob(out))
 }
 
 fn create(args: &[Value], returns: &LogicalType) -> Result<Value> {
@@ -135,24 +160,29 @@ fn encode(value: &Value, ty: &LogicalType, order: Order, out: &mut Vec<u8>) {
         }
         _ => {
             let start = out.len();
-            match (ty, value) {
-                (LogicalType::Enum(labels), Value::Varchar(label)) => {
-                    let code = labels.iter().position(|one| one == label).unwrap_or_default();
-                    let width = ty.physical().size();
-                    out.extend_from_slice(&code.to_be_bytes()[size_of::<usize>() - width..]);
-                }
-                // The key a zoned time is held in is not the pin's bits, and a sort key is.
-                (_, Value::TimeTz(key)) => {
-                    payload(&Value::BigInt(rudb_common::time_tz::bits(*key)), out);
-                }
-                _ => payload(value, out),
-            }
+            scalar(value, ty, out);
             if order.descending {
                 for byte in &mut out[start..] {
                     *byte = !*byte;
                 }
             }
         }
+    }
+}
+
+/// The bytes of a value that is not nested and not null.
+fn scalar(value: &Value, ty: &LogicalType, out: &mut Vec<u8>) {
+    match (ty, value) {
+        (LogicalType::Enum(labels), Value::Varchar(label)) => {
+            let code = labels.iter().position(|one| one == label).unwrap_or_default();
+            let width = ty.physical().size();
+            out.extend_from_slice(&code.to_be_bytes()[size_of::<usize>() - width..]);
+        }
+        // The key a zoned time is held in is not the pin's bits, and a sort key is.
+        (_, Value::TimeTz(key)) => {
+            payload(&Value::BigInt(rudb_common::time_tz::bits(*key)), out);
+        }
+        _ => payload(value, out),
     }
 }
 
