@@ -34,6 +34,13 @@
 //! that says the range is a bad description of it is left alone, and a column nobody counted is
 //! decided by `WIDEST` on its own.
 //!
+//! The rows arriving bound the groups the same way the distinct count does, since an aggregate
+//! cannot build more groups than it is handed rows, so a range more than `SPARSEST` times the
+//! estimated rows arriving is mostly holes too. That is q17, whose aggregate groups the six thousand
+//! lineitem rows of the parts the outer query asks about by part key: the key's range is all 200,000
+//! parts, the distinct count says the range describes the column well, and the array was 800
+//! kilobytes touched at random for 204 groups that a hash table holds in a few lines.
+//!
 //! # What this does not do
 //!
 //! It does not take the hash table away. The operator keeps it, fills it beside the array, and uses
@@ -118,11 +125,13 @@ fn densify(plan: &mut Plan, stats: &Facts) {
         // One column and one only, for the reason in the module doc.
         let &[key] = plan.expr_list(groups) else { continue };
         let &Expr::Column(binding) = plan.expr(key) else { continue };
-        let Some((low, values, sparse)) = range(plan, binding, stats) else { continue };
+        let Some((low, values, holes)) = range(plan, binding, stats) else { continue };
+        let rows = estimate::rows(plan, input, stats);
+        let sparse = holes || rows.is_some_and(|rows| values > rows.saturating_mul(SPARSEST));
         // A sparse range is still the window the operator's own map would grow to, a chunk at a
         // time, copying what it had at each step. Handed over, it is one map filled once. Only
         // where the rows arriving are at least the places, since each place is written once.
-        if sparse && estimate::rows(plan, input, stats).is_none_or(|rows| rows < values) {
+        if sparse && rows.is_none_or(|rows| rows < values) {
             continue;
         }
         found.push((index, (low, values), sparse));
@@ -330,6 +339,23 @@ mod tests {
         context.measure(Arc::new(facts));
         run(&mut plan, &context);
         assert_eq!((plan.dense_count(), plan.key_ends(1)), (0, None));
+    }
+
+    #[test]
+    fn a_range_far_wider_than_the_rows_arriving_is_left_alone() {
+        // A hundred rows to group over a thousand places, so the array would be at least nine
+        // tenths holes whatever the column holds.
+        let mut plan = grouped(Stub::exact(0, 999));
+        let mut facts = Facts::new();
+        facts.record("memory", "main", "t", 100);
+        let mut context = Context::new();
+        context.measure(Arc::new(facts));
+        run(&mut plan, &context);
+        assert_eq!((plan.dense_count(), plan.key_ends(1)), (0, None));
+        // The same range over a million rows is still addressed.
+        let mut plan = grouped(Stub::exact(0, 999));
+        run(&mut plan, &counted(None));
+        assert_eq!(plan.dense(1), Some((0, 1_000)));
     }
 
     #[test]
