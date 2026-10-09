@@ -22,11 +22,11 @@ use rudb_common::{Error, IdentifierCase, Result, Span, Value};
 use crate::ast::{
     AlterAction, Ast, Attach, BinaryOp, CaseArm, ColumnDef, Conflict, ConflictAction, Constraint,
     CopyTo, CreateTable, CreateView, Cte, Distinct, DropTable, Expr, ExprRef, Index, Insert,
-    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, Order, OrderItem, Overriding, Pivot,
-    PivotColumn, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp, Setting,
-    Slice, Source, SourceRef, StarLists, Statement, StrRef, Target, Transaction, Trigger,
-    TriggerEvent, TriggerTiming, Truncate, UnaryOp, WindowBound, WindowExclude, WindowRef,
-    WindowSpec, WindowUnit,
+    JoinKind, LiteralKind, MacroDef, MacroOverload, Nulls, OptionArg, Order, OrderItem, Overriding,
+    Pivot, PivotColumn, Quantifier, Query, QueryBody, QueryRef, Scope, Select, SelectRef, SetOp,
+    Setting, Slice, Source, SourceRef, StarLists, Statement, StrRef, Target, Transaction, Trigger,
+    TriggerEvent, TriggerTiming, Truncate, UnaryOp, UtilityOption, Vacuum, VacuumTarget,
+    WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 use crate::build::{Change, Interner};
 use crate::generated::rules::PROGRAM;
@@ -700,6 +700,8 @@ impl<'a> Transform<'a> {
             "UseStatement" => self.use_statement(inner),
             "PragmaStatement" => self.pragma_statement(inner),
             "ExplainStatement" => self.explain_statement(inner),
+            "VacuumStatement" => self.vacuum_statement(inner, true),
+            "AnalyzeStatement" => self.vacuum_statement(inner, false),
             "CheckpointStatement" => {
                 let name = self.find(inner, "CatalogName");
                 let name = if name == NONE { NONE } else { self.identifier(name) };
@@ -879,6 +881,61 @@ impl<'a> Transform<'a> {
             ));
         }
         Ok(Statement::Explain { query, analyze, statistics, codegen, options: Slice::default() })
+    }
+
+    /// `VacuumStatement <- 'VACUUM' VacuumOptions? AnalyzeTarget?` and
+    /// `AnalyzeStatement <- AnalyzeKeyword AnalyzeVerbose? AnalyzeTarget?`.
+    ///
+    /// Each option becomes a utility option with no value, under the name the PostgreSQL grammar
+    /// gives it, so the binder reads one shape from either grammar. An option that the grammar only
+    /// takes as an identifier is one DuckDB does not know, and its parser refuses it.
+    fn vacuum_statement(&mut self, node: u32, vacuum: bool) -> Result<Statement> {
+        let mut written = Vec::new();
+        let options = match self.find(node, "VacuumOptions") {
+            NONE => NONE,
+            found => self.first(found),
+        };
+        if options != NONE && self.name(options) == "VacuumParensOptions" {
+            let mut found = Vec::new();
+            self.named_nodes(options, "VacuumOption", &mut found);
+            written.extend(found.into_iter().map(|option| self.first(option)));
+        } else if options != NONE {
+            written.extend(self.kids(options));
+        }
+        written.extend(self.kids(node).filter(|&kid| self.name(kid) == "AnalyzeVerbose"));
+        let mut read = Vec::with_capacity(written.len());
+        for option in written {
+            let name = match self.name(option) {
+                "OptAnalyze" => "analyze",
+                "OptFull" => "full",
+                "OptFreeze" => "freeze",
+                "OptVerbose" | "AnalyzeVerbose" => "verbose",
+                _ => {
+                    let name = self.text(option).to_ascii_lowercase();
+                    return Err(Error::parser(format!("unrecognized VACUUM option \"{name}\""))
+                        .with_span(self.span(option)));
+                }
+            };
+            let name = self.intern(name);
+            read.push(UtilityOption { name, arg: OptionArg::None, span: self.span(option) });
+        }
+        let start = self.ast.utility_options.len() as u32;
+        self.ast.utility_options.extend(read);
+        let options = Slice { start, len: self.ast.utility_options.len() as u32 - start };
+        let mut targets = Vec::new();
+        let target = self.find(node, "AnalyzeTarget");
+        if target != NONE {
+            let table = self.find(target, "BaseTableName");
+            let name = self.name_parts(table);
+            let mut found = Vec::new();
+            self.named_nodes(self.find(target, "NameList"), "ColId", &mut found);
+            let columns: Vec<StrRef> = found.into_iter().map(|id| self.identifier(id)).collect();
+            let columns = self.part_slice(columns);
+            targets.push(VacuumTarget { name, columns, span: self.span(table) });
+        }
+        let index = self.ast.vacuums.len() as u32;
+        self.ast.vacuums.push(Vacuum { vacuum, options, targets });
+        Ok(Statement::Vacuum(index))
     }
 
     /// `CallStatement <- 'CALL' QualifiedTableFunction TableFunctionArguments`, which is the table
@@ -8004,6 +8061,23 @@ mod tests {
                 format!("EXECUTE {} {}", ast.string(name), show_query(&ast, values))
             }
             Statement::Deallocate(name) => format!("DEALLOCATE {}", ast.string(name)),
+            Statement::Vacuum(index) => {
+                let vacuum = &ast.vacuums[index as usize];
+                let mut text = if vacuum.vacuum { "VACUUM" } else { "ANALYZE" }.to_string();
+                for option in &ast.utility_options[vacuum.options.range()] {
+                    text.push(' ');
+                    text.push_str(ast.string(option.name));
+                }
+                for target in &vacuum.targets {
+                    text.push(' ');
+                    text.push_str(&ast.name_text(target.name));
+                    if !target.columns.is_empty() {
+                        let columns: Vec<&str> = ast.name(target.columns).collect();
+                        text.push_str(&format!("({})", columns.join(", ")));
+                    }
+                }
+                text
+            }
         }
     }
 

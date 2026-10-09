@@ -7064,6 +7064,23 @@ impl Shared {
                     Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns },
                 )
             }
+            // The statistics of a table are kept up to date as its rows are written, so what is
+            // left is the refusal of PostgreSQL in a transaction block and the warnings for the
+            // relations it skips.
+            Bound::Vacuum(vacuum) => {
+                if vacuum.outside_transaction && self.transacting() {
+                    return Err(Error::transaction("VACUUM cannot run inside a transaction block")
+                        .state(SqlState::ACTIVE_SQL_TRANSACTION)
+                        .unplaced());
+                }
+                let level = rudb_common::notice::Level::Warning;
+                let notices = vacuum
+                    .warnings
+                    .into_iter()
+                    .map(|warning| Notice::new(level, "01000", warning))
+                    .collect();
+                Ok(QueryResult::empty().noting(notices))
+            }
             Bound::CopyTo(mut copy) => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut copy.plan, &context)?;
                 let budget = self.budget();

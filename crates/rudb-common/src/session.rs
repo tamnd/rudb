@@ -194,6 +194,7 @@ pub struct Semantics {
     query_columns: QueryColumns,
     conflict_arbiter: ConflictArbiter,
     explain_output: ExplainOutput,
+    maintenance: Maintenance,
     character_types: CharacterTypes,
     column_names: ColumnNames,
     default_descending: bool,
@@ -250,6 +251,7 @@ impl Default for Semantics {
             query_columns: QueryColumns::Pin,
             conflict_arbiter: ConflictArbiter::Pin,
             explain_output: ExplainOutput::Pin,
+            maintenance: Maintenance::Pin,
             from_functions: FromFunctions::Pin,
             float_range: FloatRange::Pin,
             row_fields: RowFields::Pin,
@@ -428,6 +430,12 @@ impl Semantics {
     #[must_use]
     pub fn conflict_arbiter(self) -> ConflictArbiter {
         self.conflict_arbiter
+    }
+    /// Which options `VACUUM` and `ANALYZE` take, and what they do with a view and in a
+    /// transaction block.
+    #[must_use]
+    pub fn maintenance(self) -> Maintenance {
+        self.maintenance
     }
     /// Which options `EXPLAIN` takes and what it prints.
     #[must_use]
@@ -938,6 +946,19 @@ pub enum ConflictArbiter {
     Postgres,
 }
 
+/// Which options `VACUUM` and `ANALYZE` take, and what they do with a view and in a transaction
+/// block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Maintenance {
+    /// As in DuckDB: `ANALYZE` and `VACUUM ANALYZE` only. `FULL`, `FREEZE` and `VERBOSE` are not
+    /// implemented, a view is an error, and both run in a transaction block.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the options of `ExecVacuum`, a column list only with `ANALYZE`, a view is
+    /// skipped with a warning, and `VACUUM` does not run in a transaction block.
+    Postgres,
+}
+
 /// What type the count of a `LIMIT` and an `OFFSET` takes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CountTypes {
@@ -1409,6 +1430,7 @@ impl Session {
             self.semantics.query_columns = QueryColumns::Postgres;
             self.semantics.conflict_arbiter = ConflictArbiter::Postgres;
             self.semantics.explain_output = ExplainOutput::Postgres;
+            self.semantics.maintenance = Maintenance::Postgres;
             self.semantics.from_functions = FromFunctions::Postgres;
             self.semantics.float_range = FloatRange::Postgres;
             self.semantics.row_fields = RowFields::Postgres;
