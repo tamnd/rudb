@@ -549,7 +549,7 @@ impl<'a> Binder<'a> {
             current_span: Span::new(0, 0),
             pinned_span: None,
             collated: crate::collate::Collated::default(),
-            pin_collated: crate::collation::PinCollated::default(),
+            pin_collated: crate::collation::PinCollated::for_session(session),
             inlined: None,
             aggregation: None,
             want_ascending: false,
@@ -1635,17 +1635,28 @@ impl<'a> Binder<'a> {
             })
             .collect();
         self.set_op_collations(index, &sides, operator.op == SetOp::Union && all)?;
-        let left_node = self.conform(left_node, &left_scope, &merged, |column| column.left)?;
-        let right_node = self.conform(right_node, &right_scope, &merged, |column| column.right)?;
+        let conformed = self.conform(left_node, &left_scope, &merged, |column| column.left)?;
+        let left_columns = self.conformed(left_node, conformed, &left_scope, &merged, true);
+        let left_node = conformed;
+        let conformed = self.conform(right_node, &right_scope, &merged, |column| column.right)?;
+        let right_columns = self.conformed(right_node, conformed, &right_scope, &merged, false);
+        let right_node = conformed;
         let kind = match operator.op {
             SetOp::Union => SetOpKind::Union,
             SetOp::Except => SetOpKind::Except,
             SetOp::Intersect => SetOpKind::Intersect,
         };
+        let columns: Vec<(String, LogicalType)> =
+            merged.iter().map(|column| (column.name.clone(), column.ty.clone())).collect();
+        let sides = [(left_node, left_columns), (right_node, right_columns)];
         // UNION alone removes duplicates and UNION ALL keeps them, which is the one place the
         // unwritten quantifier and ALL disagree.
-        let mut node =
-            self.add_node(Node::SetOp { left: left_node, right: right_node, kind, all, index });
+        let mut node = match self.collated_set_op(kind, all, index, sides, &columns)? {
+            Some(node) => node,
+            None => {
+                self.add_node(Node::SetOp { left: left_node, right: right_node, kind, all, index })
+            }
+        };
         let mut scope = Scope::empty();
         for (at, column) in merged.iter().enumerate() {
             scope.push(Visible {
@@ -1806,6 +1817,31 @@ impl<'a> Binder<'a> {
         Ok(self.add_node(Node::Project { input: node, index, exprs, names }))
     }
 
+    /// The columns `conform` left `before` with as `after`, which are the columns of the
+    /// projection it added or, when it added none, the columns of the side as they were.
+    fn conformed(
+        &self,
+        before: NodeRef,
+        after: NodeRef,
+        scope: &Scope,
+        merged: &[Merged],
+        left: bool,
+    ) -> Vec<ColumnBinding> {
+        if before != after
+            && let Node::Project { index, .. } = *self.plan.node(after)
+        {
+            return (0..merged.len()).map(|at| ColumnBinding::new(index, at as u32)).collect();
+        }
+        merged
+            .iter()
+            .enumerate()
+            .map(|(at, column)| {
+                let picked = if left { column.left } else { column.right };
+                scope.columns[picked.unwrap_or(at)].binding
+            })
+            .collect()
+    }
+
     // ----------------------------------------------------------------- select
 
     /// The expression the alias `word` was written for, bound where the alias is named.
@@ -1928,7 +1964,9 @@ impl<'a> Binder<'a> {
                 node = self.plan_unnests(node, index, &unnests)?;
             }
             let index = self.fresh_index();
+            let uncollated = self.collate_groups(&mut groups)?;
             self.aggregation = Some(Aggregation { index, groups, aggregates: Vec::new() });
+            self.first_of_groups(uncollated)?;
         }
 
         // The queries this block's clauses wrote that are joined in above the grouping rather than
@@ -2119,6 +2157,7 @@ impl<'a> Binder<'a> {
         });
 
         if written.distinct != Distinct::No {
+            let on = self.collate_distinct(on, &output.columns[..visible])?;
             let on = self.plan.add_expr_list(&on);
             node = self.add_node(Node::Distinct { input: node, on });
         }
@@ -5745,7 +5784,7 @@ impl<'a> Binder<'a> {
     /// The column of the aggregate output that holds the call `name` over `args`. Two identical
     /// aggregates are one column of the aggregate's output, so `SELECT sum(x), sum(x) / count(*)`
     /// computes one sum, not two.
-    fn aggregate_call(
+    pub(crate) fn aggregate_call(
         &mut self,
         name: &str,
         args: &[ExprRef],
@@ -6397,6 +6436,9 @@ impl<'a> Binder<'a> {
         };
         let index = aggregation.index;
         let groups = aggregation.groups.clone();
+        if let Some(first) = self.collated_group(expr) {
+            return Ok(first);
+        }
         for (at, group) in groups.iter().enumerate() {
             if self.same_expr(expr, *group) {
                 let ty = self.plan.expr_type(*group).clone();
