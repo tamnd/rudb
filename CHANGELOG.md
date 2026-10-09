@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.4
+
+This is the first release since 0.9.3 to reach crates.io. The tags for 0.10.0 through 0.10.3 were pushed but their release runs stopped at the documentation step of the gate, because seven doc comments in rudb-opt and rudb-vector linked to private items and the gate builds docs with warnings as errors. #2925 writes those names as plain code, so the gate passes again and this release publishes everything that went into the four tags before it.
+
+#2921 sums a packed run a block at a time and adds its base once a block rather than once a value. In the PostgreSQL dialect, #2920 sorts `ORDER BY ... USING` as the btree family of the operator and puts nulls high, and #2922 makes `DISTINCT ON` keep the first row in the order of `ORDER BY`. #2923 lends a busy machine's share of its cores rather than only its idle ones, and #2924 checks the options, tables and columns of `VACUUM` and `ANALYZE` in both dialects.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.3
 
 TPC-H q05 and q13 got their plans fixed. #2904 gives join ordering the equalities that a class of equal columns implies, so q05 joins customer to the filtered nation first again, which takes it from 380.5M to 176.7M instructions a run at SF1. #2906 gives the build side of a join the keys of its driving side, so q05 builds over the 2,003 suppliers of Asia instead of all 10,000, and it goes on to 99M. #2909 asks a `count` that eager aggregation moves below a left join again whether its column has no nulls, so q13 counts orders as rows and stops reading `o_orderkey`, and makes `coalesce` of a column and a constant as the column with the constant written over its nulls. q13 goes from 193.5M to 145.6M.
