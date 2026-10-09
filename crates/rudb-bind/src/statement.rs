@@ -2467,19 +2467,22 @@ fn create_index(
             continue;
         }
         plain = false;
-        let text = deparse::expression(ast, expr);
-        let used = columns_in(&text)?;
-        if used.is_empty() {
+        // The columns come from the bound expression and not from the names in its text, so a
+        // reference to the whole row, as in `((t = ROW (1, 2)))`, reads each column of the table.
+        let before = columns.len();
+        binder.plan().read_columns(value, &mut |_, binding| {
+            if let Some(at) = scope.columns.iter().position(|held| held.binding == binding)
+                && at < fields.len()
+            {
+                columns.push(at);
+            }
+        });
+        if columns.len() == before {
             return Err(Error::binder(
                 "CREATE INDEX does not refer to any columns in the base table!",
             ));
         }
-        for used in used {
-            if let Some(at) = fields.iter().position(|field| same_name(&field.name, &used)) {
-                columns.push(at);
-            }
-        }
-        texts.push(format!("({text})"));
+        texts.push(format!("({})", deparse::expression(ast, expr)));
     }
     if written.unique && !plain {
         return Err(Error::not_implemented("A UNIQUE index over an expression is not supported"));

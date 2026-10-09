@@ -6151,6 +6151,34 @@ fn on_conflict_reads_its_action_before_it_matches_a_key() {
 }
 
 #[test]
+fn an_index_over_the_whole_row_reads_each_column() {
+    let dirs = Dirs::new("index-whole-row");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The case of `generated_virtual`. The index reads no column by name, and the database file
+    // must still take the table, so the statements after it work.
+    for sql in [
+        "create table gtest20d (a int, b int)",
+        "insert into gtest20d values (1), (1)",
+        "create index gtest20d_idx2 on gtest20d ((gtest20d = row (1, 2)))",
+        "create table after_it (x int)",
+        "insert into after_it values (1)",
+    ] {
+        assert!(!tags(&client.query(sql)).contains('E'), "{sql}");
+    }
+    let rows = client.query("select count(*) from gtest20d");
+    assert_eq!(
+        data_row(rows.iter().find(|message| message.tag == b'D').unwrap())[0],
+        Some(b"2".to_vec())
+    );
+    // An index that reads no column at all is still refused.
+    let messages = client.query("create index nothing on gtest20d ((1))");
+    assert!(tags(&messages).contains('E'));
+    server.stop().unwrap();
+}
+
+#[test]
 fn an_index_with_no_name_is_named_as_postgres_names_it() {
     let dirs = Dirs::new("index-names");
     let server = Server::start(dirs.config()).unwrap();
