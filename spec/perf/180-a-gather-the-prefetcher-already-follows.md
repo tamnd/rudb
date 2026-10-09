@@ -24,3 +24,5 @@ At SF1 on server2, instructions in millions from perf at one thread, against mai
 | all 22 | 2069 | 2003 |
 
 No other query moved by more than two. Cycles on server2 move by about eight percent from run to run, and over four rounds q09 and q21 came out the same as before within that, at one thread and at six, which is the check that the rows a join reaches were not left to wait on their misses.
+
+This was taken back in note 181, which measured it on cycles over nine queries and found it slower at every gap tried.
