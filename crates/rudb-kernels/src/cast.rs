@@ -943,8 +943,13 @@ fn approximate_out(run: Vec<f64>, single: bool) -> Option<Data> {
 /// of types is one this does not handle yet.
 pub fn cast_value(value: &Value, target: &LogicalType, try_cast: bool) -> Result<Value> {
     let target = target.storage();
-    if value.is_null() || matches!(target, LogicalType::Null) {
+    if value.is_null() {
         return Ok(Value::Null);
+    }
+    // The pin has no cast into the type of an untyped null, and refuses one only when a value is
+    // there to lose, so a null of any type casts to it and `TRY_CAST` answers null for the rest.
+    if matches!(target, LogicalType::Null) {
+        return if try_cast { Ok(Value::Null) } else { Err(no_cast(value, target)) };
     }
     if &value.logical_type() == target {
         return Ok(value.clone());
