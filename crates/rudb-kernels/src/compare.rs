@@ -462,7 +462,7 @@ fn packed_literal(
     let bound = Bound { op, value: &value, held };
     let mut words = vec![0_u64; left.len().div_ceil(64)];
     let kept = mask_within(left, &[bound], &mut words, true)?;
-    Some(mask_selection(&words, kept))
+    Some(mask_selection(words, kept))
 }
 
 /// The rows where one bit packed column with no nulls holds against another.
@@ -507,7 +507,7 @@ fn packed_kept(
         }
     }
     let kept = against_kept(&one, &other, shift, test, len, &mut words, rows.is_none());
-    Some(mask_selection(&words, kept))
+    Some(mask_selection(words, kept))
 }
 
 /// The two packed sides of a comparison [`packed_kept`] and [`mask_against`] answer, the difference
@@ -852,54 +852,11 @@ pub fn mask_within(
     )
 }
 
-/// How many dropped rows a word may have and still be walked by the rows it drops.
-const DENSE_WORD: u32 = 8;
-
-/// The rows a mask [`mask_within`] filled keeps, in order.
+/// The rows a mask [`mask_within`] filled keeps, `kept` of them, which are listed only when
+/// something asks for them. See [`Selection::from_mask`].
 #[must_use]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "a mask is over a chunk, whose rows fit in a u32"
-)]
-pub fn mask_selection(words: &[u64], kept: usize) -> Selection {
-    let mut out = Vec::with_capacity(kept + 64);
-    for (block, &word) in words.iter().enumerate() {
-        if word == 0 {
-            continue;
-        }
-        let base = (block * 64) as u32;
-        if word == u64::MAX {
-            out.extend(base..base + 64);
-            continue;
-        }
-        // A word that keeps most of its rows is walked by the rows it drops. Each run between two
-        // of them is written as a whole 64 rows and cut back to its own, so it is a copy of fixed
-        // width with no tail to finish a row at a time, and what it writes past its rows is
-        // written over by the next run. A filter that keeps nearly every row would otherwise pay
-        // a step for every row it keeps.
-        if word.count_zeros() <= DENSE_WORD {
-            let mut dropped = !word;
-            let mut from = 0;
-            loop {
-                let at = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
-                let listed = out.len() + (at - from) as usize;
-                out.extend(base + from..base + from + 64);
-                out.truncate(listed);
-                if dropped == 0 {
-                    break;
-                }
-                from = at + 1;
-                dropped &= dropped - 1;
-            }
-            continue;
-        }
-        let mut word = word;
-        while word != 0 {
-            out.push(base + word.trailing_zeros());
-            word &= word - 1;
-        }
-    }
-    Selection::from_indices(out)
+pub fn mask_selection(words: Vec<u64>, kept: usize) -> Selection {
+    Selection::from_mask(words, kept)
 }
 
 /// Each word of `words` set or narrowed to the rows of its block that `fill` flags, the way
@@ -1002,7 +959,7 @@ fn packed_range(
         None => {
             let mut words = vec![0_u64; len.div_ceil(64)];
             let kept = packed_words(packed, len, &mut words, true, from, span);
-            mask_selection(&words, kept)
+            mask_selection(words, kept)
         }
     })
 }
@@ -3624,7 +3581,7 @@ mod tests {
             .filter(|&row| words[row / 64] >> (row % 64) & 1 == 1)
             .map(|row| u32::try_from(row).expect("a small mask"))
             .collect();
-        let selection = mask_selection(&words, expected.len());
+        let selection = mask_selection(words.to_vec(), expected.len());
         assert_eq!(selection, Selection::from_indices(expected));
     }
 
@@ -3671,7 +3628,7 @@ mod tests {
                                 .expect("integers with no nulls");
                             let expected = Selection::from_predicate(rows, kept);
                             assert_eq!(count, expected.len(), "{one:?} {low}, {other:?} {high}");
-                            assert_eq!(mask_selection(&words, count), expected);
+                            assert_eq!(mask_selection(words.clone(), count), expected);
                             let mut words = before.clone();
                             let count = mask_within(column, &bounds, &mut words, false)
                                 .expect("integers with no nulls");
@@ -3679,7 +3636,7 @@ mod tests {
                             let expected =
                                 Selection::from_predicate(rows, |row| was(row) && kept(row));
                             assert_eq!(count, expected.len(), "{one:?} {low}, {other:?} {high}");
-                            assert_eq!(mask_selection(&words, count), expected);
+                            assert_eq!(mask_selection(words.clone(), count), expected);
                         }
                     }
                 }

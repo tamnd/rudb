@@ -1085,7 +1085,7 @@ impl Prepared {
         if fresh {
             return Ok(None);
         }
-        Ok(Some((rudb_kernels::mask_selection(&words, kept), answered)))
+        Ok(Some((rudb_kernels::mask_selection(words, kept), answered)))
     }
 
     /// The comparison and the places in the chunk of the two columns an operand compares with each
