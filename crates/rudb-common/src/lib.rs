@@ -67,7 +67,7 @@ pub use session::{
     InsertColumns, JoinColumns, Maintenance, NumberCasts, NumberLiterals, OperatorRules,
     PlanErrors, PreparedStatement, QueryColumns, RecursiveUnion, RegexRules, RowFields, RowNulls,
     Semantics, SequenceOwners, Session, SessionTimeZone, SetFunctions, ShowBehavior, SortOperators,
-    Subscripts, TableNames, TypeNames, UnknownTypes, ValuesNames, Variable,
+    Subscripts, TableNames, TieOrder, TypeNames, UnknownTypes, ValuesNames, Variable,
 };
 pub use slow::{Cause, Tally};
 pub use spread::{Spread, serially};

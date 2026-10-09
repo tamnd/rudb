@@ -227,6 +227,7 @@ pub struct Semantics {
     set_functions: SetFunctions,
     show_behavior: ShowBehavior,
     sort_operators: SortOperators,
+    tie_order: TieOrder,
     subscripts: Subscripts,
     collations: Collations,
     single_arrow_lambdas: bool,
@@ -283,6 +284,7 @@ impl Default for Semantics {
             sequence_owners: SequenceOwners::Table,
             set_functions: SetFunctions::Pin,
             sort_operators: SortOperators::Pin,
+            tie_order: TieOrder::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
             collations: Collations::Pin,
@@ -476,6 +478,11 @@ impl Semantics {
     #[must_use]
     pub fn sort_operators(self) -> SortOperators {
         self.sort_operators
+    }
+    /// What order a sort leaves the rows in whose keys tie.
+    #[must_use]
+    pub fn tie_order(self) -> TieOrder {
+        self.tie_order
     }
     /// How a subscript and a slice of a list read the list.
     #[must_use]
@@ -1015,6 +1022,19 @@ pub enum SortOperators {
     Postgres,
 }
 
+/// What order a sort leaves the rows in whose keys tie.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TieOrder {
+    /// As in DuckDB: the rows that tie stay in the order they arrived in, whatever the number of
+    /// threads.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the rows that tie are in the order its in-memory sort leaves them in,
+    /// which is a quicksort, or a radix sort when the first key compares as an integer. Neither
+    /// is stable, so a window function that numbers the rows or reads a neighbor sees that order.
+    Postgres,
+}
+
 /// How a subscript and a slice of a list read the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Subscripts {
@@ -1438,6 +1458,7 @@ impl Session {
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
             self.semantics.sort_operators = SortOperators::Postgres;
+            self.semantics.tie_order = TieOrder::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;

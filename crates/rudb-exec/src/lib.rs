@@ -136,6 +136,7 @@ mod storagenames;
 mod strategies;
 mod stream;
 mod table;
+mod ties;
 mod topn;
 mod typenames;
 mod unnest;
