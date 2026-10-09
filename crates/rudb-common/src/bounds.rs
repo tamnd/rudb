@@ -527,6 +527,20 @@ pub trait Zones: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// How many rows hold a value any of `branches` keeps, each a function and a constant called
+    /// as [`Self::matching`] is, counted over every row where the table is small enough to run them
+    /// over all of it.
+    ///
+    /// A share of a sample cannot say none. `k.keyword = 'character-name-in-title'` keeps one row
+    /// of 134,170 and a sample of fifteen thousand of them holds no row of it, so the share was
+    /// half a row of the sample and the estimate four. The dimension tables a query filters are
+    /// the tables small enough to run the filter on outright. `None` where the store cannot or will
+    /// not.
+    fn counted(&self, column: usize, branches: &[(&str, &str)]) -> Option<u64> {
+        let _ = (column, branches);
+        None
+    }
+
     /// The values of `key` in every row `function` keeps, called as [`Self::matching`] is, where
     /// the table is small enough to run it over all of it and it keeps no more than `most` rows.
     ///

@@ -164,7 +164,8 @@ impl fmt::Display for Direction {
 /// The list is `spec/stats/02-the-catalogue.md` section 2.1.1's fourteen plus [`Self::Propagation`],
 /// which the specification does not name because it is not a source of data. It is what a number
 /// derived from two others says about itself, and leaving it out would mean a combination inherited
-/// the provenance of whichever operand happened to be on the left.
+/// the provenance of whichever operand happened to be on the left. [`Self::Evaluated`] is the
+/// fourth kind of `bench/job/12-cardinality.md` section 12.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provenance {
     /// A maintained row count. Exact.
@@ -198,6 +199,9 @@ pub enum Provenance {
     DegreeDistribution,
     /// The stored sample.
     Sample,
+    /// The filter itself, run by the planner over every row of a table small enough to run it on.
+    /// Exact, and the answer `spec/stats` has no source for because it is not kept in the file.
+    Evaluated,
     /// A constant in the source. The weakest answer that is not `Unknown`, and the one worth
     /// searching an `EXPLAIN` for, because it means nobody had a number at that node at all.
     Default,
@@ -227,6 +231,7 @@ impl Provenance {
             Self::LinkHeader => "link header",
             Self::DegreeDistribution => "degree distribution",
             Self::Sample => "sample",
+            Self::Evaluated => "evaluated",
             Self::Default => "default",
             Self::Observed => "observed",
             Self::Propagation => "propagation",
@@ -876,6 +881,7 @@ mod tests {
             Provenance::LinkHeader,
             Provenance::DegreeDistribution,
             Provenance::Sample,
+            Provenance::Evaluated,
             Provenance::Default,
             Provenance::Propagation,
         ] {
