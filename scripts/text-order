@@ -5,9 +5,17 @@ A page of the binary counts toward a query's peak resident size once any byte of
 the kernel maps the pages around a faulting one that are already in memory with it, sixteen at a
 time. Linked in the order the compiler emits them, the functions a query runs are spread over most of
 the binary: `SELECT COUNT(*)` executes 1.4 MB of functions and had 7 MB of code resident. The script
-this writes gathers the functions a set of runs executed into one section in front of the rest,
-those most runs use first and those the same runs use next to each other, so a run touches fewer of
-those windows. `crates/rudb-cli/build.rs` passes it to the linker.
+this writes gathers the functions a set of runs executed into one section in front of the rest, so a
+run touches fewer of those windows. `crates/rudb-cli/build.rs` passes it to the linker.
+
+Functions executed by exactly the same runs go together, since nothing is gained by splitting them.
+Sorting those groups by how many runs use each, as the script once did, left a run's code over more
+windows than it fills: two groups of three runs each sit side by side whether or not they share a
+run. The groups are chained instead, each followed by the one whose runs differ from it in the
+fewest, and the chain is then improved by moving a few groups at a time to another place and keeping
+every move that leaves the runs touching no more windows than before. Against the order by count
+that took about 0.8 MB off the peak of most ClickBench queries, native and parquet. The section
+starts on a window so the count the script works with is the one the linked binary has.
 
 Each line of RUNS is a command, run once under callgrind, whose first word is replaced by BINARY. The
 functions a run executed are the ones callgrind saw retire an instruction. A function the compiler
@@ -26,6 +34,7 @@ Usage: scripts/text-order BINARY RUNS OUT
 """
 
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -56,8 +65,8 @@ def executed(binary, command, scratch):
     return names
 
 
-def aliases(binary):
-    """The names each function in BINARY answers to, keyed by every one of them.
+def bodies(listing):
+    """The function bodies in an `nm -S` LISTING, each as its size and the names it answers to.
 
     Rust merges functions that compile to the same machine code into one body with an alias per
     name, and callgrind reports a run of that body under whichever name it picks. The body's section
@@ -65,13 +74,99 @@ def aliases(binary):
     the body where it was.
     """
     at = {}
-    listing = subprocess.run(['nm', '--defined-only', binary],
-                             capture_output=True, text=True, check=True).stdout
     for line in listing.splitlines():
         fields = line.split()
-        if len(fields) == 3 and fields[1] in 'tTwW':
-            at.setdefault(fields[0], []).append(fields[2])
-    return {name: names for names in at.values() for name in names}
+        if len(fields) in (3, 4) and fields[-2] in 'tTwW':
+            body = at.setdefault(fields[0], [0, []])
+            if len(fields) == 4:
+                body[0] = max(body[0], int(fields[1], 16))
+            body[1].append(fields[-1])
+    return list(at.values())
+
+
+WINDOW = 65536
+
+
+def windows(size, order):
+    """How many windows the runs touch between them, with the groups in ORDER from a window's start.
+
+    A group is the set of runs that executed it, as a bit per run, and SIZE is its bytes.
+    """
+    at = 0
+    touched = {}
+    for group in order:
+        for window in range(at // WINDOW, (at + size[group] - 1) // WINDOW + 1):
+            touched[window] = touched.get(window, 0) | group
+        at += size[group]
+    return sum(bin(runs).count('1') for runs in touched.values())
+
+
+def arrange(size, everyone, steps=200000):
+    """The groups of SIZE in an order whose runs touch few windows, starting next to EVERYONE."""
+    differ = lambda one, other: bin(one ^ other).count('1')
+    left = set(size)
+    order = []
+    last = everyone
+    while left:
+        last = min(left, key=lambda group: (differ(group, last), -differ(group, 0), group))
+        left.remove(last)
+        order.append(last)
+    best = windows(size, order)
+    # A fixed seed writes the same script from the same runs.
+    pick = random.Random(1)
+    for _ in range(steps):
+        at = pick.randrange(len(order))
+        moved = order[at:at + pick.choice([1, 1, 1, 2, 4, 8, 16])]
+        rest = order[:at] + order[at + len(moved):]
+        if pick.random() < 0.3:
+            moved.reverse()
+        to = pick.randrange(len(rest) + 1)
+        tried = rest[:to] + moved + rest[to:]
+        count = windows(size, tried)
+        if count <= best:
+            best, order = count, tried
+    return order
+
+
+def layout(listing, used, runs):
+    """The patterns for the bodies in LISTING that RUNS runs executed, in the order they go.
+
+    USED maps each name callgrind reported to the runs that executed it. A pattern takes every body
+    it matches to where it is, a body the runs never executed or one some other runs did, so the
+    bodies that share a pattern, and those that share one with them, move as one and count as used
+    by every run that executed any of them.
+    """
+    found = bodies(listing)
+    parent = {}
+
+    def root(each):
+        while parent.setdefault(each, each) != each:
+            parent[each] = parent[parent[each]]
+            each = parent[each]
+        return each
+
+    for _, names in found:
+        first = root(pattern(names[0]))
+        for name in names[1:]:
+            parent[root(pattern(name))] = first
+    runs_of = {}
+    size = {}
+    for length, names in found:
+        unit = root(pattern(names[0]))
+        size[unit] = size.get(unit, 0) + (length + 15) // 16 * 16
+        for name in names:
+            for at in used.get(name, ()):
+                runs_of[unit] = runs_of.get(unit, 0) | 1 << at
+    group = {}
+    members = {}
+    for unit, each in runs_of.items():
+        group[each] = group.get(each, 0) + size[unit]
+        members.setdefault(each, []).append(unit)
+    order = arrange(group, (1 << runs) - 1)
+    patterns = {}
+    for name in sorted(parent):
+        patterns.setdefault(root(name), []).append(name)
+    return [name for each in order for unit in sorted(members[each]) for name in patterns[unit]]
 
 
 def pattern(name):
@@ -95,20 +190,19 @@ def main():
     binary, runs, out = sys.argv[1:]
     commands = [shlex.split(line) for line in open(runs) if line.strip()]
     used = {}
-    same = aliases(binary)
+    listing = subprocess.run(['nm', '-S', '--defined-only', binary],
+                             capture_output=True, text=True, check=True).stdout
     # Callgrind runs a program tens of times slower on one core, so the runs go side by side.
     with tempfile.TemporaryDirectory() as scratch, ThreadPoolExecutor(os.cpu_count()) as pool:
         runs = [pool.submit(executed, binary, command, os.path.join(scratch, str(at)))
                 for at, command in enumerate(commands)]
         for at, run in enumerate(runs):
             for name in run.result():
-                for each in same.get(name, [name]):
-                    used.setdefault(each, set()).add(at)
+                used.setdefault(name, set()).add(at)
             print(f'{at + 1}/{len(commands)} runs, {len(used)} functions', file=sys.stderr)
-    order = sorted(used, key=lambda name: (-len(used[name]), sorted(used[name]), name))
-    patterns = list(dict.fromkeys(pattern(name) for name in order))
+    patterns = layout(listing, used, len(commands))
     with open(out, 'w') as file:
-        file.write('/* Written by scripts/text-order. */\nSECTIONS {\n  .text.hot : {\n')
+        file.write('/* Written by scripts/text-order. */\nSECTIONS {\n  .text.hot : ALIGN(0x10000) {\n')
         file.writelines(f'    *(.text.{each} .text.unlikely.{each})\n' for each in patterns)
         file.write('  }\n} INSERT BEFORE .text;\n')
 
