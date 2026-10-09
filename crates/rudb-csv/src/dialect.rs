@@ -48,7 +48,7 @@ pub struct Dialect {
 /// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
 /// rather than folded into a [`Dialect`] and forgotten.
 ///
-/// The last five are not punctuation, and they are here because they travel the same road: the
+/// The last six are not punctuation, and they are here because they travel the same road: the
 /// binder works them out from the call to sniff the file with and the executor works them out again
 /// from the plan to read it with, and a second struct beside this one would be a second thing for
 /// the two ends to keep in step.
@@ -94,6 +94,42 @@ pub struct Given {
     /// is a row unless `header` says otherwise. Measured on `v2.0.0-dev84237`, where a file of
     /// `a,b` over `1,x` read with two `VARCHAR` columns and `auto_detect=false` has three rows.
     pub fixed: bool,
+    /// The types the call set for some of the columns over what the sniffer found, which is
+    /// `types`, `dtypes` or `column_types` on a call.
+    ///
+    /// They are put in once the file has been sniffed, so the header is still decided by the types
+    /// the sample has, and once the names are, so a name here is one `names` gave. Measured on
+    /// `v2.0.0-dev84237`, where `types={'a': 'INTEGER'}` with `all_varchar=true` reads `a` as
+    /// `INTEGER` and the rest as `VARCHAR`.
+    pub retype: Option<Retype>,
+    /// Whether every column the call did not set a type for is read as text, which is
+    /// `all_varchar` on a call.
+    pub all_varchar: bool,
+}
+
+/// The types a call set for some of a file's columns, by name or by position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retype {
+    /// A struct of a type name for each column it names, matched to the columns without regard to
+    /// case. A name the file has no column for is an error.
+    Named(Vec<(String, LogicalType)>),
+    /// A list of types for the first columns, first column first. A list longer than the file has
+    /// columns is an error.
+    Positional(Vec<LogicalType>),
+}
+
+impl Retype {
+    /// The type set for the column at `at`, called `name`, if there is one.
+    #[must_use]
+    pub fn of(&self, at: usize, name: &str) -> Option<&LogicalType> {
+        match self {
+            Self::Named(set) => {
+                let name = name.to_lowercase();
+                set.iter().find(|(set, _)| set.to_lowercase() == name).map(|(_, ty)| ty)
+            }
+            Self::Positional(set) => set.get(at),
+        }
+    }
 }
 
 impl Given {
