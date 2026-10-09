@@ -24,6 +24,9 @@ pub struct Parameters {
     /// The PostgreSQL type that the client declared for a parameter, such as `name` or `oid`,
     /// which a value of its logical type does not tell.
     types: Vec<(String, DeclaredType)>,
+    /// The type of a null that a parameter was given, such as the `INTEGER` of `NULL::INT` in an
+    /// `EXECUTE`, which the null itself does not carry.
+    nulls: Vec<(String, LogicalType)>,
 }
 
 /// What a statement takes and gives, found by binding it with no values, which is what a client
@@ -193,6 +196,7 @@ impl Parameters {
             capture: None,
             placeholders: None,
             types: Vec::new(),
+            nulls: Vec::new(),
         }
     }
 
@@ -232,6 +236,19 @@ impl Parameters {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.iter().find(|(held, _)| same(held, name)).map(|(_, value)| value)
+    }
+
+    /// Notes that the null one parameter was given is a null of `ty`.
+    pub fn type_null(&mut self, name: impl Into<String>, ty: LogicalType) {
+        let name = name.into();
+        self.nulls.retain(|(held, _)| !same(held, &name));
+        self.nulls.push((name, ty));
+    }
+
+    /// The type of the null one parameter was given, when it was given a null of a type.
+    #[must_use]
+    pub fn null_type(&self, name: &str) -> Option<&LogicalType> {
+        self.nulls.iter().find(|(held, _)| same(held, name)).map(|(_, ty)| ty)
     }
 
     /// Gives one parameter the PostgreSQL type that the client declared for it.
@@ -305,6 +322,7 @@ impl Parameters {
             && self.capture.is_none()
             && self.placeholders.is_none()
             && self.types.is_empty()
+            && self.nulls.is_empty()
     }
 
     /// How many were provided.

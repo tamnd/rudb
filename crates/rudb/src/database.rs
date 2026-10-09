@@ -6444,7 +6444,14 @@ impl Shared {
                 } else {
                     ast.string(target.alias).to_string()
                 };
-                parameters.set(name, row.value_at(0, at));
+                let value = row.value_at(0, at);
+                if value.is_null()
+                    && let Some(ty) = row.types().get(at)
+                    && *ty != LogicalType::Null
+                {
+                    parameters.type_null(name.clone(), ty.clone());
+                }
+                parameters.set(name, value);
             }
         }
         // Excess first, which is the order the pin checks in from SQL.

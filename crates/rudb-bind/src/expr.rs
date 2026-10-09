@@ -687,6 +687,13 @@ impl Binder<'_> {
         {
             return Ok(self.cast_to(constant, &ty));
         }
+        // A null handed to an `EXECUTE` as `NULL::INT` is a null of that type, as it is on the pin.
+        if value.is_null()
+            && let Some(ty) = self.parameters.null_type(name)
+        {
+            let ty = ty.clone();
+            return Ok(self.cast_to(constant, &ty));
+        }
         Ok(constant)
     }
 
@@ -1888,7 +1895,8 @@ impl Binder<'_> {
             if target == LogicalType::Null {
                 return Err(Error::invalid_input("cast_to_type cannot be used to cast to NULL"));
             }
-            return self.checked_cast_to(bound[0], &target, false);
+            let cast = self.checked_cast_to(bound[0], &target, false)?;
+            return self.collated_like(cast, bound[1]);
         }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
@@ -2914,15 +2922,21 @@ impl Binder<'_> {
         args: Vec<ExprRef>,
     ) -> Result<ExprRef> {
         let mut args = self.push_collations(resolved_name, args)?;
-        // The pin's string literal reaches any parameter type by a cast, and the UUID readers are
-        // the calls here whose one parameter takes nothing else, so a literal is read as a UUID
-        // before the call is resolved rather than refused as a VARCHAR.
-        if matches!(resolved_name, "uuid_extract_version" | "uuid_extract_timestamp") {
+        // The pin's string literal reaches any parameter type by a cast, and the UUID readers and
+        // `timetz_byte_comparable` are the calls here whose one parameter takes nothing else, so a
+        // literal is read as that type before the call is resolved rather than refused as a
+        // VARCHAR.
+        let only = match resolved_name {
+            "uuid_extract_version" | "uuid_extract_timestamp" => Some(LogicalType::Uuid),
+            "timetz_byte_comparable" => Some(LogicalType::TimeTz),
+            _ => None,
+        };
+        if let Some(only) = only {
             for arg in &mut args {
                 if let Expr::Constant(value) = *self.plan().expr(*arg)
                     && matches!(self.plan().value(value), Value::Varchar(_))
                 {
-                    *arg = self.cast_to(*arg, &LogicalType::Uuid);
+                    *arg = self.cast_to(*arg, &only);
                 }
             }
         }
