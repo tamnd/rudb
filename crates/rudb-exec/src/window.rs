@@ -165,6 +165,12 @@ struct Call {
     /// like the arguments were, so the values are already on the row by the time this is used, and
     /// the expressions in here are the plan's own and are not looked at again.
     order: Vec<SortKey>,
+    /// Whether those keys are the first keys of the `OVER` order, written the same way.
+    ///
+    /// The pin takes a shorter road for a ranking window, `lag` or `lead` whose keys the window is
+    /// already sorted by, and that road does not always reach the place the long one does. Which
+    /// one is taken is decided by this and by nothing in the rows, so it is worked out once.
+    leads: bool,
     /// Whether duplicate argument tuples are collapsed before aggregating.
     distinct: bool,
     /// Whether an argument that is null is passed over.
@@ -408,6 +414,13 @@ impl Window {
             let inner = plan.sort_key_list(*inner).to_vec();
             let order_at = gathered.len();
             gathered.extend(inner.iter().map(|key| key.expr));
+            let leads = !inner.is_empty()
+                && inner.len() <= order.len()
+                && inner.iter().zip(&order).all(|(inside, over)| {
+                    inside.descending == over.descending
+                        && inside.nulls_first == over.nulls_first
+                        && plan.same_expr(inside.expr, over.expr)
+                });
             let written = plan.string(*name);
             calls.push(Call {
                 reads: Reads::of(written),
@@ -418,6 +431,7 @@ impl Window {
                 filter_at,
                 order_at,
                 order: inner,
+                leads,
                 distinct: *distinct,
                 ignore_nulls: *ignore_nulls,
             });
@@ -1071,8 +1085,14 @@ impl Window {
         frame: std::ops::Range<usize>,
     ) -> Result<Value> {
         match call.reads {
+            Reads::Position(ranking) if !call.order.is_empty() => {
+                return self.ranked_in_frame(ranking, call, rows, peers, at, frame);
+            }
             Reads::Position(ranking) => return ranked(ranking, call, rows, peers, at),
             Reads::Picked(pick) => return self.picked(pick, call, rows, peers, at, frame),
+            Reads::Shifted(look) if !call.order.is_empty() => {
+                return shifted_in_frame(look, call, rows, at, frame);
+            }
             Reads::Shifted(look) => return shifted(look, call, rows, at),
             // `over` answers this one for the whole partition before it asks about any row, so
             // getting here means the two of them disagree about which calls those are.
@@ -1306,8 +1326,140 @@ fn ranked(
         // How much of the partition is at or before this row, counting the whole peer group, so it
         // ends at one on every partition and starts above zero.
         Ranking::CumeDist => Value::Double((last + 1) as f64 / total as f64),
-        Ranking::Ntile => ntile(call, rows, at, total)?,
+        Ranking::Ntile => ntile(call, rows, at, at, total)?,
     })
+}
+
+/// Where the current row falls among the rows of a frame, in the order a call's own keys put them.
+///
+/// The row does not have to be in the frame for this to mean something. `ROWS BETWEEN 2 PRECEDING
+/// AND 1 PRECEDING` never holds the current row, and a rank over it is still how many of those two
+/// rows come first.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    /// The rows of the frame that sort before the current row.
+    below: usize,
+    /// The rows of the frame that tie with it and come before it in the partition.
+    earlier: usize,
+    /// The rows of the frame that tie with it, which includes the row itself when it is there.
+    tied: usize,
+}
+
+impl Placed {
+    fn of(
+        call: &Call,
+        rows: &[Windowed],
+        at: usize,
+        frame: std::ops::Range<usize>,
+    ) -> Result<Self> {
+        let keys = call.order_at..call.order_at + call.order.len();
+        let own = &rows[at].0[keys.clone()];
+        let mut placed = Self { below: 0, earlier: 0, tied: 0 };
+        let mut failure = None;
+        for row in frame {
+            match compare(&call.order, &rows[row].0[keys.clone()], own, &mut failure) {
+                Ordering::Less => placed.below += 1,
+                Ordering::Equal => {
+                    placed.tied += 1;
+                    if row < at {
+                        placed.earlier += 1;
+                    }
+                }
+                Ordering::Greater => {}
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(placed),
+        }
+    }
+
+    /// The row's number, which separates the rows that tie by where they are in the partition.
+    fn number(self) -> usize {
+        self.below + self.earlier + 1
+    }
+
+    /// The row's rank, which every row that ties with it shares.
+    fn rank(self) -> usize {
+        self.below + 1
+    }
+}
+
+/// A count as the `BIGINT` a ranking window answers with.
+fn counted_as(held: usize) -> Result<Value> {
+    i64::try_from(held)
+        .map(Value::BigInt)
+        .map_err(|_| Error::internal("a partition longer than a BIGINT"))
+}
+
+impl Window {
+    /// One ranking window's value for one row when it was written with keys of its own.
+    ///
+    /// The keys turn the ranking from a question about the partition into one about the frame, so
+    /// `rank(ORDER BY v)` is one more than the rows of this row's frame with a smaller `v`, and the
+    /// frame is read here where it is ignored without them. The current row need not be one of the
+    /// rows counted.
+    ///
+    /// The pin answers some of these without ranking anything, when the window is already sorted by
+    /// the keys: by the place of the row in the frame for `row_number` and `ntile` when the keys
+    /// lead the `OVER` order, and by the start of its peer group for the other three when they are
+    /// the whole of it. That is the same answer as ranking whenever the row is inside its frame and
+    /// not always when it is outside, and it is the one the pin gives, so it is the one given here.
+    /// The pin with its optimizer off ranks instead, which is tamnd/duckdb#46.
+    fn ranked_in_frame(
+        &self,
+        ranking: Ranking,
+        call: &Call,
+        rows: &[Windowed],
+        peers: &[usize],
+        at: usize,
+        frame: std::ops::Range<usize>,
+    ) -> Result<Value> {
+        let begin = frame.start.min(rows.len());
+        let end = frame.end.clamp(begin, rows.len());
+        let width = end - begin;
+        let whole = call.leads && call.order.len() == self.order.len();
+        let placed = || Placed::of(call, rows, at, begin..end);
+        let rank = || -> Result<usize> {
+            if whole {
+                Ok(first_of(peers, peers[at]).max(begin) - begin + 1)
+            } else {
+                Ok(placed()?.rank())
+            }
+        };
+        Ok(match ranking {
+            Ranking::RowNumber if call.leads => counted_as(at.clamp(begin, end) - begin + 1)?,
+            Ranking::RowNumber => counted_as(placed()?.number())?,
+            Ranking::Rank => counted_as(rank()?)?,
+            Ranking::PercentRank => Value::Double(if width <= 1 {
+                0.0
+            } else {
+                (rank()? - 1) as f64 / (width - 1) as f64
+            }),
+            Ranking::CumeDist => Value::Double(if width == 0 {
+                0.0
+            } else {
+                let reached = if whole {
+                    (last_of(peers, peers[at]) + 1).min(end).max(begin) - begin
+                } else {
+                    let placed = placed()?;
+                    placed.below + placed.tied
+                };
+                reached as f64 / width as f64
+            }),
+            Ranking::Ntile => {
+                let place = if call.leads {
+                    at.clamp(begin, end.saturating_sub(1).max(begin)) - begin
+                } else {
+                    (placed()?.number() - 1).min(width.saturating_sub(1))
+                };
+                ntile(call, rows, at, place, width)?
+            }
+            Ranking::DenseRank => {
+                return Err(Error::internal("a dense_rank with keys of its own was bound"));
+            }
+        })
+    }
 }
 
 /// Which bucket of `buckets` the row at `at` falls in, numbered from one.
@@ -1316,7 +1468,11 @@ fn ranked(
 /// arrangement and the standard's: six rows in four buckets are two, two, one and one, and never
 /// one, one, two and two. The count is read off the current row rather than once for the partition
 /// because upstream reads it per row, so `ntile(i)` gives each row a cut of its own.
-fn ntile(call: &Call, rows: &[Windowed], at: usize, total: usize) -> Result<Value> {
+///
+/// `place` is where the row is counted from, which is `at` unless the call ranks the rows of its
+/// frame by keys of its own, and `total` is how many rows are being cut, which is none for an
+/// empty frame and answers null then.
+fn ntile(call: &Call, rows: &[Windowed], at: usize, place: usize, total: usize) -> Result<Value> {
     let written = &rows[at].0[call.args_at];
     if written.is_null() {
         return Ok(Value::Null);
@@ -1330,15 +1486,18 @@ fn ntile(call: &Call, rows: &[Windowed], at: usize, total: usize) -> Result<Valu
             .pg("argument of ntile must be greater than zero")
             .unplaced());
     }
+    if total == 0 {
+        return Ok(Value::Null);
+    }
     let buckets = usize::try_from(buckets).unwrap_or(total).min(total.max(1));
     let each = total / buckets;
     let wide = total % buckets;
     // The first `wide` buckets hold one row more than the rest. A row inside that stretch divides
     // by the wider size and a row past it starts counting again from where the stretch ended.
-    let bucket = if at < wide * (each + 1) {
-        at / (each + 1)
+    let bucket = if place < wide * (each + 1) {
+        place / (each + 1)
     } else {
-        wide + (at - wide * (each + 1)) / each.max(1)
+        wide + (place - wide * (each + 1)) / each.max(1)
     };
     let bucket = i64::try_from(bucket + 1).map_err(|_| Error::internal("too many buckets"))?;
     Ok(Value::BigInt(bucket))
@@ -1380,6 +1539,70 @@ fn shifted(look: Looks, call: &Call, rows: &[Windowed], at: usize) -> Result<Val
         at.checked_sub(steps)
     } else {
         at.checked_add(steps).filter(|&row| row < rows.len())
+    };
+    Ok(match landed {
+        Some(row) => rows[row].0[call.args_at].clone(),
+        None => held.get(2).cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// The value `lag` or `lead` answers with when it was written with keys of its own.
+///
+/// The keys make these two read the frame rather than the partition. The rows of the frame are put
+/// in the order the keys give, the current row is given the number it would have among them, and
+/// the answer is the row that many places on from it, so `lead(v ORDER BY v)` is the next larger
+/// `v` in the frame. A place that is not in the frame answers the default.
+///
+/// When the keys lead the `OVER` order the pin does not sort anything and steps through the window
+/// as it is instead. A step back stops at the start of the frame and a step forward at its end, but
+/// each starts from the current row, and when the frame ends before the row a step forward answers
+/// the row the frame ended at. That is not what the sorted reading gives for a row outside its
+/// frame, and it is reproduced as the pin has it because it is the answer the pin gives. The pin
+/// with its optimizer off sorts instead, which is tamnd/duckdb#46.
+fn shifted_in_frame(
+    look: Looks,
+    call: &Call,
+    rows: &[Windowed],
+    at: usize,
+    frame: std::ops::Range<usize>,
+) -> Result<Value> {
+    let held = &rows[at].0[call.args_at..call.args_at + call.args];
+    let offset = match held.get(1) {
+        None => 1,
+        Some(value) if value.is_null() => return Ok(Value::Null),
+        Some(value) => value.as_i64().ok_or_else(|| {
+            Error::invalid_input(format!("Argument for {} must be a number", call.name))
+        })?,
+    };
+    let begin = frame.start.min(rows.len());
+    let end = frame.end.clamp(begin, rows.len());
+    let place = |held: usize| i64::try_from(held).unwrap_or(i64::MAX);
+    let from = if call.leads { at } else { Placed::of(call, rows, at, begin..end)?.number() - 1 };
+    let from = place(from);
+    let target = match look {
+        Looks::Forward => from.checked_add(offset).ok_or_else(|| {
+            Error::out_of_range(format!("Overflow in addition of INT64 ({from} + {offset})!"))
+        })?,
+        Looks::Back => from.checked_sub(offset).ok_or_else(|| {
+            Error::out_of_range(format!("Overflow in subtraction of INT64 ({from} - {offset})!"))
+        })?,
+    };
+    let landed = if call.leads {
+        if target < from {
+            (target >= place(begin)).then_some(target)
+        } else if target > from && place(end) <= from {
+            Some(place(end))
+        } else if target > from {
+            (target < place(end)).then_some(target)
+        } else {
+            Some(from)
+        }
+        .and_then(|row| usize::try_from(row).ok())
+    } else {
+        match usize::try_from(target) {
+            Ok(target) if target < end - begin => reading(call, rows, begin..end)?.nth(target),
+            _ => None,
+        }
     };
     Ok(match landed {
         Some(row) => rows[row].0[call.args_at].clone(),

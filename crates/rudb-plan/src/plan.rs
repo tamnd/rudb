@@ -161,6 +161,135 @@ impl Default for Plan {
 }
 
 impl Plan {
+    /// Whether two expressions of this plan are the same expression, by shape rather than by
+    /// reference.
+    #[must_use]
+    pub fn same_expr(&self, left: ExprRef, right: ExprRef) -> bool {
+        if left == right {
+            return true;
+        }
+        if self.expr_type(left) != self.expr_type(right) {
+            return false;
+        }
+        let lists = |left, right| {
+            let left: &[ExprRef] = self.expr_list(left);
+            let right: &[ExprRef] = self.expr_list(right);
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(&left, &right)| self.same_expr(left, right))
+        };
+        match (self.expr(left), self.expr(right)) {
+            (Expr::Column(left), Expr::Column(right)) => left == right,
+            (Expr::Constant(left), Expr::Constant(right)) => {
+                self.value(*left).identical(self.value(*right))
+            }
+            (
+                Expr::Cast { input: left, try_cast: left_try },
+                Expr::Cast { input: right, try_cast: right_try },
+            ) => left_try == right_try && self.same_expr(*left, *right),
+            (
+                Expr::Compare { op: left_op, left: left_a, right: left_b },
+                Expr::Compare { op: right_op, left: right_a, right: right_b },
+            ) => {
+                left_op == right_op
+                    && self.same_expr(*left_a, *right_a)
+                    && self.same_expr(*left_b, *right_b)
+            }
+            (
+                Expr::Conjunction { op: left_op, children: left_children },
+                Expr::Conjunction { op: right_op, children: right_children },
+            ) => left_op == right_op && lists(*left_children, *right_children),
+            (
+                Expr::Function { name: left_name, args: left_args },
+                Expr::Function { name: right_name, args: right_args },
+            ) => {
+                self.string(*left_name) == self.string(*right_name)
+                    && lists(*left_args, *right_args)
+            }
+            (
+                Expr::Aggregate {
+                    name: left_name,
+                    args: left_args,
+                    distinct: left_distinct,
+                    filter: left_filter,
+                },
+                Expr::Aggregate {
+                    name: right_name,
+                    args: right_args,
+                    distinct: right_distinct,
+                    filter: right_filter,
+                },
+            ) => {
+                self.string(*left_name) == self.string(*right_name)
+                    && left_distinct == right_distinct
+                    && match (left_filter, right_filter) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => self.same_expr(*left, *right),
+                        _ => false,
+                    }
+                    && lists(*left_args, *right_args)
+            }
+            // The partition, the order and the frame are not compared here and do not need to be.
+            // Two window calls are only ever asked about when they are already in the same run,
+            // which is what agreeing on all three means.
+            (
+                Expr::Window {
+                    name: left_name,
+                    args: left_args,
+                    distinct: left_distinct,
+                    filter: left_filter,
+                    ignore_nulls: left_nulls,
+                    order: left_order,
+                },
+                Expr::Window {
+                    name: right_name,
+                    args: right_args,
+                    distinct: right_distinct,
+                    filter: right_filter,
+                    ignore_nulls: right_nulls,
+                    order: right_order,
+                },
+            ) => {
+                // The keys inside the brackets are compared, unlike the ones in the `OVER`, because
+                // two calls in the same run can still read their frame in different orders.
+                let left_keys = self.sort_key_list(*left_order);
+                let right_keys = self.sort_key_list(*right_order);
+                self.string(*left_name) == self.string(*right_name)
+                    && left_distinct == right_distinct
+                    && left_nulls == right_nulls
+                    && left_keys.len() == right_keys.len()
+                    && left_keys.iter().zip(right_keys).all(|(left, right)| {
+                        left.descending == right.descending
+                            && left.nulls_first == right.nulls_first
+                            && self.same_expr(left.expr, right.expr)
+                    })
+                    && match (left_filter, right_filter) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => self.same_expr(*left, *right),
+                        _ => false,
+                    }
+                    && lists(*left_args, *right_args)
+            }
+            (
+                Expr::Case { arms: left_arms, otherwise: left_otherwise },
+                Expr::Case { arms: right_arms, otherwise: right_otherwise },
+            ) => {
+                let left_arms = self.arm_list(*left_arms);
+                let right_arms = self.arm_list(*right_arms);
+                left_arms.len() == right_arms.len()
+                    && left_arms.iter().zip(right_arms).all(|(left, right)| {
+                        self.same_expr(left.when, right.when)
+                            && self.same_expr(left.then, right.then)
+                    })
+                    && match (left_otherwise, right_otherwise) {
+                        (None, None) => true,
+                        (Some(left), Some(right)) => self.same_expr(*left, *right),
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
+
     /// An empty plan, which is one row and no columns.
     #[must_use]
     pub fn new() -> Self {
@@ -1209,8 +1338,8 @@ impl Plan {
                     return fail("names a constant that is not in the value table");
                 }
                 // A null literal takes its type from context, so it is the one case where the
-                // stored type is allowed to disagree with the value. A `TYPE`, a `JSON` and a `JSONB`
-                // are held as their text, which is a string.
+                // stored type is allowed to disagree with the value. A `TYPE`, a `JSON` and a
+                // `JSONB` are held as their text, which is a string.
                 let held = self.value(value);
                 let ty = self.expr_type(reference);
                 let text = matches!(ty, LogicalType::Type | LogicalType::Json | LogicalType::Jsonb)

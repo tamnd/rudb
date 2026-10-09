@@ -1151,17 +1151,89 @@ fn a_key_inside_the_brackets_does_not_have_to_be_a_column_the_call_returns() {
     assert_eq!(column(&database, &sql, 0), vec![Value::Varchar("b".into()); 6]);
 }
 
+/// A column of BIGINT values with nulls in it, which is what a ranking or a shift over `range`
+/// answers with.
+fn longs(values: &[Option<i64>]) -> Vec<Value> {
+    values.iter().map(|held| held.map_or(Value::Null, Value::BigInt)).collect()
+}
+
 #[test]
-fn the_window_functions_that_do_not_read_the_frame_say_so_rather_than_guessing() {
-    // `lead`, `lag`, `fill` and the rankings read something other than the frame, so an order over
-    // the frame is a question they have no obvious answer to. The pinned binary has one and it is
-    // not the ordinary reading of the words, so these are turned down until that is worked through.
-    // Per #1204.
-    let database = built();
+fn the_rankings_and_the_shifts_with_an_order_of_their_own_read_the_frame() {
+    // The pinned binary's answers. The keys inside the brackets differ from the `OVER` order here,
+    // so each row is ranked among the rows of its own frame, which it is not one of.
+    let database = Database::new();
+    let frame = "ORDER BY i ROWS BETWEEN 1 FOLLOWING AND 3 FOLLOWING";
+    let sql = format!(
+        "SELECT row_number(ORDER BY i % 2, i DESC) OVER ({frame}), \
+         rank(ORDER BY i % 2) OVER ({frame}) FROM range(6) t(i) ORDER BY i"
+    );
+    assert_eq!(column(&database, &sql, 0), counts(&[2, 4, 2, 3, 1, 1]));
+    assert_eq!(column(&database, &sql, 1), counts(&[1, 3, 1, 2, 1, 1]));
+    // Keys that lead the `OVER` order without being all of it are still ranked, so a rank over a
+    // frame of earlier rows counts only the rows of that frame.
+    let sql = "SELECT rank(ORDER BY i) OVER (ORDER BY i, i % 2 \
+        ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING) FROM range(4) t(i) ORDER BY i";
+    assert_eq!(column(&database, sql, 0), counts(&[1, 1, 2, 3]));
+    // A null placement the `OVER` did not write is a different key, and `lead` then steps through
+    // the frame sorted by it.
+    let sql = "SELECT lead(i ORDER BY i NULLS FIRST) OVER (ORDER BY i \
+        ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) FROM range(4) t(i) ORDER BY i";
+    assert_eq!(column(&database, sql, 0), longs(&[Some(3), None, None, None]));
+}
+
+#[test]
+fn keys_the_window_is_already_sorted_by_take_the_pinned_binarys_shorter_road() {
+    // The pinned binary's answers with its optimizer on, which is how it runs unless told not to.
+    // Over a frame of earlier rows the rank is where the peer group starts and not a count of the
+    // frame, which is why it passes three and the percent rank passes one, and `lead` answers the
+    // row the frame ended at.
+    let database = Database::new();
+    let sql = "SELECT rank(ORDER BY i) OVER w, percent_rank(ORDER BY i) OVER w, \
+        cume_dist(ORDER BY i) OVER w, row_number(ORDER BY i) OVER w, ntile(2 ORDER BY i) OVER w, \
+        lead(i ORDER BY i) OVER w, lag(i ORDER BY i) OVER w FROM range(6) t(i) \
+        WINDOW w AS (ORDER BY i ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING) ORDER BY i";
+    assert_eq!(column(&database, sql, 0), counts(&[1, 2, 3, 4, 4, 4]));
+    assert_eq!(column(&database, sql, 1), doubles(&[0.0, 0.0, 0.0, 3.0, 3.0, 3.0]));
+    assert_eq!(column(&database, sql, 2), doubles(&[0.0, 0.0, 1.0, 1.0, 1.0, 1.0]));
+    assert_eq!(column(&database, sql, 3), counts(&[1, 1, 2, 3, 3, 3]));
+    let ntiles = longs(&[None, None, Some(1), Some(2), Some(2), Some(2)]);
+    assert_eq!(column(&database, sql, 4), ntiles);
+    let leads = longs(&[Some(0), Some(0), Some(1), Some(2), Some(3), Some(4)]);
+    assert_eq!(column(&database, sql, 5), leads);
+    let lags = longs(&[None, Some(0), Some(1), Some(2), Some(3), Some(4)]);
+    assert_eq!(column(&database, sql, 6), lags);
+    // Over a frame of later rows `lead` steps from the current row and not from the frame.
+    let sql = "SELECT lead(i ORDER BY i) OVER w, lead(i, 2 ORDER BY i) OVER w, \
+        lag(i ORDER BY i) OVER w FROM range(6) t(i) \
+        WINDOW w AS (ORDER BY i ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING) ORDER BY i";
+    let leads = longs(&[Some(1), Some(2), Some(3), Some(4), Some(5), None]);
+    assert_eq!(column(&database, sql, 0), leads);
+    let leads = longs(&[Some(2), Some(3), Some(4), Some(5), None, None]);
+    assert_eq!(column(&database, sql, 1), leads);
+    assert_eq!(column(&database, sql, 2), longs(&[None; 6]));
+}
+
+#[test]
+fn dense_rank_refuses_an_order_and_a_shift_past_a_bigint_is_an_overflow() {
+    // Both in the pinned binary's words.
+    let database = Database::new();
     let connection = database.connect();
-    let sql = "SELECT lead(i ORDER BY i DESC) OVER (ORDER BY i) FROM t";
-    let error = connection.query(sql).expect_err("lead has no reading of this yet");
-    assert!(error.to_string().contains("ORDER BY inside the arguments"), "{error}");
+    let error = connection
+        .query("SELECT dense_rank(ORDER BY i) OVER () FROM range(3) t(i)")
+        .expect_err("refused");
+    assert!(
+        error
+            .to_string()
+            .contains("ORDER BY is not supported for the window function \"\"dense_rank\"\""),
+        "{error}"
+    );
+    let error = connection
+        .query("SELECT lead(i, 9223372036854775807 ORDER BY i DESC) OVER () FROM range(2) t(i)")
+        .expect_err("overflows");
+    assert!(
+        error.to_string().contains("Overflow in addition of INT64 (1 + 9223372036854775807)!"),
+        "{error}"
+    );
 }
 
 #[test]

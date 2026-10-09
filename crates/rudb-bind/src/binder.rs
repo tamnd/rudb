@@ -6551,13 +6551,12 @@ impl<'a> Binder<'a> {
             )));
         }
         // An `ORDER BY` inside the brackets puts the rows of the frame in a different order for
-        // this one call to read them in, which is a question every aggregate and the three that
-        // count through the frame have an answer to. The rest of the window functions read
-        // something other than the frame, and what the reference binary does with them under an
-        // order of their own is a different reading again, so they are turned down rather than
-        // guessed at. The exclusion is refused first and in the reference binary's own sentence,
-        // because that is the one it reaches for when both apply, and it is refused for `fill`
-        // too, whose order is the key it reads. Per #1204.
+        // this one call to read them in. Every aggregate and the three that count through the
+        // frame read the frame in that order, and the ranking windows, `lag` and `lead` stop
+        // reading the partition and read the frame instead, ranked by those keys. `dense_rank` is
+        // the one the reference binary turns down. The exclusion is refused first and in the
+        // reference binary's own sentence, because that is the one it reaches for when both
+        // apply, and it is refused for `fill` too, whose order is the key it reads. Per #1204.
         if !parts.inner.is_empty() && kind_of(resolved.name) == Some(FunctionKind::Window) {
             let counts = matches!(resolved.name, "first_value" | "last_value" | "nth_value");
             if !counts && parts.frame.exclude != WindowExclude::NoOthers {
@@ -6566,11 +6565,10 @@ impl<'a> Binder<'a> {
                     resolved.name
                 )));
             }
-            if !counts && resolved.name != "fill" {
-                return Err(Error::not_implemented(format!(
-                    "ORDER BY inside the arguments of the window function \"{}\"",
-                    resolved.name
-                )));
+            if resolved.name == "dense_rank" {
+                return Err(Error::binder(
+                    "ORDER BY is not supported for the window function \"\"dense_rank\"\"",
+                ));
             }
         }
         if resolved.name == "approx_top_k" {
@@ -6952,7 +6950,7 @@ impl<'a> Binder<'a> {
 
     /// Whether two bound expressions are the same expression, by shape rather than by reference.
     pub(crate) fn same_expr(&self, left: ExprRef, right: ExprRef) -> bool {
-        same_expr(&self.plan, left, right) && self.same_written_collation(left, right)
+        self.plan.same_expr(left, right) && self.same_written_collation(left, right)
     }
 }
 
@@ -7406,129 +7404,6 @@ fn top_values<'a>(name: &'a str, args: &mut Vec<ExprRef>) -> &'a str {
     let &[value, n] = &args[..] else { return name };
     *args = vec![value, value, n];
     top
-}
-
-/// Structural equality over two expressions of one plan.
-fn same_expr(plan: &Plan, left: ExprRef, right: ExprRef) -> bool {
-    if left == right {
-        return true;
-    }
-    if plan.expr_type(left) != plan.expr_type(right) {
-        return false;
-    }
-    let lists = |left, right| {
-        let left: &[ExprRef] = plan.expr_list(left);
-        let right: &[ExprRef] = plan.expr_list(right);
-        left.len() == right.len()
-            && left.iter().zip(right).all(|(&left, &right)| same_expr(plan, left, right))
-    };
-    match (plan.expr(left), plan.expr(right)) {
-        (Expr::Column(left), Expr::Column(right)) => left == right,
-        (Expr::Constant(left), Expr::Constant(right)) => {
-            plan.value(*left).identical(plan.value(*right))
-        }
-        (
-            Expr::Cast { input: left, try_cast: left_try },
-            Expr::Cast { input: right, try_cast: right_try },
-        ) => left_try == right_try && same_expr(plan, *left, *right),
-        (
-            Expr::Compare { op: left_op, left: left_a, right: left_b },
-            Expr::Compare { op: right_op, left: right_a, right: right_b },
-        ) => {
-            left_op == right_op
-                && same_expr(plan, *left_a, *right_a)
-                && same_expr(plan, *left_b, *right_b)
-        }
-        (
-            Expr::Conjunction { op: left_op, children: left_children },
-            Expr::Conjunction { op: right_op, children: right_children },
-        ) => left_op == right_op && lists(*left_children, *right_children),
-        (
-            Expr::Function { name: left_name, args: left_args },
-            Expr::Function { name: right_name, args: right_args },
-        ) => plan.string(*left_name) == plan.string(*right_name) && lists(*left_args, *right_args),
-        (
-            Expr::Aggregate {
-                name: left_name,
-                args: left_args,
-                distinct: left_distinct,
-                filter: left_filter,
-            },
-            Expr::Aggregate {
-                name: right_name,
-                args: right_args,
-                distinct: right_distinct,
-                filter: right_filter,
-            },
-        ) => {
-            plan.string(*left_name) == plan.string(*right_name)
-                && left_distinct == right_distinct
-                && match (left_filter, right_filter) {
-                    (None, None) => true,
-                    (Some(left), Some(right)) => same_expr(plan, *left, *right),
-                    _ => false,
-                }
-                && lists(*left_args, *right_args)
-        }
-        // The partition, the order and the frame are not compared here and do not need to be. Two
-        // window calls are only ever asked about when they are already in the same run, which is
-        // what agreeing on all three means.
-        (
-            Expr::Window {
-                name: left_name,
-                args: left_args,
-                distinct: left_distinct,
-                filter: left_filter,
-                ignore_nulls: left_nulls,
-                order: left_order,
-            },
-            Expr::Window {
-                name: right_name,
-                args: right_args,
-                distinct: right_distinct,
-                filter: right_filter,
-                ignore_nulls: right_nulls,
-                order: right_order,
-            },
-        ) => {
-            // The keys inside the brackets are compared, unlike the ones in the `OVER`, because two
-            // calls in the same run can still read their frame in different orders.
-            let left_keys = plan.sort_key_list(*left_order);
-            let right_keys = plan.sort_key_list(*right_order);
-            plan.string(*left_name) == plan.string(*right_name)
-                && left_distinct == right_distinct
-                && left_nulls == right_nulls
-                && left_keys.len() == right_keys.len()
-                && left_keys.iter().zip(right_keys).all(|(left, right)| {
-                    left.descending == right.descending
-                        && left.nulls_first == right.nulls_first
-                        && same_expr(plan, left.expr, right.expr)
-                })
-                && match (left_filter, right_filter) {
-                    (None, None) => true,
-                    (Some(left), Some(right)) => same_expr(plan, *left, *right),
-                    _ => false,
-                }
-                && lists(*left_args, *right_args)
-        }
-        (
-            Expr::Case { arms: left_arms, otherwise: left_otherwise },
-            Expr::Case { arms: right_arms, otherwise: right_otherwise },
-        ) => {
-            let left_arms = plan.arm_list(*left_arms);
-            let right_arms = plan.arm_list(*right_arms);
-            left_arms.len() == right_arms.len()
-                && left_arms.iter().zip(right_arms).all(|(left, right)| {
-                    same_expr(plan, left.when, right.when) && same_expr(plan, left.then, right.then)
-                })
-                && match (left_otherwise, right_otherwise) {
-                    (None, None) => true,
-                    (Some(left), Some(right)) => same_expr(plan, *left, *right),
-                    _ => false,
-                }
-        }
-        _ => false,
-    }
 }
 
 /// Whether a call is to one of the ordered-set aggregates, and whether it takes the value it reads
