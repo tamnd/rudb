@@ -1635,10 +1635,12 @@ impl<'a> Binder<'a> {
             match_by_position(&left_scope, &right_scope, operator.op)
                 .map_err(|error| error.with_fallback_span(first_column(ast, right)))?
         };
-        for (column, ty) in merged.iter_mut().zip(common) {
+        let mut declared = vec![None; merged.len()];
+        for ((column, (ty, typed)), declared) in merged.iter_mut().zip(common).zip(&mut declared) {
             if let Some(ty) = ty {
                 column.ty = ty;
             }
+            *declared = typed.map(Origin::typed);
         }
         let index = self.fresh_index();
         let all = operator.quantifier == Quantifier::All;
@@ -1692,7 +1694,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
-                origin: None,
+                origin: declared[at],
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1720,24 +1722,30 @@ impl<'a> Binder<'a> {
     /// no type of its own, so it is read with the input function of the common type, and its error
     /// is at the literal. The entry is the common type when the two sides hold different types,
     /// and `None` when they hold the same one or when the rule leaves the column to the pin.
+    ///
+    /// A side reads as the type its column declares, so a `char(n)` column is a `bpchar` and not
+    /// the `text` its value is. The second entry is the PostgreSQL type of the column when it says
+    /// more than the type of its value: the common type, with the type modifier of the two sides
+    /// when they have the same type and modifier, as `select_common_typmod` keeps it.
     fn set_op_types(
         &mut self,
         ast: &Ast,
         op: SetOp,
         mut sides: [(ast::QueryRef, NodeRef, &mut Scope); 2],
-    ) -> Result<Vec<Option<LogicalType>>> {
+    ) -> Result<Vec<(Option<LogicalType>, Option<DeclaredType>)>> {
         let width = sides[0].2.len();
         let mut common = Vec::with_capacity(width);
         'column: for at in 0..width {
             let mut written = [None; 2];
             let mut types = [None; 2];
+            let mut typmods = [None; 2];
             for (side, (query, _, scope)) in sides.iter().enumerate() {
                 let ty = &scope.columns[at].ty;
                 written[side] = written_column(ast, *query, at, scope.len());
                 let unknown = match written[side].map(|expr| ast.expr(expr)) {
                     // A parameter of no type takes the type of the other side in `conform`.
                     Some(ast::Expr::Parameter { .. }) => {
-                        common.push(None);
+                        common.push((None, None));
                         continue 'column;
                     }
                     Some(ast::Expr::Literal { kind: LiteralKind::String, .. }) => true,
@@ -1746,15 +1754,21 @@ impl<'a> Binder<'a> {
                 if unknown {
                     continue;
                 }
-                let oid = match written[side] {
-                    Some(expr) => written_oid(ast, expr, ty),
-                    None => postgres_oid(ty),
+                let declared =
+                    scope.columns[at].origin.and_then(|origin| origin.ty).filter(|declared| {
+                        rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(ty)
+                    });
+                let oid = match (declared, written[side]) {
+                    (Some(declared), _) => Some(declared.oid),
+                    (None, Some(expr)) => written_oid(ast, expr, ty),
+                    (None, None) => postgres_oid(ty),
                 };
                 let Some(oid) = oid else {
-                    common.push(None);
+                    common.push((None, None));
                     continue 'column;
                 };
                 types[side] = Some(oid);
+                typmods[side] = Some(declared.map_or(-1, |declared| declared.typmod));
             }
             let oid = rudb_pgtypes::common_type(&types).map_err(|mismatch| {
                 let first = rudb_pgtypes::format_type(mismatch.first);
@@ -1767,9 +1781,20 @@ impl<'a> Binder<'a> {
                     .with_span(span)
             })?;
             let Some(target) = rudb_pgtypes::logical_type(oid) else {
-                common.push(None);
+                common.push((None, None));
                 continue;
             };
+            // A side of another type, or one of no type, leaves the column with no modifier.
+            let typmod = match (types, typmods) {
+                ([Some(left), Some(right)], [Some(one), Some(other)])
+                    if left == oid && right == oid && one == other =>
+                {
+                    one
+                }
+                _ => -1,
+            };
+            let declared = (Some(oid) != postgres_oid(&target) || typmod != -1)
+                .then_some(DeclaredType { oid, typmod });
             for (side, (_, node, scope)) in sides.iter_mut().enumerate() {
                 let Some(expr) = written[side] else { continue };
                 if scope.columns[at].ty == target {
@@ -1796,7 +1821,7 @@ impl<'a> Binder<'a> {
             // Two nulls are the common type too, which is `text`.
             let (one, other) = (&sides[0].2.columns[at].ty, &sides[1].2.columns[at].ty);
             let same = one == other && *one != LogicalType::Null;
-            common.push(if same { None } else { Some(target) });
+            common.push((if same { None } else { Some(target) }, declared));
         }
         Ok(common)
     }
@@ -5946,18 +5971,31 @@ impl<'a> Binder<'a> {
             return self.call("/", vec![total, count]);
         }
         let column = self.aggregate_call(&name, &cast, distinct, filter, ty)?;
-        // PostgreSQL sums an `int2` or an `int4` into an `int8` and a `float4` into a `float4`,
-        // where the pin sums them into a HUGEINT and a DOUBLE.
-        if postgres && !exporting && resolved.name == "sum" {
-            match types.first() {
-                Some(LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer) => {
-                    return Ok(self.cast_to(column, &LogicalType::BigInt));
-                }
-                Some(LogicalType::Float) => return Ok(self.cast_to(column, &LogicalType::Float)),
-                _ => {}
-            }
+        if exporting {
+            return Ok(column);
         }
-        Ok(column)
+        Ok(self.summed_as_postgres(resolved.name, &types, column))
+    }
+
+    /// A `sum` with the type PostgreSQL gives it, over a group or over a window. PostgreSQL sums an
+    /// `int2` or an `int4` into an `int8` and a `float4` into a `float4`, where the pin sums them
+    /// into a HUGEINT and a DOUBLE. Any other call is the column as it is.
+    fn summed_as_postgres(
+        &mut self,
+        name: &str,
+        types: &[LogicalType],
+        column: ExprRef,
+    ) -> ExprRef {
+        if self.semantics.aggregate_types() != AggregateTypes::Postgres || name != "sum" {
+            return column;
+        }
+        match types.first() {
+            Some(LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer) => {
+                self.cast_to(column, &LogicalType::BigInt)
+            }
+            Some(LogicalType::Float) => self.cast_to(column, &LogicalType::Float),
+            _ => column,
+        }
     }
 
     /// The column of the aggregate output that holds the call `name` over `args`. Two identical
@@ -6417,7 +6455,7 @@ impl<'a> Binder<'a> {
         let index = self.windows.last().expect("the run was just filed").index;
         let column = self.column(index, at, ty);
         self.carry_collation(call, column)?;
-        Ok(column)
+        Ok(self.summed_as_postgres(resolved.name, &types, column))
     }
 
     /// Files a call under the run that matches it, or opens a new run, and says which column it is.

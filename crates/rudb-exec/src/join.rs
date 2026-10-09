@@ -87,7 +87,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_common::stage::{self, Stage};
 use rudb_common::{
-    Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, Value,
+    Cancel, Error, LogicalType, Memory, Reservation, Result, Session, SessionTimeZone, SqlState,
+    Value,
 };
 use rudb_kernels::{Connective, combine, is_true};
 use rudb_metrics::{Algorithm, Counters, Declined, Joined};
@@ -2606,12 +2607,16 @@ fn unaddressable() -> Error {
     Error::internal("a join gathered more rows than it can address")
 }
 
-/// What a scalar subquery says when it turns out not to be scalar.
+/// What a scalar subquery says when it turns out not to be scalar, in the words of the pin or of
+/// `ExecScanSubPlan`.
 fn too_many_rows() -> Error {
     Error::invalid_input(
         "More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.\n\nUse \"SET scalar_subquery_error_on_multiple_rows=false\" to revert to previous behavior of returning a random row."
             .to_string(),
     )
+    .state(SqlState::CARDINALITY_VIOLATION)
+    .pg("more than one row returned by a subquery used as an expression")
+    .unplaced()
 }
 
 /// The expressions a join's equalities line up, one pair per equality.
