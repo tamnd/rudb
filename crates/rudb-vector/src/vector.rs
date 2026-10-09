@@ -5313,6 +5313,22 @@ fn gather_widened<T: Copy + Into<i64>>(
     if !below(at, run.len()) {
         return false;
     }
+    // Rows far apart are what a join hands back through a link or a hash table, and each of them
+    // misses the cache, so the line is asked for some rows ahead as in `picked`. On q16 that was
+    // the wait on `ps_partkey` for the parts the probe found.
+    let spread = match (at.first(), at.last()) {
+        (Some(&first), Some(&last)) => first.abs_diff(last) as usize >= at.len().saturating_mul(4),
+        _ => false,
+    };
+    if spread {
+        out.extend(at.iter().enumerate().map(|(place, &row)| {
+            if let Some(&ahead) = at.get(place + PREFETCH_AHEAD) {
+                prefetch(run, ahead as usize);
+            }
+            run[row as usize].into()
+        }));
+        return true;
+    }
     out.extend(at.iter().map(|&row| run[row as usize].into()));
     true
 }
