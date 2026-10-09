@@ -16,7 +16,7 @@ At SF1 on server2 against main at #2899, one thread. Across all 22 queries only 
 
 | query | aggregate | main | this change |
 | --- | --- | --- | --- |
-| q17 | grouped by `l_partkey` | 1.15 to 1.32ms, most near 1.17 | 0.54 to 0.65ms, most near 0.61 |
+| q17 | grouped by `l_partkey` | 1.15 to 1.55ms, most near 1.17 | 0.54 to 0.93ms, most near 0.61 |
 | q02 | grouped by `ps_partkey` | 120 to 350us | 120 to 350us |
 
 Instructions a run are 77,439 thousand before and 77,327 after on q17, and 23,548 and 23,639 on q02. The answers to all 22 queries are the same bytes as before at one thread and at six.
