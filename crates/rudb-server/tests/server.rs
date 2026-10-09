@@ -1487,6 +1487,61 @@ fn the_temporary_objects_of_a_session_go_when_it_ends() {
     server.stop().unwrap();
 }
 
+/// `ORDER BY ... USING op` sorts as the btree family that has the operator as its `<` or its `>`,
+/// in a query, in a window and in an aggregate, and another operator is the error of PostgreSQL.
+#[test]
+fn an_order_by_using_sorts_as_the_operator_family() {
+    let dirs = Dirs::new("pgusing");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client
+        .query("create temp table sorted (a int, b text); insert into sorted values (1, 'x'), (3, 'y'), (null, 'z'), (2, null)");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for (sql, value) in [
+        (
+            "select string_agg(coalesce(a::text, 'n'), ',') from (select a from sorted order by a using >) s",
+            "n,3,2,1",
+        ),
+        (
+            "select string_agg(coalesce(a::text, 'n'), ',') from (select a from sorted order by a using <) s",
+            "1,2,3,n",
+        ),
+        ("select string_agg(b, ',' order by b using ~>~) from sorted", "z,y,x"),
+        (
+            "select string_agg(a::text, ',' order by a using operator(pg_catalog.>)) from sorted",
+            "3,2,1",
+        ),
+        (
+            "select string_agg(r::text, ',') from (select row_number() over (order by a using > nulls last) as r from sorted order by a) s",
+            "3,2,1,4",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    for (sql, state, message, position) in [
+        (
+            "select a from sorted order by a using =",
+            "42809",
+            "operator = is not a valid ordering operator",
+            "39",
+        ),
+        (
+            "select a from sorted order by a using @@",
+            "42883",
+            "operator does not exist: integer @@ integer",
+            "39",
+        ),
+    ] {
+        let messages = client.query(sql);
+        let error = messages.iter().find(|message| message.tag == b'E').unwrap();
+        assert_eq!(error.field(b'C').unwrap(), state, "{sql}");
+        assert_eq!(error.field(b'M').unwrap(), message);
+        assert_eq!(error.field(b'P').unwrap(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// A string compared with a `name` column is a `name`, so the input of `name` cuts it to 63 bytes
 /// before the comparison, as in PostgreSQL.
 #[test]

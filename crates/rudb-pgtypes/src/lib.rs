@@ -167,7 +167,10 @@ pub use numeric::{
     Numeric, NumericSign, decimal_out, decimal_send, numeric_in, numeric_out, numeric_out_sci,
     numeric_recv, numeric_send,
 };
-pub use opclasses::{Opclass, binary_coercible, default_opclass, has_equality, has_ordering};
+pub use opclasses::{
+    Amop, Opclass, OrderingOperator, binary_coercible, default_opclass, equality_for_ordering,
+    has_equality, has_ordering, ordering_operator,
+};
 pub use operators::{Operator, hashable, operators, operators_of};
 pub use param::{
     InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,

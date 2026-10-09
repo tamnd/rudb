@@ -347,6 +347,10 @@ fn order(ast: &Ast, item: &OrderItem) -> String {
         Order::Unstated => {}
         Order::Ascending => out += " ASC",
         Order::Descending => out += " DESC",
+        Order::Using { operator, .. } => {
+            out += " USING ";
+            out += ast.string(operator);
+        }
     }
     match item.nulls {
         Nulls::Unstated => {}

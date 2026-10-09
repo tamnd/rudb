@@ -786,6 +786,8 @@ impl RangeRead {
             ast::Order::Unstated => None,
             ast::Order::Ascending => Some(false),
             ast::Order::Descending => Some(true),
+            // The operator decides the direction, and only the binder knows the operator.
+            ast::Order::Using { .. } => return None,
         };
         let limit = match ast.expr(query.limit) {
             ast::Expr::Literal { kind: ast::LiteralKind::Number, text } => {

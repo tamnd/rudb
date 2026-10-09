@@ -19,7 +19,7 @@
 use std::fmt::Write as _;
 
 use crate::ast::{
-    Ast, ConflictAction, Distinct, Expr, ExprRef, Insert, LiteralKind, OrderItem, QueryBody,
+    Ast, ConflictAction, Distinct, Expr, ExprRef, Insert, LiteralKind, Order, OrderItem, QueryBody,
     QueryRef, Slice, Source, SourceRef, Statement, StrRef, Target, WindowBound, WindowRef,
 };
 use crate::matcher::NONE;
@@ -102,7 +102,15 @@ impl Shape<'_> {
     fn order(&self, items: &[OrderItem]) -> String {
         let items: Vec<String> = items
             .iter()
-            .map(|item| format!("{} {:?} {:?}", self.expr(item.expr), item.order, item.nulls))
+            .map(|item| {
+                let order = match item.order {
+                    Order::Using { operator, .. } => {
+                        format!("Using({})", self.ast.string(operator))
+                    }
+                    order => format!("{order:?}"),
+                };
+                format!("{} {order} {:?}", self.expr(item.expr), item.nulls)
+            })
             .collect();
         format!("[{}]", items.join(", "))
     }

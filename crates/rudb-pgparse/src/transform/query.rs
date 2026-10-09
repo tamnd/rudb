@@ -168,12 +168,16 @@ impl Transform<'_> {
         let Node::SortBy(sort) = node else {
             return Err(not_yet(node));
         };
-        let SortBy { node, sortby_dir, sortby_nulls, .. } = &**sort;
+        let SortBy { node, sortby_dir, sortby_nulls, useOp, location } = &**sort;
         let order = match *sortby_dir {
             SortByDir::SORTBY_ASC => Order::Ascending,
             SortByDir::SORTBY_DESC => Order::Descending,
             SortByDir::SORTBY_DEFAULT => Order::Unstated,
-            _ => return clause("SortByUsing"),
+            SortByDir::SORTBY_USING => {
+                let symbol = Self::symbol(useOp)?;
+                Order::Using { operator: self.intern(symbol), span: self.at(*location) }
+            }
+            _ => return clause("SortBy"),
         };
         let nulls = match *sortby_nulls {
             SortByNulls::SORTBY_NULLS_FIRST => Nulls::First,

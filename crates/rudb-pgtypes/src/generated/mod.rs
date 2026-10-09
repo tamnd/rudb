@@ -4,6 +4,8 @@
 //! tables from the files in `crates/rudb-pgtypes/vendor`, and `cargo xtask pg-check` fails the
 //! gate if the two disagree.
 
+#[rustfmt::skip]
+pub(crate) mod amops;
 pub(crate) mod casts;
 #[rustfmt::skip]
 pub(crate) mod collations;

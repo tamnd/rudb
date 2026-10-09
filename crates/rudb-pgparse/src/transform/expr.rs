@@ -239,7 +239,7 @@ impl Transform<'_> {
 
     /// The symbol of an operator name. A name with a schema is valid only when the schema is
     /// `pg_catalog`, which is where the operators of the dialect are.
-    fn symbol(name: &List) -> Made<&str> {
+    pub(super) fn symbol(name: &List) -> Made<&str> {
         match Self::strings(name)?[..] {
             [symbol] | ["pg_catalog", symbol] => Ok(symbol),
             _ => clause("QualifiedOperator"),

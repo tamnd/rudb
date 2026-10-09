@@ -1365,7 +1365,8 @@ impl Session {
     ///
     /// A PostgreSQL session also takes the rules of PostgreSQL for division: `/` of two integers
     /// is an integer, and a zero divisor is an error for every type. It takes the rule of
-    /// PostgreSQL for the values of an `INSERT`, and it compares identifiers byte for byte. Its
+    /// PostgreSQL for the values of an `INSERT`, and it compares identifiers byte for byte. Nulls
+    /// are high, so an unstated order puts them last when ascending and first when descending. Its
     /// `TimeZone` is the zone of the session, see [`SessionTimeZone::of_postgres`].
     pub fn set_postgres(&mut self, postgres: Option<Arc<Postgres>>) {
         if let Some(postgres) = &postgres
@@ -1414,6 +1415,7 @@ impl Session {
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
+            self.semantics.default_null_order = DefaultNullOrder::Postgres;
         }
         self.postgres = Postgreses(postgres);
     }

@@ -1013,6 +1013,9 @@ pub enum Order {
     Ascending,
     /// `DESC` or `DESCENDING`.
     Descending,
+    /// `USING op` of PostgreSQL: the order of the operator, which the binder finds as the `<` or
+    /// the `>` of a btree operator family. The span is the span of the operator.
+    Using { operator: StrRef, span: Span },
 }
 
 /// Null placement in a sort.

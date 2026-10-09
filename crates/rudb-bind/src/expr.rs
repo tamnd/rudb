@@ -4719,11 +4719,15 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 .iter()
                 .map(|item| {
                     let mut key = describe(ast, item.expr, semantics);
-                    key += match item.order {
-                        ast::Order::Unstated => "",
-                        ast::Order::Ascending => " ASC",
-                        ast::Order::Descending => " DESC",
-                    };
+                    match item.order {
+                        ast::Order::Unstated => {}
+                        ast::Order::Ascending => key += " ASC",
+                        ast::Order::Descending => key += " DESC",
+                        ast::Order::Using { operator, .. } => {
+                            key += " USING ";
+                            key += ast.string(operator);
+                        }
+                    }
                     key += match item.nulls {
                         ast::Nulls::Unstated => "",
                         ast::Nulls::First => " NULLS FIRST",
