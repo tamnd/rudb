@@ -493,6 +493,18 @@ impl Frequencies for Common {
         }
     }
 
+    fn most(&self, column: usize) -> Option<u64> {
+        let (entries, omitted_max) = self.reader.held_prefix(column).ok()??;
+        // The list is in no order this can lean on once the null entry is in it, so the largest
+        // count is looked for rather than read off the front.
+        let listed = entries
+            .iter()
+            .filter(|(value, _)| !matches!(value, Value::Null))
+            .map(|&(_, count)| count)
+            .max();
+        Some(listed.unwrap_or(0).max(omitted_max))
+    }
+
     #[expect(clippy::cast_precision_loss, reason = "counts are weights here and not identities")]
     fn skew(&self, column: usize) -> Option<(f64, u64)> {
         let (entries, omitted_max) = self.reader.held_prefix(column).ok()??;

@@ -740,6 +740,21 @@ pub trait Frequencies: std::fmt::Debug + Send + Sync {
     /// [`rows_with`]: Self::rows_with
     fn remainder(&self, column: usize) -> Option<Remainder>;
 
+    /// The most rows any one value of the column holds, nulls left out.
+    ///
+    /// The largest count the synopsis lists, or the bound it keeps on every value it left out where
+    /// that is larger. It is a fact about the column rather than an estimate, so a join can be held
+    /// under it: a row on one side of an equality meets no more rows on the other side than the
+    /// value it carries holds there. JOB 20a joins six people to `name` on its key and the
+    /// containment reading put that at all 4,167,491 rows of `name`, where the key holds one row
+    /// per value and the join can make six.
+    ///
+    /// `None` for a column with no synopsis.
+    fn most(&self, column: usize) -> Option<u64> {
+        let _ = column;
+        None
+    }
+
     /// How many times more rows a value somebody named holds than the average value does.
     ///
     /// A filter names the values it keeps, and the values people name are the ones that turn up.

@@ -108,6 +108,15 @@ impl Frequencies for Held {
         }
     }
 
+    fn most(&self, column: usize) -> Option<u64> {
+        let Some((_, Some(held))) = self.columns.get(column) else {
+            return None;
+        };
+        // Complete, so the largest count in it is the largest the column has.
+        let most = held.iter().filter(|(value, _)| !value.is_null()).map(|&(_, count)| count).max();
+        Some(most.unwrap_or(0))
+    }
+
     fn remainder(&self, _column: usize) -> Option<Remainder> {
         // Never. A list here is complete or it is absent, so there is nothing outside one for a
         // caller to divide the rows of. `tally.rs` has why a streaming pass cannot produce the other
