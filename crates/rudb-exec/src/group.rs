@@ -6241,10 +6241,18 @@ enum BigIntDistinct {
 }
 
 /// How many values a distinct set keeps in a run before it becomes a hash table.
-const FEW_DISTINCT: usize = 16;
+///
+/// Fifteen, so that the run and its length are two cache lines exactly, see [`FewDistinct`].
+const FEW_DISTINCT: usize = 15;
 
 /// The run of a [`BigIntDistinct`] that has more than one value and no more than [`FEW_DISTINCT`].
+///
+/// The length first and the run on a cache line of its own, so that the length and the first seven
+/// values are one line. Laid out as the compiler chose, the length went after the values on a line
+/// of its own, and giving a set its values read the length and then the values, two misses a set
+/// where TPC-H q16 has six values a set and one miss would have held them all.
 #[derive(Debug)]
+#[repr(C, align(64))]
 struct FewDistinct {
     len: usize,
     values: [i64; FEW_DISTINCT],
@@ -6277,6 +6285,8 @@ struct HeldDistinct {
     values: Vec<(u32, i64)>,
     /// Where the sort puts them, kept so that giving them out allocates nothing.
     spare: Vec<(u32, i64)>,
+    /// Where each set's values start in the sort, kept for the same reason.
+    starts: Vec<u32>,
 }
 
 impl HeldDistinct {
@@ -6319,7 +6329,7 @@ impl HeldDistinct {
         if self.values.is_empty() {
             return Ok(0);
         }
-        by_set(&mut self.values, &mut self.spare, seen.len());
+        by_set(&mut self.values, &mut self.spare, &mut self.starts, seen.len());
         // A set's values sit together after the sort, so the set and its accumulator are found once
         // for the run of them rather than once a value. A COUNT is told how many were new once at
         // the end of the run, which is what it would have counted one value at a time.
@@ -6359,10 +6369,38 @@ impl HeldDistinct {
 
 /// Sorts held values by their set and keeps the order they came in within each set.
 ///
-/// A byte of the set at a time from the lowest, each pass a count and a scatter, which is stable,
-/// so the order within a set is the order of the rows. There are only as many passes as the number
-/// of sets has bytes, two for the 18,314 of TPC-H q16.
-fn by_set(values: &mut Vec<(u32, i64)>, spare: &mut Vec<(u32, i64)>, sets: usize) {
+/// With no more sets than values it is one count of each set and one scatter, which is stable, so
+/// the order within a set is the order of the rows. Otherwise it is a byte of the set at a time from
+/// the lowest, each pass a count and a scatter, as many passes as the number of sets has bytes.
+/// TPC-H q16 gives 65,536 values at a time to 18,314 sets, which was two passes a byte at a time,
+/// and each scatter wrote every value to a cache line it then missed on.
+fn by_set(
+    values: &mut Vec<(u32, i64)>,
+    spare: &mut Vec<(u32, i64)>,
+    starts: &mut Vec<u32>,
+    sets: usize,
+) {
+    if sets <= values.len() && u32::try_from(values.len()).is_ok() {
+        starts.clear();
+        starts.resize(sets + 1, 0);
+        for &(set, _) in values.iter() {
+            starts[set as usize] += 1;
+        }
+        let mut next = 0;
+        for start in starts.iter_mut() {
+            let count = *start;
+            *start = next;
+            next += count;
+        }
+        spare.resize(values.len(), (0, 0));
+        for &held in values.iter() {
+            let at = &mut starts[held.0 as usize];
+            spare[*at as usize] = held;
+            *at += 1;
+        }
+        std::mem::swap(values, spare);
+        return;
+    }
     let bits = usize::BITS - sets.leading_zeros();
     let mut shift = 0;
     while shift < bits.min(u32::BITS) {
@@ -9782,7 +9820,15 @@ mod tests {
         let mut expected = values.clone();
         expected.sort_by_key(|&(set, _)| set);
         let mut spare = Vec::new();
-        by_set(&mut values, &mut spare, 1500);
+        by_set(&mut values, &mut spare, &mut Vec::new(), 1500);
+        assert_eq!(values, expected);
+        // More sets than values, which sorts a byte at a time.
+        let mut values: Vec<(u32, i64)> = (0..5000_i64)
+            .map(|at| (u32::try_from(at * 7919 % 70_000).expect("a small set"), at))
+            .collect();
+        let mut expected = values.clone();
+        expected.sort_by_key(|&(set, _)| set);
+        by_set(&mut values, &mut spare, &mut Vec::new(), 70_000);
         assert_eq!(values, expected);
     }
 
