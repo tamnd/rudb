@@ -20,6 +20,17 @@
 //! any other and hands its own keys to the scan it drives, so what the scan reads is a test of five
 //! nation keys per row.
 //!
+//! The same join leaves a second gap the other way round. A runtime filter only ever goes down the
+//! driving side, so the scan under the gathered side is never reached by one, and in q05 that scan
+//! is supplier. Once the join order takes the equivalence class of the nation keys into account,
+//! the second equality reads `s_nationkey = n_nationkey`, with nation joined to region under the
+//! filter on Asia on the driving side. All 10,000 suppliers went into the hash table where the
+//! 2,003 of Asia would have done, and the key bitmap that table hands the lineitem scan held five
+//! times the keys it needed. So the pass tries each equality both ways, and over the supplier scan
+//! goes a semi join against a copy of the nation and region join, on the same columns. The scan
+//! under the driving side is tried first, and the gathered side only when the driving side does not
+//! take one.
+//!
 //! # Why it is the same query
 //!
 //! The join is an inner join, so a row with no match on the other side is not in the answer. The
@@ -27,9 +38,11 @@
 //! projections that pass the column through, and none of them changes the column's value or adds a
 //! row that was not built from a scan row. So a scan row whose key the other side does not hold
 //! only ever reaches the join in rows carrying that key, and every one of them is dropped there.
-//! Dropping it at the scan is the same answer. A null key matches nothing under `=` at either
-//! place. The copy is the same relation as the original only if reading it twice reads the same
-//! rows, so a side with anything volatile in it is refused.
+//! Dropping it at the scan is the same answer. The other way round swaps the two sides and nothing
+//! else: the scan is under the gathered side, the copy is of a part of the driving side, and the
+//! join drops a gathered row whose key no driving row holds just the same. A null key matches
+//! nothing under `=` at either place. The copy is the same relation as the original only if reading
+//! it twice reads the same rows, so a side with anything volatile in it is refused.
 //!
 //! # What it refuses
 //!
@@ -132,28 +145,48 @@ fn matched(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<Reach> {
         let (&Expr::Column(was), &Expr::Column(is)) = (plan.expr(one), plan.expr(other)) else {
             continue;
         };
-        let (key, held, table) = if near.contains(was.table) && far.contains(is.table) {
-            (was, other, is.table)
+        let ((key, keyed), (held, holding)) = if near.contains(was.table) && far.contains(is.table)
+        {
+            ((was, one), (is, other))
         } else if near.contains(is.table) && far.contains(was.table) {
-            (is, one, was.table)
+            ((is, other), (was, one))
         } else {
             continue;
         };
-        if reached(plan, driving, key) {
-            continue;
+        if !reached(plan, driving, key)
+            && let Some(found) =
+                toward(plan, stats, condition, (driving, key), (gathered, held, holding))
+        {
+            return Some(found);
         }
-        let Some((scan, key)) = scanned(plan, driving, key) else { continue };
-        let Some(reads) = estimate::rows(plan, scan, stats) else { continue };
-        let wanted = TableSet::of(table);
-        let source = descent(plan, gathered, &wanted).into_iter().rev().find(|&at| {
-            copyable(plan, at)
-                && estimate::side(plan, at, stats).is_some_and(|side| side.rows < side.base)
-                && scans(plan, at, stats).is_some_and(|rows| rows.saturating_mul(WORTH_IT) <= reads)
-        });
-        let Some(source) = source else { continue };
-        return Some(Reach { scan, key, source, held, condition });
+        // The other way round: the gathered side is never reached by this join's runtime filter, so
+        // its scan takes the keys the driving side holds whenever they are a short list.
+        if let Some(found) = toward(plan, stats, condition, (gathered, held), (driving, key, keyed))
+        {
+            return Some(found);
+        }
     }
     None
+}
+
+/// The semi join over the scan of `key` under `side`, against a copy of the part of `other` that
+/// holds `held`, or nothing when no part of it restricts the keys for less than it costs.
+fn toward(
+    plan: &Plan,
+    stats: &Facts,
+    condition: ExprRef,
+    (side, key): (NodeRef, ColumnBinding),
+    (other, column, held): (NodeRef, ColumnBinding, ExprRef),
+) -> Option<Reach> {
+    let (scan, key) = scanned(plan, side, key)?;
+    let reads = estimate::rows(plan, scan, stats)?;
+    let wanted = TableSet::of(column.table);
+    let source = descent(plan, other, &wanted).into_iter().rev().find(|&at| {
+        copyable(plan, at)
+            && estimate::side(plan, at, stats).is_some_and(|side| side.rows < side.base)
+            && scans(plan, at, stats).is_some_and(|rows| rows.saturating_mul(WORTH_IT) <= reads)
+    })?;
+    Some(Reach { scan, key, source, held, condition })
 }
 
 /// Whether a runtime filter from a join over `at` reaches the scan of `key`.
@@ -342,5 +375,30 @@ mod tests {
             "    Get memory.main.t AS t #2 [k::INTEGER, b::INTEGER]\n",
         );
         assert_eq!(reached(text), text);
+    }
+
+    #[test]
+    fn a_scan_on_the_gathered_side_gets_the_keys_of_the_driving_side() {
+        assert_eq!(
+            reached(concat!(
+                "Join INNER on=[(#1.0::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+                "  Join INNER on=[(#0.0::INTEGER = #1.1::INTEGER)::BOOLEAN]\n",
+                "    Get memory.main.t AS t #0 [k::INTEGER, n::INTEGER]\n",
+                "    Filter (#1.1::INTEGER = 3::INTEGER)::BOOLEAN\n",
+                "      Get memory.main.u AS u #1 [k::INTEGER, b::INTEGER]\n",
+                "  Get memory.main.w AS w #2 [k::INTEGER, v::INTEGER]\n",
+            )),
+            concat!(
+                "Join INNER on=[(#1.0::INTEGER = #2.0::INTEGER)::BOOLEAN]\n",
+                "  Join INNER on=[(#0.0::INTEGER = #1.1::INTEGER)::BOOLEAN]\n",
+                "    Get memory.main.t AS t #0 [k::INTEGER, n::INTEGER]\n",
+                "    Filter (#1.1::INTEGER = 3::INTEGER)::BOOLEAN\n",
+                "      Get memory.main.u AS u #1 [k::INTEGER, b::INTEGER]\n",
+                "  Join SEMI on=[(#2.0::INTEGER = #3.0::INTEGER)::BOOLEAN]\n",
+                "    Get memory.main.w AS w #2 [k::INTEGER, v::INTEGER]\n",
+                "    Filter (#3.1::INTEGER = 3::INTEGER)::BOOLEAN\n",
+                "      Get memory.main.u AS u #3 [k::INTEGER, b::INTEGER]\n",
+            )
+        );
     }
 }
