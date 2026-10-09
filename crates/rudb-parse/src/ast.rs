@@ -1908,10 +1908,10 @@ pub struct Ast {
     /// The `WITHIN GROUP` calls written with an `OVER` after them, which PostgreSQL refuses once
     /// it knows the name is an ordered-set aggregate.
     pub windowed_within_groups: Vec<ExprRef>,
-    /// The calls written with `RESPECT NULLS` or `IGNORE NULLS` after them, which is where
-    /// PostgreSQL puts the null treatment. PostgreSQL refuses either one on a call that is not a
-    /// window function that reads values, so the binder needs to know that `RESPECT NULLS` was
-    /// written even though it is the default.
+    /// The calls written with `RESPECT NULLS` or `IGNORE NULLS`, after them where PostgreSQL puts
+    /// the null treatment and inside the brackets where DuckDB does. Both refuse either one on a
+    /// call that does not read values the way the treatment means, so the binder needs to know
+    /// that `RESPECT NULLS` was written even though it is the default.
     pub null_treated: Vec<ExprRef>,
     /// The windows written in a `WINDOW` clause, in the order they were written in. PostgreSQL
     /// numbers the keys of these before the keys of the windows written in an `OVER`, and the

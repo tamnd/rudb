@@ -6386,6 +6386,9 @@ impl<'a> Transform<'a> {
                 order: inner,
                 spec,
             });
+            if nulls != NONE {
+                self.ast.null_treated.push(call);
+            }
             self.keep_names(call, placed, unplaced);
             return Ok(call);
         }

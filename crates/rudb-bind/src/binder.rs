@@ -6583,9 +6583,11 @@ impl<'a> Binder<'a> {
         let types: Vec<LogicalType> =
             parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         // Upstream refuses this once the arguments are bound and before it looks for an overload,
-        // so it is said even of an aggregate the arguments do not fit. PostgreSQL looks for the
-        // function first, and refuses `RESPECT NULLS` too.
-        if !postgres && ignore_nulls && kind_of(name) == Some(FunctionKind::Aggregate) {
+        // so it is said even of an aggregate the arguments do not fit. Both words are refused,
+        // although `RESPECT NULLS` is what an aggregate does anyway, because the refusal is of the
+        // clause and not of what it asks for. PostgreSQL looks for the function first.
+        let treated = ignore_nulls || ast.null_treated(call);
+        if !postgres && treated && kind_of(name) == Some(FunctionKind::Aggregate) {
             return Err(Error::binder(
                 "RESPECT/IGNORE NULLS is not supported for windowed aggregates",
             ));
@@ -6597,7 +6599,7 @@ impl<'a> Binder<'a> {
             resolved => resolved?,
         };
         if postgres
-            && (ignore_nulls || ast.null_treated(call))
+            && treated
             && let Some(error) = overcall::treated_window(name)
         {
             return Err(error);
@@ -6609,7 +6611,7 @@ impl<'a> Binder<'a> {
             let order = if parts.inner.is_empty() { &parts.order } else { &parts.inner };
             let keys: Vec<LogicalType> =
                 order.iter().map(|key| self.plan.expr_type(key.expr).clone()).collect();
-            refuse_fill(&types[0], &keys, distinct, ignore_nulls)?;
+            refuse_fill(&types[0], &keys, distinct, treated)?;
         }
         // Upstream's sentence, doubled quotes and all. A DISTINCT over an aggregate inside an OVER
         // is ordinary and answered, and a DISTINCT over a ranking window is refused there, because
@@ -7420,12 +7422,12 @@ fn subtractable(ty: &LogicalType, ordering: bool) -> bool {
 /// before the sort key is counted, and a `fill` with `DISTINCT` and no `ORDER BY` complains about
 /// the `ORDER BY`, so the count comes before the clauses. `IGNORE NULLS` is refused here rather
 /// than being answered as a no-op, since there is nothing for it to skip: `fill` is the one window
-/// whose whole job is the nulls.
+/// whose whole job is the nulls. `RESPECT NULLS` is refused with it in the same sentence.
 fn refuse_fill(
     argument: &LogicalType,
     order: &[LogicalType],
     distinct: bool,
-    ignore_nulls: bool,
+    treated: bool,
 ) -> Result<()> {
     if !subtractable(argument, false) {
         return Err(Error::binder("FILL argument must support subtraction"));
@@ -7441,7 +7443,7 @@ fn refuse_fill(
             "DISTINCT is not implemented for the window function \"\"fill\"\"",
         ));
     }
-    if ignore_nulls {
+    if treated {
         return Err(Error::binder(
             "RESPECT/IGNORE NULLS is not supported for the window function \"fill\"",
         ));
