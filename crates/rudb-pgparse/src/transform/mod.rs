@@ -33,6 +33,7 @@ use rudb_parse::ast::{
 use rudb_parse::build::Interner;
 
 use crate::nodes::{CTEMaterialize, ExplainStmt, List, Node, RawStmt, VacuumStmt};
+use query::{Place, SelfRead};
 
 /// Why [`transform`] did not give a tree.
 #[derive(Debug)]
@@ -194,12 +195,15 @@ struct Transform<'a> {
     defined: Vec<String>,
     /// How many queries deep the query being transformed is, counting itself.
     depth: usize,
-    /// The slots of the recursive definitions whose own query is being transformed.
-    recursing: Vec<u32>,
-    /// Each read of a recursive definition from inside its own query, with the slot, the span and
-    /// how many queries were made before the read. The count tells the non-recursive term from the
-    /// recursive term, because the left query of the `UNION` is made before its right query.
-    self_reads: Vec<(u32, Span, u32)>,
+    /// The slots of the recursive definitions whose own query is being transformed, each with the
+    /// depth of that query and the number of places around the definition, which are not places
+    /// inside its query.
+    recursing: Vec<(u32, usize, usize)>,
+    /// Each read of a recursive definition from inside its own query.
+    self_reads: Vec<SelfRead>,
+    /// The places around the node being transformed that PostgreSQL does not let a recursive
+    /// definition read itself from, outermost first.
+    places: Vec<Place>,
 }
 
 impl<'a> Transform<'a> {
@@ -216,6 +220,7 @@ impl<'a> Transform<'a> {
             depth: 0,
             recursing: Vec::new(),
             self_reads: Vec::new(),
+            places: Vec::new(),
         }
     }
 
@@ -446,6 +451,110 @@ mod tests {
         assert_eq!(
             error("with recursive r as (select 1 union select 2 order by 1) select 1 from r"),
             "ok"
+        );
+    }
+
+    /// The cases of `with.sql` and more, with the message and the column of the caret that
+    /// PostgreSQL gives.
+    #[test]
+    fn a_definition_that_reads_itself_is_checked_the_way_postgres_checks_it() {
+        let refused = |sql: &str| {
+            let Err(Refused::Error(error)) = transform(sql) else {
+                panic!("{sql} should be refused")
+            };
+            let column = error.span().map(|span| sql[..span.start as usize].chars().count() + 1);
+            (error.message().to_string(), column)
+        };
+        let cases: &[(&str, &str, Option<usize>)] = &[
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 1 INTERSECT SELECT n+1 FROM x) SELECT * FROM x",
+                "recursive query \"x\" does not have the form non-recursive-term UNION [ALL] recursive-term",
+                Some(16),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT n FROM x UNION ALL SELECT 1) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within its non-recursive term",
+                Some(39),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (WITH x1 AS (SELECT 1 FROM x) SELECT 0 UNION SELECT * FROM x1) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within a subquery",
+                Some(51),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 0 UNION SELECT 1 ORDER BY (SELECT n FROM x)) SELECT * FROM x",
+                "ORDER BY in a recursive query is not implemented",
+                Some(58),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT x.n+1 FROM y LEFT JOIN x ON x.n = y.a) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within an outer join",
+                Some(74),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT x.n+1 FROM x RIGHT JOIN y ON x.n = y.a) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within an outer join",
+                Some(62),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT x.n+1 FROM x FULL JOIN y ON x.n = y.a) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within an outer join",
+                Some(62),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n IN (SELECT * FROM x)) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within a subquery",
+                Some(88),
+            ),
+            (
+                "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x LIMIT 10 OFFSET 1) SELECT * FROM x",
+                "OFFSET in a recursive query is not implemented",
+                Some(78),
+            ),
+            (
+                "WITH RECURSIVE x(id) AS (VALUES (1) UNION ALL SELECT (SELECT * FROM x) FROM x WHERE id < 5) SELECT * FROM x",
+                "recursive reference to query \"x\" must not appear within a subquery",
+                Some(69),
+            ),
+            (
+                "WITH RECURSIVE foo(i) AS (VALUES (1) UNION ALL (SELECT i+1 FROM foo WHERE i < 10 UNION ALL SELECT i+1 FROM foo WHERE i < 5)) SELECT * FROM foo",
+                "recursive reference to query \"foo\" must not appear more than once",
+                Some(108),
+            ),
+            (
+                "WITH RECURSIVE foo(i) AS (VALUES (1) UNION ALL (SELECT i+1 FROM foo WHERE i < 10 EXCEPT SELECT i+1 FROM foo WHERE i < 5)) SELECT * FROM foo",
+                "recursive reference to query \"foo\" must not appear within EXCEPT",
+                Some(105),
+            ),
+            (
+                "WITH RECURSIVE foo(i) AS (VALUES (1) UNION ALL (SELECT i+1 FROM foo WHERE i < 10 INTERSECT SELECT i+1 FROM foo WHERE i < 5)) SELECT * FROM foo",
+                "recursive reference to query \"foo\" must not appear more than once",
+                Some(108),
+            ),
+            (
+                "WITH RECURSIVE foo(i) AS (VALUES (1) UNION ALL (SELECT i+1 FROM foo EXCEPT ALL SELECT 1)) SELECT * FROM foo",
+                "recursive reference to query \"foo\" must not appear within EXCEPT",
+                Some(65),
+            ),
+            (
+                "WITH RECURSIVE foo(i) AS (VALUES (1) UNION ALL (SELECT 1 INTERSECT ALL SELECT i+1 FROM foo)) SELECT * FROM foo",
+                "recursive reference to query \"foo\" must not appear within INTERSECT",
+                Some(88),
+            ),
+        ];
+        for &(sql, message, column) in cases {
+            assert_eq!(refused(sql), (message.to_string(), column), "{sql}");
+        }
+        // A read of a definition further out, from inside a definition that reads itself, is a
+        // read of that one.
+        assert_eq!(
+            refused(
+                "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n < (WITH RECURSIVE z(m) AS (SELECT 1 UNION ALL SELECT m+1 FROM z, x) SELECT 1)) SELECT * FROM x"
+            ),
+            (
+                "recursive reference to query \"x\" must not appear within a subquery".to_string(),
+                Some(135)
+            )
         );
     }
 
