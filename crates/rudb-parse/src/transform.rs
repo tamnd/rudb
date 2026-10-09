@@ -406,6 +406,19 @@ impl<'a> Transform<'a> {
         self.intern(&text)
     }
 
+    /// The name of a collation, its parts joined with dots, which is how the pin keeps one.
+    fn collation_name(&mut self, node: u32) -> StrRef {
+        let mut leaves = Vec::new();
+        self.leaves(node, &mut leaves);
+        let parts: Vec<String> = leaves
+            .iter()
+            .map(|&leaf| self.text(leaf))
+            .filter(|text| !text.is_empty() && *text != ".")
+            .map(|text| self.fold_identifier(text.strip_suffix('.').unwrap_or(text)))
+            .collect();
+        self.intern(&parts.join("."))
+    }
+
     /// The one part of a name written with nothing qualifying it, folded the way a name is folded.
     ///
     /// `None` for a name with a schema or a table in front of it, which is the same test
@@ -1788,7 +1801,15 @@ impl<'a> Transform<'a> {
                 "Adding a NOT NULL column with IF NOT EXISTS is not supported",
             ));
         }
-        let column = ColumnDef { name, ty, not_null, default, identity: None, generated: NONE };
+        let column = ColumnDef {
+            name,
+            ty,
+            not_null,
+            default,
+            identity: None,
+            generated: NONE,
+            collation: NONE,
+        };
         Ok(AlterAction::AddColumn { column, quiet })
     }
 
@@ -2218,6 +2239,7 @@ impl<'a> Transform<'a> {
         let generated = self.generated_column(node)?;
         let mut not_null = false;
         let mut default = NONE;
+        let mut collation = NONE;
         let mut keys = Vec::new();
         for kid in self.kids(node) {
             if self.name(kid) != "ColumnConstraint" {
@@ -2252,11 +2274,17 @@ impl<'a> Transform<'a> {
                     order.push(Constraint::Foreign(foreign.len() as u32));
                     foreign.push(self.foreign_key(constraint, names, 1)?);
                 }
+                "ColumnCollation" => {
+                    if collation != NONE {
+                        return Err(Error::parser("multiple COLLATE clauses not allowed"));
+                    }
+                    collation = self.collation_name(self.find(constraint, "DottedIdentifier"));
+                }
                 _ => return self.unsupported(constraint),
             }
         }
         let identity = self.identity(node)?;
-        Ok((ColumnDef { name, ty, not_null, default, identity, generated }, keys))
+        Ok((ColumnDef { name, ty, not_null, default, identity, generated, collation }, keys))
     }
 
     /// The expression of `GeneratedColumn <- Generated? 'AS' Parens(Expression)
@@ -2372,6 +2400,7 @@ impl<'a> Transform<'a> {
                     default: NONE,
                     identity: None,
                     generated: NONE,
+                    collation: NONE,
                 });
             }
             self.column_def_slice(defs)

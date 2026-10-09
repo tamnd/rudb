@@ -9634,6 +9634,9 @@ fn create_table(
     if create.types.iter().any(Option::is_some) {
         catalog.table_mut(&create.name)?.set_types(create.types);
     }
+    if create.collations.iter().any(Option::is_some) {
+        catalog.table_mut(&create.name)?.set_collations(create.collations);
+    }
     if !create.sequences.is_empty() {
         catalog.table_mut(&create.name)?.set_sequences(create.sequences);
     }
