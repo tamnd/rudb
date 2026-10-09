@@ -2344,7 +2344,7 @@ impl Vector {
     ///
     /// A kernel that wants a slice asks for it and takes the flat path if it gets one. A kernel
     /// that can do better on a constant, a dictionary or runs checks [`Self::form`] first, since
-    /// asking a run length vector for its data writes it out flat (see [`Self::laid_runs`]).
+    /// asking a run length vector for its data writes it out flat (see `laid_runs`).
     #[must_use]
     pub fn data(&self) -> Option<&Data> {
         match &self.body {
