@@ -3050,7 +3050,7 @@ impl<'a> Aggregate<'a> {
                 // the map holds for it, and no row's slot is written down. A row whose combination
                 // has no group yet stops the pass, and it goes on from that row once one is open.
                 codes.places(*length, coded_places);
-                let kept = uncut.map(|kept| kept.indices());
+                let kept = uncut;
                 if place_sums.adds_by_place(coded_map.len(), *length) {
                     // A map well short of the rows is added up by place, with no slot looked up
                     // per row, and the groups a place has none for yet are opened afterwards in

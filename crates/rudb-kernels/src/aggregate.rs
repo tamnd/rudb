@@ -57,7 +57,7 @@ use std::mem;
 use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, PhysicalType, Result, StateKey, Value};
-use rudb_vector::{Data, Form, Live, StringView, Validity, Vector};
+use rudb_vector::{Data, Form, Live, Selection, StringView, Validity, Vector};
 
 use crate::arg_extreme::Key;
 use crate::compare::extreme_order as order;
@@ -2913,7 +2913,7 @@ impl PlaceSums {
     pub fn add_places(
         &mut self,
         places: &mut [u32],
-        kept: Option<&[u32]>,
+        kept: Option<&Selection>,
         combos: usize,
         inputs: &[Option<&Vector>],
     ) -> Result<()> {
@@ -2938,6 +2938,13 @@ impl PlaceSums {
             self.by_place.resize(needed, 0);
         }
         if let Some(kept) = kept.filter(|kept| kept.len() < places.len()) {
+            // The mask a filter made is read for the rows it dropped straight away, so the rows
+            // it kept are never listed. They were listed for nothing else on q01.
+            if let Some(words) = kept.mask() {
+                fill_unmasked(words, places, past);
+                return self.add_kept_places(places, needed, inputs);
+            }
+            let kept = kept.indices();
             let (first, next) = match (kept.first(), kept.last()) {
                 (Some(&first), Some(&last)) => (first as usize, last as usize + 1),
                 _ => (0, 0),
@@ -2950,6 +2957,17 @@ impl PlaceSums {
             }
             fill_dropped(kept, places, past);
         }
+        self.add_kept_places(places, needed, inputs)
+    }
+
+    /// The rest of [`Self::add_places`], once every row the filter dropped has the place past the
+    /// map.
+    fn add_kept_places(
+        &mut self,
+        places: &[u32],
+        needed: usize,
+        inputs: &[Option<&Vector>],
+    ) -> Result<()> {
         if self.pairs_in_place(places, needed, inputs)? {
             return Ok(());
         }
@@ -3232,6 +3250,26 @@ fn fold_cells(
 /// looked at a row at a time. On q01 about one row in seventy is dropped. A walk of the kept rows
 /// to find the gaps was about seven instructions a row, and cutting the list in two while a half
 /// had a gap was about 13 steps a gap.
+/// Each place of a row whose bit `words` does not set made `combos`, with row `i` in bit `i % 64`
+/// of word `i / 64` and a word past the end of `words` setting none.
+fn fill_unmasked(words: &[u64], places: &mut [u32], combos: u32) {
+    for (block, places) in places.chunks_mut(64).enumerate() {
+        let word = words.get(block).copied().unwrap_or(0);
+        if word == u64::MAX {
+            continue;
+        }
+        if word == 0 {
+            places.fill(combos);
+            continue;
+        }
+        let mut dropped = !word & (u64::MAX >> (64 - places.len()));
+        while dropped != 0 {
+            places[dropped.trailing_zeros() as usize] = combos;
+            dropped &= dropped - 1;
+        }
+    }
+}
+
 fn fill_dropped(kept: &[u32], places: &mut [u32], combos: u32) {
     let mut start = 0;
     while start + 1 < kept.len() {
@@ -6914,6 +6952,17 @@ mod tests {
         for chunk in 0..3 {
             assert!(sums.ready(&each_place, stride, &inputs, wanted, rows));
             let mut cut = places.clone();
+            // The middle chunk's kept rows come as the mask a filter makes, which finds the
+            // dropped rows from its words rather than from the list.
+            let kept = if chunk == 1 {
+                let mut words = vec![0_u64; rows.div_ceil(64)];
+                for &row in &kept {
+                    words[row as usize / 64] |= 1 << (row % 64);
+                }
+                Selection::from_mask(words, kept.len())
+            } else {
+                Selection::from_indices(kept.clone())
+            };
             sums.add_places(&mut cut, Some(&kept), groups, &inputs).expect("adds them up");
             // The first chunk has no places from before and looks at every place. The second
             // finds its places among the first's, and the third is left one of them to ask first,
@@ -6977,6 +7026,12 @@ mod tests {
                     (0..rows as u32).filter(|_| !rng.next().is_multiple_of(every)).collect();
                 let mut found: Vec<u32> = (0..rows as u32).collect();
                 fill_dropped(&kept, &mut found, u32::MAX);
+                let mut words = vec![0_u64; (rows as usize).div_ceil(64)];
+                for &row in &kept {
+                    words[row as usize / 64] |= 1 << (row % 64);
+                }
+                let mut unmasked: Vec<u32> = (0..rows as u32).collect();
+                fill_unmasked(&words, &mut unmasked, u32::MAX);
                 let mut walked: Vec<u32> = (0..rows as u32).collect();
                 if let (Some(&first), Some(&last)) = (kept.first(), kept.last()) {
                     for (row, slot) in
@@ -6988,6 +7043,10 @@ mod tests {
                     }
                 }
                 assert_eq!(found, walked, "{rows} rows, one in {every} dropped");
+                let every_dropped: Vec<u32> = (0..rows as u32)
+                    .map(|row| if kept.binary_search(&row).is_ok() { row } else { u32::MAX })
+                    .collect();
+                assert_eq!(unmasked, every_dropped, "{rows} rows from a mask, one in {every}");
             }
         }
     }
