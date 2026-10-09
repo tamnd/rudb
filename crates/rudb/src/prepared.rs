@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rudb_bind::Parameters;
 use rudb_catalog::QualifiedName;
 use rudb_common::{
-    DeclaredType, Error, Field, IdentifierCompare, LogicalType, Origin, Result, Value,
+    Cancel, DeclaredType, Error, Field, IdentifierCompare, LogicalType, Origin, Result, Value,
 };
 use rudb_parse::ast::{self, Ast};
 
@@ -59,6 +59,9 @@ pub struct Description {
 #[derive(Debug, Clone)]
 pub struct Prepared {
     shared: Shared,
+    /// The flag of the connection that prepared the statement, so that an interrupt of the
+    /// connection stops an execution, as it stops any other statement.
+    cancel: Cancel,
     sql: String,
     ast: Ast,
     names: Vec<String>,
@@ -974,7 +977,7 @@ impl Short {
 
 impl Prepared {
     /// Parses `sql` and reads the parameters out of it.
-    pub(crate) fn new(shared: Shared, sql: &str) -> Result<Self> {
+    pub(crate) fn new(shared: Shared, sql: &str, cancel: Cancel) -> Result<Self> {
         let session = shared.session();
         let ast = crate::database::parse_statement(&session, sql)?;
         let names: Vec<String> = ast.parameters().into_iter().map(str::to_string).collect();
@@ -982,7 +985,7 @@ impl Prepared {
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
         let described = Arc::default();
-        Ok(Self { shared, sql, ast, names, short, numbered, described, types: Vec::new() })
+        Ok(Self { shared, cancel, sql, ast, names, short, numbered, described, types: Vec::new() })
     }
 
     /// Gives the parameters the PostgreSQL types that the client declared, in the order of
@@ -1177,7 +1180,8 @@ impl Prepared {
         }
         // Zero for the parse, because this statement was parsed once at `PREPARE` and the whole
         // point of it is that this execution did not parse anything.
-        self.shared.execute_ast(&self.ast, &self.sql, parameters, &self.shared.token(), 0)
+        let token = self.shared.restart(&self.cancel);
+        self.shared.execute_ast(&self.ast, &self.sql, parameters, &token, 0)
     }
 
     /// Both halves of the mismatch, in DuckDB's words.

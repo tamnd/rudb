@@ -1679,7 +1679,8 @@ impl Database {
     /// A parse error. A name that does not resolve or a type that does not work out is an error at
     /// execution rather than here, because a parameter has no type until it has a value.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
-        Prepared::new(self.shared.clone(), sql).map_err(|error| self.shared.process_error(error))
+        Prepared::new(self.shared.clone(), sql, Cancel::new())
+            .map_err(|error| self.shared.process_error(error))
     }
 
     /// Reads the catalog.
@@ -6055,10 +6056,34 @@ impl Shared {
 
     /// A fresh token for one statement, sharing `cancel`'s flag and carrying the time limit.
     ///
-    /// The limit is `max_execution_time` when a statement has set it above zero, and the query
-    /// timeout the database was opened with otherwise. The two are told apart in the sentence a
-    /// stopped query gets, which is the pin's for the setting.
+    /// In a PostgreSQL session the limit is `statement_timeout` when it is above zero. The token is
+    /// also the one that the waits of the session look at, such as `pg_sleep` and the wait for an
+    /// advisory lock, so that the limit stops them too. Otherwise the limit is
+    /// `max_execution_time` when a statement has set it above zero, and the query timeout the
+    /// database was opened with otherwise. Each source has its own sentence for a stopped query.
     pub(crate) fn restart(&self, cancel: &Cancel) -> Cancel {
+        let postgres = self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(postgres) = postgres {
+            let millis = match rudb_common::guc::find("statement_timeout")
+                .map(|parameter| postgres.settings.setting(parameter))
+            {
+                Some(rudb_common::guc::Setting::Int(millis)) => millis,
+                _ => 0,
+            };
+            let token = match millis > 0 {
+                true => cancel
+                    .restart(Some(Duration::from_millis(millis.unsigned_abs().into())))
+                    .from_statement_timeout(),
+                false => self.restart_engine(cancel),
+            };
+            rudb_common::advisory::register(postgres.backend, token.clone());
+            return token;
+        }
+        self.restart_engine(cancel)
+    }
+
+    /// [`Shared::restart`] with the limits of the engine only.
+    fn restart_engine(&self, cancel: &Cancel) -> Cancel {
         let millis = self.inner.settings.max_execution_time();
         if millis > 0 {
             let limit = Duration::from_millis(millis.unsigned_abs());
