@@ -50,6 +50,7 @@ mod unnest;
 mod vacuum;
 mod value_source;
 mod vector_types;
+mod windoworder;
 
 pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
 pub use collation::check_collation;

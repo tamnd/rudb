@@ -1875,6 +1875,10 @@ pub struct Ast {
     /// window function that reads values, so the binder needs to know that `RESPECT NULLS` was
     /// written even though it is the default.
     pub null_treated: Vec<ExprRef>,
+    /// The windows written in a `WINDOW` clause, in the order they were written in. PostgreSQL
+    /// numbers the keys of these before the keys of the windows written in an `OVER`, and the
+    /// numbers decide which window it computes first.
+    pub named_windows: Vec<WindowRef>,
     /// The aggregate calls written with `EXPORT_STATE` after them, which answer with the state
     /// they reached rather than with their result.
     pub exported: Vec<ExprRef>,
@@ -2171,6 +2175,11 @@ impl Ast {
     /// Whether a `WITHIN GROUP` call was written with an `OVER` after it.
     pub fn within_group_over(&self, call: ExprRef) -> bool {
         self.windowed_within_groups.contains(&call)
+    }
+
+    /// Whether a window was written in a `WINDOW` clause rather than in an `OVER`.
+    pub fn named_window(&self, spec: WindowRef) -> bool {
+        self.named_windows.contains(&spec)
     }
 
     /// Whether a call was written with `RESPECT NULLS` or `IGNORE NULLS` after it.

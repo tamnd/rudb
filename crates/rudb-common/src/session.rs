@@ -228,6 +228,7 @@ pub struct Semantics {
     show_behavior: ShowBehavior,
     sort_operators: SortOperators,
     tie_order: TieOrder,
+    window_order: WindowOrder,
     subscripts: Subscripts,
     collations: Collations,
     single_arrow_lambdas: bool,
@@ -285,6 +286,7 @@ impl Default for Semantics {
             set_functions: SetFunctions::Pin,
             sort_operators: SortOperators::Pin,
             tie_order: TieOrder::Pin,
+            window_order: WindowOrder::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
             collations: Collations::Pin,
@@ -483,6 +485,11 @@ impl Semantics {
     #[must_use]
     pub fn tie_order(self) -> TieOrder {
         self.tie_order
+    }
+    /// What order the windows of one query are computed in.
+    #[must_use]
+    pub fn window_order(self) -> WindowOrder {
+        self.window_order
     }
     /// How a subscript and a slice of a list read the list.
     #[must_use]
@@ -1035,6 +1042,19 @@ pub enum TieOrder {
     Postgres,
 }
 
+/// What order the windows of one query are computed in. Each window sorts the rows the window
+/// before it made, so the last one decides the order of a query with no `ORDER BY`, and the one
+/// before it decides the order of the rows that tie in it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowOrder {
+    /// As in DuckDB: in the order they were written in.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: in the order `select_active_windows` puts them in, which compares the
+    /// sort keys of the windows. See `rudb_bind::windoworder`.
+    Postgres,
+}
+
 /// How a subscript and a slice of a list read the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Subscripts {
@@ -1459,6 +1479,7 @@ impl Session {
             self.semantics.set_functions = SetFunctions::Postgres;
             self.semantics.sort_operators = SortOperators::Postgres;
             self.semantics.tie_order = TieOrder::Postgres;
+            self.semantics.window_order = WindowOrder::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
