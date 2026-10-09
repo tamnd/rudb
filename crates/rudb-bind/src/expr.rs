@@ -673,10 +673,10 @@ impl Binder<'_> {
                 return Err(Error::binder(format!("there is no parameter ${number}"))
                     .state(SqlState::UNDEFINED_PARAMETER));
             }
-            return Err(Error::invalid_input(
-                "Prepared statement parameters cannot be used directly\nTo use prepared statement \
-                 parameters, use PREPARE to prepare a statement, followed by EXECUTE",
-            ));
+            return Err(Error::invalid_input(format!(
+                "Values were not provided for the following parameters: {}",
+                name.trim_start_matches('$')
+            )));
         };
         let constant = self.add_constant(value.clone());
         // A null has no type, and in PostgreSQL it is a null of the type of its parameter.

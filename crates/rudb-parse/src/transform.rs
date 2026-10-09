@@ -88,6 +88,7 @@ fn transform_dialect(
         ast: Ast { source: query.into(), ..Ast::default() },
         interned: Interner::default(),
         anonymous: 0,
+        named_parameters: None,
         identifier_case,
         postgres,
         current_span: Span::new(0, 0),
@@ -146,6 +147,8 @@ struct Transform<'a> {
     interned: Interner,
     /// How many bare `?` parameters have been seen, which is what numbers the next one.
     anonymous: u32,
+    /// Whether the parameters seen so far go by name, or `None` before the first one.
+    named_parameters: Option<bool>,
     identifier_case: IdentifierCase,
     /// Whether a PostgreSQL session sent the script. Only the parts of a statement that PostgreSQL
     /// accepts and that change nothing here read it, such as the storage options of a table.
@@ -2131,6 +2134,7 @@ impl<'a> Transform<'a> {
             ast: std::mem::take(&mut self.ast),
             interned: std::mem::take(&mut self.interned),
             anonymous: self.anonymous,
+            named_parameters: self.named_parameters,
             identifier_case: self.identifier_case,
             postgres: self.postgres,
             current_span: self.current_span,
@@ -2151,6 +2155,7 @@ impl<'a> Transform<'a> {
         self.ast = nested.ast;
         self.interned = nested.interned;
         self.anonymous = nested.anonymous;
+        self.named_parameters = nested.named_parameters;
         Ok((sql, query?))
     }
 
@@ -7132,6 +7137,13 @@ impl<'a> Transform<'a> {
     fn parameter(&mut self, node: u32) -> Result<ExprRef> {
         let written = self.text(node).trim();
         let written = written.trim_start_matches(['?', '$']).trim();
+        // A name that starts with a digit is a number, and the pin will not take both kinds.
+        let named = written.starts_with(|first: char| !first.is_ascii_digit());
+        if *self.named_parameters.get_or_insert(named) != named {
+            return Err(Error::not_implemented(
+                "Mixing named and positional parameters is not supported yet",
+            ));
+        }
         let name = if written.is_empty() {
             self.anonymous += 1;
             self.anonymous.to_string()
