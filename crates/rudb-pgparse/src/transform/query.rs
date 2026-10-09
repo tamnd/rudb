@@ -137,6 +137,7 @@ impl Transform<'_> {
                     .into());
             }
             let spec = self.window_def(def)?;
+            self.ast.named_windows.push(spec);
             let framed = def.frameOptions != FRAMEOPTION_DEFAULTS;
             self.windows.push((name.to_string(), spec, framed));
         }

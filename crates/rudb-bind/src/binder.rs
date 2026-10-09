@@ -20,7 +20,7 @@ use rudb_common::{
     AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error,
     ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin, RecursiveUnion, Result,
     Semantics, Session, ShowBehavior, SortOperators, Span, SqlState, Stat, StateKey, TableNames,
-    UnknownTypes, Value, ValuesNames,
+    UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -195,13 +195,18 @@ pub(crate) struct WindowRun {
     /// The table index the run's result columns bind against.
     index: u32,
     /// What divides the input into independent partitions.
-    partition: Vec<ExprRef>,
+    pub(crate) partition: Vec<ExprRef>,
     /// The order within a partition.
-    order: Vec<SortKey>,
+    pub(crate) order: Vec<SortKey>,
     /// The frame every call in the run shares.
     frame: WindowFrame,
     /// The calls, in the order their columns are appended.
     calls: Vec<ExprRef>,
+    /// The window the run was written as, a window of the `WINDOW` clause when one of its calls
+    /// named one. See [`crate::windoworder`].
+    pub(crate) spec: ast::WindowRef,
+    /// Whether `spec` is a window of the `WINDOW` clause.
+    pub(crate) named: bool,
 }
 
 /// One aggregate call as it was written, before any of it has been bound.
@@ -680,7 +685,7 @@ impl<'a> Binder<'a> {
     }
 
     /// A reference to one column of an operator's output.
-    fn column(&mut self, index: u32, position: usize, ty: LogicalType) -> ExprRef {
+    pub(crate) fn column(&mut self, index: u32, position: usize, ty: LogicalType) -> ExprRef {
         let binding = ColumnBinding::new(index, position as u32);
         self.plan.add_expr(Expr::Column(binding), ty)
     }
@@ -2162,6 +2167,16 @@ impl<'a> Binder<'a> {
         node = self.attach_scalar_subqueries(node);
         self.check_recursive_aggregates(ast, &written)?;
 
+        // What PostgreSQL numbers before the keys of the windows, which is read before the grouping
+        // is taken. See `crate::windoworder`.
+        let postgres_windows =
+            self.semantics.window_order() == WindowOrder::Postgres && self.windows.len() > 1;
+        let numbered = if postgres_windows {
+            let sorted = sorted.iter().map(|key| exprs[key.position]).collect::<Vec<_>>();
+            self.numbered_before_windows(sorted, &written.distinct, &exprs[..visible])
+        } else {
+            Vec::new()
+        };
         if let Some(aggregation) = self.aggregation.take() {
             let index = aggregation.index;
             let groups = self.plan.add_expr_list(&aggregation.groups);
@@ -2180,7 +2195,11 @@ impl<'a> Binder<'a> {
         // After the grouping and after `HAVING`, which is where the reference binary puts it:
         // `SELECT j, sum(count(i)) OVER () FROM t GROUP BY j HAVING count(i) > 1` totals only the
         // groups that survived the filter.
-        for run in std::mem::replace(&mut self.windows, outer_windows) {
+        let mut runs = std::mem::replace(&mut self.windows, outer_windows);
+        if postgres_windows {
+            runs = self.postgres_window_order(runs, &numbered);
+        }
+        for run in runs {
             let partition = self.plan.add_expr_list(&run.partition);
             let order = self.plan.add_sort_keys(&run.order);
             let expressions = self.plan.add_expr_list(&run.calls);
@@ -6575,12 +6594,8 @@ impl<'a> Binder<'a> {
                     let name = self.plan.intern(name);
                     let window = Expr::Window { name, args, distinct, filter, ignore_nulls, order };
                     let call = self.plan.add_expr(window, ty.clone());
-                    let at = self.window_run(
-                        parts.partition.clone(),
-                        parts.order.clone(),
-                        parts.frame,
-                        call,
-                    );
+                    let keys = (parts.partition.clone(), parts.order.clone(), parts.frame);
+                    let at = self.window_run(ast, spec, keys, call);
                     let index = self.windows.last().expect("the run was just filed").index;
                     let column = self.column(index, at, ty);
                     self.cast_to(column, &LogicalType::Numeric)
@@ -6607,7 +6622,7 @@ impl<'a> Binder<'a> {
             ty.clone(),
         );
 
-        let at = self.window_run(parts.partition, parts.order, parts.frame, call);
+        let at = self.window_run(ast, spec, (parts.partition, parts.order, parts.frame), call);
         let index = self.windows.last().expect("the run was just filed").index;
         let column = self.column(index, at, ty);
         self.carry_collation(call, column)?;
@@ -6622,11 +6637,13 @@ impl<'a> Binder<'a> {
     /// make once it knows what the sort below each one costs.
     fn window_run(
         &mut self,
-        partition: Vec<ExprRef>,
-        order: Vec<SortKey>,
-        frame: WindowFrame,
+        ast: &Ast,
+        spec: ast::WindowRef,
+        parts: (Vec<ExprRef>, Vec<SortKey>, WindowFrame),
         call: ExprRef,
     ) -> usize {
+        let (partition, order, frame) = parts;
+        let named = ast.named_window(spec);
         let matches = self.windows.last().is_some_and(|run| {
             run.frame == frame
                 && run.partition.len() == partition.len()
@@ -6640,7 +6657,12 @@ impl<'a> Binder<'a> {
         });
         if !matches {
             let index = self.fresh_index();
-            self.windows.push(WindowRun { index, partition, order, frame, calls: Vec::new() });
+            let calls = Vec::new();
+            self.windows.push(WindowRun { index, partition, order, frame, calls, spec, named });
+        }
+        let run = self.windows.last_mut().expect("a run is open");
+        if named && (!run.named || spec < run.spec) {
+            (run.spec, run.named) = (spec, true);
         }
         // Two identical calls over one run are one column, the same way two identical aggregates
         // over one grouping are. `SELECT sum(i) OVER (), sum(i) OVER () + 1` totals once.

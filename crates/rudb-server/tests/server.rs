@@ -1948,6 +1948,51 @@ fn rows_that_tie_are_in_the_order_postgres_sorts_them_into() {
     server.stop().unwrap();
 }
 
+/// The windows of one query are computed in the order PostgreSQL computes them in, which decides
+/// the order of the rows when there is no `ORDER BY`: the windows are sorted by their keys with
+/// the keys numbered in the order the clauses name them, and the last window sorts last.
+#[test]
+fn the_windows_of_a_query_are_computed_in_the_order_postgres_computes_them_in() {
+    let dirs = Dirs::new("pgwindoworder");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "create temp table es as select * from (values ('develop',10,5200,'2007-08-01'::date),('sales',1,5000,'2006-10-01'),('personnel',5,3500,'2007-12-10'),('sales',4,4800,'2007-08-08'),('personnel',2,3900,'2006-12-23'),('develop',7,4200,'2008-01-01'),('develop',9,4500,'2008-01-01'),('sales',3,4800,'2007-08-01'),('develop',8,6000,'2006-10-01'),('develop',11,5200,'2007-08-15')) v(depname, empno, salary, enroll_date)",
+    );
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, value) in [
+        (
+            "select string_agg(empno || ':' || a || ':' || b, ',') from (select empno, rank() over (order by salary desc) a, sum(salary) over (partition by depname) b from es) s",
+            "8:1:25100,10:2:25100,11:2:25100,1:4:14600,4:5:14600,3:5:14600,9:7:25100,7:8:25100,2:9:7400,5:10:7400",
+        ),
+        (
+            "select string_agg(empno || ':' || a || ':' || b, ',') from (select empno, sum(salary) over (partition by depname) a, rank() over (order by salary desc) b from es) s",
+            "9:25100:7,10:25100:2,11:25100:2,8:25100:1,7:25100:8,5:7400:10,2:7400:9,4:14600:5,1:14600:4,3:14600:5",
+        ),
+        (
+            "select string_agg(empno || ':' || a || ':' || b, ',') from (select empno, sum(salary) over (partition by depname order by salary) a, count(*) over (order by salary) b from es) s",
+            "5:3500:1,2:7400:2,7:4200:3,9:8700:4,3:9600:6,4:9600:6,1:14600:7,11:19100:9,10:19100:9,8:25100:10",
+        ),
+        (
+            "select string_agg(empno || ':' || a || ':' || b, ',') from (select empno, row_number() over (partition by depname order by enroll_date) a, row_number() over (partition by depname order by enroll_date desc) b from es) s",
+            "8:1:5,10:2:4,11:3:3,9:4:2,7:5:1,2:1:2,5:2:1,1:1:3,3:2:2,4:3:1",
+        ),
+        (
+            "select string_agg(empno || ':' || a || ':' || b, ',') from (select empno, count(*) over (partition by enroll_date) a, sum(salary) over w b from es window w as (partition by depname)) s",
+            "8:2:25100,9:2:25100,7:2:25100,10:2:25100,11:1:25100,5:1:7400,2:1:7400,4:1:14600,3:2:14600,1:2:14600",
+        ),
+        (
+            "select string_agg(empno || ':' || a || ':' || b, ',') from (select empno, sum(salary) over (partition by depname) a, count(*) over (partition by enroll_date) b from es order by salary) s",
+            "5:7400:1,2:7400:1,7:25100:2,9:25100:2,3:14600:2,4:14600:1,1:14600:2,11:25100:1,10:25100:2,8:25100:2",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// The name, the type and the type modifier of each column of a row description.
 fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
     let bytes = message.decoded();
