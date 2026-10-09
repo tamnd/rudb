@@ -533,10 +533,10 @@ pub(crate) fn add_pair_codes(
     places: &[u32],
 ) -> usize {
     use std::arch::x86_64::{
-        _mm_add_epi64, _mm_loadu_si128, _mm_storeu_si128, _mm256_add_epi64, _mm256_castsi256_si128,
-        _mm256_cmpeq_epi32, _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256,
-        _mm256_max_epu32, _mm256_movemask_epi8, _mm256_set_epi64x, _mm256_set1_epi32,
-        _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
+        _mm256_add_epi64, _mm256_blend_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi32,
+        _mm256_cvtepu32_epi64, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_max_epu32,
+        _mm256_movemask_epi8, _mm256_permute2x128_si256, _mm256_set_epi64x, _mm256_set1_epi32,
+        _mm256_storeu_si256, _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
     };
     let mut groups = places.len() / 8;
     for &(bytes, at, width) in &sides {
@@ -568,6 +568,8 @@ pub(crate) fn add_pair_codes(
         let [ones, twos] = sides.map(side);
         let top = _mm256_set1_epi32(last as i32);
         let lift = _mm256_set_epi64x(lifts[1], lifts[0], lifts[1], lifts[0]);
+        // The upper half of a row's cell, its count and the pad after it.
+        let count = _mm256_set_epi64x(0, 1, 0, 1);
         let to = cells.as_mut_ptr();
         for group in 0..groups {
             let held = _mm256_loadu_si256(places.as_ptr().add(done).cast());
@@ -587,20 +589,19 @@ pub(crate) fn add_pair_codes(
                     _mm256_add_epi64(_mm256_unpacklo_epi64(first, second), lift),
                     _mm256_add_epi64(_mm256_unpackhi_epi64(first, second), lift),
                 );
-                let pairs = [
-                    _mm256_castsi256_si128(even),
-                    _mm256_castsi256_si128(odd),
-                    _mm256_extracti128_si256::<1>(even),
-                    _mm256_extracti128_si256::<1>(odd),
+                // Each row's two values and a count of one, as the four lanes of its cell, so a
+                // row is one add and one store of the whole cell. Adding the count apart was a
+                // second load and store a row, and two stores a row is as many as a core makes.
+                let rows = [
+                    _mm256_blend_epi32::<0b1111_0000>(even, count),
+                    _mm256_blend_epi32::<0b1111_0000>(odd, count),
+                    _mm256_permute2x128_si256::<0x31>(even, count),
+                    _mm256_permute2x128_si256::<0x31>(odd, count),
                 ];
-                for (row, pair) in pairs.into_iter().enumerate() {
+                for (row, add) in rows.into_iter().enumerate() {
                     let place = *places.get_unchecked(done + 4 * half + row) as usize;
-                    let cell = to.add(place).cast::<i64>();
-                    _mm_storeu_si128(
-                        cell.cast(),
-                        _mm_add_epi64(_mm_loadu_si128(cell.cast()), pair),
-                    );
-                    *cell.add(2) = (*cell.add(2)).wrapping_add(1);
+                    let cell = to.add(place).cast();
+                    _mm256_storeu_si256(cell, _mm256_add_epi64(_mm256_loadu_si256(cell), add));
                 }
             }
             done += 8;
