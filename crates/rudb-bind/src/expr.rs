@@ -4524,9 +4524,21 @@ pub(crate) fn has_aggregate(ast: &Ast, expr: ast::ExprRef) -> bool {
 /// Whether an expression has an aggregate in it, where `user` says which names are macros a user
 /// made whose bodies aggregate.
 pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> bool) -> bool {
+    first_aggregate(ast, expr, user).is_some()
+}
+
+/// The first aggregate call in an expression, in the order it is written, as
+/// `locate_agg_of_level` finds it. `user` is as for [`aggregating`].
+pub(crate) fn first_aggregate(
+    ast: &Ast,
+    expr: ast::ExprRef,
+    user: &dyn Fn(&str) -> bool,
+) -> Option<ast::ExprRef> {
     if expr == NONE {
-        return false;
+        return None;
     }
+    let first = |expr| first_aggregate(ast, expr, user);
+    let any = |items: &[ast::ExprRef]| items.iter().find_map(|&item| first(item));
     match ast.expr(expr) {
         ast::Expr::Star { .. }
         | ast::Expr::Columns { .. }
@@ -4534,62 +4546,51 @@ pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> 
         | ast::Expr::Positional { .. }
         | ast::Expr::Literal { .. }
         | ast::Expr::Parameter { .. }
-        | ast::Expr::Default => false,
-        ast::Expr::Fields { record } => aggregating(ast, record, user),
-        ast::Expr::Unary { operand, .. } => aggregating(ast, operand, user),
-        ast::Expr::Binary { left, right, .. } => {
-            aggregating(ast, left, user) || aggregating(ast, right, user)
-        }
+        | ast::Expr::Default => None,
+        ast::Expr::Fields { record } => first(record),
+        ast::Expr::Unary { operand, .. } => first(operand),
+        ast::Expr::Binary { left, right, .. } => first(left).or_else(|| first(right)),
         ast::Expr::Function { name, args, .. } => {
             let written = ast.name(name).last().unwrap_or_default();
-            kind_of(written) == Some(FunctionKind::Aggregate)
+            let aggregate = kind_of(written) == Some(FunctionKind::Aggregate)
                 || rudb_catalog::same_name(written, "every")
                 || crate::macros::aggregates(written)
-                || user(written)
-                || ast.expr_list(args).iter().any(|&arg| aggregating(ast, arg, user))
+                || user(written);
+            if aggregate { Some(expr) } else { any(ast.expr_list(args)) }
         }
-        ast::Expr::Cast { operand, .. } => aggregating(ast, operand, user),
-        ast::Expr::Case { operand, arms, otherwise } => {
-            aggregating(ast, operand, user)
-                || aggregating(ast, otherwise, user)
-                || ast
-                    .arm_list(arms)
+        ast::Expr::Cast { operand, .. } => first(operand),
+        ast::Expr::Case { operand, arms, otherwise } => first(operand)
+            .or_else(|| {
+                ast.arm_list(arms)
                     .iter()
-                    .any(|arm| aggregating(ast, arm.when, user) || aggregating(ast, arm.then, user))
-        }
+                    .find_map(|arm| first(arm.when).or_else(|| first(arm.then)))
+            })
+            .or_else(|| first(otherwise)),
         ast::Expr::Between { operand, low, high, .. } => {
-            aggregating(ast, operand, user)
-                || aggregating(ast, low, user)
-                || aggregating(ast, high, user)
+            first(operand).or_else(|| first(low)).or_else(|| first(high))
         }
-        ast::Expr::In { operand, list, .. } => {
-            aggregating(ast, operand, user)
-                || ast.expr_list(list).iter().any(|&item| aggregating(ast, item, user))
-        }
-        ast::Expr::InSubquery { operand, .. } => aggregating(ast, operand, user),
-        ast::Expr::QuantifiedSubquery { operand, .. } => aggregating(ast, operand, user),
+        ast::Expr::In { operand, list, .. } => first(operand).or_else(|| any(ast.expr_list(list))),
+        ast::Expr::InSubquery { operand, .. } => first(operand),
+        ast::Expr::QuantifiedSubquery { operand, .. } => first(operand),
         ast::Expr::QuantifiedArray { operand, array, .. } => {
-            aggregating(ast, operand, user) || aggregating(ast, array, user)
+            first(operand).or_else(|| first(array))
         }
-        ast::Expr::Lambda { body, .. } => aggregating(ast, body, user),
-        ast::Expr::Row { items } => {
-            ast.expr_list(items).iter().any(|&item| aggregating(ast, item, user))
-        }
-        ast::Expr::List { items } | ast::Expr::Struct { values: items, .. } => {
-            ast.expr_list(items).iter().any(|&item| aggregating(ast, item, user))
-        }
+        ast::Expr::Lambda { body, .. } => first(body),
+        ast::Expr::Row { items }
+        | ast::Expr::List { items }
+        | ast::Expr::Struct { values: items, .. } => any(ast.expr_list(items)),
         // A window call is not an aggregate and is evaluated after the grouping rather than by it,
         // but what it is given to read can be one: `sum(count(x)) OVER ()` aggregates the block.
         // The partition and the order keys count for the same reason.
         ast::Expr::Window { args, spec, order, .. } => {
             let held = ast.window(spec);
-            ast.expr_list(args).iter().any(|&arg| aggregating(ast, arg, user))
-                || ast.order_list(order).iter().any(|item| aggregating(ast, item.expr, user))
-                || ast.expr_list(held.partition).iter().any(|&key| aggregating(ast, key, user))
-                || ast.order_list(held.order).iter().any(|item| aggregating(ast, item.expr, user))
+            any(ast.expr_list(args))
+                .or_else(|| ast.order_list(order).iter().find_map(|item| first(item.expr)))
+                .or_else(|| any(ast.expr_list(held.partition)))
+                .or_else(|| ast.order_list(held.order).iter().find_map(|item| first(item.expr)))
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
-        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => false,
+        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => None,
     }
 }
 

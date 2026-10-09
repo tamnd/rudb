@@ -501,6 +501,9 @@ pub(crate) struct Binder<'a> {
     /// place it is named, so a materialised one written inside a plain one is bound once per use
     /// and each of those is a materialisation of its own with a number of its own.
     materialized: Vec<Materialized>,
+    /// The recursive definitions whose recursive side is being bound, as indexes into
+    /// `Ast::ctes`, innermost last.
+    recursing: Vec<u32>,
     /// How many materialisations have been numbered, which is where the next number comes from.
     next_cte: u32,
     /// When this statement started, read once and kept, which is what `now()` folds to.
@@ -594,6 +597,7 @@ impl<'a> Binder<'a> {
             outlined: false,
             expanding: Vec::new(),
             materialized: Vec::new(),
+            recursing: Vec::new(),
             next_cte: 0,
             started: None,
             source: None,
@@ -953,7 +957,10 @@ impl<'a> Binder<'a> {
             finished: table.clone(),
             output,
         });
-        let (recursive, other) = self.bind_query(ast, right)?;
+        self.recursing.push(index);
+        let bound = self.bind_query(ast, right);
+        self.recursing.pop();
+        let (recursive, other) = bound?;
         if other.len() != scope.len() {
             return Err(Error::binder(
                 "Set operations can only apply to expressions with the same number of result columns",
@@ -2149,6 +2156,7 @@ impl<'a> Binder<'a> {
         }
 
         node = self.attach_scalar_subqueries(node);
+        self.check_recursive_aggregates(ast, &written)?;
 
         if let Some(aggregation) = self.aggregation.take() {
             let index = aggregation.index;
@@ -3242,6 +3250,46 @@ impl<'a> Binder<'a> {
     }
 
     // ------------------------------------------------------------------- from
+
+    /// Refuses an aggregate in a block that reads, in its own `FROM`, a recursive definition whose
+    /// recursive side is being bound. PostgreSQL makes this check last of its checks on the
+    /// grouping, as `parseCheckAggregates` in `parse_agg.c` does, and gives the place of the first
+    /// aggregate. A read inside a subquery of the `FROM` is a block of its own and does not count.
+    fn check_recursive_aggregates(&self, ast: &Ast, written: &ast::Select) -> Result<()> {
+        if self.semantics.recursive_union() != RecursiveUnion::Postgres
+            || self.recursing.is_empty()
+            || self.aggregation.as_ref().is_none_or(|held| held.aggregates.is_empty())
+        {
+            return Ok(());
+        }
+        fn reads(ast: &Ast, source: ast::SourceRef, recursing: &[u32]) -> bool {
+            match ast.source(source) {
+                ast::Source::Cte { cte, .. } => recursing.contains(&cte),
+                ast::Source::Join { left, right, .. } => {
+                    reads(ast, left, recursing) || reads(ast, right, recursing)
+                }
+                _ => false,
+            }
+        }
+        if !ast.source_list(written.from).iter().any(|&source| reads(ast, source, &self.recursing))
+        {
+            return Ok(());
+        }
+        let first = ast
+            .target_list(written.targets)
+            .iter()
+            .map(|target| target.expr)
+            .chain([written.having])
+            .find_map(|expr| crate::expr::first_aggregate(ast, expr, &|_| false));
+        let error = Error::binder(
+            "aggregate functions are not allowed in a recursive query's recursive term",
+        )
+        .state(SqlState::INVALID_RECURSION);
+        Err(match first {
+            Some(call) => error.with_span(ast.expr_span(call)),
+            None => error.unplaced(),
+        })
+    }
 
     fn bind_from(&mut self, ast: &Ast, from: ast::Slice) -> Result<(NodeRef, Scope)> {
         let sources = ast.source_list(from).to_vec();
