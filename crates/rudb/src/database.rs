@@ -34,7 +34,7 @@ use crate::connection::{Connection, single};
 use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
 use crate::result::{Notice, QueryResult};
-use crate::settings::{COMPILED_ENGINE, Settings, Visibility};
+use crate::settings::{COMPILED_ENGINE, Local, Settings, Visibility};
 use crate::txn::{self, Board, Open, Registry};
 use crate::{foreign, upsert};
 
@@ -712,6 +712,9 @@ struct Conn {
     /// The database, so a connection that closes can remove its temporary objects. Weak, so that
     /// the connection alone does not keep the database open.
     database: Weak<Inner>,
+    /// The settings this connection set for itself, which it reads in front of the database's.
+    /// See [`crate::settings::Local`].
+    local: Mutex<Option<Box<Local>>>,
 }
 
 /// How many plans a connection keeps by the text of their query.
@@ -760,6 +763,7 @@ impl Conn {
             listed: Mutex::default(),
             simple: Mutex::default(),
             truncating: Mutex::default(),
+            local: Mutex::default(),
             postgres: Mutex::default(),
             begun: AtomicI64::new(0),
             received: AtomicI64::new(0),
@@ -1565,7 +1569,7 @@ impl Database {
             Some(false) => return Ok(self.shared.read().search_path()),
             None => {}
         }
-        self.shared.inner.settings.value(name)
+        self.shared.reading(name, |settings| settings.value(name))
     }
 
     /// Which implementation runs at each seam, as this session has left it.
@@ -4188,7 +4192,9 @@ impl Shared {
     /// tree that costs about what reading them costs. So it is read once per statement and the
     /// special case is gone. [`crate::settings::Settings::session`] takes two locks for it.
     pub(crate) fn session(&self) -> Session {
-        let mut session = self.inner.settings.session();
+        let local = self.conn.local.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut session = self.inner.settings.session_for(local.as_deref());
+        drop(local);
         let postgres = self.conn.postgres.lock().unwrap_or_else(PoisonError::into_inner).clone();
         if postgres.is_some() {
             session.set_postgres(postgres);
@@ -4205,6 +4211,27 @@ impl Shared {
         session
             .set_prepared(self.conn.listed.lock().unwrap_or_else(PoisonError::into_inner).clone());
         session
+    }
+
+    /// Reads the setting `name` from the values this connection set for itself when it set it,
+    /// and from the database's otherwise.
+    fn reading<T>(&self, name: &str, read: impl FnOnce(&Settings) -> T) -> T {
+        let local = self.conn.local.lock().unwrap_or_else(PoisonError::into_inner);
+        match local.as_deref() {
+            Some(local) if local.wrote(name) => read(local.settings()),
+            _ => read(&self.inner.settings),
+        }
+    }
+
+    /// Whether this connection set any setting for itself, which a plan kept for every
+    /// connection cannot have been bound under.
+    fn has_local(&self) -> bool {
+        self.conn
+            .local
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .is_some_and(|local| !local.is_empty())
     }
 
     /// Records the PostgreSQL session that speaks through this connection.
@@ -4318,7 +4345,10 @@ impl Shared {
     /// the pin that goes by the kind of error rather than by where it was raised, so a `CREATE
     /// TABLE` of a name that is taken leaves it open and a failed cast does not.
     pub(crate) fn aborts(&self, error: &Error) -> bool {
-        let keeps = self.inner.settings.syntactic_errors_keep_transaction();
+        let keeps = self.reading(
+            "default_transaction_invalidation_policy",
+            Settings::syntactic_errors_keep_transaction,
+        );
         match error.code() {
             rudb_common::ErrorCode::Parser | rudb_common::ErrorCode::NotImplemented => false,
             rudb_common::ErrorCode::Binder | rudb_common::ErrorCode::Catalog => !keeps,
@@ -4563,9 +4593,9 @@ impl Shared {
                     Fill::Now => {
                         let utc = *utc.get_or_insert_with(|| self.transaction_start());
                         if *ty == LogicalType::Timestamp {
-                            Value::Timestamp(
-                                *local.get_or_insert_with(|| self.inner.settings.local_micros(utc)),
-                            )
+                            Value::Timestamp(*local.get_or_insert_with(|| {
+                                self.reading("TimeZone", |settings| settings.local_micros(utc))
+                            }))
                         } else {
                             Value::TimestampTz(utc)
                         }
@@ -4668,8 +4698,9 @@ impl Shared {
         if limit > crate::prepared::RANGE_ROWS {
             return None;
         }
-        let descending =
-            range.descending.unwrap_or_else(|| self.inner.settings.default_descending());
+        let descending = range
+            .descending
+            .unwrap_or_else(|| self.reading("default_order", Settings::default_descending));
         let catalog = self.read();
         let target = match range.lookup.found.get(catalog.naming()) {
             Some(target) => target,
@@ -5608,6 +5639,9 @@ impl Shared {
     /// Reuse a simple native aggregate plan while the table and settings are unchanged.
     /// Execution still runs for every call, producing a fresh answer and metrics document.
     fn cached_native_aggregate(&self, sql: &str, cancel: &Cancel) -> Result<Option<QueryResult>> {
+        if self.has_local() {
+            return Ok(None);
+        }
         let catalog = self.read();
         let revision = self.inner.settings_revision.load(Ordering::Relaxed);
         let cached = self
@@ -5680,7 +5714,10 @@ impl Shared {
     }
 
     fn remember_native_aggregate(&self, sql: &str, ast: &Ast, plan: &Plan, catalog: &Catalog) {
-        if !is_native_summary_aggregate(ast, plan, catalog) || rudb_common::notice::raised() {
+        if !is_native_summary_aggregate(ast, plan, catalog)
+            || rudb_common::notice::raised()
+            || self.has_local()
+        {
             return;
         }
         *self.inner.native_aggregate_plan.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -6152,7 +6189,7 @@ impl Shared {
 
     /// [`Shared::restart`] with the limits of the engine only.
     fn restart_engine(&self, cancel: &Cancel) -> Cancel {
-        let millis = self.inner.settings.max_execution_time();
+        let millis = self.reading("max_execution_time", Settings::max_execution_time);
         if millis > 0 {
             let limit = Duration::from_millis(millis.unsigned_abs());
             return cancel.restart(Some(limit)).from_setting();
@@ -7061,7 +7098,9 @@ impl Shared {
             }
             Bound::Setting(setting) => {
                 let value = setting.value.as_ref();
-                self.inner.settings.apply(
+                let mut local = self.conn.local.lock().unwrap_or_else(PoisonError::into_inner);
+                self.inner.settings.apply_from(
+                    &mut local,
                     &self.inner.memory,
                     &self.inner.pool,
                     &mut catalog,

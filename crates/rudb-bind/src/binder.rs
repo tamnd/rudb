@@ -6841,7 +6841,8 @@ struct Sorted {
 }
 
 /// The expression that a side of a set operation writes as its column `at`, when the side is a
-/// plain `SELECT` whose targets are its columns one for one.
+/// plain `SELECT` whose targets are its columns one for one. A `UNION BY NAME` can have more
+/// columns than either side, and a column past the end of this side is not written by it.
 fn written_column(
     ast: &Ast,
     query: ast::QueryRef,
@@ -6857,7 +6858,7 @@ fn written_column(
     if starred || targets.len() != width {
         return None;
     }
-    Some(targets[at].expr)
+    targets.get(at).map(|target| target.expr)
 }
 
 /// What was written between the two sides of a set operation.

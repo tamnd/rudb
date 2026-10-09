@@ -38,7 +38,7 @@ pub use functioncatalog::{
 pub use pragmacatalog::{PRAGMAS, PragmaEntry, pragma_named};
 pub use rudb_csv::Given;
 pub use settingcatalog::{
-    Behaviour, GLOBAL, LOCAL, SETTINGS, SettingEntry, UNLISTED, UNSET, every_setting,
+    Behaviour, GLOBAL, Kept, LOCAL, SETTINGS, SettingEntry, UNLISTED, UNSET, every_setting, kept,
     setting_fields, setting_named, unknown_enum_value, unknown_setting,
 };
 pub use signature::{

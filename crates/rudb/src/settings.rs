@@ -38,12 +38,16 @@
 //! because the grammar is DuckDB's and has no such clause, which is the same reason
 //! `SET graph_links` looks the way it does.
 //!
-//! Every setting the engine reads is global, which is the scope DuckDB gives it, and for those
-//! `SET LOCAL` is refused with the sentence the binary prints and `SET SESSION` with the one it
-//! prints for a global setting, which is a different sentence and says which of the two the writer
-//! got wrong. Fifteen of the carried names are per connection on the pin, and for those all three
-//! spellings are taken and land in the same place, because rudb has one connection's worth of state
-//! and nothing reads the value anyway.
+//! Every setting has a value kept for the database, and a connection may lay its own over most of
+//! them. `SET SESSION` writes the connection's own, and so does a bare `SET` of a setting the pin
+//! keeps per connection, such as `integer_division`. [`Local`] is where a connection keeps those
+//! and [`Settings::apply_from`] decides which side a statement writes. A setting the pin keeps only
+//! for the database refuses `SET SESSION` with one of the two sentences the binary has for that.
+//! The seams and the rest of what is not a DuckDB setting have no per connection value, and for
+//! them `SET LOCAL` is refused with the sentence the binary prints and `SET SESSION` with the one
+//! it prints for a global setting. Fifteen of the carried names are per connection on the pin and take
+//! all three spellings, and they still land in the database's values, because the search path among
+//! them lives on the catalog.
 //!
 //! `duckdb_settings()` and `current_setting()` read these back from SQL, and both do it through
 //! [`Settings::session`] rather than by reaching in here, because neither the binder nor the
@@ -62,7 +66,9 @@ use rudb_common::{
     Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule, parse_clustering,
     rule_names,
 };
-use rudb_functions::{Behaviour, LOCAL, SettingEntry, UNSET, every_setting, unknown_enum_value};
+use rudb_functions::{
+    Behaviour, Kept, LOCAL, SettingEntry, UNSET, every_setting, unknown_enum_value,
+};
 use rudb_parse::ast::Scope;
 use rudb_pipeline::Pool;
 use rudb_seam::SEAM_PREFIX;
@@ -345,6 +351,42 @@ fn zone_in(value: &str) -> Option<String> {
         .map(|_| name.to_string())
 }
 
+/// The settings one connection set for itself, which it reads in place of the database's.
+///
+/// `SET SESSION default_order = 'DESC'` on one connection leaves every other one sorting the way
+/// the database does, and so does a bare `SET integer_division = true`, for a setting the pin
+/// keeps per connection, see [`rudb_functions::Kept`]. The values are held in a [`Settings`] of
+/// their own, so a value is read and refused by the same code that reads one for the database.
+/// The names say which of its values the connection set, and the rest are at their defaults and
+/// nothing reads them.
+#[derive(Debug)]
+pub(crate) struct Local {
+    settings: Settings,
+    /// The settings the connection set, by the name the table has for them.
+    written: Vec<&'static str>,
+    /// The session [`Settings::session_for`] built last, with the changes on both sides it was
+    /// built at.
+    built: Mutex<Option<(u64, u64, Session)>>,
+}
+
+impl Local {
+    /// Whether the connection set the setting with this name for itself.
+    pub(crate) fn wrote(&self, name: &str) -> bool {
+        let name = canonical(name);
+        self.written.iter().any(|held| held.eq_ignore_ascii_case(name))
+    }
+
+    /// The values the connection set, which are only good for the names it [`Local::wrote`].
+    pub(crate) fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Whether the connection set anything for itself.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.written.is_empty()
+    }
+}
+
 impl Settings {
     /// The settings a database opened with this configuration starts at.
     pub(crate) fn new(config: Config) -> Self {
@@ -535,6 +577,91 @@ impl Settings {
         self.defaults
     }
 
+    /// Applies a `SET` or a `RESET` one connection ran, to the database's values or to the ones
+    /// `local` holds for that connection, as the scope and the setting say.
+    ///
+    /// A bare `SET` writes the connection's own value for a setting the pin keeps per connection
+    /// and the database's for the rest, `SET SESSION` writes the connection's own for any setting
+    /// that may have one, and `SET GLOBAL` always writes the database's. The connection's value
+    /// stays in front of the database's until the connection resets it, which a `SET GLOBAL` of the
+    /// same setting does not do. That is the pin's rule, checked on the binary.
+    ///
+    /// # Errors
+    ///
+    /// The ones [`Settings::apply`] has, and for `SET SESSION` of a setting the pin keeps only for
+    /// the database.
+    #[expect(clippy::too_many_arguments, reason = "apply's arguments and the connection's values")]
+    pub(crate) fn apply_from(
+        &self,
+        local: &mut Option<Box<Local>>,
+        memory: &Memory,
+        pool: &Pool,
+        catalog: &mut Catalog,
+        name: &str,
+        scope: Scope,
+        value: Option<&Value>,
+    ) -> Result<()> {
+        let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
+            return self.apply(memory, pool, catalog, name, scope, value);
+        };
+        let verb = if value.is_some() { "set" } else { "reset" };
+        // The fifteen the table reports as per connection already take every spelling, and the
+        // search path among them lives on the catalog, so they keep the path they had.
+        let connection = entry.scope != LOCAL
+            && match (scope, rudb_functions::kept(entry.name)) {
+                (Scope::Session, Kept::Older) => {
+                    return Err(Error::catalog(format!(
+                        "option \"{name}\" cannot be {verb} locally"
+                    )));
+                }
+                (Scope::Session, Kept::Global(spelled)) => {
+                    return Err(Error::invalid_input(format!(
+                        "Setting \"{spelled}\" cannot be set as a session variable - it can only \
+                         be set globally"
+                    )));
+                }
+                (Scope::Session, _) | (Scope::Unwritten, Kept::Connection) => true,
+                _ => false,
+            };
+        if !connection {
+            return self.apply(memory, pool, catalog, name, scope, value);
+        }
+        self.warn(entry, value)?;
+        let local = local.get_or_insert_with(|| {
+            Box::new(Local {
+                settings: Settings::new(self.defaults),
+                written: Vec::new(),
+                built: Mutex::new(None),
+            })
+        });
+        local.written.retain(|held| *held != entry.name);
+        // A reset puts the connection's copy back at its default as well, so that a later `SET`
+        // that fails is judged against the value the connection reads and not one it dropped.
+        local.settings.apply(memory, pool, catalog, name, Scope::Unwritten, value)?;
+        if value.is_some() {
+            local.written.push(entry.name);
+        }
+        Ok(())
+    }
+
+    /// Refuses a write to a deprecated setting when warnings are errors.
+    ///
+    /// A deprecated setting warns when it is written, and with warnings as errors the warning is
+    /// the error and the value is not kept. The value is still read first, so one of the wrong type
+    /// is refused for its type, which is the order the pin does the two in. Warnings as errors is
+    /// only ever the database's, so this reads it from the database's settings even for a write
+    /// that goes to a connection.
+    fn warn(&self, entry: &SettingEntry, value: Option<&Value>) -> Result<()> {
+        if let Some(value) = value
+            && *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner())
+            && let Some(warning) = deprecation(entry.name)
+        {
+            typed(entry, value)?;
+            return Err(Error::invalid_input(warning));
+        }
+        Ok(())
+    }
+
     /// Applies a `SET`, or a `RESET` when there is no value.
     ///
     /// # Errors
@@ -567,11 +694,11 @@ impl Settings {
     ) -> Result<()> {
         let word = if value.is_some() { "SET" } else { "RESET" };
         let verb = if value.is_some() { "set" } else { "reset" };
-        // Every setting rudb reads is global, and so is every seam, so naming the session or a local
-        // copy is naming something that does not exist. Fifteen of the names rudb carries and does
-        // not read are per connection on the pin, and those take all three spellings and land in the
-        // same place, because there is one connection's worth of state here and nothing reads the
-        // value either way.
+        // A setting a connection may keep its own value of never gets here with the session scope,
+        // because [`Settings::apply_from`] takes it first. What is left is the seams and the rest
+        // of what is not a DuckDB setting, which have no copy in a session. Fifteen of the names
+        // rudb carries are per connection on the pin, and those take all three spellings and land
+        // in the database's values.
         let per_connection =
             rudb_functions::setting_named(name).is_some_and(|it| it.scope == LOCAL);
         match scope {
@@ -741,16 +868,7 @@ impl Settings {
         let Some(entry) = rudb_functions::setting_named(canonical(name)) else {
             return Err(Error::catalog(rudb_functions::unknown_setting(name)));
         };
-        // A deprecated setting warns when it is written, and with warnings as errors the warning
-        // is the error and the value is not kept. The value is still read first, so one of the
-        // wrong type is refused for its type, which is the order the pin does the two in.
-        if let Some(value) = value
-            && *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner())
-            && let Some(warning) = deprecation(entry.name)
-        {
-            typed(entry, value)?;
-            return Err(Error::invalid_input(warning));
-        }
+        self.warn(entry, value)?;
         if entry.behaviour != Behaviour::Honoured {
             return self.carry(entry, value);
         }
@@ -1380,9 +1498,42 @@ impl Settings {
         {
             return session.clone();
         }
-        let session = self.build();
+        let session = self.build(None);
         *built = Some((changes, session.clone()));
         session
+    }
+
+    /// The session of a connection that set the values in `local` for itself: these settings, with
+    /// those laid over them.
+    ///
+    /// Kept in `local` the way [`Settings::session`] keeps its own, and built again when either
+    /// side has changed since.
+    pub(crate) fn session_for(&self, local: Option<&Local>) -> Session {
+        let Some(local) = local.filter(|local| !local.is_empty()) else {
+            return self.session();
+        };
+        let at = (
+            self.changes.load(AtomicOrdering::Acquire),
+            local.settings.changes.load(AtomicOrdering::Acquire),
+        );
+        let mut built = local.built.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((ours, theirs, session)) = built.as_ref()
+            && (*ours, *theirs) == at
+        {
+            return session.clone();
+        }
+        let session = self.build(Some(local));
+        *built = Some((at.0, at.1, session.clone()));
+        session
+    }
+
+    /// The settings a session reads the setting `name` from: the connection's when it set one,
+    /// and these otherwise.
+    fn pick<'a>(&'a self, local: Option<&'a Local>, name: &str) -> &'a Settings {
+        match local {
+            Some(local) if local.wrote(name) => &local.settings,
+            _ => self,
+        }
     }
 
     /// A UTC instant shifted to the wall clock of the session's time zone. It reads the session
@@ -1400,59 +1551,45 @@ impl Settings {
         self.session().local_micros(micros)
     }
 
-    /// The session the settings come to now, built from nothing.
+    /// The session the settings come to now, built from nothing, with what a connection set for
+    /// itself in `local` in front.
     ///
     /// The locks are taken once each here rather than once per name through [`Settings::value`].
-    fn build(&self) -> Session {
+    fn build(&self, local: Option<&Local>) -> Session {
+        let at = |name| self.pick(local, name);
         let config = self.config();
         let disabled = self.disabled_optimizers();
         let memory = config.memory_limit().map_or_else(|| "unlimited".to_string(), human);
         let threads = config.threads().to_string();
-        let time_zone = self.time_zone.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let allow_parser_override_extension = self
-            .allow_parser_override_extension
-            .read()
-            .unwrap_or_else(|held| held.into_inner())
-            .clone();
-        let default_order =
-            self.default_order.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let current_dialect =
-            self.current_dialect.read().unwrap_or_else(|held| held.into_inner()).clone();
+        let time_zone = held(&at("TimeZone").time_zone);
+        let allow_parser_override_extension =
+            held(&at("allow_parser_override_extension").allow_parser_override_extension);
+        let default_order = held(&at("default_order").default_order);
+        let current_dialect = held(&at("current_dialect").current_dialect);
         let dialect_compatibility_mode =
-            self.dialect_compatibility_mode.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let default_null_order =
-            self.default_null_order.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let default_collation =
-            self.default_collation.read().unwrap_or_else(|held| held.into_inner()).clone();
+            held(&at("dialect_compatibility_mode").dialect_compatibility_mode);
+        let default_null_order = held(&at("default_null_order").default_null_order);
+        let default_collation = held(&at("default_collation").default_collation);
         let disable_timestamptz_casts =
-            *self.disable_timestamptz_casts.read().unwrap_or_else(|held| held.into_inner());
-        let errors_as_json = *self.errors_as_json.read().unwrap_or_else(|held| held.into_inner());
-        let ieee_floating_point_ops =
-            *self.ieee_floating_point_ops.read().unwrap_or_else(|held| held.into_inner());
-        let integer_division =
-            *self.integer_division.read().unwrap_or_else(|held| held.into_inner());
+            held(&at("disable_timestamptz_casts").disable_timestamptz_casts);
+        let errors_as_json = held(&at("errors_as_json").errors_as_json);
+        let ieee_floating_point_ops = held(&at("ieee_floating_point_ops").ieee_floating_point_ops);
+        let integer_division = held(&at("integer_division").integer_division);
         let null_on_division_by_zero =
-            *self.null_on_division_by_zero.read().unwrap_or_else(|held| held.into_inner());
+            held(&at("null_on_division_by_zero").null_on_division_by_zero);
         let order_by_non_integer_literal =
-            *self.order_by_non_integer_literal.read().unwrap_or_else(|held| held.into_inner());
-        let pivot_limit = *self.pivot_limit.read().unwrap_or_else(|held| held.into_inner());
+            held(&at("order_by_non_integer_literal").order_by_non_integer_literal);
+        let pivot_limit = held(&at("pivot_limit").pivot_limit);
         let preserve_identifier_case =
-            self.preserve_identifier_case.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let regex_match_operator_semantics = self
-            .regex_match_operator_semantics
-            .read()
-            .unwrap_or_else(|held| held.into_inner())
-            .clone();
-        let lambda_syntax =
-            self.lambda_syntax.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let scalar_subquery_error_on_multiple_rows = *self
-            .scalar_subquery_error_on_multiple_rows
-            .read()
-            .unwrap_or_else(|held| held.into_inner());
-        let show_behavior =
-            self.show_behavior.read().unwrap_or_else(|held| held.into_inner()).clone();
-        let warnings_as_errors =
-            *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner());
+            held(&at("preserve_identifier_case").preserve_identifier_case);
+        let regex_match_operator_semantics =
+            held(&at("regex_match_operator_semantics").regex_match_operator_semantics);
+        let lambda_syntax = held(&at("lambda_syntax").lambda_syntax);
+        let scalar_subquery_error_on_multiple_rows = held(
+            &at("scalar_subquery_error_on_multiple_rows").scalar_subquery_error_on_multiple_rows,
+        );
+        let show_behavior = held(&at("show_behavior").show_behavior);
+        let warnings_as_errors = held(&at("warnings_as_errors").warnings_as_errors);
         let mut session = Session::new();
         session.set_time_zone(&time_zone);
         session.set_default_descending(default_order == "DESC");
@@ -1488,9 +1625,17 @@ impl Settings {
         session.set_seams(self.seams().written());
         session
             .set_variables(self.variables.read().unwrap_or_else(PoisonError::into_inner).clone());
+        if let Some(local) = local {
+            session.set_local(
+                every_setting()
+                    .filter(|entry| local.wrote(entry.name))
+                    .map(|entry| entry.name.to_string())
+                    .collect(),
+            );
+        }
         for entry in every_setting() {
             if entry.behaviour != Behaviour::Honoured {
-                session.set(entry.name, self.carried(entry));
+                session.set(entry.name, at(entry.name).carried(entry));
                 continue;
             }
             let name = entry.name;
@@ -1522,8 +1667,12 @@ impl Settings {
                     "show_behavior" => show_behavior.clone(),
                     "threads" => threads.clone(),
                     "warnings_as_errors" => warnings_as_errors.to_string(),
-                    "max_execution_time" => self.max_execution_time().to_string(),
-                    "default_transaction_invalidation_policy" => self.invalidation_policy(),
+                    "max_execution_time" => {
+                        at("max_execution_time").max_execution_time().to_string()
+                    }
+                    "default_transaction_invalidation_policy" => self
+                        .pick(local, "default_transaction_invalidation_policy")
+                        .invalidation_policy(),
                     other => unreachable!("{other} is not an honoured setting"),
                 },
             );
@@ -1534,6 +1683,11 @@ impl Settings {
     fn replace(&self, config: Config) {
         *self.current.write() = config;
     }
+}
+
+/// What a setting's lock holds, as a copy.
+fn held<T: Clone>(lock: &RwLock<T>) -> T {
+    lock.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 /// The setting a name means, which is itself for every name but one half of each alias pair.
@@ -1557,7 +1711,7 @@ const ALIASES: [(&str, &str); 7] = [
 ];
 
 /// The setting a name means, in the spelling this file and the settings table both use for it.
-fn canonical(name: &str) -> &str {
+pub(crate) fn canonical(name: &str) -> &str {
     for (written, meant) in ALIASES {
         if name.eq_ignore_ascii_case(written) {
             return meant;
@@ -2173,7 +2327,7 @@ fn bytes_of(text: &str) -> Result<Option<u64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, Settings, bytes_of, zone_in};
+    use super::{Catalog, Local, Settings, bytes_of, zone_in};
     use crate::config::Config;
     use rudb_common::{Memory, Value};
     use rudb_parse::ast::Scope;
@@ -2455,6 +2609,55 @@ mod tests {
                 .expect("a local setting takes every scope");
         }
         assert_eq!(settings.value("profiling_renderer_settings").expect("a setting"), "json");
+    }
+
+    /// `SET SESSION` writes the connection's own value and a bare `SET` writes the database's,
+    /// except for a setting the pin keeps per connection, where a bare `SET` is the connection's.
+    #[test]
+    fn a_connection_lays_its_own_values_over_the_database() {
+        let (settings, memory) = settings();
+        let pool = Pool::default();
+        let mut local = None;
+        let set =
+            |local: &mut Option<Box<Local>>, name: &str, scope: Scope, value: Option<&str>| {
+                let value = value.map(|text| Value::Varchar(text.to_string()));
+                settings.apply_from(
+                    local,
+                    &memory,
+                    &pool,
+                    &mut Catalog::new(),
+                    name,
+                    scope,
+                    value.as_ref(),
+                )
+            };
+        set(&mut local, "default_order", Scope::Session, Some("DESC")).expect("a session value");
+        set(&mut local, "integer_division", Scope::Unwritten, Some("true")).expect("a bare set");
+        set(&mut local, "default_null_order", Scope::Unwritten, Some("NULLS FIRST")).expect("set");
+        let ours = settings.session_for(local.as_deref());
+        let theirs = settings.session_for(None);
+        assert!(ours.semantics().default_descending());
+        assert!(!theirs.semantics().default_descending());
+        assert_eq!(ours.get("integer_division"), Some("true"));
+        assert_eq!(theirs.get("integer_division"), Some("false"));
+        assert_eq!(ours.get("default_null_order"), Some("NULLS_FIRST"));
+        assert_eq!(theirs.get("default_null_order"), Some("NULLS_FIRST"));
+        assert!(ours.is_local("default_order") && ours.is_local("integer_division"));
+        assert!(!ours.is_local("default_null_order") && !theirs.is_local("default_order"));
+        // A `SET GLOBAL` does not move a value the connection set for itself, and a reset does.
+        set(&mut local, "integer_division", Scope::Global, Some("false")).expect("a global set");
+        assert_eq!(settings.session_for(local.as_deref()).get("integer_division"), Some("true"));
+        set(&mut local, "integer_division", Scope::Unwritten, None).expect("a bare reset");
+        assert_eq!(settings.session_for(local.as_deref()).get("integer_division"), Some("false"));
+        let older = set(&mut local, "threads", Scope::Session, Some("2")).expect_err("older");
+        assert_eq!(older.message(), "option \"threads\" cannot be set locally");
+        let global =
+            set(&mut local, "pin_threads", Scope::Session, Some("auto")).expect_err("only");
+        assert_eq!(
+            global.message(),
+            "Setting \"pin_threads\" cannot be set as a session variable - it can only be set \
+             globally"
+        );
     }
 
     /// Seven settings have two spellings, and both spellings are one setting however they are mixed.
