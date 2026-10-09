@@ -450,6 +450,7 @@ fn named(name: &str, count: usize) -> Vec<String> {
 /// with two named arities has a row for each.
 const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("can_cast_implicitly", &["source_type", "target_type"]),
+    ("cast_to_type", &["param", "type"]),
     ("current_setting", &["setting_name"]),
     ("equi_width_bins", &["min", "max", "bin_count", "nice_rounding"]),
     ("error", &["message"]),
@@ -471,6 +472,7 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("string_split_regex", &["string", "regex"]),
     ("string_split_regex", &["string", "regex", "options"]),
     ("string_to_array", &["string", "separator"]),
+    ("timetz_byte_comparable", &["time_tz"]),
     ("to_timestamp", &["sec"]),
 ];
 

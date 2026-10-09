@@ -257,6 +257,13 @@ enum Shape {
     /// argument has to be a type arithmetic can reach is the binder's rather than this table's,
     /// since it is the sort key and not just the argument that has to satisfy it.
     AsGiven,
+    /// Two arguments, and the first is cast to the type of the second. `cast_to_type`.
+    ///
+    /// The binder turns the call into the cast before it asks this table anything, since the type
+    /// is all it wants from the second argument and its value is never read. The row is here for
+    /// the arity error and for `duckdb_functions()`, which the pin fills with `ANY` all the way
+    /// through.
+    Retyped,
     /// Every argument promotes to one type and the result is a list of that type. `list_value`.
     ///
     /// The one shape whose result is not a type any of the arguments had, which is why it cannot be
@@ -1668,11 +1675,29 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::Boolean),
         numeric_only: false,
     },
+    // The upper boundaries of bins of equal width between two ends.
     Entry {
         name: "equi_width_bins",
         kind: FunctionKind::Scalar,
         arity: Arity::exactly(4),
         shape: Shape::Binned,
+        numeric_only: false,
+    },
+    // A value cast to the type of another. The binder makes it the cast, so this row only answers
+    // a call with the wrong number of arguments and the catalog.
+    Entry {
+        name: "cast_to_type",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(2),
+        shape: Shape::Retyped,
+        numeric_only: false,
+    },
+    // The number a zoned time sorts by, which is the number it is held in.
+    Entry {
+        name: "timetz_byte_comparable",
+        kind: FunctionKind::Scalar,
+        arity: Arity::exactly(1),
+        shape: Shape::Widened(Fixed::TimeTz, Fixed::UBigInt),
         numeric_only: false,
     },
     // Whether a value is the key `histogram(x, bins)` counts the values no bin took under.
@@ -2739,6 +2764,7 @@ fn resolved(name: &str, arguments: &[LogicalType]) -> Result<Resolved> {
             (cast_to, first)
         }
         Shape::AsGiven => (vec![arguments[0].clone()], arguments[0].clone()),
+        Shape::Retyped => (arguments.to_vec(), arguments[1].clone()),
         Shape::PromotedToFirst => {
             let common = promote_all(name, arguments)?;
             // An untyped null keeps nothing to hand back, so it takes the promoted type the way
@@ -5289,6 +5315,8 @@ const CANDIDATES: &[(&str, &[&str])] = &[
             "equi_width_bins(col0 ANY, col1 ANY, col2 BIGINT, col3 BOOLEAN) -> ANY[]",
         ],
     ),
+    ("cast_to_type", &["cast_to_type(col0 ANY, col1 ANY) -> ANY"]),
+    ("timetz_byte_comparable", &["timetz_byte_comparable(col0 TIME WITH TIME ZONE) -> UBIGINT"]),
     ("current_setting", &["current_setting(setting_name VARCHAR) -> ANY"]),
     ("getvariable", &["getvariable(variable_name VARCHAR) -> ANY"]),
     ("in_search_path", &["in_search_path(col0 VARCHAR, col1 VARCHAR) -> BOOLEAN"]),
@@ -5764,7 +5792,7 @@ impl Shape {
             }
             // One `ANY` in and one `ANY` out, which is the pin's row for `fill` and is the whole of
             // what it declares.
-            Self::AsGiven => (all(ANY), ANY),
+            Self::AsGiven | Self::Retyped => (all(ANY), ANY),
             // One overload with an `ANY` return, which is the pin's row for it. The name decides
             // the type and a name is not something a signature can hold.
             Self::Setting => (all(Fixed::Varchar.name()), ANY),

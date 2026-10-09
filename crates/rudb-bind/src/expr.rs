@@ -1879,6 +1879,17 @@ impl Binder<'_> {
             let casts = rudb_functions::implicit::cost(source, target).is_some();
             return Ok(self.add_constant(Value::Boolean(casts)));
         }
+        // `cast_to_type(x, y)` is `x` cast to the type of `y`. The type is settled here and the
+        // value of `y` is never read, so the call becomes the cast, which is how the pin binds it.
+        // A `y` that is a bare null has no type to cast to, and the pin refuses it.
+        if rudb_catalog::same_name(&written, "cast_to_type") && bound.len() == 2 {
+            self.over_aggregate(bound[1], scope)?;
+            let target = self.plan().expr_type(bound[1]).clone();
+            if target == LogicalType::Null {
+                return Err(Error::invalid_input("cast_to_type cannot be used to cast to NULL"));
+            }
+            return self.checked_cast_to(bound[0], &target, false);
+        }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
         // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
