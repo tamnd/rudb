@@ -173,12 +173,13 @@ impl Shape {
         self.columns().iter().map(Column::kind).collect()
     }
 
-    /// One group's code put back into the values its columns held.
-    fn values(&self, group: Grouped) -> Result<Vec<Value>> {
-        match self {
-            Self::Alone(_) if !group.valid => Ok(vec![Value::Null]),
-            Self::Alone(column) => Ok(vec![column.value(i64::from(group.group))?]),
-            Self::Many(composite) => composite.values(group.group),
+    /// One group's code put back into the values its columns held, with `None` the null group.
+    fn values(&self, group: Option<Grouped>) -> Result<Vec<Value>> {
+        match (self, group) {
+            (Self::Alone(_), None) => Ok(vec![Value::Null]),
+            (Self::Alone(column), Some(group)) => Ok(vec![column.value(i64::from(group.group))?]),
+            (Self::Many(composite), Some(group)) => composite.values(group.group),
+            (Self::Many(_), None) => Err(Error::internal("a composite group key came out null")),
         }
     }
 }
@@ -643,6 +644,7 @@ fn count_groups(
         ceiling,
         groups: Vec::new(),
         counts: Vec::new(),
+        null: None,
     };
     reserving.stop(0);
 
@@ -656,7 +658,14 @@ fn count_groups(
             table.add(*pair, i64::from(*by), &mut working)?;
         }
     }
-    let Counts { buckets, groups, counts, .. } = table;
+    // Every null group pair went to its split as a count. See [`Counted::nulls`].
+    if parts.first().is_some_and(|part| pairs::null_split(part.splits.len()) == split) {
+        let nulls = parts.iter().map(|part| i64::from(part.nulls)).sum::<i64>();
+        if nulls > 0 {
+            table.add_null(nulls)?;
+        }
+    }
+    let Counts { buckets, groups, counts, null, .. } = table;
     let kept =
         width(groups.capacity() * size_of::<Grouped>() + counts.capacity() * size_of::<i64>());
     working.grow(kept)?;
@@ -670,9 +679,9 @@ fn count_groups(
         let mut held = memory.reservation();
         held.grow(kept)?;
         drop(working);
-        return Ok(Tallied::Part(Partial { split, groups, counts, held }));
+        return Ok(Tallied::Part(Partial { split, groups, counts, null, held }));
     }
-    emit(&groups, &counts, shape, bound, memory).map(Tallied::Whole)
+    emit(&groups, &counts, null, shape, bound, memory).map(Tallied::Whole)
 }
 
 /// The table [`count_groups`] counts a split's groups into.
@@ -683,9 +692,25 @@ struct Counts {
     ceiling: usize,
     groups: Vec<Grouped>,
     counts: Vec<i64>,
+    /// The slot of the null group. Its count sits beside the others, and no bucket holds it, since
+    /// it is never looked for by its key.
+    null: Option<usize>,
 }
 
 impl Counts {
+    /// Adds `by` pairs to the null group, opening it if this is the first of them.
+    fn add_null(&mut self, by: i64) -> Result<()> {
+        match self.null {
+            Some(slot) => added(&mut self.counts[slot], by),
+            None => {
+                self.null = Some(self.groups.len());
+                self.groups.push(Grouped { group: 0 });
+                self.counts.push(by);
+                Ok(())
+            }
+        }
+    }
+
     /// Adds `by` pairs to `pair`'s group, opening it if this is the first of them.
     ///
     /// Always inlined, because it is the whole of the counting loop and it is called from two
@@ -708,7 +733,7 @@ impl Counts {
                 {
                     self.capacity *= 2;
                     working.grow(width(self.capacity * size_of::<u32>()))?;
-                    self.buckets = rehashed(self.capacity, &self.groups)?;
+                    self.buckets = rehashed(self.capacity, &self.groups, self.null)?;
                 }
                 return Ok(());
             }
@@ -718,11 +743,7 @@ impl Counts {
             // own assignment, and each of those is a bounds check and a load that the one before
             // it already paid for. See [`Grouped`].
             if self.groups[slot] == pair {
-                let count = &mut self.counts[slot];
-                *count = count
-                    .checked_add(by)
-                    .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
-                return Ok(());
+                return added(&mut self.counts[slot], by);
             }
             at = (at + 1) & mask;
         }
@@ -733,6 +754,7 @@ impl Counts {
 fn emit(
     groups: &[Grouped],
     counts: &[i64],
+    null: Option<usize>,
     shape: &Shape,
     bound: usize,
     memory: &Memory,
@@ -744,7 +766,7 @@ fn emit(
     for slot in best {
         // The code goes back to being the values it stood for here and nowhere earlier, so what is
         // copied is one row per group that reached the bound rather than one per row of input.
-        let mut row = shape.values(groups[slot])?;
+        let mut row = shape.values((null != Some(slot)).then_some(groups[slot]))?;
         row.push(Value::BigInt(counts[slot]));
         output.push(row);
     }
@@ -769,6 +791,7 @@ struct Partial {
     split: usize,
     groups: Vec<Grouped>,
     counts: Vec<i64>,
+    null: Option<usize>,
     held: Reservation,
 }
 
@@ -876,8 +899,20 @@ fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -
     let mut buckets = vec![EMPTY; capacity];
     let mut groups: Vec<Grouped> = Vec::with_capacity(input);
     let mut counts: Vec<i64> = Vec::with_capacity(input);
+    let mut null = None;
     for part in parts {
-        for (pair, &by) in part.groups.iter().zip(&part.counts) {
+        for (slot, (pair, &by)) in part.groups.iter().zip(&part.counts).enumerate() {
+            if part.null == Some(slot) {
+                match null {
+                    Some(held) => added(&mut counts[held], by)?,
+                    None => {
+                        null = Some(groups.len());
+                        groups.push(*pair);
+                        counts.push(by);
+                    }
+                }
+                continue;
+            }
             let mut at = pair.hash() as usize & mask;
             loop {
                 let slot = buckets[at];
@@ -891,10 +926,7 @@ fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -
                 }
                 let slot = slot as usize;
                 if groups[slot] == *pair {
-                    let count = &mut counts[slot];
-                    *count = count
-                        .checked_add(by)
-                        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+                    added(&mut counts[slot], by)?;
                     break;
                 }
                 at = (at + 1) & mask;
@@ -906,7 +938,7 @@ fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -
         drop(part.counts);
         drop(part.held);
     }
-    emit(&groups, &counts, shape, bound, memory)
+    emit(&groups, &counts, null, shape, bound, memory)
 }
 
 /// The slots a split's group table starts with, which is one cache line of them and then some.
@@ -916,14 +948,17 @@ fn added_up(parts: Vec<Partial>, shape: &Shape, bound: usize, memory: &Memory) -
 /// of groups never has to grow it at all. See [`count_groups`].
 const SPLIT_SEED: usize = 64;
 
-/// A fresh table of `capacity` slots holding every group in `groups` at its index.
+/// A fresh table of `capacity` slots holding every group in `groups` at its index but the null one.
 ///
 /// Only the groups are rehashed. The counts are indexed by the same number the buckets hold, so
 /// nothing about them moves when the table grows.
-fn rehashed(capacity: usize, groups: &[Grouped]) -> Result<Vec<u32>> {
+fn rehashed(capacity: usize, groups: &[Grouped], null: Option<usize>) -> Result<Vec<u32>> {
     let mask = capacity - 1;
     let mut buckets = vec![EMPTY; capacity];
     for (slot, group) in groups.iter().enumerate() {
+        if null == Some(slot) {
+            continue;
+        }
         let slot = u32::try_from(slot)
             .map_err(|_| Error::out_of_memory("a grouped distinct radix split is too large"))?;
         let mut at = group.hash() as usize & mask;
@@ -933,6 +968,15 @@ fn rehashed(capacity: usize, groups: &[Grouped]) -> Result<Vec<u32>> {
         buckets[at] = slot;
     }
     Ok(buckets)
+}
+
+/// Adds `by` pairs to a group's count.
+#[inline]
+fn added(count: &mut i64, by: i64) -> Result<()> {
+    *count = count
+        .checked_add(by)
+        .ok_or_else(|| Error::out_of_range("COUNT(DISTINCT BIGINT) overflowed"))?;
+    Ok(())
 }
 
 fn width(value: usize) -> u64 {
@@ -1112,28 +1156,40 @@ mod tests {
         // A split is cut up when it holds more pairs than one thread's fair share, and then no piece
         // of it has all of any group and the counts have to be added up afterwards. Asking for a
         // thread per pair makes every split too big for one, so every split here takes that path.
+        //
+        // The null group is a count in each partition rather than a pair, and at one split it is
+        // in a split that gets cut, so its two halves have to meet the same way the others do.
         let row = |group, user| Record { user, group };
-        let mut first = Run::default();
-        first.push(row(3, 10), true);
-        first.push(row(3, 11), true);
-        first.push(row(4, 12), true);
-        let mut second = Run::default();
-        second.push(row(3, 12), true);
-        second.push(row(3, 14), true);
-        second.push(row(4, 13), true);
-        let mut left = Held { runs: vec![first] };
-        let mut right = Held { runs: vec![second] };
-        let memory = Memory::unlimited();
-        let counted = vec![
-            distinct_pairs(&mut left, SPLITS, &memory).expect("a pair partition"),
-            distinct_pairs(&mut right, SPLITS, &memory).expect("a pair partition"),
-        ];
-        let whole = rows_of(&counted, SPLITS, &signed());
-        assert_eq!(
-            whole,
-            [vec![Value::Integer(3), Value::BigInt(4)], vec![Value::Integer(4), Value::BigInt(2)],]
-        );
-        assert_eq!(rows_at(&counted, SPLITS, &signed(), 64), whole);
+        for splits in [1, SPLITS] {
+            let mut first = Run::default();
+            first.push(row(3, 10), true);
+            first.push(row(3, 11), true);
+            first.push(row(4, 12), true);
+            first.push(row(0, 10), false);
+            let mut second = Run::default();
+            second.push(row(3, 12), true);
+            second.push(row(3, 14), true);
+            second.push(row(4, 13), true);
+            second.push(row(0, 15), false);
+            second.push(row(0, 15), false);
+            let mut left = Held { runs: vec![first] };
+            let mut right = Held { runs: vec![second] };
+            let memory = Memory::unlimited();
+            let counted = vec![
+                distinct_pairs(&mut left, splits, &memory).expect("a pair partition"),
+                distinct_pairs(&mut right, splits, &memory).expect("a pair partition"),
+            ];
+            let whole = rows_of(&counted, splits, &signed());
+            assert_eq!(
+                whole,
+                [
+                    vec![Value::Integer(3), Value::BigInt(4)],
+                    vec![Value::Integer(4), Value::BigInt(2)],
+                    vec![Value::Null, Value::BigInt(2)],
+                ]
+            );
+            assert_eq!(rows_at(&counted, splits, &signed(), 64), whole);
+        }
     }
 
     /// How many splits the tests count over, picked to be neither one nor the sixteen a big query gets.

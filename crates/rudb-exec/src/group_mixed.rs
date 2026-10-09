@@ -693,6 +693,11 @@ impl Table {
             for (pair, by) in &part.tallied[split] {
                 self.add_distinct(*pair, i64::from(*by))?;
             }
+            // The null group's pairs are a count, in the split its hash picks like any group's.
+            if part.nulls > 0 && pairs::null_split(part.splits.len()) == split {
+                let key = Key { group: 0, hash: pairs::group_hash(0, false), valid: false };
+                self.add_key(key, i64::from(part.nulls))?;
+            }
         }
         timing.stop(0);
         Ok(())
@@ -700,7 +705,12 @@ impl Table {
 
     #[inline(always)]
     fn add_distinct(&mut self, pair: Grouped, by: i64) -> Result<()> {
-        let key = Key { group: pair.group, hash: pair.hash(), valid: pair.valid };
+        self.add_key(Key { group: pair.group, hash: pair.hash(), valid: true }, by)
+    }
+
+    /// Adds `by` distinct pairs to the group `key` names.
+    #[inline(always)]
+    fn add_key(&mut self, key: Key, by: i64) -> Result<()> {
         let slot = self.slot(key)?;
         let state = &mut self.states[slot];
         state.distinct = state
