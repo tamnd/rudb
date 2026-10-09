@@ -1139,6 +1139,36 @@ fn a_filter_is_refused_where_there_is_nothing_for_it_to_keep_or_drop() {
 }
 
 #[test]
+fn a_writing_statement_refuses_a_window_or_an_aggregate_in_a_clause_of_one_row() {
+    // The condition and the values are columns of the source and the returned list is a select,
+    // where both calls are allowed, so these are found in the statement as it was written.
+    for (sql, message) in [
+        (
+            "DELETE FROM hits WHERE rank() OVER () > 1",
+            "WHERE clause cannot contain window functions!",
+        ),
+        ("DELETE FROM hits WHERE sum(counter) > 1", "WHERE clause cannot contain aggregates!"),
+        ("UPDATE hits SET counter = rank() OVER ()", "window functions are not allowed in UPDATE"),
+        ("UPDATE hits SET counter = sum(counter)", "aggregate functions are not allowed in UPDATE"),
+        (
+            "UPDATE hits SET counter = 1 RETURNING rank() OVER ()",
+            "Unimplemented expression class in ExpressionBinder::BindExpression: WINDOW",
+        ),
+        ("DELETE FROM hits RETURNING sum(counter)", "Aggregate functions are not supported here"),
+        (
+            "INSERT INTO hits VALUES (1, 'a', 1) RETURNING sum(counter)",
+            "Aggregate functions are not supported here",
+        ),
+    ] {
+        let ast = rudb_parse::parse_ast(sql).expect("a statement that parses");
+        match crate::bind_statement(&ast, &catalog()) {
+            Ok(_) => panic!("{sql} should not bind"),
+            Err(error) => assert_eq!(error.message(), message, "{sql}"),
+        }
+    }
+}
+
+#[test]
 fn what_a_filter_may_contain_depends_on_what_the_call_it_hangs_off_is() {
     // An aggregate's filter is bound as if it were inside the call, so an aggregate in it is
     // refused on its own terms and a window in it is refused the way a window inside an aggregate

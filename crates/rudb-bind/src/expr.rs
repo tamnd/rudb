@@ -4695,6 +4695,18 @@ pub(crate) fn aggregating(ast: &Ast, expr: ast::ExprRef, user: &dyn Fn(&str) -> 
     first_aggregate(ast, expr, user).is_some()
 }
 
+/// The first window call in an expression, in the order it is written. A call with `WITHIN GROUP`
+/// and `OVER` counts, because it is an aggregate used as a window.
+pub(crate) fn first_window(ast: &Ast, expr: ast::ExprRef) -> Option<ast::ExprRef> {
+    if expr == NONE {
+        return None;
+    }
+    if matches!(ast.expr(expr), ast::Expr::Window { .. }) || ast.within_group_over(expr) {
+        return Some(expr);
+    }
+    ast.children(expr).into_iter().find_map(|child| first_window(ast, child))
+}
+
 /// The first aggregate call in an expression, in the order it is written, as
 /// `locate_agg_of_level` finds it. `user` is as for [`aggregating`].
 pub(crate) fn first_aggregate(

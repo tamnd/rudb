@@ -1480,6 +1480,7 @@ impl Binder<'_> {
             "WHERE clause" => "WHERE",
             "HAVING clause" => "HAVING",
             "LIMIT clause" => "LIMIT",
+            "OFFSET clause" => "OFFSET",
             "JOIN condition" => "JOIN conditions",
             other => other,
         };

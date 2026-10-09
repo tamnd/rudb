@@ -3128,6 +3128,8 @@ impl<'a> Transform<'a> {
             copy: false,
             overriding,
             truncate: None,
+            filter: NONE,
+            values: Slice::default(),
         });
         Ok(Statement::Insert(index))
     }
@@ -3266,6 +3268,8 @@ impl<'a> Transform<'a> {
             copy: true,
             overriding: Overriding::None,
             truncate: None,
+            filter: NONE,
+            values: Slice::default(),
         });
         Ok(Statement::Insert(index))
     }
