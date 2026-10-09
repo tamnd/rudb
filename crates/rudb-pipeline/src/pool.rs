@@ -89,7 +89,7 @@ impl Pool {
         }
     }
 
-    /// The same pool, but one that lends no more threads than the machine has cores sitting idle.
+    /// The same pool, but one that lends no more threads than a busy machine's share of its cores.
     ///
     /// This is for a database on a machine it shares. Six threads on six cores that thirty other
     /// tasks also want do not get six cores, they get a share of them, and a parallel pipeline
@@ -116,7 +116,7 @@ impl Pool {
     /// How many threads a pipeline about to start should plan for.
     ///
     /// [`Pool::threads`] for a pool that lends whatever it has. A yielding pool says no more than
-    /// the caller and the cores sitting idle, which is what its lease would lend anyway. The
+    /// the caller and its share of the cores, which is what its lease would lend anyway. The
     /// number matters before the lease, because a scan is asked it first, cuts its morsels by it
     /// and spreads its own set-up over that many threads of its own, such as asking a dictionary
     /// which of its values a `LIKE` keeps. On the JOB bench machine at a load of about 36, 5a
@@ -126,7 +126,7 @@ impl Pool {
     pub fn ceiling(&self) -> usize {
         let threads = self.threads();
         if self.yielding && threads > 1 {
-            threads.min(idle_cores().saturating_add(1))
+            threads.min(spare_cores().saturating_add(1))
         } else {
             threads
         }
@@ -155,7 +155,7 @@ impl Pool {
     pub fn lease(&self, want: usize) -> Lease<'_> {
         let mut wanted = want.saturating_sub(1);
         if self.yielding && wanted > 0 {
-            wanted = wanted.min(idle_cores());
+            wanted = wanted.min(spare_cores());
         }
         self.lend(wanted)
     }
@@ -527,14 +527,24 @@ impl Drop for Lease<'_> {
     }
 }
 
-/// How many of this machine's cores nothing is running on right now, as far as Linux can say.
+/// How many threads beyond the caller's own a lease may add on a machine it shares, as far as Linux
+/// can say.
 ///
-/// The count comes from the fourth field of `/proc/loadavg`, which is the number of tasks that
-/// are runnable at the moment it is read, this one included and this pool's busy workers
-/// included. Cores less that is what a lease can add without taking a core from somebody, its
-/// own query's other pipelines among them. A machine with no such file, or one whose file this
-/// cannot read, is taken to be idle, which is how the pool behaved before it looked.
-fn idle_cores() -> usize {
+/// The count comes from the fourth field of `/proc/loadavg`, which is the number of tasks that are
+/// runnable at the moment it is read, this one included and this pool's busy workers included. A
+/// machine with no such file, or one whose file this cannot read, is taken to be idle, which is how
+/// the pool behaved before it looked.
+///
+/// This used to be the cores less that count, the cores nobody was running on, and that is a cliff.
+/// On six cores beside five other runnable tasks it lent nothing, so a query ran on one thread
+/// exactly as it would at a load of thirty. The scheduler shares the cores between the runnable
+/// tasks, so a query that asks for six threads there gets about three cores, and on one thread it
+/// gets one. JOB 7c on the bench machine was that case: every pipeline ran on one thread, a hash
+/// table over 1.6 million rows among them, while DuckDB beside the same load ran on six and was
+/// faster. What this lends now is the share a thread on every core would get, see [`shared`], which
+/// is never less than the idle cores and is still one thread at the load where one was measured to
+/// be the faster.
+fn spare_cores() -> usize {
     static BORN: OnceLock<Instant> = OnceLock::new();
     static CORES: OnceLock<usize> = OnceLock::new();
     static READ_AT: AtomicU64 = AtomicU64::new(0);
@@ -555,7 +565,20 @@ fn idle_cores() -> usize {
         READ_AT.store(now, Ordering::Relaxed);
         running
     };
-    cores.saturating_sub(running)
+    shared(cores, running.saturating_sub(1)).saturating_sub(1)
+}
+
+/// The cores a process with a thread on each of `cores` gets beside `others` runnable tasks, and at
+/// least one.
+///
+/// Each runnable task gets about the same share of the machine, so the process holds `cores` of the
+/// `cores + others` tasks and that fraction of the cores. Asking for that many threads is asking
+/// for the cores it would be given anyway, where asking for all of them would put every thread at
+/// the barrier that ends a pipeline waiting for whichever of them was descheduled last. With
+/// nothing else running it is every core. On six cores beside five others it is three, and beside
+/// the twenty seven of the load where one thread was faster than six it is one.
+pub(crate) fn shared(cores: usize, others: usize) -> usize {
+    (cores.saturating_mul(cores) / cores.saturating_add(others).max(1)).max(1)
 }
 
 /// The runnable count out of the text of `/proc/loadavg`, which reads like

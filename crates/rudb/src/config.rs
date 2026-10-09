@@ -171,8 +171,9 @@ impl Config {
         self.yielding
     }
 
-    /// The same settings, borrowing only idle cores or not. A test that counts the workers a query
-    /// ran on turns it off, so it counts the same on a small machine or a busy one.
+    /// The same settings, borrowing only a busy machine's share of its cores or not. A test that
+    /// counts the workers a query ran on turns it off, so it counts the same on a small machine or
+    /// a busy one.
     #[must_use]
     pub fn with_yielding(mut self, on: bool) -> Self {
         self.yielding = on;
