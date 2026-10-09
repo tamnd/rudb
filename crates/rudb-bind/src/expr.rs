@@ -1800,16 +1800,11 @@ impl Binder<'_> {
         {
             return Ok(cast);
         }
+        let qualified = (name.len > 1).then(|| ast.name_text(name));
+        let how = Written { qualified: qualified.as_deref(), ..Written::default() };
         if postgres
-            && let Some(call) = self.pg_proc_call(
-                ast,
-                &written,
-                &arguments,
-                &bound,
-                &untyped,
-                Written::default(),
-                scope,
-            )?
+            && let Some(call) =
+                self.pg_proc_call(ast, &written, &arguments, &bound, &untyped, how, scope)?
         {
             return Ok(call);
         }

@@ -16,7 +16,7 @@ use crate::binary::Recv;
 use crate::datetime::{
     DATE_INFINITY, DATE_NEGATIVE_INFINITY, DateTimeInput, Interval, IntervalStyle,
     UNIX_TO_POSTGRES_DAYS, date_in, date_recv, interval_in, interval_recv, time_in, time_recv,
-    timestamp_in, timestamp_recv, timestamp_to_unix, timestamptz_in,
+    timestamp_in, timestamp_recv, timestamp_to_unix, timestamptz_in, timetz_in, timetz_recv,
 };
 use crate::declared::type_name;
 use crate::error::TypeError;
@@ -61,6 +61,7 @@ pub fn logical_type(oid: Oid) -> Option<LogicalType> {
         oids::UUID => LogicalType::Uuid,
         oids::DATE => LogicalType::Date,
         oids::TIME => LogicalType::Time,
+        oids::TIMETZ => LogicalType::TimeTz,
         oids::TIMESTAMP => LogicalType::Timestamp,
         oids::TIMESTAMPTZ => LogicalType::TimestampTz,
         oids::INTERVAL => LogicalType::Interval,
@@ -238,6 +239,7 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         oids::JSONB => Value::Varchar(jsonb_in(text)?),
         oids::DATE => date(date_in(text, cx)?),
         oids::TIME => Value::Time(time_in(text, -1, cx)?),
+        oids::TIMETZ => time_tz(timetz_in(text, -1, cx)?),
         oids::TIMESTAMP => Value::Timestamp(timestamp_to_unix(timestamp_in(text, -1, cx)?)?),
         oids::TIMESTAMPTZ => Value::TimestampTz(timestamp_to_unix(timestamptz_in(text, -1, cx)?)?),
         oids::INTERVAL => interval(interval_in(text, -1, settings.interval_style)?),
@@ -335,6 +337,7 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::UUID => Value::Uuid(uuid::from_bytes(recv.uuid()?)),
         oids::DATE => date(date_recv(recv)?),
         oids::TIME => Value::Time(time_recv(recv, -1)?),
+        oids::TIMETZ => time_tz(timetz_recv(recv, -1)?),
         oids::TIMESTAMP => Value::Timestamp(timestamp_to_unix(timestamp_recv(recv, -1)?)?),
         oids::TIMESTAMPTZ => Value::TimestampTz(timestamp_to_unix(timestamp_recv(recv, -1)?)?),
         oids::INTERVAL => interval(interval_recv(recv, -1)?),
@@ -380,6 +383,11 @@ fn date(days: i32) -> Value {
         DATE_NEGATIVE_INFINITY => -i32::MAX,
         days => days - UNIX_TO_POSTGRES_DAYS,
     })
+}
+
+/// A `timetz`, the time and the zone in seconds west of UTC, as the engine holds it.
+fn time_tz((time, zone): (i64, i32)) -> Value {
+    Value::TimeTz(rudb_common::time_tz::pack(time, -zone))
 }
 
 fn interval(value: Interval) -> Value {

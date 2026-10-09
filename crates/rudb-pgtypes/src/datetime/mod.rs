@@ -15,6 +15,7 @@
 
 mod decode;
 mod format;
+mod part;
 mod session;
 
 use rudb_common::SqlState;
@@ -25,6 +26,10 @@ pub use decode::{
 };
 pub use format::{
     DateTemplate, interval_to_char, timestamp_to_char, timestamptz_to_char, to_date, to_timestamp,
+};
+pub use part::{
+    extract_date, extract_interval, extract_time, extract_timestamp, extract_timestamptz,
+    extract_timetz,
 };
 pub use session::SessionZones;
 

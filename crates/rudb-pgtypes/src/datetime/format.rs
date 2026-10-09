@@ -434,7 +434,7 @@ fn adjust_year(year: i32, interval: bool) -> i32 {
 }
 
 /// `j2day`: the day of the week of a Julian day, with Sunday 0.
-fn j2day(date: i32) -> i32 {
+pub(super) fn j2day(date: i32) -> i32 {
     date.wrapping_add(1).rem_euclid(7)
 }
 
@@ -446,7 +446,7 @@ fn isoweek2j(year: i32, week: i32) -> i32 {
 }
 
 /// `date2isoweek`.
-fn date2isoweek(year: i32, mon: i32, mday: i32) -> i32 {
+pub(super) fn date2isoweek(year: i32, mon: i32, mday: i32) -> i32 {
     let dayn = date2j(year, mon, mday);
     let mut day4 = date2j(year, 1, 4);
     let mut day0 = j2day(day4 - 1);
@@ -466,7 +466,7 @@ fn date2isoweek(year: i32, mon: i32, mday: i32) -> i32 {
 }
 
 /// `date2isoyear`.
-fn date2isoyear(mut year: i32, mon: i32, mday: i32) -> i32 {
+pub(super) fn date2isoyear(mut year: i32, mon: i32, mday: i32) -> i32 {
     let dayn = date2j(year, mon, mday);
     let mut day4 = date2j(year, 1, 4);
     let mut day0 = j2day(day4 - 1);

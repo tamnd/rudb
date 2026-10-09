@@ -1993,6 +1993,77 @@ fn the_windows_of_a_query_are_computed_in_the_order_postgres_computes_them_in() 
     server.stop().unwrap();
 }
 
+/// `extract` gives a numeric with the value and the scale that PostgreSQL gives, reads a time
+/// stamp with a time zone in the zone of the session, and refuses a unit as PostgreSQL does.
+#[test]
+fn extract_gives_the_numeric_that_postgres_gives() {
+    let dirs = Dirs::new("pgextract");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, value) in [
+        (
+            "select extract(epoch from timestamptz '2020-07-01 12:00:00.123456+00')::text",
+            "1593604800.123456",
+        ),
+        (
+            "select extract(julian from timestamp '2020-07-01 18:00:00')::text",
+            "2459032.75000000000000000000",
+        ),
+        ("select extract(j from date '2020-07-01')::text", "2459032"),
+        (
+            "select extract(epoch from interval '1 year 2 months 3 days 4.5 seconds')::text",
+            "37000804.500000",
+        ),
+        ("select extract(millisecond from interval '1.234567 s')::text", "1234.567"),
+        ("select extract(epoch from timetz '01:02:03.5+05')::text", "-14276.500000"),
+        ("select extract(year from timestamp 'infinity')::text", "Infinity"),
+        ("select coalesce(extract(month from timestamp '-infinity')::text, 'null')", "null"),
+        ("select pg_typeof(extract(year from now()))::text", "numeric"),
+        ("select extract(century from date '0001-01-01 BC')::text", "-1"),
+        ("select extract(\"Year\" from date '2020-07-01')::text", "2020"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    assert_eq!(tags(&client.query("set time zone 'America/New_York'")), "CSZ");
+    assert_eq!(
+        scalar(
+            &mut client,
+            "select extract(timezone from timestamptz '2020-07-01 12:00+00')::text"
+        ),
+        "-14400"
+    );
+    for (sql, state, message) in [
+        (
+            "select extract(hour from date '2020-07-01')",
+            "0A000",
+            "unit \"hour\" not supported for type date",
+        ),
+        (
+            "select extract(foo from timestamp '2020-07-01')",
+            "22023",
+            "unit \"foo\" not recognized for type timestamp without time zone",
+        ),
+        (
+            "select pg_catalog.extract('year', '2020-07-01')",
+            "42725",
+            "function pg_catalog.extract(unknown, unknown) is not unique",
+        ),
+        (
+            "select pg_catalog.extract('year', 1)",
+            "42883",
+            "function pg_catalog.extract(unknown, integer) does not exist",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// The name, the type and the type modifier of each column of a row description.
 fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
     let bytes = message.decoded();

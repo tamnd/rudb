@@ -17,7 +17,6 @@ use crate::nodes::{
     CoercionForm, FuncCall, List, MinMaxOp, Node, NullTestType, SQLValueFunction,
     SQLValueFunctionOp, SubLink, SubLinkType,
 };
-use crate::token;
 
 impl Transform<'_> {
     pub(super) fn expr(&mut self, node: &Node) -> Made<ExprRef> {
@@ -178,6 +177,14 @@ impl Transform<'_> {
     fn made_call(&mut self, name: &str, args: Slice, location: i32) -> ExprRef {
         let part = self.intern(name);
         let name = self.ast.part_slice([part]);
+        self.push(Expr::Function { name, args, distinct: false, filter: NONE }, location)
+    }
+
+    /// A call of the function `name` of `pg_catalog`, as the grammar makes one for a form of SQL
+    /// syntax.
+    fn system_call(&mut self, name: &str, args: Slice, location: i32) -> ExprRef {
+        let parts = [self.intern("pg_catalog"), self.intern(name)];
+        let name = self.ast.part_slice(parts);
         self.push(Expr::Function { name, args, distinct: false, filter: NONE }, location)
     }
 
@@ -704,23 +711,15 @@ impl Transform<'_> {
                 _,
             ) => self.call(name, &call.args, location),
             ("btrim", _) => self.call("trim", &call.args, location),
+            // `pg_catalog.extract(text, value)`, whose kernels read the unit as it was written.
             ("extract", [Some(Node::A_Const(part)), Some(value)]) => {
                 let Some(Node::String(written)) = &part.val else {
                     return clause("Extract");
                 };
-                // A part written as a word is spelled the way the DuckDB transform spells it, and a
-                // part written as a string is kept as it is.
-                let quoted =
-                    self.token_at(part.location).map(|(kind, _)| kind) == Some(token::SCONST);
-                let text = if quoted {
-                    written.to_string()
-                } else {
-                    rudb_parse::build::date_part(written)
-                };
-                let part = self.string(&text, part.location);
+                let part = self.string(written, part.location);
                 let value = self.expr(value)?;
                 let args = self.ast.expr_slice([part, value]);
-                Ok(self.made_call("date_part", args, location))
+                Ok(self.system_call("extract", args, location))
             }
             ("timezone", [Some(zone), Some(value)]) => {
                 let zone = self.expr(zone)?;
