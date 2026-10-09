@@ -5922,7 +5922,10 @@ impl<'a> Binder<'a> {
         }
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
-        let resolved = resolve(name, &types)?;
+        let mut resolved = resolve(name, &types)?;
+        if !exporting {
+            resolved = self.spread_as_postgres(resolved, &types);
+        }
         // The separator is read once per group and not once per row, so the pin wants it to be the
         // same on every row and says so in these words.
         if resolved.name == "string_agg"
@@ -6023,6 +6026,44 @@ impl<'a> Binder<'a> {
             return Ok(column);
         }
         Ok(self.summed_as_postgres(resolved.name, &types, column))
+    }
+
+    /// The variance family with the types PostgreSQL gives it, over a group or over a window.
+    /// PostgreSQL keeps `var_pop`, `var_samp`, `stddev_pop` and `stddev_samp` of an exact type in
+    /// exact `numeric` sums and answers a `numeric`, and of a `real` or a `double precision` in the
+    /// state of `float8_accum` and answers a `double precision`, where the pin answers a DOUBLE
+    /// from a Welford state for both. The calls take the names of PostgreSQL's final functions,
+    /// which are the states of [`rudb_kernels`] that keep them. Any other call is as resolved.
+    fn spread_as_postgres(&self, resolved: Resolved, types: &[LogicalType]) -> Resolved {
+        if self.semantics.aggregate_types() != AggregateTypes::Postgres {
+            return resolved;
+        }
+        let ([argument], [_]) = (types, &resolved.arguments[..]) else { return resolved };
+        let (argument, returns) = match argument {
+            // An exact state reads the integers that fit an `i128` as they are.
+            LogicalType::HugeInt | LogicalType::UHugeInt => {
+                (LogicalType::Numeric, LogicalType::Numeric)
+            }
+            exact if exact.is_integer() => (exact.clone(), LogicalType::Numeric),
+            LogicalType::Decimal { .. } | LogicalType::Numeric => {
+                (argument.clone(), LogicalType::Numeric)
+            }
+            LogicalType::Float | LogicalType::Double => (LogicalType::Double, LogicalType::Double),
+            _ => return resolved,
+        };
+        let exact = returns == LogicalType::Numeric;
+        let name = match (resolved.name, exact) {
+            ("var_pop", true) => "numeric_var_pop",
+            ("var_samp", true) => "numeric_var_samp",
+            ("stddev_pop", true) => "numeric_stddev_pop",
+            ("stddev_samp", true) => "numeric_stddev_samp",
+            ("var_pop", false) => "float8_var_pop",
+            ("var_samp", false) => "float8_var_samp",
+            ("stddev_pop", false) => "float8_stddev_pop",
+            ("stddev_samp", false) => "float8_stddev_samp",
+            _ => return resolved,
+        };
+        Resolved { name, arguments: vec![argument], returns, ..resolved }
     }
 
     /// A `sum` with the type PostgreSQL gives it, over a group or over a window. PostgreSQL sums an
@@ -6482,6 +6523,7 @@ impl<'a> Binder<'a> {
             columns[1] = self.zero_to_null(columns[1]);
             return self.call("/", columns.to_vec());
         }
+        let resolved = self.spread_as_postgres(resolved, &types);
         let mut cast = Vec::with_capacity(parts.args.len());
         for (arg, wanted) in parts.args.iter().zip(&resolved.arguments) {
             cast.push(self.checked_cast_to(*arg, wanted, false)?);
