@@ -327,7 +327,7 @@ impl Binder<'_> {
 
     /// The table index that the columns `node` produces bind against, under the nodes that only
     /// pass their input through.
-    fn output_index(&self, mut node: u32) -> Option<u32> {
+    pub(crate) fn output_index(&self, mut node: u32) -> Option<u32> {
         loop {
             let held = self.plan().node(node);
             if let Some(index) = held.table_index() {

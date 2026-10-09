@@ -17,8 +17,8 @@ use std::sync::Arc;
 use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name};
 use rudb_common::bounds::Zones;
 use rudb_common::{
-    AggregateTypes, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error, ErrorTexts,
-    Field, FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session,
+    AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error,
+    ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session,
     ShowBehavior, Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames,
 };
 use rudb_functions::{
@@ -372,6 +372,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) pinned_span: Option<Span>,
     /// The collations the statement wrote with `COLLATE`. See `crate::collate`.
     pub(crate) collated: crate::collate::Collated,
+    /// The collations of DuckDB the statement met.
+    pub(crate) pin_collated: crate::collation::PinCollated,
     /// The arguments of a function in SQL of `pg_proc` while its body is bound in place of the
     /// call, which `$1` and the others name there. See `crate::pgcalls`.
     pub(crate) inlined: Option<Vec<ExprRef>>,
@@ -547,6 +549,7 @@ impl<'a> Binder<'a> {
             current_span: Span::new(0, 0),
             pinned_span: None,
             collated: crate::collate::Collated::default(),
+            pin_collated: crate::collation::PinCollated::default(),
             inlined: None,
             aggregation: None,
             want_ascending: false,
@@ -2549,11 +2552,12 @@ impl<'a> Binder<'a> {
         above: &mut Vec<PendingSubquery>,
     ) -> Result<Vec<SortKey>> {
         if query.order_by_all {
-            return Ok(self.every_column(ast, query, output));
+            return self.every_column(ast, query, output, Some(&exprs[..]));
         }
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
+            let (item, ordinal) = self.ordinal_collation(ast, item);
             if let Some(expanded) = self.bind_star_each(ast, item.expr, input)? {
                 for bound in expanded {
                     let bound = self.over_aggregate(bound, input)?;
@@ -2566,6 +2570,7 @@ impl<'a> Binder<'a> {
                     sorted.push(Sorted { position, written: item.expr, extra: held.is_none() });
                     let ty = self.plan.expr_type(exprs[position]).clone();
                     let expr = self.column(project, position, ty);
+                    let expr = self.collate_key(expr, exprs[position])?;
                     keys.push(self.sort_key(expr, item));
                 }
                 continue;
@@ -2591,6 +2596,7 @@ impl<'a> Binder<'a> {
             sorted.push(Sorted { position, written: item.expr, extra });
             let ty = self.plan.expr_type(exprs[position]).clone();
             let expr = self.column(project, position, ty);
+            let expr = self.order_key(expr, exprs[position], ordinal.as_deref())?;
             keys.push(self.sort_key(expr, item));
         }
         Ok(keys)
@@ -2605,13 +2611,15 @@ impl<'a> Binder<'a> {
         targets: &[ast::Target],
     ) -> Result<Vec<SortKey>> {
         if query.order_by_all {
-            return Ok(self.every_column(ast, query, output));
+            return self.every_column(ast, query, output, None);
         }
         let items = ast.order_list(query.order_by).to_vec();
         let mut keys = Vec::with_capacity(items.len());
         for item in items {
+            let (item, ordinal) = self.ordinal_collation(ast, item);
             if let Some(expanded) = self.bind_star_each(ast, item.expr, output)? {
                 for expr in expanded {
+                    let expr = self.collate_key(expr, expr)?;
                     keys.push(self.sort_key(expr, item));
                 }
                 continue;
@@ -2628,29 +2636,44 @@ impl<'a> Binder<'a> {
                     self.bind_expr(ast, item.expr, output)?
                 }
             };
+            let expr = self.order_key(expr, expr, ordinal.as_deref())?;
             keys.push(self.sort_key(expr, item));
         }
         Ok(keys)
     }
 
-    fn every_column(&mut self, ast: &Ast, query: &ast::Query, output: &Scope) -> Vec<SortKey> {
+    /// The sort keys of `ORDER BY ALL`, one for each output column, each under the collation of
+    /// the select list entry in `from` it was made from when there is one.
+    fn every_column(
+        &mut self,
+        ast: &Ast,
+        query: &ast::Query,
+        output: &Scope,
+        from: Option<&[ExprRef]>,
+    ) -> Result<Vec<SortKey>> {
         // `ORDER BY ALL DESC` is one item with no expression, which carries the direction and the
         // null placement for every column.
         let written = ast.order_list(query.order_by).first().copied();
         let columns: Vec<(ColumnBinding, LogicalType)> =
             output.columns.iter().map(|column| (column.binding, column.ty.clone())).collect();
-        columns
-            .into_iter()
-            .map(|(binding, ty)| {
-                let expr = self.plan.add_expr(Expr::Column(binding), ty);
-                if let Some(item) = written {
-                    return self.sort_key(expr, item);
-                }
-                let expr = self.by_position(expr);
-                let descending = self.semantics.default_descending();
-                SortKey { expr, descending, nulls_first: self.semantics.nulls_first(descending) }
-            })
-            .collect()
+        let mut keys = Vec::with_capacity(columns.len());
+        for (position, (binding, ty)) in columns.into_iter().enumerate() {
+            let expr = self.plan.add_expr(Expr::Column(binding), ty);
+            let made = from.and_then(|from| from.get(position).copied()).unwrap_or(expr);
+            let expr = self.collate_key(expr, made)?;
+            if let Some(item) = written {
+                keys.push(self.sort_key(expr, item));
+                continue;
+            }
+            let expr = self.by_position(expr);
+            let descending = self.semantics.default_descending();
+            keys.push(SortKey {
+                expr,
+                descending,
+                nulls_first: self.semantics.nulls_first(descending),
+            });
+        }
+        Ok(keys)
     }
 
     /// A sort key with the session defaults filled in.
@@ -3369,6 +3392,12 @@ impl<'a> Binder<'a> {
         if !columns.is_empty() {
             let names: Vec<&str> = ast.name(columns).collect();
             scope.rename(&names, &label)?;
+        }
+        if self.semantics.collations() == Collations::Pin {
+            let collations: Vec<(u32, String)> = (0..fields.len())
+                .filter_map(|at| table.collation(at).map(|name| (at as u32, name.to_string())))
+                .collect();
+            self.collated_columns(index, collations);
         }
         let resolved = if excluded { &QualifiedName::excluded() } else { resolved };
         let catalog_name = self.plan.intern(&resolved.catalog);
@@ -6241,17 +6270,20 @@ impl<'a> Binder<'a> {
         for item in ast.order_list(written.order).to_vec() {
             let expr = self.bind_expr(ast, item.expr, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
+            let expr = self.collate_key(expr, expr)?;
             inner.push(self.sort_key(expr, item));
         }
         let mut partition = Vec::new();
         for &key in ast.expr_list(held.partition) {
             let expr = self.bind_expr(ast, key, scope)?;
-            partition.push(self.over_aggregate(expr, scope)?);
+            let expr = self.over_aggregate(expr, scope)?;
+            partition.push(self.collate_key(expr, expr)?);
         }
         let mut order = Vec::new();
         for item in ast.order_list(held.order).to_vec() {
             let expr = self.bind_expr(ast, item.expr, scope)?;
             let expr = self.over_aggregate(expr, scope)?;
+            let expr = self.collate_key(expr, expr)?;
             order.push(self.sort_key(expr, item));
         }
         let frame = WindowFrame {
@@ -6481,7 +6513,7 @@ impl<'a> Binder<'a> {
 
     /// Whether two bound expressions are the same expression, by shape rather than by reference.
     pub(crate) fn same_expr(&self, left: ExprRef, right: ExprRef) -> bool {
-        same_expr(&self.plan, left, right)
+        same_expr(&self.plan, left, right) && self.same_written_collation(left, right)
     }
 }
 

@@ -870,6 +870,9 @@ fn create_table(catalog: &Catalog, table: &Table) -> String {
         .enumerate()
         .map(|(at, column)| {
             let mut part = format!("{} {}", quoted(&column.name), column.ty);
+            if let Some(collation) = table.collation(at) {
+                part.push_str(&format!(" COLLATE {collation}"));
+            }
             if let Some(generated) = table.generated(at) {
                 part.push_str(&format!(" GENERATED ALWAYS AS({generated})"));
             }

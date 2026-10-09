@@ -1663,6 +1663,8 @@ pub struct Table {
     /// The expression of each generated column as SQL, or empty when no column is one. The value
     /// is worked out when a row is written and kept like any other, so a read is a read.
     generated: Vec<Option<String>>,
+    /// The collation each column was declared with, as written, or empty when no column has one.
+    collations: Vec<Option<String>>,
     /// Which columns are identity columns, or empty when no column is one.
     identities: Vec<Option<Identity>>,
     /// The SQL of each `CHECK` constraint, in the order written.
@@ -1720,6 +1722,7 @@ impl Table {
             defaults: Vec::new(),
             types: Vec::new(),
             generated: Vec::new(),
+            collations: Vec::new(),
             identities: Vec::new(),
             checks: Vec::new(),
             foreign: Vec::new(),
@@ -1769,6 +1772,7 @@ impl Table {
             defaults,
             types,
             generated,
+            collations: Vec::new(),
             identities,
             checks,
             foreign,
@@ -3031,6 +3035,18 @@ impl Table {
         self.types = types;
     }
 
+    /// The collation a column was declared with, as written, such as `nocase` or `NOACCENT.nocase`.
+    #[must_use]
+    pub fn collation(&self, column: usize) -> Option<&str> {
+        self.collations.get(column).and_then(Option::as_deref)
+    }
+
+    /// Declares the columns' collations, one per column, or none when no column has one.
+    pub fn set_collations(&mut self, collations: Vec<Option<String>>) {
+        self.collations =
+            if collations.iter().any(Option::is_some) { collations } else { Vec::new() };
+    }
+
     /// The expression of a generated column as SQL, or `None` for a column that holds what is
     /// written to it.
     #[must_use]
@@ -3422,6 +3438,9 @@ impl Table {
         if self.has_generated() {
             self.generated.resize(self.columns.len(), None);
         }
+        if !self.collations.is_empty() {
+            self.collations.resize(self.columns.len(), None);
+        }
         let mut moved = true;
         match alteration {
             Alteration::Rename(to) => self.name.table = to,
@@ -3439,6 +3458,9 @@ impl Table {
                 self.defaults.push(default);
                 self.types.push(declared);
                 self.identities.push(None);
+                if !self.collations.is_empty() {
+                    self.collations.push(None);
+                }
                 if self.has_generated() {
                     self.generated.push(None);
                 }
@@ -3506,6 +3528,9 @@ impl Table {
                     self.defaults.remove(column);
                     self.types.remove(column);
                     self.identities.remove(column);
+                    if column < self.collations.len() {
+                        self.collations.remove(column);
+                    }
                     if column < self.generated.len() {
                         self.generated.remove(column);
                     }
@@ -3539,6 +3564,9 @@ impl Table {
             Alteration::Type { column, ty, declared } => {
                 self.columns[column].ty = ty;
                 self.types[column] = declared;
+                if column < self.collations.len() {
+                    self.collations[column] = None;
+                }
                 self.clustering = None;
             }
             Alteration::AddKey { columns, primary } => {

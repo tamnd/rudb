@@ -1112,8 +1112,11 @@ impl Binder<'_> {
         right: ast::ExprRef,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        if op == BinaryOp::Collate && self.semantics.collations() == Collations::Postgres {
-            return self.bind_collate(ast, left, right, scope);
+        if op == BinaryOp::Collate {
+            if self.semantics.collations() == Collations::Postgres {
+                return self.bind_collate(ast, left, right, scope);
+            }
+            return self.bind_pin_collate(ast, left, right, scope);
         }
         let symbol = op;
         let op = if op == BinaryOp::Divide && self.semantics.integer_division() {
@@ -2289,9 +2292,13 @@ impl Binder<'_> {
         negated: bool,
         scope: &Scope,
     ) -> Result<ExprRef> {
-        let subject = self.bind_expr(ast, operand, scope)?;
-        let low = self.bind_expr(ast, low, scope)?;
-        let high = self.bind_expr(ast, high, scope)?;
+        let mut bounds = [
+            self.bind_expr(ast, operand, scope)?,
+            self.bind_expr(ast, low, scope)?,
+            self.bind_expr(ast, high, scope)?,
+        ];
+        self.share_collation(&mut bounds)?;
+        let [subject, low, high] = bounds;
         let (lower, upper, op) = if negated {
             (CompareOp::Less, CompareOp::Greater, ConjunctionOp::Or)
         } else {
@@ -2328,6 +2335,7 @@ impl Binder<'_> {
         let spelled: Vec<ast::ExprRef> =
             std::iter::once(operand).chain(written.iter().copied()).collect();
         self.common_type(ast, &spelled, &mut values, None)?;
+        self.share_collation(&mut values)?;
         let subject = values[0];
         let mut tests = Vec::with_capacity(written.len());
         let padded = self.semantics.character_types() == CharacterTypes::Postgres;
@@ -2833,8 +2841,9 @@ impl Binder<'_> {
         &mut self,
         resolved_name: &str,
         stored_name: Option<&str>,
-        mut args: Vec<ExprRef>,
+        args: Vec<ExprRef>,
     ) -> Result<ExprRef> {
+        let mut args = self.push_collations(resolved_name, args)?;
         // The pin's string literal reaches any parameter type by a cast, and the UUID readers are
         // the calls here whose one parameter takes nothing else, so a literal is read as a UUID
         // before the call is resolved rather than refused as a VARCHAR.
@@ -4071,6 +4080,11 @@ impl Binder<'_> {
         let left = self.checked_cast_to(left, &common, false)?;
         let right = self.checked_cast_to(right, &common, false)?;
         let (left, right) = (self.by_position(left), self.by_position(right));
+        let (left, right) = if common == LogicalType::Varchar {
+            self.collate_sides(left, right)?
+        } else {
+            (left, right)
+        };
         Ok(self.add_expr(Expr::Compare { op, left, right }, LogicalType::Boolean))
     }
 
@@ -4567,6 +4581,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
         // the operator where DuckDB says the function is a name a client keys a row by and does
         // not find.
         ast::Expr::Binary { op, left, right } => {
+            let right_written = right;
             let (left, right) = (describe(ast, left, semantics), describe(ast, right, semantics));
             match op {
                 BinaryOp::Regex => regex_name(&left, &right, false, false, semantics),
@@ -4575,8 +4590,16 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
                 BinaryOp::NotRegexInsensitive => regex_name(&left, &right, true, true, semantics),
                 BinaryOp::SimilarTo => format!("regexp_full_match({left}, {right})"),
                 BinaryOp::NotSimilarTo => format!("(NOT regexp_full_match({left}, {right}))"),
-                // The one operator DuckDB names with no brackets around it at all.
-                BinaryOp::Collate => format!("{left} COLLATE {right}"),
+                // The one operator DuckDB names with no brackets around it at all, with the name of
+                // the collation as one identifier however it was written.
+                BinaryOp::Collate => {
+                    match crate::collation::written_collation(ast, right_written) {
+                        Some(name) if semantics.collations() == Collations::Pin => {
+                            format!("{left} COLLATE {}", quoted(&name))
+                        }
+                        _ => format!("{left} COLLATE {right}"),
+                    }
+                }
                 BinaryOp::Divide if semantics.integer_division() => {
                     format!("({left} // {right})")
                 }

@@ -231,6 +231,8 @@ pub struct CreateTable {
     /// Each column's PostgreSQL type, where the declaration wrote one that the logical type does
     /// not give.
     pub types: Vec<Option<DeclaredType>>,
+    /// Each column's collation as written, or `None` for a column declared with none.
+    pub collations: Vec<Option<String>>,
     /// The sequences the defaults use, which the table depends on.
     pub sequences: Vec<QualifiedName>,
     /// The sequences that a `serial` column makes, which the table owns. Each is also in
@@ -1336,6 +1338,7 @@ fn create_table(
     let defs = ast.column_defs(written.columns);
     let mut types = Vec::with_capacity(defs.len());
     let mut serials = Vec::with_capacity(defs.len());
+    let mut collations = Vec::with_capacity(defs.len());
     let (mut columns, source) = if written.query == NONE {
         let mut columns = Vec::with_capacity(defs.len());
         for def in defs {
@@ -1344,8 +1347,15 @@ fn create_table(
                 // The type of the expression, which is settled once every column has a name.
                 serials.push(false);
                 types.push(None);
+                collations.push(None);
                 columns.push(Field::new(ast.string(def.name), LogicalType::Null));
                 continue;
+            }
+            if text.is_empty() && session.semantics().type_names() == TypeNames::Pin {
+                return Err(Error::parser(format!(
+                    "Column {} must have a type or be defined as a GENERATED column.",
+                    ast.string(def.name)
+                )));
             }
             if text.is_empty() {
                 return Err(Error::binder(format!(
@@ -1372,6 +1382,16 @@ fn create_table(
                 .state(SqlState::INVALID_PARAMETER_VALUE));
             }
             types.push(pg_declared(text, &ty));
+            collations.push(if def.collation == NONE {
+                None
+            } else {
+                if ty != LogicalType::Varchar {
+                    return Err(Error::parser("Only VARCHAR columns can have collations!"));
+                }
+                let name = ast.string(def.collation);
+                crate::collation::collation_functions(name)?;
+                Some(name.to_string())
+            });
             let column = ast.string(def.name);
             columns.push(if def.not_null || serial.is_some() || def.identity.is_some() {
                 Field::required(column, ty)
@@ -1397,6 +1417,7 @@ fn create_table(
             columns.push(Field::new(named, column.ty.clone()));
             // A column that a table column or a cast gives keeps its type, as in PostgreSQL.
             types.push(column.origin.and_then(|origin| origin.ty));
+            collations.push(binder.column_collation(column.binding)?);
         }
         if defs.is_empty() && session.semantics().query_columns() == QueryColumns::Pin {
             deduplicate(&mut columns);
@@ -1549,6 +1570,7 @@ fn create_table(
         keys,
         defaults,
         types,
+        collations,
         checks,
         generated,
         foreign,
