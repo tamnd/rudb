@@ -153,8 +153,8 @@ pub struct Linked {
     ///
     /// Separate from [`Self::built`] because a link exists for a relationship that is partial and
     /// says so, where a key that repeats gets no link at all. False is the safe answer and is what
-    /// a relationship with no link gets, since totality is a fact about the children and the thing
-    /// that counted them is the link.
+    /// a relationship nothing counted gets. The thing that counts the children is the build, which
+    /// keeps its counts whether or not the budget kept the link, see [`Self::certified`].
     pub total: bool,
     /// Whether the parent's key column is certified distinct, nulls aside.
     ///
@@ -235,6 +235,26 @@ impl Linked {
         Self { total: true, ..Self::built(child, child_column, parent, parent_column) }
     }
 
+    /// A relationship whose link the budget did not keep, and whose every child row the build
+    /// found exactly one parent for.
+    ///
+    /// Both certificates without the link. The build only counts a relationship over a parent key
+    /// it found distinct, and the counts it keeps say every child found a parent, so a join over it
+    /// drops no child row and repeats none. There is nothing to follow, so no rewrite that reads a
+    /// link may fire, but one that deletes a join may.
+    pub fn certified(
+        child: impl Into<String>,
+        child_column: impl Into<String>,
+        parent: impl Into<String>,
+        parent_column: impl Into<String>,
+    ) -> Self {
+        Self {
+            total: true,
+            unique: true,
+            ..Self::declared(child, child_column, parent, parent_column)
+        }
+    }
+
     /// A relationship somebody declared and no file holds a link for.
     pub fn declared(
         child: impl Into<String>,
@@ -304,7 +324,7 @@ impl Linked {
     /// spelled it out would be one `&&` away from asking for one certificate and acting on two.
     #[must_use]
     pub fn exactly_one(&self) -> bool {
-        self.built && self.total
+        self.unique && self.total
     }
 
     /// Whether this is the relationship between those two columns.
@@ -1533,9 +1553,16 @@ mod tests {
         let verified = Linked::verified("lineitem", "l_orderkey", "orders", "o_orderkey");
         assert!(verified.built && verified.total, "both certificates of section 7.3");
 
+        // A link over its budget is not kept, and its counts still are. That licenses deleting the
+        // join and not reading a link that is not there.
+        let certified = Linked::certified("lineitem", "l_orderkey", "orders", "o_orderkey");
+        assert!(certified.exactly_one(), "both certificates without the link");
+        assert!(!certified.built, "and nothing to follow");
+        assert!(verified.exactly_one() && !built.exactly_one() && !declared.exactly_one());
+
         // The four names are the same in all three, which is what lets a pass match on the columns
         // and then read the certificates rather than the other way round.
-        for link in [&declared, &built, &verified] {
+        for link in [&declared, &built, &verified, &certified] {
             assert!(link.between(("lineitem", "l_orderkey"), ("orders", "o_orderkey")));
         }
     }

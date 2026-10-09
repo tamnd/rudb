@@ -6071,11 +6071,25 @@ impl Shared {
                 (&link.parent.table, parent_keys),
             );
             let sides = (&link.child.table, child_key, &link.parent.table, parent_key);
+            // A link the budget turned away still left its counts, and a relationship every child
+            // row found a parent through is exactly one whether or not it can be followed.
+            let counted = if built.is_none() && second.is_none() {
+                measured_link(
+                    catalog,
+                    (&link.child.table, child_keys),
+                    (&link.parent.table, parent_keys),
+                )
+            } else {
+                None
+            };
             let linked = match built {
                 Some(head) if head.linked == head.children => {
                     rudb_opt::link::Linked::verified(sides.0, sides.1, sides.2, sides.3)
                 }
                 Some(_) => rudb_opt::link::Linked::built(sides.0, sides.1, sides.2, sides.3),
+                None if counted.is_some_and(|(children, linked)| linked == children) => {
+                    rudb_opt::link::Linked::certified(sides.0, sides.1, sides.2, sides.3)
+                }
                 None => rudb_opt::link::Linked::declared(sides.0, sides.1, sides.2, sides.3),
             };
             let linked = match built {
@@ -8229,6 +8243,30 @@ fn stored_link(
     child: (&str, &[String]),
     parent: (&str, &[String]),
 ) -> Option<rudb_graph::link::Counts> {
+    on_edge(catalog, child, parent, rudb_native::graph::stored_link_counts)
+}
+
+/// The children and the ones that found a parent, as the build counted them for a relationship it
+/// measured, when its link was not kept.
+///
+/// What [`stored_link`] reads off a link's header, read off the counts the build keeps for every
+/// relationship it measured, under the same binding check.
+fn measured_link(
+    catalog: &Catalog,
+    child: (&str, &[String]),
+    parent: (&str, &[String]),
+) -> Option<(u64, u64)> {
+    on_edge(catalog, child, parent, rudb_native::graph::measured_counts)
+}
+
+/// What `read` finds in the child's file for the relationship between those columns, when both
+/// tables are native and both keys resolve.
+fn on_edge<T>(
+    catalog: &Catalog,
+    child: (&str, &[String]),
+    parent: (&str, &[String]),
+    read: impl FnOnce(&rudb_native::Reader, &rudb_native::Reader, &Edge) -> Option<T>,
+) -> Option<T> {
     let child_table = table_named(catalog, child.0)?;
     let parent_table = table_named(catalog, parent.0)?;
     let (
@@ -8249,7 +8287,7 @@ fn stored_link(
         parent: parent_table.name().table.clone(),
         parent_column,
     };
-    rudb_native::graph::stored_link_counts(child_rows, parent_rows, &edge)
+    read(child_rows, parent_rows, &edge)
 }
 
 /// The spans the child's file measured for a relationship over one column, by column name.

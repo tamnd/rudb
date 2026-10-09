@@ -1342,14 +1342,17 @@ fn bound_to(child: &Reader, held: &section::Section) -> Option<(String, usize)> 
     Some((name.to_owned(), column))
 }
 
-/// Whether this table carries a link or an adjacency section at all, current or not.
+/// Whether this table carries a link, an adjacency or a relationship's counts at all, current or
+/// not.
 ///
 /// Only the section list is looked at, so it is cheap enough to ask before every query. A caller
 /// that gets `true` asks [`stored_relationships`] for what they are.
 #[must_use]
 pub fn carries_links(child: &Reader) -> bool {
     child.table().sections().iter().any(|section| {
-        section.kind == *section::FORWARD_LINK || section.kind == *section::ADJACENCY
+        section.kind == *section::FORWARD_LINK
+            || section.kind == *section::ADJACENCY
+            || section.kind == *section::LINK_COUNTS
     })
 }
 
@@ -1360,12 +1363,16 @@ pub fn carries_links(child: &Reader) -> bool {
 /// was a key, so each of these was declared once and checked when it was built. The declaration
 /// may have been a `SET graph_links` in the session that checkpointed, which is gone by the next
 /// open, and this is how the next open still knows about it. A relationship over the link budget
-/// can still be here through its adjacency, and one refused both is not.
+/// can still be here through its adjacency, and one refused both through the counts the build keeps
+/// for every relationship it measured.
 #[must_use]
 pub fn stored_relationships(child: &Reader) -> Vec<(usize, String, usize)> {
     let mut found: Vec<(usize, String, usize)> = Vec::new();
     for held in child.table().sections() {
-        if held.kind != *section::FORWARD_LINK && held.kind != *section::ADJACENCY {
+        if held.kind != *section::FORWARD_LINK
+            && held.kind != *section::ADJACENCY
+            && held.kind != *section::LINK_COUNTS
+        {
             continue;
         }
         let Ok(key) = usize::try_from(held.id) else { continue };
@@ -1466,6 +1473,33 @@ pub fn stored_link_counts(child: &Reader, parent: &Reader, edge: &Edge) -> Optio
     let bytes = child.payload_head(held, binding + link::HEADER_BYTES).ok()?;
     let binding = bound(&bytes, parent, edge)?;
     link::Link::counts(&bytes[binding..]).ok()
+}
+
+/// The children and the ones among them that found a parent, as the build counted them for a
+/// relationship it measured, whether the budget kept its link or not.
+///
+/// The same two numbers [`stored_link_counts`] reads off a kept link, read off the counts section
+/// the build writes for every relationship it measured, under the same binding check. JOB's
+/// `cast_info -> name` is over its budget and has no link, and every one of its 36 million rows
+/// found a parent, which is the certificate a planner needs to drop `name` from a join that reads
+/// nothing of it but its key.
+#[must_use]
+pub fn measured_counts(child: &Reader, parent: &Reader, edge: &Edge) -> Option<(u64, u64)> {
+    let table = child.table();
+    let id = u64::try_from(edge.child_column).ok()?;
+    let held = table
+        .sections()
+        .iter()
+        .find(|section| section.kind == *section::LINK_COUNTS && section.id == id)?;
+    if !held.usable(table.generation()) || held.refused().is_some() {
+        return None;
+    }
+    let bytes = child.payload_head(held, binding_bytes(&edge.parent) + 24).ok()?;
+    let binding = bound(&bytes, parent, edge)?;
+    let counts = bytes.get(binding..binding + 24)?;
+    let children = u64::from_le_bytes(counts.get(0..8)?.try_into().ok()?);
+    let linked = u64::from_le_bytes(counts.get(16..24)?.try_into().ok()?);
+    Some((children, linked))
 }
 
 /// The parent table and column the current forward link for this child column was built against.
