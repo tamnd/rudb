@@ -114,6 +114,7 @@ mod sequence;
 mod shape;
 mod similarity;
 mod sleep;
+pub mod sortkey;
 mod split;
 mod statistics;
 pub mod strftime;

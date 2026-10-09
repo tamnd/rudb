@@ -1666,6 +1666,15 @@ const TABLE: &[Entry] = &[
         shape: Shape::AnyTo(Fixed::UBigInt),
         numeric_only: false,
     },
+    // The bytes the pin sorts rows by. The binder reads the modifiers, passes the types of the
+    // keys, and makes the answer a BIGINT when the keys fit in one.
+    Entry {
+        name: "create_sort_key",
+        kind: FunctionKind::Scalar,
+        arity: Arity::at_least(1),
+        shape: Shape::AnyTo(Fixed::Blob),
+        numeric_only: false,
+    },
     // Whether a value of the first argument's type casts to the second's without being asked to.
     // The binder folds it from the two types, as the pin does, so the executor never sees it.
     Entry {
@@ -5314,6 +5323,7 @@ const CANDIDATES: &[(&str, &[&str])] = &[
     ("make_type", &["make_type(col0 VARCHAR, [ANY...]) -> TYPE"]),
     ("get_type", &["get_type(col0 ANY) -> TYPE"]),
     ("hash", &["hash(col0 ANY, [ANY...]) -> UBIGINT"]),
+    ("create_sort_key", &["create_sort_key(col0 ANY, [ANY...]) -> BLOB"]),
     ("can_cast_implicitly", &["can_cast_implicitly(col0 ANY, col1 ANY) -> BOOLEAN"]),
     (
         "equi_width_bins",

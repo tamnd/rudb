@@ -451,6 +451,7 @@ fn named(name: &str, count: usize) -> Vec<String> {
 const PARAMETER_NAMES: &[(&str, &[&str])] = &[
     ("can_cast_implicitly", &["source_type", "target_type"]),
     ("cast_to_type", &["param", "type"]),
+    ("create_sort_key", &["parameters..."]),
     ("current_setting", &["setting_name"]),
     ("equi_width_bins", &["min", "max", "bin_count", "nice_rounding"]),
     ("error", &["message"]),

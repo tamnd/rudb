@@ -1918,6 +1918,9 @@ impl Binder<'_> {
             }
             return Ok(cast);
         }
+        if rudb_catalog::same_name(&written, "create_sort_key") && !bound.is_empty() {
+            return self.sort_key_call(bound);
+        }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
         // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
@@ -3241,6 +3244,56 @@ impl Binder<'_> {
     /// whose order is the order of its list and not of its strings.
     pub(crate) fn by_position(&mut self, expr: ExprRef) -> ExprRef {
         if self.plan().expr_type(expr).labels().is_some() { self.enum_code(expr) } else { expr }
+    }
+
+    /// `create_sort_key(key, modifier, ...)`, whose modifiers the pin reads once when it binds.
+    ///
+    /// A modifier has to be a constant that is not null, and it is written back in one spelling so
+    /// the kernel does not take it apart for every row. The types of the keys go last as an empty
+    /// list of a struct of them, since the bytes of a null depend on its type and a null value has
+    /// none. The answer is a BIGINT rather than a BLOB when every key has a fixed width and they
+    /// fit in eight bytes together, which is the pin's rule.
+    fn sort_key_call(&mut self, mut bound: Vec<ExprRef>) -> Result<ExprRef> {
+        if !bound.len().is_multiple_of(2) {
+            return Err(Error::binder(
+                "Arguments to create_sort_key must be [key1, sort_specifier1, key2, \
+                 sort_specifier2, ...]",
+            ));
+        }
+        let mut fields = Vec::with_capacity(bound.len() / 2);
+        let mut width = Some(0);
+        for at in (1..bound.len()).step_by(2) {
+            let modifier = match fold::value_of(self.plan(), bound[at]) {
+                Ok(Some(Value::Null)) => {
+                    return Err(Error::binder(format!(
+                        "Argument #{} in function '\"create_sort_key\"' must not be NULL",
+                        at + 1
+                    )));
+                }
+                Ok(Some(Value::Varchar(text))) => text,
+                Ok(Some(other)) => other.to_string(),
+                _ => {
+                    return Err(Error::binder(format!(
+                        "Argument #{} in function \"create_sort_key\" must be a constant \
+                         expression",
+                        at + 1
+                    )));
+                }
+            };
+            bound[at] = self.add_constant(Value::Varchar(sort_modifier(&modifier)?.to_string()));
+            let ty = self.plan().expr_type(bound[at - 1]).clone();
+            width = width.zip(rudb_kernels::sortkey::fixed_width(&ty)).map(|(sum, one)| sum + one);
+            fields.push(Field::new(format!("k{}", at / 2), ty));
+        }
+        let types = Value::List { element: LogicalType::Struct(fields), values: Vec::new() };
+        bound.push(self.add_constant(types));
+        let call = self.call("create_sort_key", bound)?;
+        if width.is_some_and(|sum| sum <= 8) {
+            let copy = self.plan().expr(call).clone();
+            let span = self.plan().expr_span(call);
+            return Ok(self.plan_mut().add_expr_at(copy, LogicalType::BigInt, span));
+        }
+        Ok(call)
     }
 
     /// `nextval`, `currval` and `setval`, with the sequence they name looked up here.
@@ -5832,6 +5885,35 @@ fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) ->
     }
     message.push('\n');
     Error::binder(message)
+}
+
+/// A `create_sort_key` modifier in the one spelling the kernel reads, taken apart the way the pin
+/// takes it apart: in any case, with an underscore read as a space, starting with the direction
+/// and ending with where the nulls go.
+fn sort_modifier(text: &str) -> Result<&'static str> {
+    let text = text.to_lowercase().replace('_', " ");
+    let descending = if text.starts_with("asc") {
+        false
+    } else if text.starts_with("desc") {
+        true
+    } else {
+        return Err(Error::binder("create_sort_key modifier must start with either ASC or DESC"));
+    };
+    let nulls_first = if text.ends_with("nulls first") {
+        true
+    } else if text.ends_with("nulls last") {
+        false
+    } else {
+        return Err(Error::binder(
+            "create_sort_key modifier must end with either NULLS FIRST or NULLS LAST",
+        ));
+    };
+    Ok(match (descending, nulls_first) {
+        (false, false) => "ASC NULLS LAST",
+        (false, true) => "ASC NULLS FIRST",
+        (true, false) => "DESC NULLS LAST",
+        (true, true) => "DESC NULLS FIRST",
+    })
 }
 
 /// `ty` with each `from` in it made a `to`, which is the type `replace_type` casts to.

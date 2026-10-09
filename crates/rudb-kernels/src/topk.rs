@@ -486,6 +486,33 @@ pub(crate) fn sort_key(value: &Value, out: &mut Vec<u8>) {
     }
     out.push(VALID);
     match value {
+        Value::List { values, .. } => {
+            for value in values {
+                sort_key(value, out);
+            }
+            out.push(0);
+        }
+        Value::Map { entries, .. } => {
+            for (key, value) in entries {
+                out.push(VALID);
+                sort_key(key, out);
+                sort_key(value, out);
+            }
+            out.push(0);
+        }
+        Value::Struct(fields) => {
+            for (_, value) in fields {
+                sort_key(value, out);
+            }
+        }
+        _ => payload(value, out),
+    }
+}
+
+/// The bytes the pin's `create_sort_key` writes for a value that is not nested, after its validity
+/// byte and before any are flipped for a descending key.
+pub(crate) fn payload(value: &Value, out: &mut Vec<u8>) {
+    match value {
         Value::Boolean(v) => out.push(u8::from(*v)),
         Value::TinyInt(v) => signed(i64::from(*v), 1, out),
         Value::SmallInt(v) => signed(i64::from(*v), 2, out),
@@ -548,25 +575,6 @@ pub(crate) fn sort_key(value: &Value, out: &mut Vec<u8>) {
             }
             out.push(0);
         }
-        Value::List { values, .. } => {
-            for value in values {
-                sort_key(value, out);
-            }
-            out.push(0);
-        }
-        Value::Map { entries, .. } => {
-            for (key, value) in entries {
-                out.push(VALID);
-                sort_key(key, out);
-                sort_key(value, out);
-            }
-            out.push(0);
-        }
-        Value::Struct(fields) => {
-            for (_, value) in fields {
-                sort_key(value, out);
-            }
-        }
         other => {
             out.extend_from_slice(other.to_string().as_bytes());
             out.push(0);
@@ -596,7 +604,7 @@ fn whole_key(whole: Whole, n: i64, out: &mut Vec<u8>) {
 
 /// The low `width` bytes of a signed number, big end first, with the sign bit flipped.
 #[expect(clippy::cast_sign_loss, reason = "only the bits are written")]
-fn signed(n: i64, width: usize, out: &mut Vec<u8>) {
+pub(crate) fn signed(n: i64, width: usize, out: &mut Vec<u8>) {
     let bits = (n as u64).to_be_bytes();
     let bytes = &bits[8 - width..];
     out.push(bytes[0] ^ 0x80);
@@ -604,13 +612,13 @@ fn signed(n: i64, width: usize, out: &mut Vec<u8>) {
 }
 
 #[expect(clippy::cast_possible_truncation, reason = "the two halves are taken apart on purpose")]
-fn huge(n: i128, out: &mut Vec<u8>) {
+pub(crate) fn huge(n: i128, out: &mut Vec<u8>) {
     signed((n >> 64) as i64, 8, out);
     out.extend_from_slice(&(n as u64).to_be_bytes());
 }
 
 /// The pin's `Radix::EncodeDouble`.
-fn double_bits(x: f64) -> u64 {
+pub(crate) fn double_bits(x: f64) -> u64 {
     if x == 0.0 {
         return 1 << 63;
     }
@@ -628,7 +636,7 @@ fn double_bits(x: f64) -> u64 {
 }
 
 /// The pin's `Radix::EncodeFloat`.
-fn float_bits(x: f32) -> u32 {
+pub(crate) fn float_bits(x: f32) -> u32 {
     if x == 0.0 {
         return 1 << 31;
     }
