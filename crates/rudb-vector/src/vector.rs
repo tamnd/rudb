@@ -5083,7 +5083,8 @@ impl Packed<'_> {
             let (words, width, offset) = (self.words, self.width, self.offset);
             let wide = width as usize;
             let mut out = vec![T::default(); at.len()];
-            if streams(at.first() == Some(&(low as u32)) && at.last() == Some(&(high as u32)), high - low, at.len(), wide) {
+            let ascends = at[0] as usize == low && at[at.len() - 1] as usize == high;
+            if streams(ascends, high - low, at.len(), wide) {
                 for (slot, &row) in out.iter_mut().zip(at) {
                     *slot = value(code_at(words, (offset + row as usize) * wide, width));
                 }
