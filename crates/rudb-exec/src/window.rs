@@ -701,8 +701,8 @@ impl Window {
         let filled: Vec<Option<Vec<Value>>> = self
             .calls
             .iter()
-            .map(|call| (call.reads == Reads::Filled).then(|| self.filling(call, rows)))
-            .collect();
+            .map(|call| (call.reads == Reads::Filled).then(|| self.filling(call, rows)).transpose())
+            .collect::<Result<_>>()?;
         // An aggregate over a frame that starts at the partition's start and leaves nothing out
         // grows from one row to the next, so it keeps one accumulator for the partition and feeds
         // it only the rows the frame gained. That is what makes a running total linear instead of
@@ -1128,29 +1128,36 @@ impl Window {
     /// Only the stretch of rows whose sort key is usable takes part. A null key sorts to one end of
     /// the partition and an infinite one to the other, so that stretch is a single run in the
     /// middle, and a row outside it keeps whatever it already had.
-    fn filling(&self, call: &Call, rows: &[Windowed]) -> Vec<Value> {
+    ///
+    /// A `fill(v ORDER BY k)` reads the line along `k` instead, with the rows of the partition put
+    /// in the order of `k` for it, and answers each row where it sits in the partition.
+    fn filling(&self, call: &Call, rows: &[Windowed]) -> Result<Vec<Value>> {
         let mut out: Vec<Value> = rows.iter().map(|row| row.0[call.args_at].clone()).collect();
-        // The binder has already refused any `fill` whose `OVER` does not order by exactly one
-        // expression, so the sort key is the one gathered value that follows the partition keys.
-        let sorted = self.partitions;
-        let keys: Vec<Option<f64>> = rows.iter().map(|row| placement(&row.0[sorted])).collect();
+        // The binder has already refused any `fill` that orders by anything but exactly one
+        // expression, so the sort key is its own one key when it has one, and otherwise the one
+        // gathered value that follows the partition keys.
+        let sorted = if call.order.is_empty() { self.partitions } else { call.order_at };
+        let walk: Vec<usize> = reading(call, rows, 0..rows.len())?.collect();
+        let keys: Vec<Option<f64>> =
+            walk.iter().map(|&row| placement(&rows[row].0[sorted])).collect();
         let Some(first) = keys.iter().position(Option::is_some) else {
-            return out;
+            return Ok(out);
         };
         let last =
             keys[first..].iter().position(Option::is_none).map_or(keys.len(), |past| first + past);
         let anchors: Vec<(usize, f64, f64)> = (first..last)
-            .filter_map(|at| Some((at, keys[at]?, placement(&rows[at].0[call.args_at])?)))
+            .filter_map(|at| Some((at, keys[at]?, placement(&rows[walk[at]].0[call.args_at])?)))
             .collect();
         if anchors.is_empty() {
-            return out;
+            return Ok(out);
         }
         let mut behind = 0;
         for at in first..last {
             while behind < anchors.len() && anchors[behind].0 <= at {
                 behind += 1;
             }
-            if !out[at].is_null() {
+            let row = walk[at];
+            if !out[row].is_null() {
                 continue;
             }
             // `behind` now counts the anchors before this row, so the pair is the one on each side
@@ -1162,9 +1169,9 @@ impl Window {
             };
             let (_, x0, y0) = anchors[from];
             let (_, x1, y1) = anchors[to];
-            out[at] = blended(y0, y1, gradient(keys[at].unwrap_or(x0), x0, x1), &call.returns);
+            out[row] = blended(y0, y1, gradient(keys[at].unwrap_or(x0), x0, x1), &call.returns);
         }
-        out
+        Ok(out)
     }
 
     /// Whether `row` is left out of the frame around `at` by the frame's exclusion.
