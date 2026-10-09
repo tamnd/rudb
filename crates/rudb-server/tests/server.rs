@@ -1448,6 +1448,38 @@ fn a_recursive_union_of_columns_that_hash_runs() {
 }
 
 #[test]
+fn an_operator_between_numbers_is_the_operator_postgres_finds() {
+    let dirs = Dirs::new("pgnumops");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // PostgreSQL prefers `float8` in the numeric category, so a `real` with another number is a
+    // `double precision`. The values are those of PostgreSQL 19.
+    for (sql, value) in [
+        ("select pg_typeof(1::float4 + 1.0)::text", "double precision"),
+        ("select pg_typeof(1::float4 * 1::int4)::text", "double precision"),
+        ("select pg_typeof(1::float4 - 1::int8)::text", "double precision"),
+        ("select pg_typeof(1::numeric + 1::float4)::text", "double precision"),
+        ("select pg_typeof(1::float4 + 1::float4)::text", "real"),
+        ("select pg_typeof(1::float4 + '1')::text", "real"),
+        ("select pg_typeof(1::int2 + 1.5)::text", "numeric"),
+        ("select pg_typeof(1::int8 + 1::int2)::text", "bigint"),
+        ("select (0.1::float4 + 0.2)::text", "0.30000000149011613"),
+        ("select (0.1::float4 = 0.1)::text", "false"),
+        ("select ('Infinity'::float4 + 100.0)::text", "Infinity"),
+        ("select (10 / 4.0)::text", "2.5000000000000000"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    let messages = client.query("select 1::float4 % 1");
+    let error = messages.iter().find(|message| message.tag == b'E').unwrap();
+    assert_eq!(error.field(b'C').unwrap(), "42883");
+    assert_eq!(error.field(b'M').unwrap(), "operator does not exist: real % integer");
+    assert_eq!(error.field(b'P').unwrap(), "18");
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_key_of_a_type_with_no_equality_or_ordering_is_an_error() {
     let dirs = Dirs::new("pgsortops");
     let server = Server::start(dirs.config()).unwrap();

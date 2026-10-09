@@ -602,6 +602,56 @@ impl Binder<'_> {
         Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
     }
 
+    /// The operands of an operator between numbers, each cast to the declared type of the
+    /// operator of `pg_operator` that PostgreSQL finds for it, for the engine operator to bind.
+    ///
+    /// The engine and PostgreSQL find different operators for two numbers of different types.
+    /// PostgreSQL prefers `float8` in the numeric category, so `float4 + int4` is `float48pl`, a
+    /// `double precision`, where the engine adds two `real` values. A string literal or a null
+    /// keeps the type that the other rules give it. A `numeric` operand is not cast, since the
+    /// engine keeps the scale of a decimal where an unconstrained `numeric` would not. When no
+    /// operator takes the two numbers, as for `real % integer`, the error is `operator does not
+    /// exist`.
+    pub(crate) fn pg_numeric_operands(
+        &mut self,
+        ast: &Ast,
+        symbol: &str,
+        written: &[ast::ExprRef; 2],
+        bound: [ExprRef; 2],
+    ) -> Result<[ExprRef; 2]> {
+        use rudb_pgtypes::OperatorResolution;
+        let types = bound.map(|operand| self.plan().expr_type(operand).clone());
+        let Some(oids) = operand_oids(ast, written, &types) else { return Ok(bound) };
+        let numeric =
+            |oid| rudb_pgtypes::TypeInfo::get(oid).is_some_and(|info| info.category == b'N');
+        if !oids.iter().all(|&oid| numeric(oid)) {
+            return Ok(bound);
+        }
+        let operator = match rudb_pgtypes::resolve_operator(symbol, &oids) {
+            OperatorResolution::Found(operator) => operator,
+            OperatorResolution::NotFound => {
+                let [left, right] = types.map(|ty| ty.to_string());
+                return Err(Error::binder(format!(
+                    "No function matches the given name and argument types '{symbol}({left}, \
+                     {right})'"
+                ))
+                .state(SqlState::UNDEFINED_FUNCTION));
+            }
+            OperatorResolution::Ambiguous => return Ok(bound),
+        };
+        let mut cast = bound;
+        for (at, &declared) in operator.args.iter().enumerate().take(2) {
+            if declared != oids[at]
+                && numeric(declared)
+                && declared != rudb_pgtypes::oid::NUMERIC
+                && let Some(ty) = rudb_pgtypes::logical_type(declared)
+            {
+                cast[at] = self.cast_to(bound[at], &ty);
+            }
+        }
+        Ok(cast)
+    }
+
     /// The default `text` of an argument of the PostgreSQL type `oid`, read by the input function
     /// of the type as `proargdefaults` holds it.
     fn default_argument(
