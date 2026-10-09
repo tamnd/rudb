@@ -1921,6 +1921,9 @@ impl Binder<'_> {
         if rudb_catalog::same_name(&written, "create_sort_key") && !bound.is_empty() {
             return self.sort_key_call(bound);
         }
+        if rudb_catalog::same_name(&written, "index_key") {
+            return self.index_key_call(ast, &arguments, bound);
+        }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
         // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
@@ -3294,6 +3297,160 @@ impl Binder<'_> {
             return Ok(self.plan_mut().add_expr_at(copy, LogicalType::BigInt, span));
         }
         Ok(call)
+    }
+
+    /// `index_key(path, name, key, ...)`, the key the pin's ART index holds a row under, with the
+    /// index found here the way the pin finds it when it binds.
+    ///
+    /// A null constant anywhere makes the call a null before anything is looked up, which the pin
+    /// does for any function that takes no nulls. The path is a constant struct of `catalog`,
+    /// `schema` and `table` and the name a constant too. A table's indexes are its keys and foreign
+    /// keys, named for their kind, the table and their place among its constraints, then the ones
+    /// `CREATE INDEX` made. Each key is cast to the type of its part of the index and the types go
+    /// last, the way they do for `create_sort_key`.
+    fn index_key_call(
+        &mut self,
+        ast: &Ast,
+        arguments: &[ast::ExprRef],
+        bound: Vec<ExprRef>,
+    ) -> Result<ExprRef> {
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&arg| self.plan().expr_type(arg).clone()).collect();
+        if types.len() < 2
+            || !matches!(types[0], LogicalType::Struct(_) | LogicalType::Null)
+            || !matches!(types[1], LogicalType::Varchar | LogicalType::Null)
+        {
+            let spelled: Vec<String> =
+                types.iter().zip(arguments).map(|(ty, &arg)| spelled_type(ast, arg, ty)).collect();
+            return Err(rudb_functions::named_mismatch("index_key", &spelled, false));
+        }
+        let folded: Vec<Option<Value>> =
+            bound.iter().map(|&arg| fold::value_of(self.plan(), arg).ok().flatten()).collect();
+        if folded.iter().flatten().any(Value::is_null) {
+            let null = self.plan_mut().add_value(Value::Null);
+            return Ok(self.add_expr(Expr::Constant(null), LogicalType::Blob));
+        }
+        let constant = |at: usize, name: &str| {
+            Error::binder(format!(
+                "The \"{name}\" argument in function \"index_key\" must be a constant expression"
+            ))
+            .with_span(ast.expr_span(arguments[at]))
+        };
+        let Some(Value::Struct(path)) = &folded[0] else {
+            return Err(constant(0, "path"));
+        };
+        let Some(Value::Varchar(name)) = &folded[1] else {
+            return Err(constant(1, "name"));
+        };
+        let (mut catalog, mut schema, mut table) = (None, None, None);
+        for (field, value) in path {
+            let slot = match field.to_ascii_lowercase().as_str() {
+                "catalog" => &mut catalog,
+                "schema" => &mut schema,
+                "table" => &mut table,
+                _ => {
+                    return Err(Error::binder(format!(
+                        "index_key: unknown field \"{field}\" in path"
+                    )));
+                }
+            };
+            let problem = match value {
+                Value::Varchar(text) if text.is_empty() => "cannot be empty",
+                Value::Varchar(text) => {
+                    *slot = Some(text.as_str());
+                    continue;
+                }
+                _ if value.is_null() => "cannot be NULL",
+                _ => "must be VARCHAR",
+            };
+            return Err(Error::binder(format!("index_key: path field \"{field}\" {problem}")));
+        }
+        let Some(table) = table else {
+            return Err(Error::binder("index_key: path must contain a 'table' field"));
+        };
+        // The pin reads a path with no schema as one in `main`, and writes the path back without
+        // the schema when it is that one.
+        let written: Vec<&str> = [
+            catalog,
+            schema.filter(|schema| !rudb_catalog::same_name(schema, "main")),
+            Some(table),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let parts: Vec<&str> = [catalog, schema.or(catalog.map(|_| "main")), Some(table)]
+            .into_iter()
+            .flatten()
+            .collect();
+        // The pin looks the table up by its whole name, which says a catalog is missing this way.
+        let resolved = self.catalog().resolve(&parts).map_err(|error| match catalog {
+            Some(catalog) if error.message().starts_with("Catalog with name") => {
+                Error::binder(format!("Catalog \"{catalog}\" does not exist!"))
+            }
+            _ => error,
+        })?;
+        if self.catalog().entry(&resolved)? != rudb_catalog::Entry::Table {
+            return Err(Error::catalog(format!("{} is not an table", resolved.table)));
+        }
+        let held = self.catalog().table(&resolved)?;
+        let columns = held.columns();
+        let of = |at: &[usize]| at.iter().map(|&at| columns[at].ty.clone()).collect::<Vec<_>>();
+        let mut indexes: Vec<(String, std::result::Result<Vec<LogicalType>, String>)> = Vec::new();
+        for (at, constraint) in held.constraints().into_iter().enumerate() {
+            let (kind, keyed) = match constraint {
+                rudb_catalog::Constraint::Key(key) => {
+                    let key = &held.keys()[key];
+                    (if key.primary { "PRIMARY" } else { "UNIQUE" }, &key.columns)
+                }
+                rudb_catalog::Constraint::Foreign(key) => ("FOREIGN", &held.foreign()[key].columns),
+                _ => continue,
+            };
+            indexes.push((format!("{kind}_{}_{at}", held.name().table), Ok(of(keyed))));
+        }
+        for index in held.indexes() {
+            let types = if index.plain { Ok(of(&index.columns)) } else { Err(index.sql.clone()) };
+            indexes.push((index.name.clone(), types));
+        }
+        let Some((_, types)) = indexes.iter().find(|(held, _)| rudb_catalog::same_name(held, name))
+        else {
+            let shown = written.join(".");
+            let names: Vec<&str> = indexes.iter().map(|(held, _)| held.as_str()).collect();
+            let listed = if names.is_empty() {
+                "No indexes found on this table.".to_string()
+            } else {
+                format!("Available indexes: {}", names.join(", "))
+            };
+            return Err(Error::catalog(format!(
+                "index_key: index \"{name}\" was not found on table {shown}. {listed}"
+            )));
+        };
+        let types = match types {
+            Ok(types) => types.clone(),
+            Err(sql) => crate::statement::index_key_types(
+                self.catalog(),
+                self.parameters,
+                self.session,
+                sql,
+            )?,
+        };
+        if bound.len() - 2 != types.len() {
+            return Err(Error::binder(format!(
+                "index_key: index '{name}' expects {} key column(s), but {} argument(s) provided",
+                types.len(),
+                bound.len() - 2
+            )));
+        }
+        let mut keys = Vec::with_capacity(types.len() + 1);
+        let mut fields = Vec::with_capacity(types.len());
+        for (at, (&key, ty)) in bound[2..].iter().zip(types).enumerate() {
+            keys.push(self.checked_cast_to(key, &ty, false)?);
+            fields.push(Field::new(format!("k{at}"), ty));
+        }
+        keys.push(self.add_constant(Value::List {
+            element: LogicalType::Struct(fields),
+            values: Vec::new(),
+        }));
+        self.call("index_key", keys)
     }
 
     /// `nextval`, `currval` and `setval`, with the sequence they name looked up here.
