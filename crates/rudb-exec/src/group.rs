@@ -1642,6 +1642,7 @@ impl<'a> Aggregate<'a> {
         } else {
             PARTITION_FROM
         };
+        let partition_from = std::env::var("RUDB_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(partition_from);
         let aggregate = Self {
             plan,
             keys,
@@ -4431,7 +4432,7 @@ impl<'a> Aggregate<'a> {
     fn worth_local(&self) -> bool {
         // String groups retain their payload in every worker's table until the merge.
         // Sharing radix partitions keeps one copy of each URL key instead.
-        if self.keys.iter().any(|&key| self.plan.expr_type(key) == &LogicalType::Varchar) {
+        if std::env::var("RUDB_WL").is_err() && self.keys.iter().any(|&key| self.plan.expr_type(key) == &LogicalType::Varchar) {
             return false;
         }
         let Some(limit) = self.memory.limit() else { return true };
