@@ -2170,7 +2170,7 @@ mod tests {
         use rudb_vector::vector::Data;
 
         let mut table = MemoryTable::new(vec![LogicalType::BigInt]);
-        let rows: Vec<Vec<Value>> = (0..64).map(|n| vec![Value::BigInt(n)]).collect();
+        let rows: Vec<Vec<Value>> = (0..1024).map(|n| vec![Value::BigInt(n)]).collect();
         table.append_rows(&rows).expect("bigints");
 
         let address = |chunk: &Chunk| match chunk.column(0).expect("one column").data() {
@@ -2183,18 +2183,21 @@ mod tests {
         assert_eq!(address(&first), stored, "the read copied the column out");
         assert_eq!(address(&second), stored, "the second read copied the column out");
         assert_eq!(first.value_at(7, 0), Value::BigInt(7));
-        assert_eq!(second.value_at(63, 0), Value::BigInt(63));
+        assert_eq!(second.value_at(1023, 0), Value::BigInt(1023));
 
         // Nothing can write through what it was handed, because a vector has no mutating method at
         // all and the only way at the values is `Buffer::to_mut`, which copies the page out first.
         // So the sharing is safe without a rule anybody has to remember.
 
-        // The memory limit is not told about the page twice. Three holders of one 512 byte page add
-        // up to the page rather than to three of it, which is the rule in `Buffer::footprint`.
+        // The memory limit is not told about the page twice. Three holders of one 8 KiB page add
+        // up to the page rather than to three of it, which is the rule in `Buffer::footprint`. Each
+        // holder also counts its own chunk and vector, 224 bytes on this build, so the page is big
+        // enough for those not to decide the answer. With 64 rows the three of them came to 672
+        // bytes over a 512 byte page, and the test failed once a vector grew to 128 bytes.
         let charged = table.chunk(0).expect("the only chunk").footprint()
             + first.footprint()
             + second.footprint();
-        assert!(charged < 512 * 2, "{charged} charged for one 512 byte page held three times");
+        assert!(charged < 8192 * 2, "{charged} charged for one 8 KiB page held three times");
     }
 
     #[test]
