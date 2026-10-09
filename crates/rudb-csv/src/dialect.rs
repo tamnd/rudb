@@ -10,7 +10,7 @@
 //! no quote at all rather than as having the default one, which is visible in `sniff_csv` and is
 //! reproduced because the same field is printed back in an error message.
 
-use rudb_common::{Error, Result};
+use rudb_common::{Error, LogicalType, Result};
 
 /// The delimiters tried, in the order they are tried.
 ///
@@ -48,7 +48,7 @@ pub struct Dialect {
 /// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
 /// rather than folded into a [`Dialect`] and forgotten.
 ///
-/// The last three are not punctuation, and they are here because they travel the same road: the
+/// The last five are not punctuation, and they are here because they travel the same road: the
 /// binder works them out from the call to sniff the file with and the executor works them out again
 /// from the plan to read it with, and a second struct beside this one would be a second thing for
 /// the two ends to keep in step.
@@ -80,6 +80,20 @@ pub struct Given {
     /// for a value that does not convert, which tells somebody who set the type to look at the data
     /// and somebody who did not to set one.
     pub typed: bool,
+    /// The column types the call set, first column first, which is `columns` on a call.
+    ///
+    /// The names come with them in [`Given::names`], and the file has to have exactly this many
+    /// columns. They also decide whether the first row is a header in place of the types the rest
+    /// of the sample has, which is what the pin does: `a,b` over `1,x` is a header for `INTEGER,
+    /// VARCHAR` because `a` is not a number, and `1,x` over `2,y` is a header for `VARCHAR,
+    /// VARCHAR` because a file whose columns are all text has one.
+    pub types: Option<Vec<LogicalType>>,
+    /// Whether nothing is sniffed, which is `auto_detect=false` on a call.
+    ///
+    /// The punctuation is then what was given or the comma and the double quote, and the first row
+    /// is a row unless `header` says otherwise. Measured on `v2.0.0-dev84237`, where a file of
+    /// `a,b` over `1,x` read with two `VARCHAR` columns and `auto_detect=false` has three rows.
+    pub fixed: bool,
 }
 
 impl Given {

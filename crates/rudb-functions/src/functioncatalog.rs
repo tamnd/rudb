@@ -489,6 +489,7 @@ const PARAMETER_NAMES: &[(&str, &[&str])] = &[
 #[cfg(test)]
 mod tests {
     use super::{CONSISTENT, function_entries, function_fields};
+    use crate::TableFunction;
 
     #[test]
     fn the_table_is_the_shape_the_pin_returns() {
@@ -596,10 +597,12 @@ mod tests {
             .expect("the csv reader is a table function");
         assert_eq!(csv.parameters[0], "col0");
         assert_eq!(csv.parameter_types[0], "VARCHAR");
-        assert_eq!(
-            csv.parameters[1..],
-            ["all_varchar", "delim", "escape", "header", "names", "nullstr", "quote", "sep"]
-        );
+        // They are the reader's own list in its own order, so a parameter added there shows up here
+        // without this test being told.
+        let named: Vec<&str> =
+            TableFunction::ReadCsv.parameters().iter().map(|(name, _)| *name).collect();
+        assert!(named.contains(&"header"), "{named:?}");
+        assert_eq!(csv.parameters[1..], named);
     }
 
     /// The one scalar whose argument has a name, and the reason it needs one.

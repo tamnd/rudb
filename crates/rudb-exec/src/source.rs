@@ -3983,7 +3983,11 @@ impl<'a> FileScan<'a> {
         sideways: Option<Arc<Sideways<'a>>>,
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
-        let given = csv_options(plan, options, settings)?;
+        let given = if function == TableFunction::ReadCsv {
+            csv_options(plan, options, settings)?
+        } else {
+            Given::default()
+        };
         let json = match function.json() {
             Some(kind) => Some(Arc::new(json_options(plan, kind, options, settings)?)),
             None => None,
@@ -4623,8 +4627,8 @@ fn cut_already() -> Error {
 /// The binder worked this out to sniff the files with and wrote the names and the values into the
 /// plan, and this works it out again from them to read the files with. Both go through
 /// [`csv_given`], so a file is read the way it was sniffed and the columns a query was planned
-/// against are the columns it reads. A `read_parquet` call has none of these and gets the default,
-/// which says nothing and is never asked.
+/// against are the columns it reads. Another reader gets the default, which says nothing and is
+/// never asked, since `read_json` has an `auto_detect` and a `columns` of its own.
 fn csv_options(plan: &Plan, options: Slice, settings: Slice) -> Result<Given> {
     if options.len == 0 {
         return Ok(Given::default());

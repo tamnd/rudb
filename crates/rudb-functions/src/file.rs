@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use rudb_common::bounds::Zones;
 use rudb_common::stat::Direction;
-use rudb_common::{Error, Field, Provenance, Result, Stat, Value};
+use rudb_common::{Error, Field, LogicalType, Provenance, Result, Stat, Value};
 use rudb_compress::{gzip, zstd};
 use rudb_csv::{Given, Reader as CsvReader};
 use rudb_io::glob::has_magic;
@@ -81,12 +81,64 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             ("escape", Value::Varchar(text)) => given.escape = Some(one_byte(name, text)?),
             ("nullstr", Value::Varchar(text)) => given.nulls = Some(vec![text.clone()]),
             ("nullstr", Value::List { values, .. }) => given.nulls = Some(strings(name, values)?),
-            ("names", Value::List { values, .. }) => given.names = Some(strings(name, values)?),
+            ("names" | "column_names", Value::List { values, .. }) => {
+                given.names = Some(strings(name, values)?)
+            }
             (TYPES_SET, Value::Boolean(on)) => given.typed = *on,
+            ("auto_detect", Value::Boolean(on)) => given.fixed = !*on,
+            ("columns", value) => {
+                let (names, types) = csv_columns(value, &mut LogicalType::parse)?;
+                given.names = Some(names);
+                given.types = Some(types);
+            }
             _ => {}
         }
     }
+    let named = options.iter().any(|(name, _)| matches!(*name, "names" | "column_names"));
+    if named && options.iter().any(|(name, _)| *name == "columns") {
+        return Err(Error::binder("read_csv column_names/names can only be supplied once"));
+    }
+    // Types the call set are the caller's, except that the pin calls them auto-detected in a
+    // conversion error once nothing was sniffed, which is its slip and is kept so the message is
+    // the one a test of it expects.
+    if given.types.is_some() && !given.fixed {
+        given.typed = true;
+    }
     Ok(given)
+}
+
+/// The names and the types a `columns` parameter gives, which is a struct of one type name each,
+/// with `read` making a type of each name.
+///
+/// The binder reads the names against the catalog and writes the plan's copy of the parameter back
+/// out with the types they stand for, so the executor reads them again with nothing but the parser
+/// and a type a `CREATE TYPE` made is not a name it has to know. The refusals are the pin's, in its
+/// words.
+///
+/// # Errors
+///
+/// When the value is not a struct, when it has no fields, when a field is not a string, and
+/// whatever `read` says about a name.
+pub fn csv_columns(
+    value: &Value,
+    read: &mut dyn FnMut(&str) -> Result<LogicalType>,
+) -> Result<(Vec<String>, Vec<LogicalType>)> {
+    let Value::Struct(children) = value else {
+        return Err(Error::binder("read_csv columns requires a struct as input"));
+    };
+    if children.is_empty() {
+        return Err(Error::binder("read_csv requires at least a single column as input!"));
+    }
+    let mut names = Vec::with_capacity(children.len());
+    let mut types = Vec::with_capacity(children.len());
+    for (name, child) in children {
+        let Value::Varchar(written) = child else {
+            return Err(Error::binder("read_csv requires a type specification as string"));
+        };
+        names.push(name.clone());
+        types.push(read(written)?);
+    }
+    Ok((names, types))
 }
 
 /// The text of a JSON file, which the JSON readers take whole, decompressed the way the call said.

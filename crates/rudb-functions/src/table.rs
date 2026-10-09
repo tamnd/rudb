@@ -328,7 +328,9 @@ impl TableFunction {
     /// The CSV ones here are the ones that say how the file is written, which are the ones where
     /// guessing wrong changes the answer rather than the speed. `sep` is DuckDB's other name for
     /// `delim` and is a separate row rather than an alias, because the list is also what the
-    /// candidates on a misspelling are read out of and the binary prints both of them.
+    /// candidates on a misspelling are read out of and the binary prints both of them. The same
+    /// goes for `column_names` and `names`. `columns` takes a struct of any shape and is listed
+    /// with no type, which is how the pin's `ANY` is written here.
     #[must_use]
     pub fn parameters(self) -> &'static [(&'static str, LogicalType)] {
         static READ_PARQUET: &[(&str, LogicalType)] = &[
@@ -341,6 +343,9 @@ impl TableFunction {
             std::sync::LazyLock::new(|| {
                 vec![
                     ("all_varchar", LogicalType::Boolean),
+                    ("auto_detect", LogicalType::Boolean),
+                    ("column_names", LogicalType::list(LogicalType::Varchar)),
+                    ("columns", LogicalType::Null),
                     ("delim", LogicalType::Varchar),
                     ("escape", LogicalType::Varchar),
                     ("header", LogicalType::Boolean),

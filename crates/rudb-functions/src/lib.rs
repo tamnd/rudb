@@ -29,8 +29,8 @@ pub use entrycatalog::{
     show_expanded_fields, show_table_fields, table_fields, trigger_fields, view_fields,
 };
 pub use file::{
-    Footers, TYPES_SET, content_files, csv_fields, csv_given, files, is_file, is_pattern,
-    json_text, open_csv, open_parquet, parquet_footers, parquet_outline,
+    Footers, TYPES_SET, content_files, csv_columns, csv_fields, csv_given, files, is_file,
+    is_pattern, json_text, open_csv, open_parquet, parquet_footers, parquet_outline,
 };
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,

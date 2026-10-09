@@ -309,6 +309,9 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "Invalid named parameter \"nosuch\" for function read_csv\n",
         "Candidates:\n",
         "    all_varchar BOOLEAN\n",
+        "    auto_detect BOOLEAN\n",
+        "    column_names VARCHAR[]\n",
+        "    columns ANY\n",
         "    delim VARCHAR\n",
         "    escape VARCHAR\n",
         "    header BOOLEAN\n",
@@ -318,4 +321,122 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    sep VARCHAR\n",
     );
     assert_eq!(error.message(), expected);
+}
+
+/// A file of these bytes under a name of its own, as a SQL string literal.
+fn written(name: &str, text: &str) -> String {
+    let path = format!("{}/csv-{name}", env!("CARGO_TARGET_TMPDIR"));
+    std::fs::write(&path, text).expect("writes");
+    format!("'{path}'")
+}
+
+#[test]
+fn columns_names_and_types_the_file_and_the_types_decide_the_header() {
+    let database = Database::new();
+    let header = written("columns-header.csv", "a,b\n1,x\n2,y\n");
+    let numbers = written("columns-numbers.csv", "1,2\n3,4\n");
+    let one_line = written("columns-one-line.csv", "1,2\n");
+    let read = |file: &str, columns: &str| {
+        let sql = format!("SELECT * FROM read_csv({file}, columns={columns})");
+        database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"))
+    };
+    // `a` is not an integer, so the first line is a header and the names are the call's.
+    let result = read(&header, "{'p': 'INT', 'q': 'VARCHAR'}");
+    assert_eq!(result.names(), ["p", "q"]);
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["INTEGER", "VARCHAR"]);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.value_at(0, 0), Value::Integer(1));
+    // `1,2` fits an integer, so it is a row, and over text columns it is a header, because a file
+    // whose columns are all text has one. A single line is asked the same question.
+    assert_eq!(read(&numbers, "{'p': 'INT', 'q': 'VARCHAR'}").len(), 2);
+    let text = read(&numbers, "{'p': 'VARCHAR', 'q': 'VARCHAR'}");
+    assert_eq!(text.len(), 1);
+    assert_eq!(text.value_at(0, 0), Value::Varchar("3".into()));
+    assert_eq!(read(&one_line, "{'p': 'VARCHAR', 'q': 'VARCHAR'}").len(), 0);
+    // The pin's widths for a bare `DECIMAL`, and `all_varchar` leaves set types alone.
+    let sql = format!(
+        "SELECT * FROM read_csv({numbers}, columns={{'p': 'DECIMAL', 'q': 'INT'}}, \
+         all_varchar=true)"
+    );
+    let result = database.query(&sql).expect("runs");
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["DECIMAL(18,3)", "INTEGER"]);
+}
+
+#[test]
+fn auto_detect_false_sniffs_nothing_and_wants_the_columns_set() {
+    let database = Database::new();
+    let header = written("fixed-header.csv", "a,b\n1,x\n2,y\n");
+    let short = written("fixed-short.csv", "1,x\n2,y\n");
+    let sql = format!(
+        "SELECT * FROM read_csv({header}, columns={{'p': 'VARCHAR', 'q': 'VARCHAR'}}, \
+         auto_detect=false)"
+    );
+    let result = database.query(&sql).expect("runs");
+    // Nothing decided the first line was a header, so it is a row.
+    assert_eq!(result.len(), 3);
+    assert_eq!(result.value_at(0, 0), Value::Varchar("a".into()));
+    let error = database
+        .query(&format!("SELECT * FROM read_csv({header}, auto_detect=false)"))
+        .unwrap_err();
+    assert_eq!(
+        error.message(),
+        "read_csv requires columns to be specified through the 'columns' option. Use \
+         read_csv_auto or set read_csv(..., AUTO_DETECT=TRUE) to automatically guess columns."
+    );
+    let sql = format!(
+        "SELECT * FROM read_csv({short}, columns={{'p': 'INT', 'q': 'VARCHAR', 'r': 'INT'}}, \
+         auto_detect=false)"
+    );
+    let error = database.query(&sql).unwrap_err();
+    assert!(
+        error.message().starts_with(
+            "CSV Error on Line: 1\nOriginal Line: 1,x\nExpected Number of Columns: 3 Found: 2\n"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn columns_that_are_not_a_struct_of_type_names_are_refused_in_the_pins_words() {
+    let database = Database::new();
+    let file = written("refused.csv", "1,2\n3,4\n");
+    for (columns, expected) in [
+        ("42", "read_csv columns requires a struct as input"),
+        ("NULL", "read_csv columns requires a struct as input"),
+        ("{}", "read_csv requires at least a single column as input!"),
+        ("{'p': 5}", "read_csv requires a type specification as string"),
+        ("{'p': 'INT', 'q': NULL}", "read_csv requires a type specification as string"),
+    ] {
+        let sql = format!("SELECT * FROM read_csv({file}, columns={columns})");
+        let error = database.query(&sql).unwrap_err();
+        assert_eq!(error.message(), expected, "{columns}");
+    }
+    let sql = format!("SELECT * FROM read_csv({file}, columns={{'p': 'NOTATYPE', 'q': 'INT'}})");
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().starts_with("Type with name NOTATYPE does not exist!"), "{error}");
+    for names in ["names", "column_names"] {
+        let sql = format!("SELECT * FROM read_csv({file}, columns={{'p': 'INT'}}, {names}=['a'])");
+        let error = database.query(&sql).unwrap_err();
+        assert_eq!(error.message(), "read_csv column_names/names can only be supplied once");
+    }
+    let sql =
+        format!("SELECT * FROM read_csv({file}, columns={{'p': 'INT', 'q': 'INT'}}, delim=';')");
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().starts_with("Error when sniffing file"), "{error}");
+    assert!(
+        error.message().ends_with(
+            "\"columns = { 'p' : 'INTEGER', 'q' : 'INTEGER'}\", and they contain: 2 columns. It \
+             does not match the number of columns found by the sniffer: 1. Verify the columns \
+             parameter is correctly set."
+        ),
+        "{error}"
+    );
+    let sql = format!("SELECT * FROM read_csv({file}, auto_detect=NULL)");
+    let error = database.query(&sql).unwrap_err();
+    assert_eq!(
+        error.message(),
+        "\"auto_detect\" expects a non-null boolean value (e.g. TRUE or 1)"
+    );
 }
