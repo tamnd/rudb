@@ -1178,13 +1178,16 @@ fn collapsed(
     let (Some(keys), Stat::Known { value: rows, .. }) = (keys, input) else {
         return guess(input, KEPT_BY_A_GROUP_BY);
     };
-    let Some(total) = scanned_rows(plan, node, stats).filter(|&total| total > 0) else {
-        return guess(input, KEPT_BY_A_GROUP_BY);
-    };
     if keys.is_empty() || rows == 0 {
         return guess(input, KEPT_BY_A_GROUP_BY);
     }
+    // Over a join there is no one table the rows came out of, so each key is landed on the rows of
+    // its own table instead and the keys multiply after. Eager aggregation puts a grouping on a
+    // join key under the join that reads it, and every JOB estimate that was still the constant was
+    // one of those or a join above one.
+    let total = scanned_rows(plan, node, stats).filter(|&total| total > 0);
     let mut values: u64 = 1;
+    let mut landed: u64 = 1;
     let mut source: Option<Provenance> = None;
     for binding in keys {
         // Recorded before it is read and recorded when it is unknown, for the reason [`values`]
@@ -1196,6 +1199,12 @@ fn collapsed(
             return guess(input, KEPT_BY_A_GROUP_BY);
         };
         values = values.saturating_mul(counted);
+        if total.is_none() {
+            let Some(held) = held_by(plan, binding, stats).filter(|&held| held > 0) else {
+                return guess(input, KEPT_BY_A_GROUP_BY);
+            };
+            landed = landed.saturating_mul(landed_on(counted, rows.min(held), held));
+        }
         let from = stat.provenance().unwrap_or(FROM_A_CONSTANT);
         source = match source {
             None => Some(from),
@@ -1205,8 +1214,33 @@ fn collapsed(
             Some(_) => Some(Provenance::Propagation),
         };
     }
-    let groups = landed_on(values, rows, total);
+    let groups = match total {
+        Some(total) => landed_on(values, rows, total),
+        None => landed.clamp(1, rows),
+    };
     guess_from(input, groups as f64 / rows as f64, source.unwrap_or(FROM_A_CONSTANT))
+}
+
+/// How many rows the table a column came out of holds, through the projections and groupings that
+/// carried it up unchanged.
+///
+/// The same walk [`follow`] makes, for the caller that wants the table's size rather than the
+/// column's count. `None` where the column was made rather than carried.
+fn held_by(plan: &Plan, binding: ColumnBinding, stats: &Facts) -> Option<u64> {
+    let mut binding = binding;
+    for _ in 0..16 {
+        let at = producer(plan, binding.table)?;
+        let carried = match *plan.node(at) {
+            Node::Get { .. } => return rows_stat(plan, at, stats).value().copied(),
+            Node::Project { exprs: list, .. } | Node::Aggregate { groups: list, .. } => {
+                *plan.expr_list(list).get(binding.column as usize)?
+            }
+            _ => return None,
+        };
+        let &Expr::Column(carried) = plan.expr(carried) else { return None };
+        binding = carried;
+    }
+    None
 }
 
 /// How many rows the table under an operator holds, for a subtree that reads exactly one.
@@ -1812,6 +1846,18 @@ fn follow(
                 return Stat::Unknown;
             };
             follow(plan, carried, stats, missing, depth)
+        }
+        // A group key holds no value the column it groups did not, so that column's count bounds
+        // it. A join over an eager aggregation reads its key here, and without this it had no count
+        // on that side and fell back to the constant.
+        Node::Aggregate { groups, .. } => {
+            let Some(&grouped) = plan.expr_list(groups).get(position) else {
+                return Stat::Unknown;
+            };
+            let &Expr::Column(grouped) = plan.expr(grouped) else {
+                return Stat::Unknown;
+            };
+            follow(plan, grouped, stats, missing, depth)
         }
         _ => Stat::Unknown,
     }
@@ -2485,19 +2531,47 @@ mod tests {
     }
 
     #[test]
-    fn a_group_by_over_a_join_keeps_the_constant_because_two_tables_have_two_row_counts() {
-        // The counts are per column of a table and the arithmetic here needs the rows that column
-        // started at. Over a join there are two of those and the grouping's columns can come from
-        // either, so this is a question about a shape rather than a number to be careful with.
+    fn a_group_by_over_a_join_lands_each_key_on_the_rows_of_its_own_table() {
+        // Over a join there are two tables and the grouping's columns can come from either, so
+        // each key is read against the table it came out of. A cross product of two thousand row
+        // tables holds every value of `t.a` however many rows it makes, so that is the count.
         let text = format!(
             "Aggregate #1 groups=[#0.0::INTEGER] aggregates=[]\n  Join Inner on=[]\n    {}    {}",
             scan("t", 0),
             scan("u", 1)
         );
         assert_eq!(
+            counted_stat(&text, &[("t", 1000), ("u", 1000)], &[("t", "a", 25)]),
+            Stat::estimated(25, Provenance::Dictionary)
+        );
+        // A key from each side multiplies, and the rows going in still cap the product.
+        let text = format!(
+            "Aggregate #2 groups=[#0.0::INTEGER, #1.0::INTEGER] aggregates=[]\n  {}\n",
+            joined("t", "u").trim_end().replace('\n', "\n  ")
+        );
+        let columns = [("t", "a", 25), ("u", "a", 40)];
+        assert_eq!(counted(&text, &[("t", 1000), ("u", 1000)], &columns), Some(1000));
+        // A key nobody counted is still the constant.
+        assert_eq!(
             counted_stat(&text, &[("t", 1000), ("u", 1000)], &[("t", "a", 25)]).provenance(),
             Some(Provenance::Default)
         );
+    }
+
+    #[test]
+    fn a_join_on_a_group_key_reads_the_count_of_the_column_it_groups() {
+        // Eager aggregation leaves a join reading a group key, and that key holds no value the
+        // column under it did not. Without the count the join had nothing on that side and was
+        // the constant.
+        let text = format!(
+            "Join INNER on=[(#0.0::INTEGER = #2.0::INTEGER)::BOOLEAN]\n  {}  \
+             Aggregate #2 groups=[#1.0::INTEGER] aggregates=[]\n    {}",
+            scan("t", 0),
+            scan("u", 1)
+        );
+        let tables = [("t", 1000), ("u", 1000)];
+        let found = counted_stat(&text, &tables, &[("t", "a", 100), ("u", "a", 100)]);
+        assert_eq!(found, Stat::estimated(1000, Provenance::Propagation));
     }
 
     #[test]
