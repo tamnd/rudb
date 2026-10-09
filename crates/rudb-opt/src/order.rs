@@ -90,7 +90,9 @@
 use std::collections::HashMap;
 
 use rudb_common::{LogicalType, Result};
-use rudb_plan::{BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan};
+use rudb_plan::{
+    BuildSide, ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
+};
 
 use crate::estimate::{self, Facts, Side};
 use crate::pass::{Context, Pass};
@@ -358,9 +360,10 @@ fn classed(
     let mut added: Vec<(ExprRef, ExprRef, TableSet, usize)> = Vec::new();
     for (top, list) in &members {
         let leaves: Vec<Option<usize>> = list.iter().map(|&at| leaf(at)).collect();
-        let shared = leaves.iter().enumerate().any(|(at, one)| {
-            one.is_none() || leaves[at + 1..].iter().any(|other| other == one)
-        });
+        let shared = leaves
+            .iter()
+            .enumerate()
+            .any(|(at, one)| one.is_none() || leaves[at + 1..].iter().any(|other| other == one));
         if shared {
             continue;
         }
@@ -368,9 +371,10 @@ fn classed(
         usable.push(*top);
         for (place, &one) in list.iter().enumerate() {
             for &other in &list[place + 1..] {
-                let direct = edges.iter().flatten().any(|&(a, b)| {
-                    (a, b) == (one, other) || (a, b) == (other, one)
-                });
+                let direct = edges
+                    .iter()
+                    .flatten()
+                    .any(|&(a, b)| (a, b) == (one, other) || (a, b) == (other, one));
                 if !direct {
                     let mut reads = TableSet::of(columns[one].0.table);
                     reads.insert(columns[other].0.table);
@@ -392,8 +396,8 @@ fn classed(
         .collect();
     let mut searchable = pending.to_vec();
     for (left, right, reads, class) in added {
-        let condition =
-            plan.add_expr(Expr::Compare { op: CompareOp::Equal, left, right }, LogicalType::Boolean);
+        let condition = plan
+            .add_expr(Expr::Compare { op: CompareOp::Equal, left, right }, LogicalType::Boolean);
         searchable.push((condition, reads));
         classes.push(Some(class));
     }
@@ -401,7 +405,10 @@ fn classed(
 }
 
 /// The two columns a condition says are equal, where it is `=` between two bare columns of one type.
-fn equated(plan: &Plan, condition: ExprRef) -> Option<((ColumnBinding, ExprRef), (ColumnBinding, ExprRef))> {
+fn equated(
+    plan: &Plan,
+    condition: ExprRef,
+) -> Option<((ColumnBinding, ExprRef), (ColumnBinding, ExprRef))> {
     let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
         return None;
     };
