@@ -3072,7 +3072,7 @@ impl<'a> Aggregate<'a> {
                         row = place_sums.add(
                             coded_map,
                             &coded_places[..*length],
-                            kept,
+                            kept.map(Selection::indices),
                             row,
                             &inputs,
                         )?;
