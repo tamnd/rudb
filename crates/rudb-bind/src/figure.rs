@@ -40,51 +40,62 @@ impl Binder<'_> {
         self.figure(ast, element, input).map_or_else(|| "expr".to_owned(), |(name, _)| name)
     }
 
-    /// The name of an expression and how strong it is, as `FigureColnameInternal` gives them. A
-    /// name of strength 2 comes from a column or a function, and a name of strength 1 comes from
-    /// a type or from `CASE`. `None` is no name.
+    /// The name of an expression and how strong it is, with a column named as the scope names
+    /// it.
     fn figure(&self, ast: &Ast, expr: ast::ExprRef, input: &Scope) -> Option<(String, u8)> {
-        if expr == NONE {
-            return None;
-        }
-        // `(x).a[1]` is named for the last field it selects, and a subscript alone for what it
-        // subscripts.
-        if let Some(field) = ast.indirection(expr) {
-            return match ast.expr(expr) {
-                _ if field != NONE => Some((ast.string(field).to_owned(), 2)),
-                ast::Expr::Function { args, .. } => {
-                    self.figure(ast, ast.expr_list(args).first().copied().unwrap_or(NONE), input)
-                }
-                _ => None,
-            };
-        }
-        match ast.expr(expr) {
-            ast::Expr::Column { .. } | ast::Expr::Positional { .. } => {
-                Some((self.output_name(ast, expr, input).trim_matches('"').to_owned(), 2))
+        let column = |column| self.output_name(ast, column, input).trim_matches('"').to_owned();
+        figure(ast, expr, &|column_ref| Some(column(column_ref)))
+    }
+}
+
+/// The name of an expression and how strong it is, as `FigureColnameInternal` gives them. A name
+/// of strength 2 comes from a column or a function, and a name of strength 1 comes from a type or
+/// from `CASE`. `None` is no name. `column` names a column, which only a bound scope can do well.
+fn figure(
+    ast: &Ast,
+    expr: ast::ExprRef,
+    column: &dyn Fn(ast::ExprRef) -> Option<String>,
+) -> Option<(String, u8)> {
+    if expr == NONE {
+        return None;
+    }
+    // `(x).a[1]` is named for the last field it selects, and a subscript alone for what it
+    // subscripts.
+    if let Some(field) = ast.indirection(expr) {
+        return match ast.expr(expr) {
+            _ if field != NONE => Some((ast.string(field).to_owned(), 2)),
+            ast::Expr::Function { args, .. } => {
+                figure(ast, ast.expr_list(args).first().copied().unwrap_or(NONE), column)
             }
-            ast::Expr::Function { name, .. } | ast::Expr::Window { name, .. } => {
-                let last = ast.name(name).last().unwrap_or_default().to_ascii_lowercase();
-                // `TRIM(x)` is a call of `btrim` in PostgreSQL.
-                let last = if last == "trim" { "btrim".to_owned() } else { last };
-                Some((last, 2))
-            }
-            ast::Expr::Cast { operand, ty, .. } => match self.figure(ast, operand, input) {
-                Some((name, strength)) if strength > 1 => Some((name, strength)),
-                _ => Some((type_name(ast.string(ty)), 1)),
-            },
-            ast::Expr::Binary { op: BinaryOp::Collate, left, .. } => self.figure(ast, left, input),
-            ast::Expr::Case { otherwise, .. } => match self.figure(ast, otherwise, input) {
-                Some((name, strength)) if strength > 1 => Some((name, strength)),
-                _ => Some(("case".to_owned(), 1)),
-            },
-            ast::Expr::Exists { .. } => Some(("exists".to_owned(), 2)),
-            ast::Expr::Subquery { array: true, .. } | ast::Expr::List { .. } => {
-                Some(("array".to_owned(), 2))
-            }
-            ast::Expr::Subquery { query, array: false } => Some((first_name(ast, query), 2)),
-            ast::Expr::Row { .. } => Some(("row".to_owned(), 2)),
             _ => None,
+        };
+    }
+    match ast.expr(expr) {
+        ast::Expr::Column { .. } | ast::Expr::Positional { .. } => {
+            column(expr).map(|name| (name, 2))
         }
+        ast::Expr::Function { name, .. } | ast::Expr::Window { name, .. } => {
+            let last = ast.name(name).last().unwrap_or_default().to_ascii_lowercase();
+            // `TRIM(x)` is a call of `btrim` in PostgreSQL.
+            let last = if last == "trim" { "btrim".to_owned() } else { last };
+            Some((last, 2))
+        }
+        ast::Expr::Cast { operand, ty, .. } => match figure(ast, operand, column) {
+            Some((name, strength)) if strength > 1 => Some((name, strength)),
+            _ => Some((type_name(ast.string(ty)), 1)),
+        },
+        ast::Expr::Binary { op: BinaryOp::Collate, left, .. } => figure(ast, left, column),
+        ast::Expr::Case { otherwise, .. } => match figure(ast, otherwise, column) {
+            Some((name, strength)) if strength > 1 => Some((name, strength)),
+            _ => Some(("case".to_owned(), 1)),
+        },
+        ast::Expr::Exists { .. } => Some(("exists".to_owned(), 2)),
+        ast::Expr::Subquery { array: true, .. } | ast::Expr::List { .. } => {
+            Some(("array".to_owned(), 2))
+        }
+        ast::Expr::Subquery { query, array: false } => Some((first_name(ast, query), 2)),
+        ast::Expr::Row { .. } => Some(("row".to_owned(), 2)),
+        _ => None,
     }
 }
 
@@ -154,7 +165,6 @@ fn clip(text: &str, bytes: usize) -> &str {
 }
 
 /// The name of the first column of a subquery, which PostgreSQL gives to the subquery as a whole.
-/// The subquery is not bound here, so a column takes the last part of its name as written.
 fn first_name(ast: &Ast, query: ast::QueryRef) -> String {
     match ast.query(query).body {
         QueryBody::Select(select) => {
@@ -164,30 +174,17 @@ fn first_name(ast: &Ast, query: ast::QueryRef) -> String {
             if target.alias != NONE {
                 return ast.string(target.alias).to_owned();
             }
-            written_name(ast, target.expr).unwrap_or_else(|| NO_NAME.to_owned())
+            // The subquery is not bound here, so a column takes the last part of its name as
+            // written.
+            let column = |column| match ast.expr(column) {
+                ast::Expr::Column { name } => ast.name(name).last().map(str::to_owned),
+                _ => None,
+            };
+            figure(ast, target.expr, &column).map_or_else(|| NO_NAME.to_owned(), |(name, _)| name)
         }
         QueryBody::SetOp { left, .. } => first_name(ast, left),
         QueryBody::Values(_) => "column1".to_owned(),
         _ => NO_NAME.to_owned(),
-    }
-}
-
-/// The name of an expression from what was written alone, for a target of a subquery.
-fn written_name(ast: &Ast, expr: ast::ExprRef) -> Option<String> {
-    if expr == NONE {
-        return None;
-    }
-    match ast.expr(expr) {
-        ast::Expr::Column { name } => ast.name(name).last().map(str::to_owned),
-        ast::Expr::Function { name, .. } | ast::Expr::Window { name, .. } => {
-            ast.name(name).last().map(str::to_ascii_lowercase)
-        }
-        ast::Expr::Cast { operand, ty, .. } => {
-            written_name(ast, operand).or_else(|| Some(type_name(ast.string(ty))))
-        }
-        ast::Expr::Exists { .. } => Some("exists".to_owned()),
-        ast::Expr::Row { .. } => Some("row".to_owned()),
-        _ => None,
     }
 }
 

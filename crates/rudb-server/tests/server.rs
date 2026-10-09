@@ -1518,6 +1518,83 @@ fn distinct_on_keeps_the_first_row_in_the_order_of_order_by() {
     server.stop().unwrap();
 }
 
+/// The name, the type and the type modifier of each column of a row description.
+fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
+    let bytes = message.decoded();
+    let Backend::RowDescription(fields) = Backend::decode(&bytes).unwrap().unwrap().0 else {
+        panic!("{message:?}");
+    };
+    let shape = fields
+        .iter()
+        .map(|f| (String::from_utf8_lossy(f.name).into_owned(), f.type_oid, f.type_modifier));
+    shape.collect()
+}
+
+/// A `sum` over a window has the type it has over a group, a column of a set operation has the
+/// declared type and modifier of its two sides, a subscripted subquery is named for its column, and
+/// a scalar subquery of two rows is error 21000, all as in PostgreSQL.
+#[test]
+fn windows_set_operations_and_subqueries_have_the_types_and_names_of_postgres() {
+    let dirs = Dirs::new("pgshapes");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "create temp table shaped (s int4, m int2, f float4, c char(4), v varchar(4)); insert into shaped values (1, 2, 1.5, 'a', 'ab'), (3, 4, 2.5, 'bc', 'c')",
+    );
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    let shape = |client: &mut Client, sql: &str| {
+        let messages = client.query(sql);
+        let description = messages.iter().find(|message| message.tag == b'T');
+        typed_shape(description.unwrap_or_else(|| panic!("{sql}: {messages:?}")))
+    };
+    let column = |name: &str, oid: u32, typmod: i32| (name.to_owned(), oid, typmod);
+    assert_eq!(
+        shape(
+            &mut client,
+            "select sum(s) over (), sum(m) over (order by s), sum(f) over () from shaped"
+        ),
+        [column("sum", 20, -1), column("sum", 20, -1), column("sum", 700, -1)]
+    );
+    assert_eq!(
+        scalar(
+            &mut client,
+            "select string_agg(t::text, ',') from (select sum(s) over (order by s) t from shaped) w"
+        ),
+        "1,4"
+    );
+    for (sql, oid, typmod) in [
+        ("select cast(v as char(4)) as x from shaped union select c from shaped", 1042, 8),
+        ("select c as x from shaped union all select v from shaped", 1042, -1),
+        ("select v as x from shaped union all select v from shaped", 1043, 8),
+        ("select c as x from shaped union all select 'z'", 1042, -1),
+        (
+            "select c as x from shaped union select c from shaped union select c from shaped",
+            1042,
+            8,
+        ),
+        ("select s as x from shaped union select m from shaped", 23, -1),
+    ] {
+        assert_eq!(shape(&mut client, sql), [column("x", oid, typmod)], "{sql}");
+    }
+    let rows = client.query("select c from shaped union select c from shaped order by 1");
+    let values: Vec<_> = rows.iter().filter(|message| message.tag == b'D').map(data_row).collect();
+    assert_eq!(values, [[Some(b"a   ".to_vec())], [Some(b"bc  ".to_vec())]]);
+    assert_eq!(
+        shape(&mut client, "select (select array[1, 2, 3])[1], (select case when true then 1 end)"),
+        [column("array", 23, -1), column("case", 23, -1)]
+    );
+    // The error comes as the query runs, after the row description.
+    let messages = client.query("select (select 1 union all select 2)");
+    assert_eq!(tags(&messages), "TEZ");
+    assert_eq!(messages[1].field(b'C').as_deref(), Some("21000"));
+    assert_eq!(
+        messages[1].field(b'M').as_deref(),
+        Some("more than one row returned by a subquery used as an expression")
+    );
+    server.stop().unwrap();
+}
+
 /// `VACUUM` and `ANALYZE` check their options, tables and columns as PostgreSQL does, warn for a
 /// view they skip, and a `VACUUM` does not run in a transaction block.
 #[test]
