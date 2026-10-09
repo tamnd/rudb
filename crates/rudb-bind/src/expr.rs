@@ -1898,6 +1898,26 @@ impl Binder<'_> {
             let cast = self.checked_cast_to(bound[0], &target, false)?;
             return self.collated_like(cast, bound[1]);
         }
+        // `replace_type(x, from, to)` is `x` cast to its own type with each `from` in it, at any
+        // depth, made a `to`, which the pin binds the same way as `cast_to_type`.
+        if rudb_catalog::same_name(&written, "replace_type") && bound.len() == 3 {
+            self.over_aggregate(bound[1], scope)?;
+            self.over_aggregate(bound[2], scope)?;
+            let from = self.plan().expr_type(bound[1]).clone();
+            let to = self.plan().expr_type(bound[2]).clone();
+            if to == LogicalType::Null {
+                return Err(Error::invalid_input(
+                    "replace_type cannot be used to replace type with NULL",
+                ));
+            }
+            let source = self.plan().expr_type(bound[0]).clone();
+            let target = replaced_type(&source, &from, &to);
+            let cast = self.checked_cast_to(bound[0], &target, false)?;
+            if source == from {
+                return self.collated_like(cast, bound[2]);
+            }
+            return Ok(cast);
+        }
         // `current_setting` is the other one the binder answers, and it has to be answered here
         // rather than by a kernel for a reason `typeof` does not have: its declared return type is
         // ANY, so there is no type for a plan to carry until the name is read. Upstream folds it
@@ -5812,6 +5832,32 @@ fn part_mismatch(name: &str, spelled: &[String], interval: bool, timed: bool) ->
     }
     message.push('\n');
     Error::binder(message)
+}
+
+/// `ty` with each `from` in it made a `to`, which is the type `replace_type` casts to.
+///
+/// The pin replaces inside out, so a nested type is looked at after its parts are replaced. That is
+/// why `INTEGER[][]` with `INTEGER[]` replaced by `VARCHAR` is `VARCHAR[]`.
+fn replaced_type(ty: &LogicalType, from: &LogicalType, to: &LogicalType) -> LogicalType {
+    let fields = |fields: &[Field]| -> Vec<Field> {
+        let replace =
+            |field: &Field| Field { ty: replaced_type(&field.ty, from, to), ..field.clone() };
+        fields.iter().map(replace).collect()
+    };
+    let inner = match ty {
+        LogicalType::List(element) => LogicalType::List(Box::new(replaced_type(element, from, to))),
+        LogicalType::Array(element, size) => {
+            LogicalType::Array(Box::new(replaced_type(element, from, to)), *size)
+        }
+        LogicalType::Map(key, value) => LogicalType::Map(
+            Box::new(replaced_type(key, from, to)),
+            Box::new(replaced_type(value, from, to)),
+        ),
+        LogicalType::Struct(members) => LogicalType::Struct(fields(members)),
+        LogicalType::Union(members) => LogicalType::Union(fields(members)),
+        other => other.clone(),
+    };
+    if inner == *from { to.clone() } else { inner }
 }
 
 /// The PostgreSQL type of a value of the type `ty` that `written` wrote, or `None` for a type such
