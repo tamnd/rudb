@@ -40,7 +40,9 @@ fn bins(args: &[Value], returns: &LogicalType) -> Result<Value> {
     };
     let ordered = match (min, max) {
         (Value::BigInt(min), Value::BigInt(max)) => max.cmp(min),
-        (Value::Double(min), Value::Double(max)) => max.partial_cmp(min).unwrap_or_default(),
+        (Value::Double(min), Value::Double(max)) => {
+            max.partial_cmp(min).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (Value::Timestamp(min), Value::Timestamp(max)) => max.cmp(min),
         _ => return Err(Error::internal("equi_width_bins takes two ends of one type")),
     };
