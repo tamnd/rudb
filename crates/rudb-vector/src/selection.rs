@@ -102,9 +102,11 @@ impl Selection {
         match (&self.mask, self.list.get()) {
             (Some(words), None) => {
                 let (whole, part) = (len / 64, len % 64);
-                words.iter().enumerate().skip(whole).all(|(at, &word)| {
-                    if at == whole { word >> part == 0 } else { word == 0 }
-                })
+                words
+                    .iter()
+                    .enumerate()
+                    .skip(whole)
+                    .all(|(at, &word)| if at == whole { word >> part == 0 } else { word == 0 })
             }
             _ => crate::vector::below(self.indices(), len),
         }
