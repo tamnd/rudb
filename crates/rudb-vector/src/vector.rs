@@ -4174,7 +4174,7 @@ impl Vector {
             let mut out = vec![T::default(); rows];
             let mut at = 0;
             for (index, &(start, length)) in runs.iter().enumerate() {
-                if let Some(&(ahead, _)) = runs.get(index + PREFETCH_AHEAD) {
+                if let Some(&(ahead, _)) = runs.get(index + prefetch_ahead()) {
                     prefetch_word(words, (packed.offset + ahead as usize) * width / 64);
                 }
                 let length = length as usize;
@@ -5036,8 +5036,8 @@ impl Packed<'_> {
             let (words, width, offset) = (self.words, self.width, self.offset);
             let wide = width as usize;
             for (index, code) in out[..rows].iter_mut().enumerate() {
-                if index + PREFETCH_AHEAD < rows {
-                    let ahead = (offset + at(index + PREFETCH_AHEAD)) * wide;
+                if index + prefetch_ahead() < rows {
+                    let ahead = (offset + at(index + prefetch_ahead())) * wide;
                     prefetch_word(words, ahead / u64::BITS as usize);
                 }
                 *code = code_at(words, (offset + at(index)) * wide, width);
@@ -5085,7 +5085,7 @@ impl Packed<'_> {
             let wide = width as usize;
             let mut out = vec![T::default(); at.len()];
             for (index, (slot, &row)) in out.iter_mut().zip(at).enumerate() {
-                if let Some(&ahead) = at.get(index + PREFETCH_AHEAD) {
+                if let Some(&ahead) = at.get(index + prefetch_ahead()) {
                     prefetch_word(words, (offset + ahead as usize) * wide / u64::BITS as usize);
                 }
                 *slot = value(code_at(words, (offset + row as usize) * wide, width));
@@ -5581,7 +5581,7 @@ fn gather_widened<T: Copy + Into<i64>>(
     };
     if spread {
         out.extend(at.iter().enumerate().map(|(place, &row)| {
-            if let Some(&ahead) = at.get(place + PREFETCH_AHEAD) {
+            if let Some(&ahead) = at.get(place + prefetch_ahead()) {
                 prefetch(run, ahead as usize);
             }
             run[row as usize].into()
@@ -5819,6 +5819,13 @@ fn unpack(
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
 pub const PREFETCH_AHEAD: usize = 16;
 
+/// Scratch: the distance from RUDB_DT.
+#[inline]
+fn prefetch_ahead() -> usize {
+    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| std::env::var("RUDB_DT").ok().and_then(|v| v.parse().ok()).unwrap_or(16))
+}
+
 /// `values` at each of `at`, every one of which is inside it.
 ///
 /// Positions far apart each miss the cache, and read in turn the core waits out every miss, so
@@ -5839,7 +5846,7 @@ fn picked<T: Copy, P: Copy>(values: &[T], at: &[P], index: impl Fn(P) -> usize) 
     at.iter()
         .enumerate()
         .map(|(place, &position)| {
-            if let Some(&ahead) = at.get(place + PREFETCH_AHEAD) {
+            if let Some(&ahead) = at.get(place + prefetch_ahead()) {
                 prefetch(values, index(ahead));
             }
             values[index(position)]
