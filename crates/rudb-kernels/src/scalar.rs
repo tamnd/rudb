@@ -641,6 +641,8 @@ fn filled(
     if column.len() != rows || !matches!(column.form(), Form::Flat | Form::Gathered) {
         return Ok(None);
     }
+    // flatten: a gather is copied out once so the fill can write over whole values, which is the
+    // copy the pick was going to make a value at a time.
     let column = column.flatten()?;
     let one = Vector::from_values(returns.clone(), std::slice::from_ref(value))?;
     let words: &[u64] = match column.validity() {

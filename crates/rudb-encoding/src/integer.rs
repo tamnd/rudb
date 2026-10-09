@@ -493,8 +493,11 @@ pub fn decode_runs_laid_as<T: Lane>(
     Ok(Some((values, ends, rows)))
 }
 
+/// The row count, run values and run lengths of a run length chunk, in that order.
+type Runs = (u32, Vec<i64>, Vec<i64>);
+
 /// The row count, run values and run lengths of a run length chunk, or `None` for any other kind.
-fn read_runs(bytes: &[u8]) -> Result<Option<(u32, Vec<i64>, Vec<i64>)>> {
+fn read_runs(bytes: &[u8]) -> Result<Option<Runs>> {
     if !run_length(bytes) {
         return Ok(None);
     }

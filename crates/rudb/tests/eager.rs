@@ -107,7 +107,7 @@ fn a_count_moved_below_a_left_join_counts_rows_when_the_column_has_no_nulls() {
     let sql = "SELECT c.k, count(o.id) FROM c LEFT JOIN o ON c.k = o.c AND o.id % 3 = 1 GROUP BY \
                c.k";
     let plan = database.plan(sql).expect("the plan");
-    let below = plan.lines().filter(|line| line.contains("Aggregate")).last().expect("aggregates");
+    let below = plan.lines().rfind(|line| line.contains("Aggregate")).expect("aggregates");
     assert!(below.contains("count_star()"), "the moved count still reads the column:\n{plan}");
     let (on, off) = both_from(&database, sql, "stats_validity_free");
     assert_eq!(on.len(), 100);

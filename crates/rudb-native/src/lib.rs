@@ -14199,10 +14199,9 @@ const HELD_RUN: usize = 3;
 /// since a join or a filter reads it a row at a time and a row of runs is a search. The flat form
 /// is the copy the part cost before, and the runs are a run's value and end on top of it.
 fn cascade_runs(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Option<Vector>> {
-    fn held<T: integer::Lane>(
-        bytes: &[u8],
-        rows: usize,
-    ) -> Result<Option<(Vec<T>, Vec<u32>, Vec<T>)>> {
+    /// A run's values, the row each run ends at, and the rows laid out flat beside them.
+    type Held<T> = (Vec<T>, Vec<u32>, Vec<T>);
+    fn held<T: integer::Lane>(bytes: &[u8], rows: usize) -> Result<Option<Held<T>>> {
         integer::decode_runs_laid_as::<T>(bytes, rows / HELD_RUN)
             .map_err(|error| invalid(&format!("page value is not of its type: {error}")))
     }
