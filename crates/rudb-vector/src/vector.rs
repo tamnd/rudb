@@ -3759,6 +3759,16 @@ impl Vector {
             return Ok(self.clone());
         }
         slow::took(Cause::Flatten);
+        self.written_out()
+    }
+
+    /// What [`Self::flatten`] and [`Self::opened`] both do to a vector that is not flat yet.
+    ///
+    /// One body for the two, because they had one each and drifted apart. `opened` never learned
+    /// the block unpack, so a packed key the aggregate opens went through the general copy, which
+    /// lists every position, marks each one live and reads its code on its own. Grouping `part` by
+    /// `p_brand` and `p_size` spent more on that than on the grouping.
+    fn written_out(&self) -> Result<Self> {
         if let Some(flat) = self.decoded_codes().or_else(|| self.runs_written_out()) {
             return Ok(flat);
         }
@@ -4019,10 +4029,7 @@ impl Vector {
         if let Body::Flat(_) = self.body {
             return Ok(self.clone());
         }
-        if let Some(flat) = self.decoded_codes().or_else(|| self.runs_written_out()) {
-            return Ok(flat);
-        }
-        self.copied((0..self.len).collect(), false)
+        self.written_out()
     }
 
     /// The same as [`Self::flatten`].
