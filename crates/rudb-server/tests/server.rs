@@ -1448,6 +1448,79 @@ fn a_recursive_union_of_columns_that_hash_runs() {
 }
 
 #[test]
+fn a_key_of_a_type_with_no_equality_or_ordering_is_an_error() {
+    let dirs = Dirs::new("pgsortops");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // `json` has no default btree or hash operator class, so it has no equality operator and no
+    // ordering operator. The texts and the positions are those of PostgreSQL 19.
+    let equality = "could not identify an equality operator for type json";
+    let ordering = "could not identify an ordering operator for type json";
+    for (sql, message, position) in [
+        ("select distinct '{}'::json", equality, "17"),
+        ("select 1, '{}'::json union select 1, '{}'::json", equality, "11"),
+        ("select '{}'::json group by 1", equality, "28"),
+        ("select count(distinct '{}'::json)", equality, "23"),
+        ("select 1 from (values ('{}'::json)) v(j) order by j", ordering, "51"),
+        ("select distinct on (j) j from (values ('{}'::json)) v(j)", equality, "21"),
+        (
+            "select distinct array['{}'::json]",
+            "could not identify an equality operator for type json[]",
+            "17",
+        ),
+        (
+            "select 1 from (values ('{}'::json)) v(j) order by array[j]",
+            "could not identify an ordering operator for type json[]",
+            "51",
+        ),
+        ("select array_agg(j order by j) from (values ('{}'::json)) v(j)", ordering, "29"),
+        (
+            "select row_number() over (partition by j) from (values ('{}'::json)) v(j)",
+            equality,
+            "40",
+        ),
+        ("select row_number() over (order by j) from (values ('{}'::json)) v(j)", ordering, "36"),
+        (
+            "with recursive r(j) as (select '{}'::json union select j from r) select 1 from r",
+            equality,
+            "32",
+        ),
+        (
+            "select j from (values ('{}'::json)) v(j) union all select '{}'::json order by 1",
+            ordering,
+            "79",
+        ),
+        ("select '{}'::json union select '{}'::json union select '{}'::json", equality, "8"),
+        ("select * from (select 1, '{}'::json union select 2, '{}'::json) s", equality, "26"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42883"), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(position), "{sql}");
+        let hint = message
+            .contains("ordering")
+            .then_some("Use an explicit ordering operator or modify the query.");
+        assert_eq!(messages[0].field(b'H').as_deref(), hint, "{sql}");
+    }
+    // These types have both operators, `varchar` through the class of `text`, and `xid` has an
+    // equality from its hash class.
+    for (sql, rows) in [
+        ("select distinct '{}'::jsonb, 'a'::varchar, array[1], 1.5::numeric, ''::bytea", 1),
+        ("select '{}'::jsonb union select '{}'::jsonb", 1),
+        ("select count(distinct x) from (values ('a'::varchar), ('a')) v(x)", 1),
+        ("select x from (values (array['a']), (array['a'])) v(x) group by x order by x", 1),
+        ("select row_number() over (partition by '{}'::json::text order by 1) ", 1),
+        ("select '{}'::json union all select '{}'::json", 2),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(rows)), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("pgstring");
     let server = Server::start(dirs.config()).unwrap();

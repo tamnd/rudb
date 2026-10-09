@@ -222,6 +222,7 @@ pub struct Semantics {
     sequence_owners: SequenceOwners,
     set_functions: SetFunctions,
     show_behavior: ShowBehavior,
+    sort_operators: SortOperators,
     subscripts: Subscripts,
     collations: Collations,
     single_arrow_lambdas: bool,
@@ -276,6 +277,7 @@ impl Default for Semantics {
             scalar_subquery_error_on_multiple_rows: true,
             sequence_owners: SequenceOwners::Table,
             set_functions: SetFunctions::Pin,
+            sort_operators: SortOperators::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
             collations: Collations::Pin,
@@ -458,6 +460,11 @@ impl Semantics {
     #[must_use]
     pub fn set_functions(self) -> SetFunctions {
         self.set_functions
+    }
+    /// Which types a sort, a grouping, a `DISTINCT` and a set operation can take.
+    #[must_use]
+    pub fn sort_operators(self) -> SortOperators {
+        self.sort_operators
     }
     /// How a subscript and a slice of a list read the list.
     #[must_use]
@@ -971,6 +978,19 @@ pub enum SetFunctions {
     Postgres,
 }
 
+/// Which types a sort, a grouping, a `DISTINCT` and a set operation can take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortOperators {
+    /// As in DuckDB: each type, because the engine compares any two values of one type.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a key compares with the equality operator of its type and sorts with
+    /// the ordering operator, which come from the default btree or hash operator class. A type
+    /// with none, such as `json`, is `42883 could not identify an equality operator for type
+    /// json`.
+    Postgres,
+}
+
 /// How a subscript and a slice of a list read the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Subscripts {
@@ -1390,6 +1410,7 @@ impl Session {
             self.semantics.row_nulls = RowNulls::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
+            self.semantics.sort_operators = SortOperators::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
