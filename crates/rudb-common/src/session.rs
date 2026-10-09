@@ -42,6 +42,9 @@ pub struct Session {
     begun: Begun,
     transaction: Transaction,
     prepared: Prepareds,
+    /// The names of the settings this connection set for itself, under every spelling, which
+    /// `duckdb_settings()` reports as `LOCAL` whatever their usual scope is.
+    local: Arc<Vec<String>>,
 }
 
 /// When the open transaction began and when the statement arrived, in microseconds since the
@@ -1180,6 +1183,7 @@ impl Default for Session {
             begun: Begun::default(),
             transaction: Transaction::default(),
             prepared: Prepareds::default(),
+            local: Arc::new(Vec::new()),
         }
     }
 }
@@ -1505,6 +1509,17 @@ impl Session {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
+    }
+
+    /// Records the settings this connection set for itself, under every spelling.
+    pub fn set_local(&mut self, names: Vec<String>) {
+        self.local = Arc::new(names);
+    }
+
+    /// Whether this connection set the setting with this name for itself.
+    #[must_use]
+    pub fn is_local(&self, name: &str) -> bool {
+        self.local.iter().any(|held| held == name)
     }
 
     /// Every setting and its value, in name order.

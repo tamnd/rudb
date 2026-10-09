@@ -16,7 +16,9 @@
 //! is where that is written down.
 
 use rudb_common::{LogicalType, Result, Session, Value};
-use rudb_functions::{SETTINGS, UNSET, prepared_statement_fields, setting_fields, variable_fields};
+use rudb_functions::{
+    LOCAL, SETTINGS, UNSET, prepared_statement_fields, setting_fields, variable_fields,
+};
 use rudb_plan::{Plan, Slice};
 
 use crate::metadata::{Metadata, text};
@@ -45,7 +47,7 @@ pub(crate) fn settingnames(
             value.clone(),
             text(entry.description),
             text(entry.input_type),
-            text(entry.scope),
+            text(if session.is_local(entry.name) { LOCAL } else { entry.scope }),
             aliases(entry.aliases),
             value,
         ]);

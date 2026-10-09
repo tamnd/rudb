@@ -3351,11 +3351,15 @@ fn dialect_compatibility_mode_accepts_exactly_the_modes_the_pin_has() {
     );
     db.execute("SET dialect_compatibility_mode = 'spark'").expect("Spark mode");
     assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "spark");
+    // The setting is per connection, so the bare `SET` above is the connection's and a global
+    // value under it is not what the connection reads, which is the pin's answer too.
     db.execute("SET GLOBAL dialect_compatibility_mode = 'SPARK'").expect("global Spark mode");
-    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "SPARK");
+    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "spark");
     db.execute("SET dialect_compatibility_mode = 'none'").expect("no compatibility mode");
     assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "none");
     db.execute("RESET GLOBAL dialect_compatibility_mode").expect("the default mode");
+    assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "none");
+    db.execute("RESET dialect_compatibility_mode").expect("the default mode");
     assert_eq!(db.setting("dialect_compatibility_mode").expect("the mode"), "NONE");
     let error = db.execute("SET dialect_compatibility_mode = 'nope'").expect_err("an unknown mode");
     assert_eq!(error.code().duckdb_name(), "Not implemented Error");

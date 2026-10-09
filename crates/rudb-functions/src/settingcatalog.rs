@@ -1745,6 +1745,193 @@ pub fn setting_named(name: &str) -> Option<&'static SettingEntry> {
     every_setting().find(|entry| entry.name.eq_ignore_ascii_case(name))
 }
 
+/// Where the pin keeps a setting, which decides what `SET`, `SET SESSION` and `SET GLOBAL` write.
+///
+/// The pin keeps a value for the database and lets each connection lay its own over it. Which of
+/// the two a bare `SET` writes is a fact about the setting, and so is whether a connection may
+/// have its own at all, so it is here with the rest of what the table says about a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// A bare `SET` writes the connection's own value, and `SET GLOBAL` the database's.
+    Connection,
+    /// A bare `SET` writes the database's value, and `SET SESSION` the connection's own.
+    Database,
+    /// The database's value and nothing else. `SET SESSION` is refused with the sentence that
+    /// names the setting by this spelling, which for a renamed setting is the new name.
+    Global(&'static str),
+    /// The database's value and nothing else, through the older path, which refuses `SET SESSION`
+    /// with the sentence that says it cannot be set locally and names it as it was written.
+    Older,
+}
+
+/// Where the pin keeps the setting with this name. See [`Kept`].
+///
+/// The three lists were read from the `Scope` of each setting in the pin's `settings.hpp` and
+/// checked against the binary, which also puts every extension setting in the first one. The
+/// fifteen whose scope this table reports as `LOCAL` are not in any of them, because they are kept
+/// per connection by a path of their own.
+#[must_use]
+pub fn kept(name: &str) -> Kept {
+    let named = |list: &[&str]| list.iter().any(|it| it.eq_ignore_ascii_case(name));
+    if named(PER_CONNECTION) {
+        Kept::Connection
+    } else if name.eq_ignore_ascii_case("force_bitpacking_mode") {
+        Kept::Global("debug_force_bitpacking_mode")
+    } else if let Some(written) = GLOBAL_ONLY.iter().find(|it| it.eq_ignore_ascii_case(name)) {
+        Kept::Global(written)
+    } else if named(OLDER) {
+        Kept::Older
+    } else {
+        Kept::Database
+    }
+}
+
+/// The settings a bare `SET` writes for the one connection, `LOCAL_DEFAULT` in `settings.hpp` and
+/// the settings an extension adds.
+const PER_CONNECTION: &[&str] = &[
+    "approximate_join_order_threshold",
+    "asof_loop_join_threshold",
+    "binary_as_string",
+    "Calendar",
+    "checkpoint_on_detach",
+    "debug_asof_iejoin",
+    "debug_disable_optimizer",
+    "debug_enable_caching_operators",
+    "debug_force_external",
+    "debug_force_fetch_row",
+    "debug_force_no_cross_product",
+    "debug_force_update_to_del_and_insert",
+    "debug_transformer_trampoline_style",
+    "delim_join_as_cte",
+    "dialect_compatibility_mode",
+    "disable_parquet_prefetching",
+    "disable_timestamptz_casts",
+    "dynamic_or_filter_threshold",
+    "enable_geoparquet_conversion",
+    "errors_as_json",
+    "explain_output",
+    "file_search_path",
+    "heap_based_parser",
+    "home_directory",
+    "ieee_floating_point_ops",
+    "ignore_unknown_crs",
+    "integer_division",
+    "json_geometry_format",
+    "lambda_syntax",
+    "late_materialization_max_rows",
+    "legacy_disable_null_type",
+    "legacy_metrics_format",
+    "log_query_path",
+    "max_execution_time",
+    "max_expression_depth",
+    "merge_join_threshold",
+    "nested_loop_join_threshold",
+    "null_on_division_by_zero",
+    "order_by_non_integer_literal",
+    "ordered_aggregate_threshold",
+    "parquet_metadata_cache",
+    "parquet_prefetch_column_gap",
+    "partitioned_write_flush_threshold",
+    "partitioned_write_max_open_files",
+    "perfect_ht_threshold",
+    "pivot_filter_threshold",
+    "pivot_limit",
+    "prefer_range_joins",
+    "prefetch_all_parquet_files",
+    "preserve_identifier_case",
+    "regex_match_operator_semantics",
+    "scalar_subquery_error_on_multiple_rows",
+    "table_function_identifier_conversion",
+    "TimeZone",
+];
+
+/// The settings `settings.hpp` scopes `GLOBAL_ONLY`.
+const GLOBAL_ONLY: &[&str] = &[
+    "allow_community_extensions",
+    "allow_extension_repositories",
+    "allow_extensions_metadata_mismatch",
+    "allow_unredacted_secrets",
+    "allow_unsigned_extensions",
+    "autoinstall_extension_repository",
+    "autoinstall_known_extensions",
+    "autoload_known_extensions",
+    "cache_local_files",
+    "current_dialect",
+    "current_transaction_invalidation_policy",
+    "custom_extension_repository",
+    "debug_eviction_queue_sleep_micro_seconds",
+    "debug_force_bitpacking_mode",
+    "debug_local_file_system_delay_ms",
+    "default_block_size",
+    "disable_database_invalidation",
+    "duckdb_api",
+    "enable_external_access",
+    "enable_external_file_cache",
+    "enable_fsst_vectors",
+    "experimental_metadata_reuse",
+    "extension_directory",
+    "extension_repository_directory",
+    "external_file_cache_spill",
+    "external_threads",
+    "force_column_metadata_reuse",
+    "force_compression",
+    "geometry_minimum_shredding_size",
+    "http_proxy_password",
+    "http_proxy_username",
+    "lock_configuration",
+    "max_vacuum_tasks",
+    "pin_threads",
+    "scheduler_process_partial",
+    "storage_block_prefetch",
+    "temp_file_encryption",
+    "variant_minimum_shredding_size",
+    "warnings_as_errors",
+    "zstd_min_string_length",
+];
+
+/// The settings that still go through the pin's older path and have no per connection setter,
+/// as the binary refuses them.
+const OLDER: &[&str] = &[
+    "__delta_only_variant_encoding_enabled",
+    "access_mode",
+    "allocator_bulk_deallocation_flush_threshold",
+    "allow_persistent_secrets",
+    "allowed_configs",
+    "allowed_directories",
+    "allowed_paths",
+    "async_threads",
+    "block_allocator_memory",
+    "checkpoint_threshold",
+    "custom_user_agent",
+    "debug_force_mbedtls_unsafe",
+    "debug_order_verification",
+    "debug_verification_mode",
+    "default_secret_storage",
+    "disabled_compression_methods",
+    "disabled_filesystems",
+    "disabled_log_types",
+    "disabled_optimizers",
+    "enable_logging",
+    "enabled_log_types",
+    "extension_directories",
+    "force_mbedtls_unsafe",
+    "http_proxy",
+    "logging_level",
+    "logging_mode",
+    "logging_storage",
+    "max_memory",
+    "max_temp_directory_size",
+    "memory_limit",
+    "secret_directory",
+    "standard_vector_size",
+    "storage_compatibility_version",
+    "temp_directory",
+    "threads",
+    "wal_autocheckpoint",
+    "worker_threads",
+    "write_buffer_row_group_memory_limit",
+];
+
 /// What the engine says when it is handed a name that is not a setting.
 ///
 /// Here rather than where each caller is, because there are three of them and they are in two
@@ -1913,7 +2100,7 @@ mod tests {
         assert_eq!(setting_named("nothing_called_this"), None);
     }
 
-    /// Twenty seven names are read by the engine and the rest are taken and kept, or taken at one
+    /// Twenty eight names are read by the engine and the rest are taken and kept, or taken at one
     /// value and refused at the others. The counts are here so that moving a setting from one case
     /// to another is a line in a diff rather than something nobody notices.
     #[test]
@@ -1921,9 +2108,9 @@ mod tests {
         let count = |wanted: fn(&Behaviour) -> bool| {
             SETTINGS.iter().filter(|entry| wanted(&entry.behaviour)).count()
         };
-        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 27);
+        assert_eq!(count(|b| matches!(b, Behaviour::Honoured)), 28);
         assert_eq!(count(|b| matches!(b, Behaviour::Knob(_))), 136);
-        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 29);
+        assert_eq!(count(|b| matches!(b, Behaviour::DefaultOnly(_))), 28);
         assert_eq!(
             setting_named("memory_limit").expect("a setting").behaviour,
             Behaviour::Honoured
