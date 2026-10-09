@@ -65,8 +65,11 @@
 
 use rudb_common::Result;
 use rudb_common::rules::Rule;
-use rudb_plan::{ColumnBinding, CompareOp, Expr, JoinKind, Node, NodeRef, Plan};
+use std::collections::HashMap;
 
+use rudb_plan::{ColumnBinding, CompareOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice};
+
+use crate::domain::remap;
 use crate::link::{Linked, absorbed, consumers};
 use crate::pass::{Context, Pass};
 use crate::walk;
@@ -155,8 +158,13 @@ fn rewrite(plan: &mut Plan, at: NodeRef, consumers: &[Option<NodeRef>], context:
             // Every child row keeps exactly one copy of itself, so the join is a no-op on the row
             // set and the only thing it adds is the parent's columns. Where nobody reads those, it
             // adds nothing.
-            JoinKind::Inner if unread(plan, parent, at) && absorbed(plan, consumers, at) => {
-                stand_in(plan, at, child, consumers);
+            //
+            // Where the only parent column read above is its key, the child's key is the same value
+            // on every row the join emits, so reading that instead leaves the join adding nothing.
+            JoinKind::Inner if absorbed(plan, consumers, at) => {
+                if unread(plan, parent, at) || substituted(plan, at, parent, conditions) {
+                    stand_in(plan, at, child, consumers);
+                }
             }
             // Nothing to check above: a left join over a total relationship emits exactly the rows
             // an inner join over it emits, in the same columns, so this is a change of one field.
@@ -292,6 +300,153 @@ fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
     clear
 }
 
+/// Whether every read of the parent above the join was of its key, and is now of the child's key.
+///
+/// JOB writes `an.person_id = n.id AND n.id = ci.person_id` and reads nothing else of `name`. Once
+/// the join order has put `name` between the other two, its key is the one thing above that reads
+/// it, and on 16b that join builds a hash table over 2.8 million rows to change none of them: every
+/// cast row has exactly one person, whose id is the cast row's `person_id`. So the reads of `n.id`
+/// above become reads of `ci.person_id` and the join goes.
+///
+/// Only a join's conditions and a filter's predicate are rewritten, and only over the path from the
+/// root down to the join, which is where the child's key is in scope wherever the parent's was.
+/// Anything else that reads the key, a projection that hands it on included, leaves the plan as it
+/// was, and nothing is changed until every reader is known to take the rewrite.
+fn substituted(plan: &mut Plan, join: NodeRef, parent: NodeRef, conditions: Slice) -> bool {
+    let Node::Get { index, .. } = *plan.node(parent) else {
+        return false;
+    };
+    let Some([one, other]) = equated_pair(plan, conditions) else {
+        return false;
+    };
+    let (key, child_key) = match (one.table == index, other.table == index) {
+        (true, false) => (one, other),
+        (false, true) => (other, one),
+        _ => return false,
+    };
+    // A cast would have to go where the key is read, and a reader that compares the key with a
+    // column of its own type is what this rewrite is for.
+    let [condition] = plan.expr_list(conditions) else {
+        return false;
+    };
+    let Expr::Compare { left, right, .. } = *plan.expr(*condition) else {
+        return false;
+    };
+    if plan.expr_type(left) != plan.expr_type(right) {
+        return false;
+    }
+    let Some(readers) = key_readers(plan, parent, join, key) else {
+        return false;
+    };
+    let map = HashMap::from([(key, child_key)]);
+    let mut rewritten = Vec::with_capacity(readers.len());
+    for reader in readers {
+        let mut node = plan.node(reader).clone();
+        match &mut node {
+            Node::Join { conditions, .. } => {
+                let held = plan.expr_list(*conditions).to_vec();
+                let mut kept: Vec<ExprRef> = Vec::with_capacity(held.len());
+                for expr in held {
+                    let moved = remap(plan, expr, &map);
+                    // `an.person_id = n.id AND an.person_id = ci.person_id` is the same condition
+                    // twice once `n.id` is `ci.person_id`.
+                    if !kept.iter().any(|&seen| walk::same(plan, seen, moved)) {
+                        kept.push(moved);
+                    }
+                }
+                if kept.iter().any(|&expr| equates_itself(plan, expr)) {
+                    return false;
+                }
+                *conditions = plan.add_expr_list(&kept);
+            }
+            Node::Filter { predicate, .. } => *predicate = remap(plan, *predicate, &map),
+            _ => return false,
+        }
+        rewritten.push((reader, node));
+    }
+    for (reader, node) in rewritten {
+        *plan.node_mut(reader) = node;
+    }
+    true
+}
+
+/// The nodes that read the parent's key, when that is all anything running reads of the parent
+/// and each of them is a join or a filter on the path from the root down to `join`.
+fn key_readers(
+    plan: &Plan,
+    parent: NodeRef,
+    join: NodeRef,
+    key: ColumnBinding,
+) -> Option<Vec<NodeRef>> {
+    let mut path = Vec::new();
+    if !path_to(plan, plan.root(), join, &mut path) {
+        return None;
+    }
+    let mut produced = Vec::new();
+    indices(plan, parent, &mut produced);
+    let mut running = vec![false; plan.node_count()];
+    mark(plan, plan.root(), &mut running);
+    let mut inside = vec![false; plan.node_count()];
+    mark(plan, parent, &mut inside);
+    let mut readers = Vec::new();
+    for node in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        let at = node as usize;
+        if node == join
+            || !running.get(at).copied().unwrap_or(false)
+            || inside.get(at).copied().unwrap_or(false)
+        {
+            continue;
+        }
+        let (mut reads_key, mut reads_other) = (false, false);
+        walk::node_columns(plan, node, &mut |_, binding| {
+            if binding == key {
+                reads_key = true;
+            } else if produced.contains(&binding.table) {
+                reads_other = true;
+            }
+        });
+        if reads_other {
+            return None;
+        }
+        if reads_key {
+            let shaped = matches!(plan.node(node), Node::Join { .. } | Node::Filter { .. });
+            if !shaped || !path.contains(&node) {
+                return None;
+            }
+            readers.push(node);
+        }
+    }
+    Some(readers)
+}
+
+/// Whether `target` is under `at`, with the nodes from `at` down to it, `target` left out, pushed
+/// onto `path`.
+fn path_to(plan: &Plan, at: NodeRef, target: NodeRef, path: &mut Vec<NodeRef>) -> bool {
+    if at == target {
+        return true;
+    }
+    path.push(at);
+    for child in plan.node(at).children().into_iter().flatten() {
+        if path_to(plan, child, target, path) {
+            return true;
+        }
+    }
+    path.pop();
+    false
+}
+
+/// Whether a condition compares a column with itself, which is what an equality between the two
+/// keys turns into and is no condition a join can be run on.
+fn equates_itself(plan: &Plan, expr: ExprRef) -> bool {
+    let Expr::Compare { left, right, .. } = *plan.expr(expr) else {
+        return false;
+    };
+    matches!(
+        (plan.expr(left), plan.expr(right)),
+        (Expr::Column(left), Expr::Column(right)) if left == right
+    )
+}
+
 /// The columns of `side` that something above `join` reads, or nothing when something above it
 /// reads its columns by position.
 ///
@@ -374,10 +529,7 @@ fn mark(plan: &Plan, at: NodeRef, inside: &mut [bool]) {
 /// The same shape [`crate::link::LinkJoinRewrite`] asks for and for the same reason: one condition,
 /// because a second one is a restriction no certificate covers, and two plain columns, because a
 /// relationship is between columns.
-pub(crate) fn equated_pair(
-    plan: &Plan,
-    conditions: rudb_plan::Slice,
-) -> Option<[ColumnBinding; 2]> {
+pub(crate) fn equated_pair(plan: &Plan, conditions: Slice) -> Option<[ColumnBinding; 2]> {
     let [condition] = plan.expr_list(conditions) else {
         return None;
     };
@@ -533,6 +685,59 @@ mod tests {
         let mut plan = joined("INNER", "#0.0::BIGINT AS k");
         let text = rewritten(&mut plan, &context);
         assert!(text.contains("Join INNER"), "the switch is what the per rule table needs: {text}");
+    }
+
+    /// Aliases joined to orders on the customer key twice over, once through `customer` and once
+    /// directly, which is the shape JOB's `an.person_id = n.id AND n.id = ci.person_id` binds to
+    /// once the join order has put the parent in the middle.
+    fn through_the_key(projected: &str) -> Plan {
+        let text = format!(
+            "Project #4 [{projected}]\n  \
+             Join INNER on=[(#3.0::BIGINT = #1.0::BIGINT)::BOOLEAN, \
+             (#3.0::BIGINT = #0.1::BIGINT)::BOOLEAN]\n    \
+             Get memory.main.aliases AS a #3 [a_custkey::BIGINT, a_name::VARCHAR]\n    \
+             Join INNER on=[(#0.1::BIGINT = #1.0::BIGINT)::BOOLEAN]\n      \
+             Get memory.main.orders AS orders #0 [o_orderkey::BIGINT, o_custkey::BIGINT]\n      \
+             Get memory.main.customer AS customer #1 [c_custkey::BIGINT]\n"
+        );
+        Plan::parse(&text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"))
+    }
+
+    #[test]
+    fn a_parent_read_only_for_its_key_is_read_through_the_child_instead() {
+        let mut plan = through_the_key("#3.1::VARCHAR AS name");
+        let text = rewritten(&mut plan, &context(verified()));
+        assert!(!text.contains("customer"), "the parent's key is the child's key: {text}");
+        assert_eq!(text.matches("Join INNER").count(), 1, "one join is left: {text}");
+        assert_eq!(
+            text.matches("(#3.0::BIGINT = #0.1::BIGINT)").count(),
+            1,
+            "and the two conditions it had are now one: {text}"
+        );
+        plan.validate().unwrap_or_else(|error| panic!("{text} is not a plan: {error}"));
+    }
+
+    #[test]
+    fn a_parent_key_the_query_projects_keeps_the_join() {
+        let mut plan = through_the_key("#1.0::BIGINT AS k");
+        let text = rewritten(&mut plan, &context(verified()));
+        assert!(text.contains("customer"), "a projection of the key is not rewritten: {text}");
+    }
+
+    #[test]
+    fn a_parent_key_is_not_read_through_a_link_that_was_never_counted() {
+        let built = vec![Linked::built("orders", "o_custkey", "customer", "c_custkey")];
+        let mut plan = through_the_key("#3.1::VARCHAR AS name");
+        let text = rewritten(&mut plan, &context(built));
+        assert!(text.contains("customer"), "an order with no customer is dropped: {text}");
+    }
+
+    #[test]
+    fn counts_kept_without_their_link_are_both_certificates() {
+        let certified = vec![Linked::certified("orders", "o_custkey", "customer", "c_custkey")];
+        let mut plan = joined("INNER", "#0.0::BIGINT AS k");
+        let text = rewritten(&mut plan, &context(certified));
+        assert!(!text.contains("customer"), "nothing has to be followed to delete it: {text}");
     }
 
     #[test]
