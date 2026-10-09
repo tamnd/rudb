@@ -6445,10 +6445,12 @@ impl<'a> Binder<'a> {
         }
         let resolved = window_signature(name, &types)?;
         // `fill` reads the sort key rather than the frame, so what it needs from the query is not
-        // what any other window needs and it is refused on its own terms.
+        // what any other window needs and it is refused on its own terms. An `ORDER BY` inside
+        // its brackets is the key it reads in place of the one in the `OVER`.
         if resolved.name == "fill" {
+            let order = if parts.inner.is_empty() { &parts.order } else { &parts.inner };
             let keys: Vec<LogicalType> =
-                parts.order.iter().map(|key| self.plan.expr_type(key.expr).clone()).collect();
+                order.iter().map(|key| self.plan.expr_type(key.expr).clone()).collect();
             refuse_fill(&types[0], &keys, distinct, ignore_nulls)?;
         }
         // Upstream's sentence, doubled quotes and all. A DISTINCT over an aggregate inside an OVER
@@ -6472,16 +6474,17 @@ impl<'a> Binder<'a> {
         // something other than the frame, and what the reference binary does with them under an
         // order of their own is a different reading again, so they are turned down rather than
         // guessed at. The exclusion is refused first and in the reference binary's own sentence,
-        // because that is the one it reaches for when both apply. Per #1204.
+        // because that is the one it reaches for when both apply, and it is refused for `fill`
+        // too, whose order is the key it reads. Per #1204.
         if !parts.inner.is_empty() && kind_of(resolved.name) == Some(FunctionKind::Window) {
             let counts = matches!(resolved.name, "first_value" | "last_value" | "nth_value");
-            if !counts {
-                if parts.frame.exclude != WindowExclude::NoOthers {
-                    return Err(Error::binder(format!(
-                        "EXCLUDE is not supported for the window function \"\"{}\"\"",
-                        resolved.name
-                    )));
-                }
+            if !counts && parts.frame.exclude != WindowExclude::NoOthers {
+                return Err(Error::binder(format!(
+                    "EXCLUDE is not supported for the window function \"\"{}\"\"",
+                    resolved.name
+                )));
+            }
+            if !counts && resolved.name != "fill" {
                 return Err(Error::not_implemented(format!(
                     "ORDER BY inside the arguments of the window function \"{}\"",
                     resolved.name

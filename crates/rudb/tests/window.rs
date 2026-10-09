@@ -856,6 +856,29 @@ fn a_partition_is_filled_on_its_own_and_nothing_is_read_across_the_line() {
 }
 
 #[test]
+fn fill_with_an_order_of_its_own_reads_the_line_along_that_key() {
+    // The pinned binary's answers. The `OVER` puts no order on the rows at all here, so the line
+    // is read along the key inside the brackets, and a descending key reads it from the far end.
+    // A row whose key is null keeps its gap and is no value for anybody else either.
+    let database = Database::new();
+    let connection = database.connect();
+    connection.execute("CREATE TABLE h(k INTEGER, v INTEGER)").expect("creates the table");
+    connection
+        .execute("INSERT INTO h VALUES (0,0),(1,NULL),(2,4),(3,NULL),(4,16),(NULL,NULL),(NULL,9)")
+        .expect("inserts seven rows");
+    let sql = "SELECT fill(v ORDER BY k DESC) OVER () FROM h ORDER BY k, v";
+    assert_eq!(
+        column(&database, sql, 0),
+        ints(&[Some(0), Some(2), Some(4), Some(10), Some(16), Some(9), None])
+    );
+    let sql = "SELECT fill(v ORDER BY k NULLS FIRST) OVER (ORDER BY v) FROM h ORDER BY k, v";
+    assert_eq!(
+        column(&database, sql, 0),
+        ints(&[Some(0), Some(2), Some(4), Some(10), Some(16), Some(9), None])
+    );
+}
+
+#[test]
 fn fill_answers_in_the_type_it_was_given_and_the_arithmetic_happens_where_that_type_stores_it() {
     // Four types and four different number lines under them. A DECIMAL interpolates on its unscaled
     // integer so the scale cancels out of the slope, a DATE on its day count, a TIMESTAMP on its
