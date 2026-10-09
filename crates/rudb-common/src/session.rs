@@ -229,6 +229,7 @@ pub struct Semantics {
     sort_operators: SortOperators,
     tie_order: TieOrder,
     window_order: WindowOrder,
+    empty_targets: EmptyTargets,
     subscripts: Subscripts,
     collations: Collations,
     single_arrow_lambdas: bool,
@@ -287,6 +288,7 @@ impl Default for Semantics {
             sort_operators: SortOperators::Pin,
             tie_order: TieOrder::Pin,
             window_order: WindowOrder::Pin,
+            empty_targets: EmptyTargets::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
             collations: Collations::Pin,
@@ -490,6 +492,11 @@ impl Semantics {
     #[must_use]
     pub fn window_order(self) -> WindowOrder {
         self.window_order
+    }
+    /// Whether a `SELECT` can have no targets.
+    #[must_use]
+    pub fn empty_targets(self) -> EmptyTargets {
+        self.empty_targets
     }
     /// How a subscript and a slice of a list read the list.
     #[must_use]
@@ -1055,6 +1062,17 @@ pub enum WindowOrder {
     Postgres,
 }
 
+/// Whether a `SELECT` can have no targets, as in `SELECT FROM t`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmptyTargets {
+    /// As in DuckDB: a `SELECT` needs at least one target.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: a `SELECT` with no targets gives rows with no columns, one for each row
+    /// of its `FROM`.
+    Postgres,
+}
+
 /// How a subscript and a slice of a list read the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Subscripts {
@@ -1480,6 +1498,7 @@ impl Session {
             self.semantics.sort_operators = SortOperators::Postgres;
             self.semantics.tie_order = TieOrder::Postgres;
             self.semantics.window_order = WindowOrder::Postgres;
+            self.semantics.empty_targets = EmptyTargets::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
