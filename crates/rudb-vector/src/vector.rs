@@ -5028,6 +5028,12 @@ impl Packed<'_> {
             // The fields in locals, the way [`Self::values_at`] reads rows far apart.
             let (words, width, offset) = (self.words, self.width, self.offset);
             let wide = width as usize;
+            if streams(first == low && at(rows - 1) == high, high - low, rows, wide) {
+                for (index, code) in out[..rows].iter_mut().enumerate() {
+                    *code = code_at(words, (offset + at(index)) * wide, width);
+                }
+                return;
+            }
             for (index, code) in out[..rows].iter_mut().enumerate() {
                 if index + PREFETCH_AHEAD < rows {
                     let ahead = (offset + at(index + PREFETCH_AHEAD)) * wide;
@@ -5077,6 +5083,13 @@ impl Packed<'_> {
             let (words, width, offset) = (self.words, self.width, self.offset);
             let wide = width as usize;
             let mut out = vec![T::default(); at.len()];
+            let ascends = at[0] as usize == low && at[at.len() - 1] as usize == high;
+            if streams(ascends, high - low, at.len(), wide) {
+                for (slot, &row) in out.iter_mut().zip(at) {
+                    *slot = value(code_at(words, (offset + row as usize) * wide, width));
+                }
+                return out;
+            }
             for (index, (slot, &row)) in out.iter_mut().zip(at).enumerate() {
                 if let Some(&ahead) = at.get(index + PREFETCH_AHEAD) {
                     prefetch_word(words, (offset + ahead as usize) * wide / u64::BITS as usize);
@@ -5812,6 +5825,23 @@ fn unpack(
 /// and a row's read is a handful, so the line has to be asked for well before it is wanted.
 pub const PREFETCH_AHEAD: usize = 16;
 
+/// The widest gap, in bits, that rows read in ascending order may leave on average and still be
+/// left to the hardware to fetch ahead. Four cache lines.
+const STREAM_GAP: usize = 4 * 512;
+
+/// Whether a gather of `rows` rows over `span` rows of `bits` bits each can skip asking for lines
+/// ahead, because the rows ascend and lie close enough that the hardware is already following them.
+///
+/// The rows a filter keeps out of a chunk ascend and are a few dozen bytes apart, and the
+/// prefetcher streams them in on its own. Asking again for each one was more than half the
+/// instructions of the gather on TPC-H q15, where three columns are read at the four percent of
+/// `lineitem` a quarter of ship dates keeps. A join hands back rows in no order and far apart, and
+/// those still prefetch. `ascends` is only that the first row is the lowest and the last the
+/// highest, which is all a guess about the cache needs.
+fn streams(ascends: bool, span: usize, rows: usize, bits: usize) -> bool {
+    ascends && span.saturating_mul(bits) <= rows.saturating_mul(STREAM_GAP)
+}
+
 /// `values` at each of `at`, every one of which is inside it.
 ///
 /// Positions far apart each miss the cache, and read in turn the core waits out every miss, so
@@ -5826,7 +5856,16 @@ fn picked<T: Copy, P: Copy>(values: &[T], at: &[P], index: impl Fn(P) -> usize) 
         }
         _ => false,
     };
-    if !spread {
+    let near = match (at.first(), at.last()) {
+        (Some(&first), Some(&last)) => streams(
+            index(first) <= index(last),
+            index(last).abs_diff(index(first)),
+            at.len(),
+            size_of::<T>() * 8,
+        ),
+        _ => false,
+    };
+    if !spread || near {
         return at.iter().map(|&position| values[index(position)]).collect();
     }
     at.iter()
