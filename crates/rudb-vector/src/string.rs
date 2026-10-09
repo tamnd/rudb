@@ -137,6 +137,7 @@ impl StringView {
     /// different, and two strings with the same prefix are usually equal, so a filter on a string
     /// column resolves without touching the payload on almost every row.
     #[must_use]
+    #[inline]
     pub fn prefix(&self) -> [u8; 4] {
         [self.payload[0], self.payload[1], self.payload[2], self.payload[3]]
     }
