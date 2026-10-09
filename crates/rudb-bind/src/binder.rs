@@ -18,8 +18,9 @@ use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, same_name
 use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder, Error,
-    ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin, Result, Semantics, Session,
-    ShowBehavior, Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames,
+    ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin, RecursiveUnion, Result,
+    Semantics, Session, ShowBehavior, Span, SqlState, Stat, StateKey, TableNames, UnknownTypes,
+    Value, ValuesNames,
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
@@ -962,6 +963,16 @@ impl<'a> Binder<'a> {
             .with_span(first_column(ast, right)));
         }
         let (recursive, over) = self.project_onto(recursive, &other, &fields, &name)?;
+        if !all && self.semantics.recursive_union() == RecursiveUnion::Postgres {
+            let hashable = |field: &Field| {
+                crate::pgcalls::exact_oid(&field.ty).is_none_or(rudb_pgtypes::hashable)
+            };
+            if !table.iter().all(hashable) {
+                return Err(Error::not_implemented("could not implement recursive UNION")
+                    .state(SqlState::FEATURE_NOT_SUPPORTED)
+                    .detail("All column datatypes must be hashable."));
+            }
+        }
         let mut args = Vec::with_capacity(args.len());
         for fold in &folds {
             args.extend(self.fold_call(ast, fold.call, &over)?.args);

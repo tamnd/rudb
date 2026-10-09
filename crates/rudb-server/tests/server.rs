@@ -1417,6 +1417,37 @@ fn a_call_of_the_function_of_an_operator_is_the_operator() {
 }
 
 #[test]
+fn a_recursive_union_of_columns_that_hash_runs() {
+    let dirs = Dirs::new("pgrecunion");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // PostgreSQL 19 keeps the rows of a recursive UNION in a hash table, so a column must have a
+    // type whose equality hashes. These types do, and `varchar` hashes as `text`.
+    for (sql, rows) in [
+        (
+            "with recursive t(n, s) as (values (1, 'a'::varchar) union select n + 1, s from t \
+             where n < 4) select n from t",
+            4,
+        ),
+        (
+            "with recursive t(n, a) as (values (1, array['a']) union select n + 1, a || 'b'::text \
+             from t where n < 3) select n from t",
+            3,
+        ),
+        (
+            "with recursive t(n) as (values (1.5::numeric) union select n from t) \
+             select n from t",
+            1,
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(rows)), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("pgstring");
     let server = Server::start(dirs.config()).unwrap();
