@@ -36,7 +36,9 @@
 use std::cmp::Ordering;
 use std::sync::Mutex;
 
-use rudb_common::{Error, Field, LogicalType, Memory, Reservation, Result, Session, Value};
+use rudb_common::{
+    Error, Field, LogicalType, Memory, Reservation, Result, Session, SqlState, Value,
+};
 use rudb_functions::resolve;
 use rudb_kernels::Accumulator;
 use rudb_pipeline::{Lease, Progress, Sink};
@@ -1254,7 +1256,10 @@ fn ntile(call: &Call, rows: &[Windowed], at: usize, total: usize) -> Result<Valu
         .as_i64()
         .ok_or_else(|| Error::invalid_input("Argument for ntile must be a number"))?;
     if buckets <= 0 {
-        return Err(Error::invalid_input("Argument for ntile must be greater than zero"));
+        return Err(Error::invalid_input("Argument for ntile must be greater than zero")
+            .state(SqlState::INVALID_ARGUMENT_FOR_NTILE)
+            .pg("argument of ntile must be greater than zero")
+            .unplaced());
     }
     let buckets = usize::try_from(buckets).unwrap_or(total).min(total.max(1));
     let each = total / buckets;
