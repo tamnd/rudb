@@ -612,9 +612,10 @@ enum Body {
     /// two are the same information and only one of them is the one that gets asked for.
     ///
     /// The values are behind an `Arc` for the reason the dictionary's are: a page is cut into chunk
-    /// sized pieces and the values are the same values every time.
+    /// sized pieces and the values are the same values every time. The ends are behind one too,
+    /// because a part held for later statements is handed out as a clone of itself to each of them.
     Runs {
-        ends: Vec<u32>,
+        ends: Arc<Vec<u32>>,
         values: Arc<Vector>,
         laid: Laid,
     },
@@ -1709,7 +1710,11 @@ impl Vector {
             ty: values.ty.clone(),
             len,
             validity: Validity::AllValid,
-            body: Body::Runs { ends, values: Arc::new(values), laid: Laid::default() },
+            body: Body::Runs {
+                ends: Arc::new(ends),
+                values: Arc::new(values),
+                laid: Laid::default(),
+            },
         })
     }
 
@@ -3690,7 +3695,7 @@ impl Vector {
                     .map(|&stop| stop.min(end as u32) - at as u32)
                     .collect();
                 let values = values.slice(first, last - first + 1)?;
-                Body::Runs { ends: cut, values: Arc::new(values), laid }
+                Body::Runs { ends: Arc::new(cut), values: Arc::new(values), laid }
             }
             // An empty cut has no run to point at and an empty run length body would be a vector of
             // no runs claiming a length, so it comes back as the empty flat vector instead.

@@ -3118,17 +3118,19 @@ impl Source for Scan<'_> {
             self.narrow_read(at, out, true)?;
             return Ok(more(morsel));
         }
+        let rows = read.len();
+        // Moved rather than cloned, since a clone of a column the read owns copies its values.
+        let mut columns = read.into_columns().into_iter();
         let mut held = Vec::with_capacity(self.columns.len());
-        let mut real = 0;
         for column in &self.columns {
             if column.is_some() {
-                held.push(read.column(real)?.clone());
-                real += 1;
+                let read = columns.next().ok_or_else(|| Error::internal("a column not read"))?;
+                held.push(read);
             } else {
-                held.push(Vector::sequence(self.offsets[at], 1, read.len()));
+                held.push(Vector::sequence(self.offsets[at], 1, rows));
             }
         }
-        *out = Chunk::with_rows(held, read.len())?;
+        *out = Chunk::with_rows(held, rows)?;
         self.narrow_read(at, out, true)?;
         Ok(more(morsel))
     }
