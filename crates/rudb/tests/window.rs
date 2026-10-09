@@ -856,6 +856,26 @@ fn a_partition_is_filled_on_its_own_and_nothing_is_read_across_the_line() {
 }
 
 #[test]
+fn first_and_last_under_an_over_are_the_window_functions_and_skip_nulls_when_asked() {
+    // The pinned binary's answers, and its column names, which say what the call became.
+    const RUNNING: &str = "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+    let database = Database::new();
+    let connection = database.connect();
+    let sql = format!(
+        "SELECT first(s IGNORE NULLS) OVER ({RUNNING}) FROM (VALUES (NULL), (1), (NULL), (2)) t(s)"
+    );
+    assert_eq!(column(&database, &sql, 0), ints(&[None, Some(1), Some(1), Some(1)]));
+    let sql = format!(
+        "SELECT LAST(s IGNORE NULLS) OVER ({RUNNING}) FROM (VALUES (1), (NULL), (2), (NULL)) t(s)"
+    );
+    assert_eq!(column(&database, &sql, 0), ints(&[Some(1), Some(1), Some(2), Some(2)]));
+    let result = connection.query("SELECT main.first(1) OVER ()").expect("runs");
+    assert_eq!(result.column_name(0), "main.first_value(1) OVER ()");
+    let error = connection.query("SELECT first(DISTINCT 1) OVER ()").expect_err("refused");
+    assert!(error.to_string().contains("window function \"\"first_value\"\""), "{error}");
+}
+
+#[test]
 fn fill_with_an_order_of_its_own_reads_the_line_along_that_key() {
     // The pinned binary's answers. The `OVER` puts no order on the rows at all here, so the line
     // is read along the key inside the brackets, and a descending key reads it from the far end.
