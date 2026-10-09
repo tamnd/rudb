@@ -602,7 +602,8 @@ fn build_from<'a>(
 ///
 /// A sort and a top n both decide one. Everything between them and the root either keeps the order
 /// it was given or is not a node that can sit there, and the walk stops at the first node that is
-/// neither.
+/// neither. A `DISTINCT ON` runs as one instance and gives the rows it keeps in the order it read
+/// them, so it keeps the order. A plain `DISTINCT` runs in parallel and does not.
 fn ordered(plan: &Plan, node: NodeRef) -> bool {
     match *plan.node(node) {
         Node::Sort { .. } | Node::TopN { .. } => true,
@@ -611,6 +612,7 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
         | Node::Fetch { input, .. } => ordered(plan, input),
+        Node::Distinct { input, on } if !on.is_empty() => ordered(plan, input),
         _ => false,
     }
 }
