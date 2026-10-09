@@ -65,6 +65,7 @@ use crate::fallback::{self, Kernel};
 use crate::general::{General, Measure};
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral, pow10, rescale};
+use crate::pgorderedset::OrderedSet;
 use crate::quantile::{Column, Held};
 use crate::shape::{identity, nulls_of};
 
@@ -498,6 +499,10 @@ impl Accumulator {
             if let ("lttb", [key]) = (inner, keys.as_slice()) {
                 let plot = Plot::sorted(returns, (key.descending, key.nulls_first));
                 let general = General::Plotted { plot: Box::new(plot), returns: returns.clone() };
+                return Ok(Self { state: State::General(Box::new(general)) });
+            }
+            if let Some(set) = OrderedSet::named(inner, &keys, returns) {
+                let general = General::Set(Box::new(set));
                 return Ok(Self { state: State::General(Box::new(general)) });
             }
             let inner = Box::new(Self::new(inner, returns)?);

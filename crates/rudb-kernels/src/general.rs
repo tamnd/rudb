@@ -29,6 +29,7 @@ use crate::hash::Sketch;
 use crate::histogram::Binned;
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
+use crate::pgorderedset::OrderedSet;
 use crate::pgvariance::{ExactSpread, FloatSpread};
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
@@ -104,6 +105,9 @@ pub(crate) enum General {
     /// `lttb`, which holds every point and thins them when the answer is asked for, in
     /// [`crate::lttb`].
     Plotted { plot: Box<Plot>, returns: LogicalType },
+    /// PostgreSQL's ordered-set and hypothetical-set aggregates, `percentile_cont(0.5) WITHIN
+    /// GROUP (ORDER BY x)` and `rank(3) WITHIN GROUP (ORDER BY x)`, in [`crate::pgorderedset`].
+    Set(Box<OrderedSet>),
     /// The `arg_min` and `arg_max` spellings, which keep the row with the least or greatest key,
     /// or the best `n` of them when the call passes a count, and answer in [`crate::arg_extreme`].
     Arg { state: Box<ArgExtreme>, returns: LogicalType },
@@ -314,6 +318,7 @@ impl General {
             // The rows of an ordered call are kept whole, nulls and all, and the aggregate it wraps
             // decides what to skip once they are in order.
             Self::Ordered { rows, .. } => rows.push(args.to_vec()),
+            Self::Set(state) => state.update(args)?,
             Self::Paired(state) => state.update(args)?,
             _ if value.is_null() => {}
             Self::Counted { key, .. } if args.len() > 1 => {
@@ -751,6 +756,7 @@ impl General {
                 plot.combine(theirs)
             }
             (Self::Paired(state), Self::Paired(theirs)) => state.combine(theirs),
+            (Self::Set(state), Self::Set(theirs)) => state.combine(theirs)?,
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (Self::ExactSpread(state), Self::ExactSpread(theirs)) => state.combine(theirs)?,
             (Self::FloatSpread(state), Self::FloatSpread(theirs)) => state.combine(theirs)?,
@@ -899,6 +905,7 @@ impl General {
             Self::Sketched(sketch) => Value::BigInt(sketch.count()),
             Self::Top { top, element } => top.finish(element),
             Self::Plotted { plot, returns } => plot.finish(returns),
+            Self::Set(state) => state.finish()?,
             Self::Paired(state) => state.finish(),
             Self::Powers(state) => state.finish()?,
             Self::ExactSpread(state) => state.finish()?,

@@ -240,6 +240,12 @@ impl Binder<'_> {
                 let expanded = self.user_macro(ast, expr, name, args, modified, scope)?;
                 expanded.ok_or_else(|| Error::internal("a macro that went away while it was bound"))
             }
+            ast::Expr::Function { name, args, filter, .. } if ast.within_group(expr).is_some() => {
+                let written = ast.name(name).last().unwrap_or_default();
+                let sorted = ast.within_group(expr).unwrap_or_default();
+                let direct = ast.expr_list(args);
+                self.bind_within_group(ast, expr, written, direct, sorted, filter, scope)
+            }
             ast::Expr::Function { name, args, .. }
                 if self.semantics.function_rules() == FunctionRules::Postgres
                     && (ast.variadic(expr) || !ast.named_args(expr).is_empty()) =>
@@ -1647,6 +1653,11 @@ impl Binder<'_> {
         let unknowns = self.semantics.unknown_types() == UnknownTypes::Postgres;
         if postgres && rudb_catalog::same_name(&written, "every") {
             written = "bool_and".to_string();
+        }
+        // PostgreSQL finds `percentile_cont(p, p)` and `rank(1)` as the ordered-set aggregates
+        // read whole, and then refuses them for the `WITHIN GROUP` they are written without.
+        if postgres && let Some(error) = self.within_group_required(&written, arguments.len()) {
+            return Err(error);
         }
         // count(*) is a different function from count(x), because one of them counts rows and the
         // other counts the rows where its argument is not null.
@@ -4711,6 +4722,7 @@ pub(crate) fn first_aggregate(
             let written = ast.name(name).last().unwrap_or_default();
             let aggregate = kind_of(written) == Some(FunctionKind::Aggregate)
                 || rudb_catalog::same_name(written, "every")
+                || ast.within_group(expr).is_some()
                 || crate::macros::aggregates(written)
                 || user(written);
             if aggregate { Some(expr) } else { any(ast.expr_list(args)) }

@@ -553,7 +553,7 @@ impl Transform<'_> {
             return self.syntax_call(call);
         }
         if call.agg_within_group {
-            return clause("WithinGroup");
+            return self.within_group(call);
         }
         let named = call.args.iter().flatten().any(|node| matches!(node, Node::NamedArgExpr(_)));
         if named || call.func_variadic {
@@ -611,6 +611,32 @@ impl Transform<'_> {
         let ignore_nulls = call.ignore_nulls == 1;
         let window = Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec };
         Ok(self.push(window, location))
+    }
+
+    /// An ordered-set call, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`. The grammar keeps the
+    /// order of `WITHIN GROUP` where an `ORDER BY` inside the call goes, and the call keeps its
+    /// written name and its direct arguments, with the order beside it, for the binder to resolve
+    /// the way `ParseFuncOrColumn` does. A call with `OVER` or a null treatment is left to the
+    /// other transform.
+    fn within_group(&mut self, call: &FuncCall) -> Made<ExprRef> {
+        if call.ignore_nulls != 0 {
+            return clause("WithinGroup");
+        }
+        let name = self.names(&call.funcname)?;
+        let args = self.row_items(&call.args, false)?;
+        let mut items: Vec<OrderItem> = Vec::with_capacity(call.agg_order.len());
+        for node in call.agg_order.iter().flatten() {
+            items.push(self.sort_by(node)?);
+        }
+        let order = self.ast.order_slice(items);
+        let filter = self.optional(call.agg_filter.as_ref())?;
+        let function = Expr::Function { name, args, distinct: false, filter };
+        let made = self.push(function, call.location);
+        self.ast.within_groups.push((made, order));
+        if call.over.is_some() {
+            self.ast.windowed_within_groups.push(made);
+        }
+        Ok(made)
     }
 
     /// A plain call with named arguments or with `VARIADIC`, which the binder resolves by the rules

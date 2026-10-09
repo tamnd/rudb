@@ -100,6 +100,7 @@ pub mod pginput;
 pub mod pgjson;
 mod pgmath;
 mod pgnormalize;
+mod pgorderedset;
 pub mod pgproc;
 pub mod pgregexp;
 mod pgstring;
