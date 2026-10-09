@@ -4672,6 +4672,10 @@ pub fn call_values(
     if let Some(answer) = crate::path::before_nulls(name, args) {
         return answer;
     }
+    // A sort key writes a null like any other value.
+    if let Some(answer) = crate::sortkey::value(name, args, returns) {
+        return answer;
+    }
     // `hash` hashes a null like any other value.
     if name == "hash" {
         return Ok(Value::UBigInt(hash::hash_all(args)));
