@@ -120,6 +120,30 @@ const DEPRECATED: [&str; 11] = [
 const DEPRECATED_PRAGMAS: [&str; 4] =
     ["disable_object_cache", "disable_verification", "enable_object_cache", "enable_verification"];
 
+/// The pin's refusal of a value one of its two enum settings that are going away cannot take.
+///
+/// The pin reads the value into its enum before it warns that the setting is deprecated, so a null
+/// or a word the enum does not have is refused in those words and not with the warning, whether
+/// or not warnings are errors.
+fn refused_choice(name: &str, value: &Value) -> Result<()> {
+    let (spelled, values): (&str, &[&str]) = match name {
+        "regex_match_operator_semantics" => ("RegexMatchOperatorSemantics", &["PARTIAL", "FULL"]),
+        "table_function_identifier_conversion" => (
+            "TableFunctionIdentifierConversion",
+            &["DEFAULT", "ENABLE_IMPLICIT_STRING", "DISABLE_IMPLICIT_STRING"],
+        ),
+        _ => return Ok(()),
+    };
+    if value.is_null() {
+        return Err(Error::invalid_input(format!("{name} setting cannot be NULL")));
+    }
+    let written = text_of(value);
+    if !values.iter().any(|known| known.eq_ignore_ascii_case(&written)) {
+        return Err(Error::not_implemented(unknown_enum_value(&written, spelled, values)));
+    }
+    Ok(())
+}
+
 /// The warning the pin raises when a deprecated setting is written, and `None` for the rest.
 fn deprecation(name: &str) -> Option<String> {
     if name == "profiling_mode" {
@@ -648,12 +672,13 @@ impl Settings {
     ///
     /// A deprecated setting warns when it is written, and with warnings as errors the warning is
     /// the error and the value is not kept. The value is still read first, so one of the wrong type
-    /// is refused for its type, which is the order the pin does the two in. Warnings as errors is
-    /// only ever the database's, so this reads it from the database's settings even for a write
-    /// that goes to a connection.
+    /// or one the setting does not take is refused for that, which is the order the pin does the
+    /// two in. Warnings as errors is only ever the database's, so this reads it from the database's
+    /// settings even for a write that goes to a connection.
     fn warn(&self, entry: &SettingEntry, value: Option<&Value>) -> Result<()> {
-        if let Some(value) = value
-            && *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner())
+        let Some(value) = value else { return Ok(()) };
+        refused_choice(entry.name, value)?;
+        if *self.warnings_as_errors.read().unwrap_or_else(|held| held.into_inner())
             && let Some(warning) = deprecation(entry.name)
         {
             typed(entry, value)?;
@@ -1067,24 +1092,9 @@ impl Settings {
                 }
                 *self.lambda_syntax.write().unwrap_or_else(|held| held.into_inner()) = written;
             }
+            // The value was checked against the pin's two words by `warn`, ahead of the warning.
             "regex_match_operator_semantics" => {
                 let written = value.map_or("partial".to_string(), text_of);
-                if !written.eq_ignore_ascii_case("partial") && !written.eq_ignore_ascii_case("full")
-                {
-                    let candidate = if self
-                        .regex_match_operator_semantics
-                        .read()
-                        .unwrap_or_else(|held| held.into_inner())
-                        .eq_ignore_ascii_case("partial")
-                    {
-                        "FULL"
-                    } else {
-                        "PARTIAL"
-                    };
-                    return Err(Error::not_implemented(format!(
-                        "Enum value: unrecognized value \"{written}\" for enum \"RegexMatchOperatorSemantics\"\n\nCandidates: \"{candidate}\""
-                    )));
-                }
                 *self
                     .regex_match_operator_semantics
                     .write()
