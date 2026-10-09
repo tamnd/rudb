@@ -1455,6 +1455,8 @@ fn a_recursive_union_of_columns_that_hash_runs() {
     assert_eq!(error(b'C').as_deref(), Some("0A000"));
     assert_eq!(error(b'M').as_deref(), Some("could not implement recursive UNION"));
     assert_eq!(error(b'D').as_deref(), Some("All column datatypes must be hashable."));
+    // The planner refuses it, which has no place in the text to point at.
+    assert_eq!(error(b'P'), None);
     server.stop().unwrap();
 }
 
