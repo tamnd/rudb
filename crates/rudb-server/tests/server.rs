@@ -1376,6 +1376,47 @@ fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
 }
 
 #[test]
+fn a_call_of_the_function_of_an_operator_is_the_operator() {
+    let dirs = Dirs::new("pgopfunc");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    // The values and the types are the ones that PostgreSQL 19 gives. The shifts shift as C
+    // does, with the count modulo the width of the type that C shifts.
+    for (sql, expected, oids) in [
+        (
+            "select booleq(true, false), int4pl(1, 2), int2pl(1::int2, 2::int2), texteq('a', 'a'), \
+             int4um(5), float8div(3, 2), int4div(7, 2), textcat('a', 'b')",
+            "f|3|3|t|-5|1.5|3|ab",
+            vec![16, 23, 21, 16, 23, 701, 23, 25],
+        ),
+        (
+            "select 1 << 31, 1 << 33, -8 >> 33, 1::int2 << 15, 1::int2 << 16, 1::int8 << 64, \
+             int4shl(1, 2)",
+            "-2147483648|2|-4|-32768|0|1|4",
+            vec![23, 23, 23, 21, 21, 20, 23],
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "TDCZ", "{sql}");
+        let shape: Vec<u32> = row_shape(&messages[0]).into_iter().map(|(_, oid, _)| oid).collect();
+        assert_eq!(shape, oids, "{sql}");
+        assert_eq!(text(data_row(&messages[1])), expected, "{sql}");
+    }
+    let messages = client.query("select int4pl(2147483647, 1)");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22003"));
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("integer out of range"));
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_string_functions_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("pgstring");
     let server = Server::start(dirs.config()).unwrap();

@@ -17,7 +17,7 @@ use rudb_common::{
 use rudb_kernels::pgarray;
 use rudb_kernels::pgjson::JsonSet;
 use rudb_kernels::pgregexp::{self, Function};
-use rudb_parse::ast::LiteralKind;
+use rudb_parse::ast::{BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, ast, deparse};
 use rudb_pgtypes::keywords::quote_identifier;
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
@@ -89,6 +89,28 @@ pub(crate) fn kernel_function(written: &str) -> bool {
                 && matches!(proc.lang, b'i' | b'c')
                 && rudb_kernels::pgproc::has(proc.src)
         })
+}
+
+/// The operator of the engine that calls the function `proc` of `pg_proc`: an infix operator that
+/// both grammars have, or the prefix `-`, `+` or `~`.
+fn operator_of(proc: &rudb_pgtypes::Proc) -> Option<Operator> {
+    if !matches!(proc.lang, b'i' | b'c') {
+        return None;
+    }
+    rudb_pgtypes::operators_of(proc).find_map(|operator| match (operator.kind, operator.name) {
+        (b'b', name) => rudb_parse::build::symbol_op(name).map(Operator::Infix),
+        (b'l', "-") => Some(Operator::Prefix(UnaryOp::Negate)),
+        (b'l', "+") => Some(Operator::Prefix(UnaryOp::Plus)),
+        (b'l', "~") => Some(Operator::Prefix(UnaryOp::BitNot)),
+        _ => None,
+    })
+}
+
+/// An operator of the engine, for a call of the function of an operator.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Operator {
+    Infix(BinaryOp),
+    Prefix(UnaryOp),
 }
 
 /// The list of one dimension inside a list of lists, or `ty` itself.
@@ -451,7 +473,13 @@ impl Binder<'_> {
             }
             _ => None,
         };
-        if !kernel && body.is_none() && !special {
+        // A function in C with no kernel that an operator calls, such as `booleq` for `=` of two
+        // `boolean` values, is that operator, which the engine has.
+        let operator = match !kernel && body.is_none() && !special {
+            true => operator_of(proc),
+            false => None,
+        };
+        if !kernel && body.is_none() && !special && operator.is_none() {
             return Ok(None);
         }
         // A polymorphic argument of a body whose actual type has no type here is the argument as
@@ -486,6 +514,10 @@ impl Binder<'_> {
             .into_iter()
             .collect::<Option<Vec<ExprRef>>>()
             .ok_or_else(|| Error::internal(format!("a call of {written} with an empty place")))?;
+        if let Some(operator) = operator {
+            let call = self.operator_call(ast, operator, arguments, &cast, scope)?;
+            return Ok(Some(self.cast_to(call, &returns)));
+        }
         if let Some(body) = body {
             // A body that the parser or the binder here cannot take yet leaves the call to the
             // path of the pin.
@@ -533,8 +565,9 @@ impl Binder<'_> {
     /// The operator is found by the rules of `oper_select_candidate` over the types of the
     /// operands, with `unknown` for a string literal and a null. An operator that takes a
     /// polymorphic type, such as `||` of two arrays, is the kernel of its function, with each
-    /// operand cast to the actual type of its declared type. The engine has the other operators,
-    /// over its vectors, with the same values.
+    /// operand cast to the actual type of its declared type. So is an operator whose engine
+    /// operator answers in another way, such as `<<` of two integers, which shifts as C does. The
+    /// engine has the other operators, over its vectors, with the same values.
     pub(crate) fn pg_operator(
         &mut self,
         ast: &Ast,
@@ -551,7 +584,8 @@ impl Binder<'_> {
             return Ok(None);
         };
         let Some(proc) = operator.proc() else { return Ok(None) };
-        if !operator.args.iter().any(|&oid| rudb_pgtypes::is_polymorphic(oid))
+        let polymorphic = operator.args.iter().any(|&oid| rudb_pgtypes::is_polymorphic(oid));
+        if !(polymorphic || rudb_kernels::pgproc::operator(proc.src))
             || !matches!(proc.lang, b'i' | b'c')
             || !rudb_kernels::pgproc::has(proc.src)
         {

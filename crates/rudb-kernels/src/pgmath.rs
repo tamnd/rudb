@@ -52,14 +52,20 @@ pub(crate) const SOURCES: &[&str] = &[
     "float8abs",
     "int2abs",
     "int2mod",
+    "int2shl",
+    "int2shr",
     "int4abs",
     "int4gcd",
     "int4lcm",
     "int4mod",
+    "int4shl",
+    "int4shr",
     "int8abs",
     "int8gcd",
     "int8lcm",
     "int8mod",
+    "int8shl",
+    "int8shr",
     "numeric_abs",
     "numeric_ceil",
     "numeric_div_trunc",
@@ -89,6 +95,13 @@ pub(crate) const SOURCES: &[&str] = &[
     "width_bucket_float8",
     "width_bucket_numeric",
 ];
+
+/// The C functions of this module whose operators the engine answers in another way, so that the
+/// operator is the kernel too. The shifts of `int.c` and `int8.c` shift as C does: the count is
+/// taken modulo the width of the type that C shifts, which is `int` for an `int2`, and the bits
+/// that go past the top are lost.
+pub(crate) const OPERATORS: &[&str] =
+    &["int2shl", "int2shr", "int4shl", "int4shr", "int8shl", "int8shr"];
 
 /// The value of the C function `src` for the arguments, or `None` when the arguments are not of
 /// the types of the function.
@@ -130,6 +143,25 @@ pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
             Value::Integer(int_mod(i64::from(*x), i64::from(*y))? as i32)
         }
         ("int8mod", [Value::BigInt(x), Value::BigInt(y)]) => Value::BigInt(int_mod(*x, *y)?),
+        // `int2shl` and `int2shr` shift the value as an `int` and keep the low 16 bits.
+        ("int2shl", [Value::SmallInt(x), Value::Integer(y)]) => {
+            Value::SmallInt(i32::from(*x).wrapping_shl(y.cast_unsigned()) as i16)
+        }
+        ("int2shr", [Value::SmallInt(x), Value::Integer(y)]) => {
+            Value::SmallInt(i32::from(*x).wrapping_shr(y.cast_unsigned()) as i16)
+        }
+        ("int4shl", [Value::Integer(x), Value::Integer(y)]) => {
+            Value::Integer(x.wrapping_shl(y.cast_unsigned()))
+        }
+        ("int4shr", [Value::Integer(x), Value::Integer(y)]) => {
+            Value::Integer(x.wrapping_shr(y.cast_unsigned()))
+        }
+        ("int8shl", [Value::BigInt(x), Value::Integer(y)]) => {
+            Value::BigInt(x.wrapping_shl(y.cast_unsigned()))
+        }
+        ("int8shr", [Value::BigInt(x), Value::Integer(y)]) => {
+            Value::BigInt(x.wrapping_shr(y.cast_unsigned()))
+        }
         ("int4gcd", [Value::Integer(x), Value::Integer(y)]) => {
             let gcd = int_gcd(i64::from(*x), i64::from(*y));
             Value::Integer(i32::try_from(gcd).map_err(|_| out_of_range("integer"))?)
@@ -726,6 +758,7 @@ mod tests {
     fn shown(src: &str, args: &[Value]) -> String {
         match call(src, args) {
             Ok(Some(Value::Double(x))) => x.to_string(),
+            Ok(Some(Value::SmallInt(x))) => x.to_string(),
             Ok(Some(Value::Integer(x))) => x.to_string(),
             Ok(Some(Value::BigInt(x))) => x.to_string(),
             Ok(Some(Value::Varchar(x))) => x,
@@ -823,6 +856,16 @@ mod tests {
                 "22003 integer out of range",
             ),
             ("int4abs", vec![Value::Integer(i32::MIN)], "22003 integer out of range"),
+            ("int4shl", vec![Value::Integer(1), Value::Integer(31)], "-2147483648"),
+            ("int4shl", vec![Value::Integer(1), Value::Integer(33)], "2"),
+            ("int4shl", vec![Value::Integer(1), Value::Integer(-1)], "-2147483648"),
+            ("int4shr", vec![Value::Integer(-8), Value::Integer(33)], "-4"),
+            ("int2shl", vec![Value::SmallInt(1), Value::Integer(15)], "-32768"),
+            ("int2shl", vec![Value::SmallInt(1), Value::Integer(16)], "0"),
+            ("int2shl", vec![Value::SmallInt(1), Value::Integer(-1)], "0"),
+            ("int2shr", vec![Value::SmallInt(-8), Value::Integer(2)], "-2"),
+            ("int8shl", vec![Value::BigInt(1), Value::Integer(63)], "-9223372036854775808"),
+            ("int8shl", vec![Value::BigInt(1), Value::Integer(64)], "1"),
             ("to_bin32", vec![Value::Integer(-1)], "11111111111111111111111111111111"),
             ("to_oct64", vec![Value::BigInt(-8)], "1777777777777777777770"),
             ("to_hex64", vec![Value::BigInt(-1)], "ffffffffffffffff"),
