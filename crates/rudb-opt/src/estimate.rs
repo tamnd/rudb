@@ -602,10 +602,12 @@ pub fn rows_stat_into(
         },
         Node::Join { left, right, kind, conditions, .. } => {
             let tested = plan.expr_list(conditions);
-            // Only an inner join, where the shares are what the join keeps. An outer join keeps its
-            // preserved side whatever a filter on the other one named.
+            // Only an inner or a semi join, where the shares are what the join keeps. An outer join
+            // keeps its preserved side whatever a filter on the other one named.
             let named = match kind {
-                JoinKind::Inner => (named(plan, left, tested), named(plan, right, tested)),
+                JoinKind::Inner | JoinKind::Semi => {
+                    (named(plan, left, tested), named(plan, right, tested))
+                }
                 _ => (None, None),
             };
             join(
@@ -2085,9 +2087,18 @@ fn join(
 ) -> Stat<u64> {
     let (left, right, bases) = (left.rows, right.rows, (left.base, right.base));
     match kind {
-        // Left rows, filtered by whether a match exists. Never more than the left side, and the
-        // right side's size does not enter into it.
-        JoinKind::Semi => guess(left, KEPT_BY_A_CONDITION),
+        // Left rows, filtered by whether a match exists, so never more than the left side and never
+        // more than the inner join of the same two sides, which is what it is wherever the right
+        // side's key is unique. A flat fifth of the left side put `lineitem` cut to the 204 parts
+        // of q17 at 1.2 million rows rather than six thousand, and the aggregate above it made
+        // room for 200,000 groups. A side nobody counted keeps the fifth.
+        JoinKind::Semi => {
+            let sides = (Both { rows: left, base: bases.0 }, Both { rows: right, base: bases.1 });
+            match join(sides.0, sides.1, JoinKind::Inner, conditions, keys, named) {
+                inner @ Stat::Known { .. } if left.value().is_some() => left.zip(inner, u64::min),
+                _ => guess(left, KEPT_BY_A_CONDITION),
+            }
+        }
         JoinKind::Anti => guess(left, 1.0 - KEPT_BY_A_CONDITION),
         // At most one right row each, by definition, which makes this a fact about the node rather
         // than a guess about the data.
@@ -2821,6 +2832,21 @@ mod tests {
         let tables = &[("lineitem", 6_000_000), ("part", 200_000)];
         assert_eq!(estimate(&joined_to_a_filtered_part(false), tables), Some(6_000_000));
         assert_eq!(estimate(&joined_to_a_filtered_part(true), tables), Some(1_200_000));
+    }
+
+    #[test]
+    fn a_semi_join_to_a_dimension_keeps_what_the_inner_join_to_it_would() {
+        // TPC-H q17 written small. `part`'s key is unique, so the rows of `lineitem` that have a
+        // part are the rows the inner join makes, and a flat fifth of `lineitem` is the wrong
+        // number whichever way the filter on `part` goes.
+        let tables = &[("lineitem", 6_000_000), ("part", 200_000)];
+        for filter in [false, true] {
+            let inner = joined_to_a_filtered_part(filter);
+            let semi = inner.replacen("Join INNER", "Join SEMI", 1);
+            assert_eq!(estimate(&semi, tables), estimate(&inner, tables), "{semi}");
+        }
+        let whole_part = joined_to_a_filtered_part(false).replacen("Join INNER", "Join SEMI", 1);
+        assert_eq!(estimate(&whole_part, tables), Some(6_000_000));
     }
 
     #[test]

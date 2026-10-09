@@ -69,11 +69,12 @@
 //! That ratio is asked of a filtered scan, whose size is a filter over a row count, and not of a
 //! join whose size carries [`Provenance::Default`]. A join's cardinality comes out of
 //! [`estimate::matched`], which clamps upwards and so cannot score a join to a heavily filtered
-//! dimension table below the larger of its two sides. q20 is where that bites: the `forest%` filter
-//! over part is a `LIKE` no synopsis covers, so the partsupp rows behind it come back at a default
-//! reading sixteen million against a truth four orders of magnitude smaller, and a ratio computed
-//! from that is not evidence about anything. The structural refusal above still applies there, so a
-//! join restricting nothing is still refused.
+//! dimension table below the larger of its two sides. q20 was where that bit, when a semi join was
+//! sized as a flat fifth of its left side: the partsupp rows behind the `forest%` parts came back at
+//! a default of a hundred and sixty thousand against a truth of about eight and a half thousand. A
+//! semi join is now sized as the inner join it is bounded by, which puts q20's source at nine and a
+//! half thousand and lets it through the ratio, so the escape is for a join still sized by default.
+//! The structural refusal above applies there too, so a join restricting nothing is still refused.
 //!
 //! A source that is not a scan, an inner or semi join, and filters and projections, over which the
 //! copy can be reproduced. A subtree with an aggregate in it is one the copy would run twice, and a
@@ -267,11 +268,8 @@ fn matched(plan: &Plan, node: NodeRef, stats: &Facts) -> Option<Push> {
 /// pass was written against and is good enough to refuse on. A join is not: its cardinality comes
 /// out of [`estimate::matched`], which clamps upwards and cannot go below the larger of its two
 /// sides, so a join to a heavily filtered dimension table is scored as though the filter were not
-/// there. q20 is that case. Its `forest%` filter over part is a `LIKE` no synopsis covers, so the
-/// partsupp rows behind it come back at a hardcoded default that reads as sixteen million where the
-/// truth is four orders of magnitude smaller, and the ratio computed from it is not evidence about
-/// anything. The structural question still stands there, so a join that restricts nothing is still
-/// refused.
+/// there, and a join sized by a default constant is not evidence about anything. The structural
+/// question still stands there, so a join that restricts nothing is still refused.
 fn worth_copying(plan: &Plan, source: NodeRef, input: NodeRef, stats: &Facts) -> bool {
     let Some(keys) = estimate::side(plan, source, stats) else { return false };
     if keys.rows >= keys.base {
@@ -530,6 +528,7 @@ pub(crate) fn renamed(plan: &mut Plan, expr: ExprRef, renames: &[(u32, u32)]) ->
 
 #[cfg(test)]
 mod tests {
+    use rudb_common::Provenance;
     use rudb_plan::Plan;
 
     use super::push;
@@ -733,7 +732,10 @@ mod tests {
     /// `lineitem` mentions; with it the semi join underneath it leaves only the pairs the two
     /// hundred thousand restricted `partsupp` rows will ask about. The source the pass has to find
     /// is the semi join, not the `Get` beneath it: the `Get` is all eight million rows and would
-    /// remove nothing, and the pass reaching past it is the whole of what this test pins.
+    /// remove nothing, and the pass reaching past it is the whole of what this test pins. The filter
+    /// on `u` is given a distinct count so that it keeps one row in a hundred, which is about what
+    /// `forest%` keeps of part, since the semi join is sized from it and has to come out small enough
+    /// to be worth copying.
     #[test]
     fn the_keys_of_the_twentieth_query_come_from_the_semi_join_and_not_the_scan_under_it() {
         let text = concat!(
@@ -753,6 +755,7 @@ mod tests {
         for (table, rows) in [("t", 60_000_000), ("u", 2_000_000), ("w", 8_000_000)] {
             counts.record("memory", "main", table, rows);
         }
+        counts.record_distinct("memory", "main", "u", "c", 100, Provenance::Dictionary);
         let mut plan = Plan::parse(text).unwrap();
         push(&mut plan, &counts);
         assert_eq!(
