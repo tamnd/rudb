@@ -56,7 +56,11 @@
 //! A copy that costs more than it can save. The copy scans its tables again, so the rows those
 //! tables hold together have to be a tenth of the rows the scan reads or less. That is a bound on
 //! the work rather than on what it removes, because the rows a join between two filtered dimension
-//! tables keeps are a number the estimates do not know well.
+//! tables keeps are a number the estimates do not know well. The side the scan is under has to
+//! produce ten times the copy's rows as well, because a scan another join's runtime filter already
+//! cuts down reads about what that side produces rather than the whole table. That is q02, where
+//! partsupp is the gathered side's scan and part's keys leave 3,000 of its 800,000 rows, so a copy
+//! of the 10,000 suppliers would cost more than everything it could drop.
 //!
 //! A scan that already has a semi join over it. That is the shape this pass writes, so it is taken
 //! as its own work from an earlier run, and without it the fixed sequence would write a second one.
@@ -179,7 +183,7 @@ fn toward(
     (other, column, held): (NodeRef, ColumnBinding, ExprRef),
 ) -> Option<Reach> {
     let (scan, key) = scanned(plan, side, key)?;
-    let reads = estimate::rows(plan, scan, stats)?;
+    let reads = estimate::rows(plan, scan, stats)?.min(estimate::rows(plan, side, stats)?);
     let wanted = TableSet::of(column.table);
     let source = descent(plan, other, &wanted).into_iter().rev().find(|&at| {
         copyable(plan, at)
