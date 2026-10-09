@@ -68,7 +68,7 @@
 //! not care how often a row turns up, so a small relation of that kind can also be read once more
 //! on its own, ahead of the tree, as a root of a tree of its own whose keys go to the next relation
 //! scanned in each of its classes. The answer is the same, since every row of the join has a
-//! partner in that copy, and the copy is empty exactly when the relation is. See [`shadowed`].
+//! partner in that copy, and the copy is empty exactly when the relation is. See `shadowed`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

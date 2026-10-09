@@ -15,7 +15,7 @@
 //! # When it is worth a test
 //!
 //! The test always holds, so the store is asked only whether it pays, and any count it has will do,
-//! an estimate as well as an exact one. A column in which at least one row in [`SHARE`] is null
+//! an estimate as well as an exact one. A column in which at least one row in `SHARE` is null
 //! gets the test, and one with fewer does not, because then the test is a mask read on every row
 //! for a handful of rows dropped. A column with no nulls at all is the common case and is left
 //! alone, and so is a column the store knows nothing about.

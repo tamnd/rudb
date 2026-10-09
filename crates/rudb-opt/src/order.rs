@@ -45,7 +45,7 @@
 //! at a time.
 //!
 //! A region of up to fourteen leaves is searched exhaustively instead, over the connected subgraphs
-//! and their complements, which is DPccp and is described at [`searched`]. Greedy is what a larger
+//! and their complements, which is DPccp and is described at `searched`. Greedy is what a larger
 //! region gets, and what a region gets whose graph has a shape that would make the search score too
 //! many pairs. Both are scored by the same measure, so the search only ever finds an order greedy
 //! would have scored the same way or a cheaper one.
@@ -54,7 +54,7 @@
 //! Columns that a chain of equalities joins are one equivalence class, and two columns of a class in
 //! different leaves are an edge whether or not a condition compares them directly. Joining two sets
 //! that each hold a column of the class then tests one of the class's conditions and not all of
-//! them, since inside each set the class's columns are already equal. [`classed`] is where that is
+//! them, since inside each set the class's columns are already equal. `classed` is where that is
 //! and why it is the same query.
 //!
 //! # What it refuses

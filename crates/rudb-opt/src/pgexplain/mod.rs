@@ -5,11 +5,11 @@
 //! order, the indents and the numbers' formats are those of `explain.c`, because pgAdmin, sqlx and
 //! every other tool that reads a plan parses them.
 //!
-//! The output is made in two steps. [`Builder`] maps each rudb operator to the PostgreSQL node it
+//! The output is made in two steps. `Builder` maps each rudb operator to the PostgreSQL node it
 //! is closest to, which is sometimes two nodes (a hash join is a `Hash Join` over a `Hash`) and
 //! sometimes none (a projection is the output of the node under it). An operator that has no
 //! PostgreSQL name keeps the closest name and carries its own name in a `rudb` key. Then
-//! [`Builder::write`] writes the nodes in the order `ExplainNode` writes them, through the writer
+//! `Builder::write` writes the nodes in the order `ExplainNode` writes them, through the writer
 //! of [`format`].
 //!
 //! The estimates are the ones PostgreSQL makes for a table it has not analyzed, which is every
