@@ -1487,6 +1487,37 @@ fn the_temporary_objects_of_a_session_go_when_it_ends() {
     server.stop().unwrap();
 }
 
+/// `DISTINCT ON` keeps the first row of each key in the order of the `ORDER BY`, and gives the rows
+/// in that order.
+#[test]
+fn distinct_on_keeps_the_first_row_in_the_order_of_order_by() {
+    let dirs = Dirs::new("pgdistincton");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "create temp table kept (g text, v int, i int); insert into kept values ('A', 1, 1), ('A', 2, 2), ('B', 3, 1), ('B', 1, 2), ('B', 1, 3)",
+    );
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for (sql, value) in [
+        (
+            "select string_agg(g || v || i, ',') from (select distinct on (g) g, v, i from kept order by g, v, i) s",
+            "A11,B12",
+        ),
+        (
+            "select string_agg(g || v || i, ',') from (select distinct on (g) g, v, i from kept order by g desc, v desc, i desc) s",
+            "B31,A22",
+        ),
+        (
+            "select string_agg(g || v || i, ',') from (select distinct on (g, v) g, v, i from kept order by g, v, i desc) s",
+            "A11,A22,B13,B31",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// `ORDER BY ... USING op` sorts as the btree family that has the operator as its `<` or its `>`,
 /// in a query, in a window and in an aggregate, and another operator is the error of PostgreSQL.
 #[test]

@@ -2088,7 +2088,7 @@ impl<'a> Binder<'a> {
         self.clause = "ORDER BY clause";
         let mut sorted = Vec::new();
         self.unnest_here = true;
-        let keys = self.select_sort_keys(
+        let mut keys = self.select_sort_keys(
             ast,
             query,
             &input,
@@ -2183,6 +2183,15 @@ impl<'a> Binder<'a> {
         });
 
         if written.distinct != Distinct::No {
+            // `DISTINCT ON` keeps the first row of each key in the order of the `ORDER BY`, in
+            // PostgreSQL and on the pin. The distinct keeps the first row it reads and gives the rows
+            // it keeps in the order it read them, so the sort goes below it and no sort is needed
+            // above it. A plain `DISTINCT` keeps whole rows, and which of two equal rows it keeps
+            // makes no difference.
+            if !on.is_empty() && !keys.is_empty() {
+                let keys = self.plan.add_sort_keys(&std::mem::take(&mut keys));
+                node = self.add_node(Node::Sort { input: node, keys });
+            }
             let on = self.collate_distinct(on, &output.columns[..visible])?;
             let on = self.plan.add_expr_list(&on);
             node = self.add_node(Node::Distinct { input: node, on });
