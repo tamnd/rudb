@@ -10488,8 +10488,11 @@ impl Reader {
             return Arc::clone(vector);
         }
         let dense = wanted.is_some_and(|wanted| wanted.saturating_mul(SPARSE_RENT) > vector.len());
+        // Held as pages, because every statement after this one reads the part through a clone of
+        // what is held, and a clone of an owned body copies every value of it.
         let vector =
             if dense && !self.pool.is_final() { vector.unpacked_to_hold() } else { vector };
+        let vector = vector.into_pages();
         let bytes = vector.footprint();
         let vector = Arc::new(vector);
         let used = Arc::new(AtomicBool::new(false));
