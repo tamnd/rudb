@@ -2,7 +2,7 @@
 
 ## What was slow
 
-A gather of packed codes at rows far apart asks for the cache line of the row sixteen places ahead before it reads each row, so that the misses of a join's rows overlap. Far apart meant only that the rows cover four times as many rows as there are of them. The rows a filter keeps out of a chunk pass that test too, since a quarter of ship dates keeps about one row in twenty seven, but they ascend and lie a few dozen bytes apart, and the hardware prefetcher already streams them in. Each prefetch was a bounds check, a multiply and a divide for the word, and the hint itself, which is about a third of what the gather spent a row. On TPC-H q15 `Packed::values_at` was about a fifth of the query.
+A gather of packed codes at rows far apart asks for the cache line of the row sixteen places ahead before it reads each row, so that the misses of a join's rows overlap. Far apart meant only that the rows cover four times as many rows as there are of them. The rows a filter keeps out of a chunk pass that test too, since a quarter of ship dates keeps about one row in twenty seven, but they ascend and lie a few dozen bytes apart, and the hardware prefetcher already streams them in. Each prefetch was a bounds check, a multiply and a divide for the word, and the hint itself, and on q15 that was more than half of what the gather spent. On TPC-H q15 `Packed::values_at` was about a fifth of the query.
 
 ## The change
 

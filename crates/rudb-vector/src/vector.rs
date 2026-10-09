@@ -5832,12 +5832,12 @@ const STREAM_GAP: usize = 4 * 512;
 /// Whether a gather of `rows` rows over `span` rows of `bits` bits each can skip asking for lines
 /// ahead, because the rows ascend and lie close enough that the hardware is already following them.
 ///
-/// The rows a filter keeps out of a chunk ascend and are a few dozen bytes apart, and the prefetcher
-/// streams them in on its own. Asking again for each one was about a third of the instructions of
-/// the gather on TPC-H q15, where three columns are read at the four percent of `lineitem` a quarter
-/// of ship dates keeps. A join hands back rows in no order and far apart, and those still prefetch.
-/// `ascends` is only that the first row is the lowest and the last the highest, which is all a
-/// guess about the cache needs.
+/// The rows a filter keeps out of a chunk ascend and are a few dozen bytes apart, and the
+/// prefetcher streams them in on its own. Asking again for each one was more than half the
+/// instructions of the gather on TPC-H q15, where three columns are read at the four percent of
+/// `lineitem` a quarter of ship dates keeps. A join hands back rows in no order and far apart, and
+/// those still prefetch. `ascends` is only that the first row is the lowest and the last the
+/// highest, which is all a guess about the cache needs.
 fn streams(ascends: bool, span: usize, rows: usize, bits: usize) -> bool {
     ascends && span.saturating_mul(bits) <= rows.saturating_mul(STREAM_GAP)
 }
