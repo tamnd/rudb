@@ -33,7 +33,8 @@ impl Transform<'_> {
     fn query_inner(&mut self, select: &SelectStmt) -> Made<QueryRef> {
         let mark = self.scope.len();
         if let Some(with) = &select.withClause {
-            self.with_clause(with)?;
+            let own = self.recursing.last().is_some_and(|&(_, depth, _)| depth == self.depth);
+            self.within(own.then_some(Place::With), |this| this.with_clause(with))?;
         }
         // The names of a `WINDOW` clause are seen only by the select that writes them, and by its
         // `ORDER BY`. A subquery does not see them, which is how PostgreSQL reads them.
@@ -92,8 +93,16 @@ impl Transform<'_> {
         let (Some(left), Some(right)) = (&select.larg, &select.rarg) else {
             return clause("SelectStmt");
         };
-        let left = self.leg(left)?;
-        let right = self.leg(right)?;
+        // `checkWellFormedSelectStmt`: both sides of `INTERSECT ALL`, the left side of
+        // `EXCEPT ALL` and the right side of any `EXCEPT`.
+        let all = select.all;
+        let (left_place, right_place) = match op {
+            SetOp::Union => (None, None),
+            SetOp::Intersect => (all.then_some(Place::Intersect), all.then_some(Place::Intersect)),
+            SetOp::Except => (all.then_some(Place::Except), Some(Place::Except)),
+        };
+        let left = self.within(left_place, |this| this.leg(left))?;
+        let right = self.within(right_place, |this| this.leg(right))?;
         let quantifier = if select.all { Quantifier::All } else { Quantifier::Unstated };
         Ok(QueryBody::SetOp { op, quantifier, by_name: false, left, right })
     }
@@ -265,11 +274,7 @@ impl Transform<'_> {
     }
 
     /// A definition under `WITH RECURSIVE`, with its own name in scope while its query is read.
-    ///
-    /// PostgreSQL checks the form of a definition that reads itself when it analyzes the query, and
-    /// the errors are given here with its messages. The query is a `UNION` or a `UNION ALL`. Its
-    /// left side, the non-recursive term, does not read the name. And the query has no `ORDER BY`,
-    /// `OFFSET` or `LIMIT` of its own.
+    /// A definition that reads itself gets the checks of [`Self::well_formed`].
     fn recursive_definition(
         &mut self,
         cte: &CommonTableExpr,
@@ -298,54 +303,20 @@ impl Transform<'_> {
             reads: Vec::new(),
         });
         let reads = self.self_reads.len();
-        self.recursing.push(slot);
+        self.recursing.push((slot, self.depth + 1, self.places.len()));
         let query = self.query(select);
         self.recursing.pop();
         self.scope.pop();
         let query = query?;
-        let found: Vec<(Span, u32)> = self
-            .self_reads
-            .drain(reads..)
-            .filter(|&(read, ..)| read == slot)
-            .map(|(_, span, made)| (span, made))
-            .collect();
-        if let Some(&(span, _)) = found.first() {
-            let written = self.ast.queries[query as usize];
-            let QueryBody::SetOp { op: SetOp::Union, left, .. } = written.body else {
-                return Err(Error::parser(format!(
-                    "recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] recursive-term"
-                ))
-                .state(SqlState::INVALID_RECURSION)
-                .with_span(self.at(cte.location))
-                .into());
-            };
-            if let Some(&(span, _)) = found.iter().find(|&&(_, made)| made <= left) {
-                return Err(Error::parser(format!(
-                    "recursive reference to query \"{name}\" must not appear within its non-recursive term"
-                ))
-                .state(SqlState::INVALID_RECURSION)
-                .with_span(span)
-                .into());
-            }
-            let refused = if !written.order_by.is_empty() {
-                Some("ORDER BY")
-            } else if written.offset != NONE {
-                Some("OFFSET")
-            } else if written.limit != NONE {
-                Some("LIMIT")
-            } else {
-                None
-            };
-            if let Some(refused) = refused {
-                return Err(Error::parser(format!(
-                    "{refused} in a recursive query is not implemented"
-                ))
-                .state(SqlState::FEATURE_NOT_SUPPORTED)
-                .with_span(span)
-                .into());
-            }
+        // A read of a definition further out stays for that definition's own check.
+        let (mut found, others): (Vec<SelfRead>, Vec<SelfRead>) =
+            self.self_reads.split_off(reads).into_iter().partition(|read| read.cte == slot);
+        self.self_reads.extend(others.into_iter().map(|read| SelfRead { nested: true, ..read }));
+        if !found.is_empty() {
+            found.sort_by_key(|read| read.span.start);
+            self.well_formed(query, name, self.at(cte.location), &found)?;
         }
-        let recursive = !found.is_empty();
+        let recursive = found.iter().any(|read| !read.nested);
         self.ast.ctes[slot as usize].query = query;
         self.ast.ctes[slot as usize].recursive = recursive;
         Ok(Definition {
@@ -358,6 +329,98 @@ impl Transform<'_> {
             logged: 0,
             reads: Vec::new(),
         })
+    }
+
+    /// The checks of `checkWellFormedRecursion` in `parse_cte.c`, in its order, on a definition
+    /// under `WITH RECURSIVE` that reads itself through `reads`, which are in the order written.
+    /// PostgreSQL makes them before it analyzes the query, with these messages.
+    ///
+    /// The query has to be a `UNION` or a `UNION ALL`. The `WITH` of the query may not read the
+    /// name, and the union may not sort or limit itself. The left side, the non-recursive term,
+    /// may not read the name at all, and the right side reads it once, in none of the places of
+    /// [`Place`].
+    fn well_formed(&self, query: QueryRef, name: &str, at: Span, reads: &[SelfRead]) -> Made<()> {
+        let refused = |message: String, span: Span| -> Made<()> {
+            Err(Error::parser(message).state(SqlState::INVALID_RECURSION).with_span(span).into())
+        };
+        let written = self.ast.queries[query as usize];
+        let QueryBody::SetOp { op: SetOp::Union, left, .. } = written.body else {
+            return refused(
+                format!(
+                    "recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] recursive-term"
+                ),
+                at,
+            );
+        };
+        if let Some(read) = reads.iter().find(|read| read.place == Some(Place::With)) {
+            return refused(Place::With.message(name), read.span);
+        }
+        let decorated = [
+            (
+                "ORDER BY",
+                self.ast.order_items[written.order_by.range()].first().map(|item| item.expr),
+            ),
+            ("OFFSET", Some(written.offset).filter(|&expr| expr != NONE)),
+            ("LIMIT", Some(written.limit).filter(|&expr| expr != NONE)),
+        ];
+        if let Some((clause, Some(expr))) = decorated.into_iter().find(|(_, expr)| expr.is_some()) {
+            return Err(Error::parser(format!("{clause} in a recursive query is not implemented"))
+                .state(SqlState::FEATURE_NOT_SUPPORTED)
+                .with_span(self.ast.expr_span(expr))
+                .into());
+        }
+        let mut counted = 0;
+        for read in reads {
+            match read.place {
+                Some(Place::Sublink) => return refused(Place::Sublink.message(name), read.span),
+                _ if read.made <= left => {
+                    return refused(
+                        format!(
+                            "recursive reference to query \"{name}\" must not appear within its non-recursive term"
+                        ),
+                        read.span,
+                    );
+                }
+                Some(place) => return refused(place.message(name), read.span),
+                None => counted += 1,
+            }
+            if counted > 1 {
+                return refused(
+                    format!(
+                        "recursive reference to query \"{name}\" must not appear more than once"
+                    ),
+                    read.span,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes a read of the recursive definition in `slot` from inside its own query.
+    fn read_itself(&mut self, cte: u32, span: Span) {
+        let made = self.ast.queries.len() as u32;
+        let around = self.recursing.iter().find(|&&(slot, ..)| slot == cte).map_or(0, |&(.., n)| n);
+        let places = &self.places[around..];
+        // A subquery is named wherever it is, and else the outermost place is.
+        let place = if places.contains(&Place::Sublink) && places[0] != Place::With {
+            Some(Place::Sublink)
+        } else {
+            places.first().copied()
+        };
+        self.self_reads.push(SelfRead { cte, span, made, place, nested: false });
+    }
+
+    /// Transforms what `transform` does with `place` as the innermost place, see [`Place`].
+    pub(super) fn within<T>(
+        &mut self,
+        place: Option<Place>,
+        transform: impl FnOnce(&mut Self) -> Made<T>,
+    ) -> Made<T> {
+        let Some(place) = place else { return transform(self) };
+        self.places.push(place);
+        let made = transform(self);
+        self.places.pop();
+        made
     }
 
     /// Takes the definitions of the query out of scope, and gives the ones that are held, which
@@ -450,8 +513,7 @@ impl Transform<'_> {
             let definition = &self.scope[at];
             if definition.query == NONE {
                 let cte = definition.slot;
-                let made = self.ast.queries.len() as u32;
-                self.self_reads.push((cte, span, made));
+                self.read_itself(cte, span);
                 let recurring = false;
                 return Ok(self
                     .ast
@@ -478,8 +540,17 @@ impl Transform<'_> {
         let (Some(left), Some(right)) = (&join.larg, &join.rarg) else {
             return clause("JoinExpr");
         };
-        let left = self.source(left)?;
-        let right = self.source(right)?;
+        // The side of an outer join that can be all nulls is a place a recursive definition does
+        // not read itself from.
+        let outer = |side: bool| side.then_some(Place::OuterJoin);
+        let (left_outer, right_outer) = match join.jointype {
+            JoinType::JOIN_LEFT => (false, true),
+            JoinType::JOIN_RIGHT => (true, false),
+            JoinType::JOIN_FULL => (true, true),
+            _ => (false, false),
+        };
+        let left = self.within(outer(left_outer), |this| this.source(left))?;
+        let right = self.within(outer(right_outer), |this| this.source(right))?;
         let using = self.names(&join.usingClause)?;
         let on = self.optional(join.quals.as_ref())?;
         let kind = match join.jointype {
@@ -769,4 +840,53 @@ fn missing_window(name: &str, span: Span) -> super::Refused {
         .state(SqlState::UNDEFINED_OBJECT)
         .with_span(span)
         .into()
+}
+
+/// A read of a recursive definition from inside its own query.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SelfRead {
+    /// The slot of the definition in `Ast::ctes`.
+    pub(super) cte: u32,
+    pub(super) span: Span,
+    /// How many queries were made before the read. The count tells the non-recursive term from
+    /// the recursive term, because the left query of the `UNION` is made before its right query.
+    pub(super) made: u32,
+    /// The place the read is in, see [`Place::message`].
+    pub(super) place: Option<Place>,
+    /// The read is inside a recursive definition that the definition's own query has. PostgreSQL
+    /// checks it as a read of this definition. It does not make the definition recursive yet,
+    /// because a recursion runs to its end before the query that reads it, and the inner one
+    /// would not end where PostgreSQL stops it for a limit.
+    pub(super) nested: bool,
+}
+
+/// A place that a recursive definition may not read itself from, as the `RecursionContext` of
+/// `parse_cte.c` names it. The outermost place is the one that counts, because PostgreSQL only
+/// changes the place while it is in none. A subquery in an expression is the exception and is
+/// named wherever it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Place {
+    /// The `WITH` of the definition's own query, which PostgreSQL reads as a subquery.
+    With,
+    /// A subquery in an expression.
+    Sublink,
+    /// The side of an outer join that can be all nulls.
+    OuterJoin,
+    /// A side of `INTERSECT ALL`.
+    Intersect,
+    /// The right side of `EXCEPT`, and the left side of `EXCEPT ALL`.
+    Except,
+}
+
+impl Place {
+    /// What PostgreSQL says of a read in the place, from `recursion_errormsgs`.
+    fn message(self, name: &str) -> String {
+        let place = match self {
+            Self::With | Self::Sublink => "a subquery",
+            Self::OuterJoin => "an outer join",
+            Self::Intersect => "INTERSECT",
+            Self::Except => "EXCEPT",
+        };
+        format!("recursive reference to query \"{name}\" must not appear within {place}")
+    }
 }

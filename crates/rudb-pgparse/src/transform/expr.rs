@@ -11,7 +11,7 @@ use rudb_parse::ast::{
     BinaryOp, CaseArm, Expr, ExprRef, LiteralKind, OrderItem, Slice, Target, UnaryOp,
 };
 
-use super::{Made, Transform, clause, not_yet};
+use super::{Made, Place, Transform, clause, not_yet};
 use crate::nodes::{
     A_Const, A_Expr, A_Expr_Kind, A_Indirection, BoolExpr, BoolExprType, BoolTestType,
     CoercionForm, FuncCall, List, MinMaxOp, Node, NullTestType, SQLValueFunction,
@@ -435,7 +435,7 @@ impl Transform<'_> {
             | SubLinkType::ARRAY_SUBLINK => NONE,
             _ => return clause("SubLink"),
         };
-        let query = self.query(select)?;
+        let query = self.within(Some(Place::Sublink), |this| this.query(select))?;
         let expr = match link.subLinkType {
             SubLinkType::EXISTS_SUBLINK => Expr::Exists { query, negated },
             SubLinkType::ANY_SUBLINK if link.operName.is_empty() => {
