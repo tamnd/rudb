@@ -14181,6 +14181,53 @@ fn cascade(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Data> {
     })
 }
 
+/// How many rows the runs of a run length part have to cover on average before it is held as its
+/// runs. See [`cascade_runs`].
+const HELD_RUN: usize = 3;
+
+/// A run length part of a `BIGINT`, `INTEGER` or `DATE` column as a vector of its runs, when they
+/// are long enough to be worth it, and `None` for anything else.
+///
+/// A part is decoded once and then held, so the form it is held in is what every later scan reads.
+/// `l_orderkey` is stored as runs of about four rows, one run an order. Held flat it was written
+/// out a row at a time, and then a grouping by it compared every row with the one before it to find
+/// the same runs again, which on TPC-H q18 was a quarter of the query. Held as runs, the ends are
+/// where the groups are. It is laid out flat beside its runs as well (see [`Vector::runs_laid_out`]),
+/// since a join or a filter reads it a row at a time and a row of runs is a search. The flat form
+/// is the copy the part cost before, and the runs are a run's value and end on top of it.
+fn cascade_runs(ty: &LogicalType, bytes: &[u8], rows: usize) -> Result<Option<Vector>> {
+    fn held<T: integer::Lane>(
+        bytes: &[u8],
+        rows: usize,
+    ) -> Result<Option<(Vec<T>, Vec<u32>, Vec<T>)>> {
+        integer::decode_runs_laid_as::<T>(bytes, rows / HELD_RUN)
+            .map_err(|error| invalid(&format!("page value is not of its type: {error}")))
+    }
+    if !integer::run_length(bytes) {
+        return Ok(None);
+    }
+    let data = match ty {
+        LogicalType::Integer | LogicalType::Date => {
+            held::<i32>(bytes, rows)?.map(|(values, ends, flat)| {
+                (Data::Int32(values.into()), ends, Data::Int32(flat.into()))
+            })
+        }
+        LogicalType::BigInt => held::<i64>(bytes, rows)?.map(|(values, ends, flat)| {
+            (Data::Int64(values.into()), ends, Data::Int64(flat.into()))
+        }),
+        _ => None,
+    };
+    let Some((values, ends, flat)) = data else { return Ok(None) };
+    if ends.last().map_or(0, |&end| end as usize) != rows {
+        return Err(invalid("cascade page holds the wrong number of rows"));
+    }
+    Ok(Some(Vector::runs_laid_out(
+        ends,
+        Vector::flat(ty.clone(), values)?,
+        Vector::flat(ty.clone(), flat)?,
+    )?))
+}
+
 /// How many bytes a part of this type costs written out plainly, which is what the cascade has to
 /// beat before it is worth the decode.
 fn plain_width(ty: &LogicalType) -> Option<usize> {
@@ -16356,15 +16403,20 @@ fn decode(
     if codec == 5 {
         // The cascade holds the whole tail of the page and says how long it is itself.
         let tail = &bytes[cur.at..];
+        if matches!(validity, Validity::AllValid)
+            && let Some(runs) = cascade_runs(ty, tail, rows)?
+        {
+            return Ok(runs);
+        }
         let flat = Vector::flat(ty.clone(), cascade(ty, tail, rows)?)?;
         // A page is decoded once and then held for the statements after it, so the form it is
         // held in is what every later scan reads. A stride is held packed over the range of its
         // values: `l_quantity` is a stride of 100 over six bit codes, and flat it was eight bytes a
         // row, 48 MB at SF1, which q06 read from memory on every run, where packed it is thirteen
         // bits a row, held at sixteen so that a filter compares the codes where they lie, and the
-        // packed filter kernels take it. Anything else stays flat, because
-        // `l_orderkey` is a delta and the grouping by runs over it was four times slower on q18
-        // packed. See spec/perf/107-a-stride-held-packed.md.
+        // packed filter kernels take it. A run length part with long enough runs went out as its
+        // runs above. Anything else stays flat, because the grouping by runs over a key was four
+        // times slower on q18 packed. See spec/perf/107-a-stride-held-packed.md.
         let held = if integer::is_strided(tail) { flat.bit_packed_on_lanes()? } else { flat };
         return Ok(held.with_validity(validity));
     }

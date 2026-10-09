@@ -2052,14 +2052,17 @@ impl<'a> Aggregate<'a> {
         // packed. [`interior`] finds the runs by comparing what the rows hold, and a key a filter
         // left as a dictionary over its page is not a form it reads, so every filtered chunk went
         // to the table instead. `GROUP BY l_orderkey` under a filter on lineitem was ten times the
-        // instructions of the same grouping without one.
+        // instructions of the same grouping without one. A key the page held as runs is left alone
+        // as well, since its runs are the groups and [`held_runs`] reads them as they are.
         let closing = self.closes();
         if keys.len() > 1 || closing {
             for key in &mut keys {
+                // The runs are asked about before the data, which a run length key answers by
+                // laying itself out flat.
                 if key.logical_type().is_integer()
+                    && !(closing && (key.packed_parts().is_some() || key.run_parts().is_some()))
                     && key.data().is_none()
                     && key.constant_value().is_none()
-                    && !(closing && key.packed_parts().is_some())
                 {
                     *key = key.opened()?;
                 }
@@ -5811,6 +5814,9 @@ fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, us
     if rows < 3 || u32::try_from(rows).is_err() || key.validity().has_nulls(rows) {
         return None;
     }
+    if let Some((ends, values)) = key.run_parts() {
+        return held_runs(ends, values, rows, grouped);
+    }
     if let Some(packed) = key.packed_parts() {
         return CODES.with_borrow_mut(|codes| {
             codes.clear();
@@ -5830,6 +5836,33 @@ fn closed_runs(key: &Vector, rows: usize, grouped: bool) -> Option<(Vec<u32>, us
         Data::UInt64(values) => flat!(values),
         _ => None,
     }
+}
+
+/// [`closed_runs`] of a key held as its runs, which is where they end with nothing to compare.
+///
+/// The reader holds a key stored as runs in that form, and its runs are the key's runs unless two
+/// next to each other hold the same value, which would be one group cut in two. The writer never
+/// leaves two like that, and a chunk that has them goes to the table, as does one whose runs go
+/// down when the promise is that the key goes up.
+fn held_runs(
+    ends: &[u32],
+    values: &Vector,
+    rows: usize,
+    grouped: bool,
+) -> Option<(Vec<u32>, usize)> {
+    if ends.last().map(|&end| end as usize) != Some(rows) || values.validity().has_nulls(ends.len())
+    {
+        return None;
+    }
+    let values = integers(values, ends.len())?;
+    let split = |pair: &[i64]| if grouped { pair[0] == pair[1] } else { pair[0] >= pair[1] };
+    if values.windows(2).any(split) {
+        return None;
+    }
+    // Every start but the first run's, and the last of them is where the last run starts.
+    let mut starts = ends[..ends.len() - 1].to_vec();
+    let to = starts.pop()? as usize;
+    (!starts.is_empty()).then_some((starts, to))
 }
 
 /// The total of every run of a packed argument, where run `group` is `starts[group]` up to
@@ -5953,6 +5986,10 @@ fn interior(key: &Vector, rows: usize, grouped: bool) -> Option<(usize, usize)> 
             }
             sliced(&values[..rows], grouped)
         }};
+    }
+    // A key held as its runs has its ends where the runs end, the same ones [`closed_runs`] reads.
+    if let Some((ends, values)) = key.run_parts() {
+        return held_runs(ends, values, rows, grouped).map(|(starts, to)| (starts[0] as usize, to));
     }
     // A packed code is the value less the frame's base, so codes are in the order the values are.
     if let Some(packed) = key.packed_parts() {
@@ -9018,6 +9055,8 @@ mod tests {
         let flat = Vector::from_values(LogicalType::BigInt, &values).expect("keys");
         let packed = flat.bit_packed().expect("packed");
         assert!(packed.packed_parts().is_some());
+        let runs = flat.run_encoded().expect("runs");
+        assert!(runs.run_parts().is_some());
         for rows in [300, 64, 130, 65, 7] {
             let mut walked = (1..rows)
                 .filter(|&row| keys[row] != keys[row - 1])
@@ -9026,9 +9065,11 @@ mod tests {
             let to = walked.pop().expect("runs") as usize;
             let (from, end) = interior(&flat, rows, false).expect("closed runs");
             assert_eq!((walked[0] as usize, to), (from, end), "{rows} rows");
-            for vector in [&flat, &packed] {
+            let held = runs.slice(0, rows).expect("a cut of the runs");
+            for vector in [&flat, &packed, &held] {
                 assert_eq!(closed_runs(vector, rows, false), Some((walked.clone(), to)), "{rows}");
             }
+            assert_eq!(interior(&held, rows, false), Some((from, end)), "{rows} rows as runs");
         }
         assert_eq!(closed_runs(&flat, 3, false), None, "one run of three");
         assert_eq!(run_total(&[1, 2, 3]), 6);

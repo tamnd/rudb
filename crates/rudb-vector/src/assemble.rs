@@ -1226,6 +1226,13 @@ fn run_of(pieces: &[&Vector], rows: usize) -> Validity {
     }
     let mut live = Vec::with_capacity(rows);
     for piece in pieces {
+        // A piece that says it holds no null is all ones, which is most pieces of a mixed column and
+        // costs nothing to know. Asking it a row at a time read through a run length piece to its
+        // values on every row.
+        if piece.never_null() {
+            live.resize(live.len() + piece.len(), true);
+            continue;
+        }
         // row at a time: the mixed case, which is a bit per row however it is written, and it runs
         // once per column per row group rather than once per chunk.
         for row in 0..piece.len() {
