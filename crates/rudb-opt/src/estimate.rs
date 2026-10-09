@@ -1292,6 +1292,14 @@ fn nulls_at(plan: &Plan, input: NodeRef, position: usize) -> Option<Stat<u64>> {
     Some(zones.nulls(zones.column(name)?))
 }
 
+/// How many rows of a scan's column the store guesses are null, for a choice that only costs time.
+///
+/// Any class of count, through [`NULLS`], because what reads it adds a test that holds whatever the
+/// count turns out to be and only asks the count whether the test is worth its time.
+pub(crate) fn nulls_guessed(plan: &Plan, scan: NodeRef, position: usize) -> Option<u64> {
+    nulls_at(plan, scan, position)?.read(NULLS).copied()
+}
+
 /// A null count that licenses a rewrite is entitled to an exact one and to nothing else.
 ///
 /// [`NULLS`] is the same number read to choose between two plans, where any class will do because a
