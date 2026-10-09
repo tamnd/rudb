@@ -92,6 +92,7 @@ impl Validity {
     /// Out of range reads report invalid rather than panicking, because this is called from
     /// kernels that are allowed to read past the end of a partially filled vector.
     #[must_use]
+    #[inline]
     pub fn is_valid(&self, index: usize) -> bool {
         match self {
             Self::AllValid => true,

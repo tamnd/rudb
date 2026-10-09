@@ -4794,18 +4794,21 @@ impl Packed<'_> {
 
     /// Bit offset, in rows, of the first value.
     #[must_use]
+    #[inline]
     pub fn offset(&self) -> usize {
         self.offset
     }
 
     /// How many bits one code takes, between one and [`PACKED_WIDTH_MAX`].
     #[must_use]
+    #[inline]
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// What zero means, so that the value of a row is the base plus its code.
     #[must_use]
+    #[inline]
     pub fn base(&self) -> i128 {
         self.base
     }

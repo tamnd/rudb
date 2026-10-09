@@ -4839,7 +4839,13 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
                 // A dictionary over a packed run, which is what a stored column of numbers with
                 // few distinct values in it is, and where every decimal of TPC-H arrives.
                 if let Some(packed) = values.packed_parts() {
-                    return from_packed(&packed, |row| codes[row] as usize, rows, nulls, want);
+                    return from_packed::<false, _>(
+                        &packed,
+                        |row| codes[row] as usize,
+                        rows,
+                        nulls,
+                        want,
+                    );
                 }
                 // A dictionary whose values sit in a file rather than in a run of memory, which is
                 // what a scan of a native column hands over. There is nothing for the loops below
@@ -4859,7 +4865,9 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
             }
             collect::<false, _>(data, |index| codes[index] as usize, rows, nulls, want)
         }
-        Form::BitPacked => from_packed(&input.packed_parts()?, identity, rows, nulls, want),
+        Form::BitPacked => {
+            from_packed::<true, _>(&input.packed_parts()?, identity, rows, nulls, want)
+        }
         // A constant folds in as one value repeated and a sequence as an arithmetic series, and
         // both have a closed form that is better than any loop. Neither is what a scan of a column
         // produces, so both wait for the counter to ask for them.
@@ -4877,20 +4885,58 @@ fn gather(input: &Vector, rows: usize, nulls: &Validity, want: Want) -> Option<C
 /// The mapping is a generic parameter for the reason the rest of this file gives, and it is what
 /// lets a dictionary over a packed run come here with its codes rather than through the row at a
 /// time path. That is the form every decimal column of a stored TPC-H table arrives in.
-fn from_packed<M: Fn(usize) -> usize>(
+fn from_packed<const DIRECT: bool, M: Fn(usize) -> usize>(
     packed: &rudb_vector::Packed<'_>,
     at: M,
     rows: usize,
     nulls: &Validity,
     want: Want,
 ) -> Option<Contribution> {
+    // The codes are read out a block at a time and the block is then added up, rather than a
+    // code read and added a row at a time. When the rows are the run's own, `DIRECT`, a block is
+    // the unpack that works a whole word of codes at once, and a column with no null in it adds
+    // the base once a block and the codes with no test between them. Row at a time, with the
+    // base and the validity asked for each row, `sum(l_quantity)` over all of `lineitem` was
+    // about 44 instructions a row.
+    let base = packed.base();
+    let valid = matches!(nulls, Validity::AllValid);
+    let mut block = [0_u64; PACKED_BLOCK];
+    let read = |from: usize, codes: &mut [u64]| {
+        if DIRECT {
+            packed.unpack(from, codes);
+        } else {
+            for (index, code) in codes.iter_mut().enumerate() {
+                *code = packed.code(at(from + index));
+            }
+        }
+    };
+    // A block ends where a word of the run does, so that only the first one can start inside a
+    // word and every other is unpacked whole.
+    let span = |from: usize| (PACKED_BLOCK - (packed.offset() + from) % 64).min(rows - from);
+    let mut from = 0;
     match want {
         Want::Whole => {
             let mut total = 0_i128;
-            for row in 0..rows {
-                if nulls.is_valid(row) {
-                    total += packed.base() + i128::from(packed.code(at(row)));
+            while from < rows {
+                let codes = &mut block[..span(from)];
+                read(from, codes);
+                if valid {
+                    // A block of codes at most 55 bits wide adds up inside a `u64`, since it has
+                    // at most 256 of them, and that sum is the one the compiler puts in lanes.
+                    let sum = if packed.width() <= 55 {
+                        i128::from(codes.iter().sum::<u64>())
+                    } else {
+                        codes.iter().map(|&code| i128::from(code)).sum()
+                    };
+                    total += base * codes.len() as i128 + sum;
+                } else {
+                    for (index, &code) in codes.iter().enumerate() {
+                        if nulls.is_valid(from + index) {
+                            total += base + i128::from(code);
+                        }
+                    }
                 }
+                from += codes.len();
             }
             Some(Contribution::Whole(total))
         }
@@ -4898,35 +4944,47 @@ fn from_packed<M: Fn(usize) -> usize>(
         // the same factor, or a mean over a `DECIMAL(15, 2)` column comes back a hundred times too
         // large. The unscaled integer is what a packed run holds, so the division is the only
         // thing that turns it back into the number the column says it is.
-        Want::Real { scale, from } => {
+        Want::Real { scale, from: start } => {
             let factor = pow10(scale) as f64;
             let scaled = scale != 0;
-            let mut total = from;
+            let mut total = start;
             let mut seen = 0_i64;
-            for row in 0..rows {
-                if nulls.is_valid(row) {
-                    let number = (packed.base() + i128::from(packed.code(at(row)))) as f64;
-                    total += if scaled { number / factor } else { number };
-                    seen += 1;
+            while from < rows {
+                let codes = &mut block[..span(from)];
+                read(from, codes);
+                for (index, &code) in codes.iter().enumerate() {
+                    if valid || nulls.is_valid(from + index) {
+                        let number = (base + i128::from(code)) as f64;
+                        total += if scaled { number / factor } else { number };
+                        seen += 1;
+                    }
                 }
+                from += codes.len();
             }
             Some(Contribution::Real { total, seen })
         }
         Want::Extreme(least) => {
             let mut found: Option<(usize, u64)> = None;
-            for row in 0..rows {
-                if !nulls.is_valid(row) {
-                    continue;
+            while from < rows {
+                let codes = &mut block[..span(from)];
+                read(from, codes);
+                for (index, &code) in codes.iter().enumerate() {
+                    if !valid && !nulls.is_valid(from + index) {
+                        continue;
+                    }
+                    if found.is_none_or(|(_, held)| if least { code < held } else { code > held }) {
+                        found = Some((from + index, code));
+                    }
                 }
-                let code = packed.code(at(row));
-                if found.is_none_or(|(_, held)| if least { code < held } else { code > held }) {
-                    found = Some((row, code));
-                }
+                from += codes.len();
             }
             Some(Contribution::Extreme(found.map(|(row, _)| row)))
         }
     }
 }
+
+/// How many codes [`from_packed`] reads out of a packed run at a time.
+const PACKED_BLOCK: usize = 256;
 
 /// The row that wins an extreme over a dictionary whose values are not a run in memory.
 ///
@@ -7250,6 +7308,70 @@ mod tests {
         assert_eq!(fallback::count(Kernel::Aggregate, Form::BitPacked, Form::BitPacked), 0);
         assert_eq!(fallback::count(Kernel::Aggregate, Form::Dictionary, Form::Dictionary), 0);
         fallback::reset();
+    }
+
+    /// A packed run is read a block at a time, with the base added once a block when no row is
+    /// null. Every total and extreme over one has to come out the same as over the flat column it
+    /// packs, whether the run starts on a word or partway into one, whether it has nulls, and
+    /// whether its codes are wide enough that a block of them cannot be summed in a u64.
+    #[test]
+    fn a_packed_run_read_a_block_at_a_time_agrees_with_the_flat_column() {
+        let narrow = LogicalType::decimal(15, 2).expect("a legal decimal");
+        let wide = LogicalType::decimal(38, 2).expect("a legal decimal");
+        for (ty, step) in [(narrow, 13_i128), (wide, 1_i128 << 50)] {
+            for with_nulls in [false, true] {
+                let values: Vec<Value> = (0..1100_i128)
+                    .map(|row| {
+                        if with_nulls && row % 7 == 3 {
+                            Value::Null
+                        } else {
+                            let width = if step > 1 << 40 { 38 } else { 15 };
+                            Value::Decimal {
+                                unscaled: -500 + ((row * 31) % 977) * step,
+                                width,
+                                scale: 2,
+                            }
+                        }
+                    })
+                    .collect();
+                let flat = Vector::from_values(ty.clone(), &values).expect("a flat decimal");
+                let packed = flat.bit_packed().expect("packs");
+                assert_eq!(packed.form(), Form::BitPacked);
+                for (at, len) in [(0, 1100), (37, 700), (64, 256), (100, 3)] {
+                    let flat = flat.slice(at, len).expect("in range");
+                    let packed = packed.slice(at, len).expect("in range");
+                    let nulls = flat.validity().clone();
+                    let whole = |input: &Vector| match gather(input, len, &nulls, Want::Whole) {
+                        Some(Contribution::Whole(total)) => total,
+                        _ => panic!("a total"),
+                    };
+                    assert_eq!(whole(&packed), whole(&flat), "{ty:?} {with_nulls} {at}");
+                    let real = |input: &Vector| match gather(
+                        input,
+                        len,
+                        &nulls,
+                        Want::Real { scale: 2, from: 0.5 },
+                    ) {
+                        Some(Contribution::Real { total, seen }) => (total, seen),
+                        _ => panic!("a total"),
+                    };
+                    let ((ours, seen), (theirs, flat_seen)) = (real(&packed), real(&flat));
+                    assert_eq!(seen, flat_seen);
+                    assert!((ours - theirs).abs() <= theirs.abs() * 1e-12, "{ours} {theirs}");
+                    for least in [true, false] {
+                        let row =
+                            |input: &Vector| match gather(input, len, &nulls, Want::Extreme(least))
+                            {
+                                Some(Contribution::Extreme(row)) => row,
+                                _ => panic!("a row"),
+                            };
+                        let (ours, theirs) = (row(&packed), row(&flat));
+                        let value = |row: Option<usize>| row.map(|row| flat.value_at(row));
+                        assert_eq!(value(ours), value(theirs), "{ty:?} {with_nulls} {at} {least}");
+                    }
+                }
+            }
+        }
     }
 
     /// The same two forms scattered into groups, which is the half of this that q01 is.
