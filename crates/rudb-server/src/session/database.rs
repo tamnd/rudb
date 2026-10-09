@@ -8,11 +8,12 @@
 //! that sorts in another order fails with `0A000`, after all the checks of PostgreSQL.
 
 use rudb_common::Fields;
+use rudb_common::guc::Settings;
 use rudb_pgwire::{CommandTag, OutBuf};
 
 use super::Failure;
 use super::role::{Invalid, Parser, Spec, failure, notice, truncate, with_detail};
-use super::setting::{Token, spanned};
+use super::setting::{self, Clause, Keep, Token, spanned};
 use crate::databases::{self, Catalog, Row, UTF8, encoding_name};
 use crate::locale::{self, Codeset};
 use crate::roles::{self, BOOTSTRAP_SUPERUSER, FIRST_NORMAL_OID};
@@ -66,8 +67,11 @@ pub(in crate::session) enum Statement {
     Refresh {
         name: String,
     },
-    /// A form that the server does not run yet, with the text of the error.
-    Unsupported(&'static str),
+    /// `ALTER DATABASE name SET|RESET ...`.
+    Set {
+        name: String,
+        clause: Clause,
+    },
 }
 
 /// A statement as the reader gives it: the notices of the scanner, and the statement or the
@@ -248,11 +252,9 @@ fn alter_statement(p: &mut Parser<'_>) -> Result<Statement, Invalid> {
         let options = vec![Opt { name: "tablespace".to_owned(), arg: Some(Arg::Text(space)), at }];
         return Ok(Statement::Alter { name, options });
     }
-    // The server does not keep settings for databases yet, so the rest of the statement is not
-    // read.
-    if p.eat("set") || p.eat("reset") {
-        p.at = p.tokens.len();
-        return Ok(Statement::Unsupported("ALTER DATABASE SET is not supported yet"));
+    if p.peek(0).is_some_and(|t| t.is("set") || t.is("reset")) {
+        let clause = setting::clause(p)?;
+        return Ok(Statement::Set { name, clause });
     }
     p.eat("with");
     let mut options = Vec::new();
@@ -308,6 +310,8 @@ pub(in crate::session) struct Context<'a> {
     pub(in crate::session) block: bool,
     /// The text that the positions count in, for the position of a `WARNING`.
     pub(in crate::session) sql: &'a str,
+    /// The settings of the session, for the check of `ALTER DATABASE SET`.
+    pub(in crate::session) guc: &'a Settings,
 }
 
 /// Runs a statement. `offset` is the place of the statement in the query, for the position of an
@@ -363,7 +367,10 @@ pub(in crate::session) fn execute(
             refresh(name, cx, out)?;
             Ok(CommandTag::AlterDatabase)
         }
-        Statement::Unsupported(message) => Err(failure("0A000", *message)),
+        Statement::Set { name, clause } => {
+            alter_set(name, clause, cx, out)?;
+            Ok(CommandTag::AlterDatabase)
+        }
     }
 }
 
@@ -1046,6 +1053,14 @@ fn drop(
         },
         written,
     )?;
+    // `DropSetting` for the database.
+    cx.shared.db_role_settings.change(
+        |settings| {
+            settings.rows.retain(|row| row.database != oid);
+            Ok(())
+        },
+        written,
+    )?;
     if let Err(error) = cx.shared.remove_database(oid) {
         notice(out, "WARNING", "01000", &error, &[]);
     }
@@ -1143,6 +1158,29 @@ fn set_owner(name: &str, spec: &Spec, cx: &Context<'_>) -> Result<(), Failure> {
         },
         written,
     )
+}
+
+/// `AlterDatabaseSet`: the owner of the database keeps a value for the sessions of each role in
+/// it.
+fn alter_set(
+    name: &str,
+    clause: &Clause,
+    cx: &Context<'_>,
+    out: &mut OutBuf,
+) -> Result<(), Failure> {
+    let row = cx.shared.databases.snapshot().find(name).map(|row| (row.oid, row.owner));
+    let (oid, owner) = row.ok_or_else(|| missing(name))?;
+    let roles = cx.shared.roles.snapshot();
+    if !roles.has_privs(cx.current, owner) {
+        return Err(not_owner(name));
+    }
+    let keep = Keep {
+        settings: &cx.shared.db_role_settings,
+        guc: cx.guc,
+        roles: &roles,
+        session: cx.session,
+    };
+    setting::keep(clause, oid, 0, &keep, out)
 }
 
 /// `AlterDatabase`, and `movedb` for the option `tablespace`.
@@ -1243,7 +1281,7 @@ fn refresh(name: &str, cx: &Context<'_>, out: &mut OutBuf) -> Result<(), Failure
 
 #[cfg(test)]
 mod tests {
-    use super::{Arg, Opt, Statement, parse};
+    use super::{Arg, Clause, Opt, Statement, parse};
     use crate::session::role::Spec;
 
     fn statement(sql: &str) -> Result<Statement, (String, usize)> {
@@ -1319,7 +1357,17 @@ mod tests {
         );
         assert_eq!(
             statement("alter database d set work_mem to '1MB'"),
-            Ok(Statement::Unsupported("ALTER DATABASE SET is not supported yet"))
+            Ok(Statement::Set {
+                name: "d".to_owned(),
+                clause: Clause::Set {
+                    name: "work_mem".to_owned(),
+                    value: Some(vec![rudb_common::guc::Arg::String("1MB".to_owned())]),
+                },
+            })
+        );
+        assert_eq!(
+            statement("alter database d reset all"),
+            Ok(Statement::Set { name: "d".to_owned(), clause: Clause::ResetAll })
         );
         assert_eq!(
             statement("alter database d refresh collation version"),

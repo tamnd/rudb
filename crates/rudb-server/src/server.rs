@@ -27,6 +27,7 @@ use rudb_common::guc;
 use crate::conf;
 use crate::config::Config;
 use crate::databases::{self, Catalog, Databases, Row};
+use crate::db_role_settings::DbRoleSettings;
 use crate::hba::{self, Hba, Ident, ParseSettings};
 use crate::poll;
 use crate::roles::{self, Role, Roles};
@@ -153,6 +154,8 @@ pub(crate) struct Shared {
     pub(crate) roles: Arc<Roles>,
     /// The databases of the cluster.
     pub(crate) databases: Databases,
+    /// The values that `ALTER DATABASE SET` and `ALTER ROLE SET` keep.
+    pub(crate) db_role_settings: DbRoleSettings,
     /// The open databases by OID. The lock goes after the lock of the sessions and after the lock
     /// of the databases.
     open: Mutex<HashMap<u32, Arc<Database>>>,
@@ -985,6 +988,7 @@ impl Server {
         let mock_nonce = mock_nonce(&config.data)?;
         let roles = Arc::new(Roles::open(&config.data)?);
         let databases = Databases::open(&config.data)?;
+        let db_role_settings = DbRoleSettings::open(&config.data)?;
         let mut owned = Vec::new();
         let pid_file = config.data.join(PID_FILE);
         let me = std::process::id();
@@ -1018,6 +1022,7 @@ impl Server {
             ident: Mutex::new(Arc::new(ident)),
             roles,
             databases,
+            db_role_settings,
             open: Mutex::new(HashMap::new()),
             ddl: Mutex::new(()),
             sessions: Mutex::new(Sessions {

@@ -6,9 +6,14 @@
 //! `SET threads = 4`, goes to the engine, which has settings of its own. A statement that this
 //! reader cannot read also goes to the engine, which gives the syntax error.
 
-use rudb_common::guc::{self, Arg};
+use rudb_common::guc::{self, Arg, Settings};
+use rudb_pgtypes::keywords::{Category, category};
+use rudb_pgwire::OutBuf;
 
-use super::{database, role};
+use super::role::{Invalid, failure, notice};
+use super::{Failure, database, role};
+use crate::db_role_settings::{DbRoleSettings, split};
+use crate::roles;
 
 /// A statement that the server runs on the settings of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,6 +554,359 @@ impl Parser {
     }
 }
 
+/// The `SetResetClause` of `ALTER DATABASE` and `ALTER ROLE`, as `ExtractSetVariableArgs` sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Clause {
+    /// `SET name TO value`. `value` is `None` for the forms that remove a value, such as
+    /// `SET name TO DEFAULT` and `RESET name`, and for the forms with more than one value, which
+    /// have the name in upper case, such as `TRANSACTION`.
+    Set { name: String, value: Option<Vec<Arg>> },
+    /// `SET name FROM CURRENT`, which keeps the value of the session.
+    Current(String),
+    /// `RESET ALL`.
+    ResetAll,
+}
+
+/// Reads a `SetResetClause` at the next token, with the rules of `set_rest` and `reset_rest` in
+/// `gram.y`. A key word that starts a special form, such as `ROLE`, is a name when `TO`, `=` or
+/// `FROM` comes after it.
+pub(super) fn clause(p: &mut role::Parser<'_>) -> Result<Clause, Invalid> {
+    let set =
+        |name: &str, value: Option<Vec<Arg>>| Ok(Clause::Set { name: name.to_owned(), value });
+    if p.eat("reset") {
+        if p.eat("all") {
+            return Ok(Clause::ResetAll);
+        }
+        if p.eat("time") {
+            p.expect("zone")?;
+            return set("timezone", None);
+        }
+        if p.eat("transaction") {
+            p.expect("isolation")?;
+            p.expect("level")?;
+            return set("transaction_isolation", None);
+        }
+        if p.peek(0).is_some_and(|t| t.is("session"))
+            && p.peek(1).is_some_and(|t| t.is("authorization"))
+        {
+            p.at += 2;
+            return set("session_authorization", None);
+        }
+        return set(&var_name(p)?, None);
+    }
+    p.expect("set")?;
+    let generic = p.peek(1).is_some_and(|t| {
+        t.is("to") || t.is("from") || *t == Token::Punct('=') || *t == Token::Punct('.')
+    });
+    let special = |word: &str| p.peek(0).is_some_and(|t| t.is(word));
+    if special("session") && p.peek(1).is_some_and(|t| t.is("characteristics")) {
+        p.at += 2;
+        p.expect("as")?;
+        p.expect("transaction")?;
+        transaction_modes(p)?;
+        return set("SESSION CHARACTERISTICS", None);
+    }
+    if special("session") && p.peek(1).is_some_and(|t| t.is("authorization")) {
+        p.at += 2;
+        if p.eat("default") {
+            return set("session_authorization", None);
+        }
+        return set("session_authorization", Some(vec![Arg::String(word_or_string(p)?)]));
+    }
+    if !generic {
+        if p.eat("transaction") {
+            if p.eat("snapshot") {
+                p.string()?;
+                return set("TRANSACTION SNAPSHOT", None);
+            }
+            transaction_modes(p)?;
+            return set("TRANSACTION", None);
+        }
+        if p.eat("time") {
+            p.expect("zone")?;
+            return set("timezone", zone_value(p)?);
+        }
+        if p.eat("catalog") {
+            let at = p.here();
+            p.string()?;
+            return Err(Invalid {
+                sqlstate: "0A000",
+                message: "current database cannot be changed".to_owned(),
+                hint: None,
+                at,
+            });
+        }
+        if p.eat("schema") {
+            return set("search_path", Some(vec![Arg::String(p.string()?)]));
+        }
+        if p.eat("names") {
+            if p.done() || p.eat("default") {
+                return set("client_encoding", None);
+            }
+            return set("client_encoding", Some(vec![Arg::String(p.string()?)]));
+        }
+        if p.eat("role") {
+            return set("role", Some(vec![Arg::String(word_or_string(p)?)]));
+        }
+        if p.eat("xml") {
+            p.expect("option")?;
+            let option = if p.eat("document") {
+                "document"
+            } else {
+                p.expect("content")?;
+                "content"
+            };
+            return set("xmloption", Some(vec![Arg::String(option.to_owned())]));
+        }
+    }
+    let name = var_name(p)?;
+    if p.eat("from") {
+        p.expect("current")?;
+        return Ok(Clause::Current(name));
+    }
+    if !p.eat("to") && !eat_punct(p, '=') {
+        return Err(p.syntax());
+    }
+    if p.eat("default") {
+        return set(&name, None);
+    }
+    let mut values = vec![var_value(p)?];
+    while eat_punct(p, ',') {
+        values.push(var_value(p)?);
+    }
+    set(&name, Some(values))
+}
+
+fn eat_punct(p: &mut role::Parser<'_>, c: char) -> bool {
+    let next = p.peek(0) == Some(&Token::Punct(c));
+    if next {
+        p.at += 1;
+    }
+    next
+}
+
+/// Whether a word that is not in quotes is a key word of `category`, or no key word.
+fn is_word(text: &str, allowed: &[Category]) -> bool {
+    category(text).is_none_or(|c| allowed.contains(&c))
+}
+
+/// `var_name`: `ColId`, with dots between them.
+fn var_name(p: &mut role::Parser<'_>) -> Result<String, Invalid> {
+    let mut name = String::new();
+    loop {
+        match p.peek(0) {
+            Some(Token::Word { text, quoted })
+                if *quoted || is_word(text, &[Category::Unreserved, Category::ColName]) =>
+            {
+                name.push_str(text);
+                p.at += 1;
+            }
+            _ => return Err(p.syntax()),
+        }
+        if !eat_punct(p, '.') {
+            return Ok(name);
+        }
+        name.push('.');
+    }
+}
+
+/// `NonReservedWord_or_Sconst`.
+fn word_or_string(p: &mut role::Parser<'_>) -> Result<String, Invalid> {
+    match p.peek(0) {
+        Some(Token::String(text)) => {
+            let text = text.clone();
+            p.at += 1;
+            Ok(text)
+        }
+        Some(Token::Word { text, quoted })
+            if *quoted
+                || is_word(
+                    text,
+                    &[Category::Unreserved, Category::ColName, Category::TypeFuncName],
+                ) =>
+        {
+            let text = text.clone();
+            p.at += 1;
+            Ok(text)
+        }
+        _ => Err(p.syntax()),
+    }
+}
+
+/// `var_value`: `opt_boolean_or_string` or `NumericOnly`.
+fn var_value(p: &mut role::Parser<'_>) -> Result<Arg, Invalid> {
+    match p.peek(0) {
+        Some(Token::Word { text, quoted: false })
+            if matches!(text.as_str(), "true" | "false" | "on") =>
+        {
+            let text = text.clone();
+            p.at += 1;
+            Ok(Arg::String(text))
+        }
+        Some(Token::String(_) | Token::Word { .. }) => Ok(Arg::String(word_or_string(p)?)),
+        _ => numeric(p),
+    }
+}
+
+/// `NumericOnly`: a number with an optional sign.
+fn numeric(p: &mut role::Parser<'_>) -> Result<Arg, Invalid> {
+    let negative = if eat_punct(p, '-') {
+        true
+    } else {
+        eat_punct(p, '+');
+        false
+    };
+    let Some(Token::Number { text, integer }) = p.peek(0) else { return Err(p.syntax()) };
+    let text = if negative { format!("-{text}") } else { text.clone() };
+    let integer = *integer;
+    p.at += 1;
+    Ok(if integer { Arg::Integer(text) } else { Arg::Number(text) })
+}
+
+/// `zone_value`. `None` for `LOCAL` and `DEFAULT`.
+fn zone_value(p: &mut role::Parser<'_>) -> Result<Option<Vec<Arg>>, Invalid> {
+    if p.eat("local") || p.eat("default") {
+        return Ok(None);
+    }
+    if p.eat("interval") {
+        if eat_punct(p, '(') {
+            if !matches!(p.peek(0), Some(Token::Number { integer: true, .. })) {
+                return Err(p.syntax());
+            }
+            p.at += 1;
+            if !eat_punct(p, ')') {
+                return Err(p.syntax());
+            }
+        }
+        let text = p.string()?;
+        if p.eat("hour") && p.eat("to") {
+            p.expect("minute")?;
+        }
+        return Ok(Some(vec![Arg::Interval(text)]));
+    }
+    match p.peek(0) {
+        Some(Token::String(text)) => {
+            let text = text.clone();
+            p.at += 1;
+            Ok(Some(vec![Arg::String(text)]))
+        }
+        Some(Token::Word { text, quoted }) if *quoted || category(text).is_none() => {
+            let text = text.clone();
+            p.at += 1;
+            Ok(Some(vec![Arg::String(text)]))
+        }
+        _ => Ok(Some(vec![numeric(p)?])),
+    }
+}
+
+/// `transaction_mode_list`, whose items the clause does not keep.
+fn transaction_modes(p: &mut role::Parser<'_>) -> Result<(), Invalid> {
+    loop {
+        if p.eat("isolation") {
+            p.expect("level")?;
+            if p.eat("read") {
+                if !p.eat("uncommitted") {
+                    p.expect("committed")?;
+                }
+            } else if p.eat("repeatable") {
+                p.expect("read")?;
+            } else {
+                p.expect("serializable")?;
+            }
+        } else if p.eat("read") {
+            if !p.eat("only") {
+                p.expect("write")?;
+            }
+        } else {
+            // `[NOT] DEFERRABLE`.
+            p.eat("not");
+            p.expect("deferrable")?;
+        }
+        if p.done() {
+            return Ok(());
+        }
+        eat_punct(p, ',');
+    }
+}
+
+/// What `AlterSetting` needs from the session.
+pub(super) struct Keep<'a> {
+    pub(super) settings: &'a DbRoleSettings,
+    pub(super) guc: &'a Settings,
+    pub(super) roles: &'a roles::Catalog,
+    /// The session user, `GetSessionUserId`, for the check of a value of `role`.
+    pub(super) session: u32,
+}
+
+/// `AlterSetting`: keeps the value of a clause in the row of `database` and `role` of
+/// `pg_db_role_setting`, after the check of `validate_option_array_item`. The check of a value of
+/// `role` or `session_authorization` gives a `NOTICE` and not an error, as `check_role` does for
+/// the source `PGC_S_TEST`.
+pub(super) fn keep(
+    clause: &Clause,
+    database: u32,
+    role: u32,
+    cx: &Keep<'_>,
+    out: &mut OutBuf,
+) -> Result<(), Failure> {
+    let engine = |e: rudb::Error| Failure::engine(&e, 0);
+    let written = |e: String| failure("XX000", e);
+    let (name, text) = match clause {
+        Clause::ResetAll => {
+            let superuser = cx.guc.superuser();
+            return cx.settings.change(
+                |catalog| {
+                    catalog.retain(database, role, |item| {
+                        !superuser
+                            && split(item).is_none_or(|(name, _)| !cx.guc.stored_resettable(name))
+                    });
+                    Ok(())
+                },
+                written,
+            );
+        }
+        Clause::Current(name) => (name, Some(cx.guc.show(name).map_err(engine)?.1)),
+        Clause::Set { name, value: Some(args) } => {
+            (name, Some(guc::flatten(name, args).map_err(engine)?))
+        }
+        Clause::Set { name, value: None } => (name, None),
+    };
+    let key = cx.guc.check_stored(name, text.as_deref()).map_err(engine)?;
+    let Some(text) = text else {
+        return cx.settings.change(
+            |catalog| {
+                catalog.delete(database, role, &key);
+                Ok(())
+            },
+            written,
+        );
+    };
+    match key.as_str() {
+        "role" if text != "none" => match cx.roles.find(&text) {
+            None => notice(out, "NOTICE", "42704", &format!("role \"{text}\" does not exist"), &[]),
+            Some(target) if !cx.roles.can_set(cx.session, target.oid) => notice(
+                out,
+                "NOTICE",
+                "42501",
+                &format!("permission will be denied to set role \"{text}\""),
+                &[],
+            ),
+            Some(_) => {}
+        },
+        "session_authorization" if cx.roles.find(&text).is_none() => {
+            notice(out, "NOTICE", "42704", &format!("role \"{text}\" does not exist"), &[]);
+        }
+        _ => {}
+    }
+    cx.settings.change(
+        |catalog| {
+            catalog.add(database, role, &key, &text);
+            Ok(())
+        },
+        written,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +917,64 @@ mod tests {
 
     fn s(text: &str) -> Arg {
         Arg::String(text.to_owned())
+    }
+
+    fn clause_of(sql: &str) -> Result<Clause, String> {
+        let (tokens, starts) = spanned(sql).unwrap();
+        let mut p = role::Parser { sql, tokens, starts, at: 0 };
+        let clause = clause(&mut p).map_err(|invalid| invalid.message)?;
+        if !p.done() {
+            return Err(format!("{sql} has more tokens"));
+        }
+        Ok(clause)
+    }
+
+    #[test]
+    fn the_clauses_of_alter_database_and_alter_role() {
+        let set =
+            |name: &str, value: Option<Vec<Arg>>| Ok(Clause::Set { name: name.to_owned(), value });
+        assert_eq!(clause_of("set work_mem to default"), set("work_mem", None));
+        assert_eq!(clause_of("set a.b.c = 1"), set("a.b.c", Some(vec![Arg::Integer("1".into())])));
+        assert_eq!(clause_of("set work_mem from current"), Ok(Clause::Current("work_mem".into())));
+        assert_eq!(clause_of("reset all"), Ok(Clause::ResetAll));
+        assert_eq!(clause_of("reset time zone"), set("timezone", None));
+        assert_eq!(clause_of("reset session authorization"), set("session_authorization", None));
+        assert_eq!(
+            clause_of("reset transaction isolation level"),
+            set("transaction_isolation", None)
+        );
+        assert_eq!(clause_of("set time zone local"), set("timezone", None));
+        assert_eq!(
+            clause_of("set time zone interval '+02:00' hour to minute"),
+            set("timezone", Some(vec![Arg::Interval("+02:00".into())]))
+        );
+        assert_eq!(clause_of("set schema 'a'"), set("search_path", Some(vec![s("a")])));
+        assert_eq!(clause_of("set names"), set("client_encoding", None));
+        assert_eq!(clause_of("set names default"), set("client_encoding", None));
+        assert_eq!(clause_of("set names = 'x'"), set("names", Some(vec![s("x")])));
+        assert_eq!(clause_of("set role x"), set("role", Some(vec![s("x")])));
+        assert_eq!(clause_of("set role = 'x'"), set("role", Some(vec![s("x")])));
+        assert_eq!(
+            clause_of("set session authorization default"),
+            set("session_authorization", None)
+        );
+        assert_eq!(
+            clause_of("set xml option document"),
+            set("xmloption", Some(vec![s("document")]))
+        );
+        assert_eq!(
+            clause_of("set transaction isolation level read committed, read only"),
+            set("TRANSACTION", None)
+        );
+        assert_eq!(
+            clause_of("set session characteristics as transaction read write"),
+            set("SESSION CHARACTERISTICS", None)
+        );
+        assert_eq!(
+            clause_of("set search_path = a, \"B\", 'c d'"),
+            set("search_path", Some(vec![s("a"), s("B"), s("c d")]))
+        );
+        assert_eq!(clause_of("set catalog 'x'"), Err("current database cannot be changed".into()));
     }
 
     #[test]

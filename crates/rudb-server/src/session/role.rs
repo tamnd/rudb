@@ -12,8 +12,9 @@ use rudb_pgtypes::{DateTimeInput, timestamptz_in};
 use rudb_pgwire::{CommandTag, OutBuf, PasswordType, md5_encrypt, verify_password};
 
 use super::Failure;
-use super::setting::{Token, spanned};
+use super::setting::{self, Clause, Keep, Token, spanned};
 use crate::crypto::Provider;
+use crate::db_role_settings::DbRoleSettings;
 use crate::roles::{BOOTSTRAP_SUPERUSER, Catalog, Member, Role, Roles, scram};
 
 /// The longest name, `NAMEDATALEN - 1`. The scanner cuts a longer name.
@@ -205,6 +206,12 @@ pub(in crate::session) enum Statement {
     Drop {
         roles: Vec<Spec>,
         missing_ok: bool,
+    },
+    /// `ALTER ROLE role|ALL [IN DATABASE name] SET|RESET ...`, with `role` `None` for `ALL`.
+    Set {
+        role: Option<Spec>,
+        database: Option<String>,
+        clause: Clause,
     },
     /// A form that the server does not run yet, with the text of the error.
     Unsupported(&'static str),
@@ -428,8 +435,8 @@ impl Parser<'_> {
 
     /// The forms of `ALTER ROLE`, `ALTER USER` and `ALTER GROUP`.
     fn alter(&mut self, kind: Kind) -> Result<Statement, Invalid> {
-        if self.eat("all") {
-            return self.alter_set();
+        if kind != Kind::Group && self.eat("all") {
+            return self.alter_set(None);
         }
         let start = self.at;
         let role = self.spec()?;
@@ -450,7 +457,7 @@ impl Parser<'_> {
             return Ok(Statement::Unsupported("ALTER GROUP is not supported yet"));
         }
         if self.peek(0).is_some_and(|t| t.is("in") || t.is("set") || t.is("reset")) {
-            return self.alter_set();
+            return self.alter_set(Some(role));
         }
         self.eat("with");
         let mut options = Vec::new();
@@ -460,18 +467,18 @@ impl Parser<'_> {
         Ok(Statement::Alter { role, options })
     }
 
-    /// `ALTER ROLE ... [IN DATABASE name] SET|RESET ...`. The server does not keep settings for
-    /// roles yet, so the rest of the statement is not read.
-    fn alter_set(&mut self) -> Result<Statement, Invalid> {
+    /// `ALTER ROLE ... [IN DATABASE name] SET|RESET ...`.
+    fn alter_set(&mut self, role: Option<Spec>) -> Result<Statement, Invalid> {
+        let mut database = None;
         if self.eat("in") {
             self.expect("database")?;
-            self.at += 1;
+            database = Some(self.id()?);
         }
-        if !self.eat("set") && !self.eat("reset") {
+        if !self.peek(0).is_some_and(|t| t.is("set") || t.is("reset")) {
             return Err(self.syntax());
         }
-        self.at = self.tokens.len();
-        Ok(Statement::Unsupported("ALTER ROLE SET is not supported yet"))
+        let clause = setting::clause(self)?;
+        Ok(Statement::Set { role, database, clause })
     }
 
     /// `DROP ROLE|USER|GROUP [IF EXISTS] role_list`.
@@ -600,6 +607,8 @@ pub(in crate::session) struct Context<'a> {
     pub(in crate::session) datetime: DateTimeInput<'a>,
     /// The databases, for the owners that `DROP ROLE` checks.
     pub(in crate::session) databases: &'a crate::databases::Catalog,
+    /// The values that `ALTER ROLE SET` keeps.
+    pub(in crate::session) settings: &'a DbRoleSettings,
 }
 
 pub(in crate::session) fn failure(sqlstate: &str, message: impl Into<String>) -> Failure {
@@ -666,7 +675,22 @@ pub(in crate::session) fn execute(
             cx.roles.change(|catalog| rename(catalog, from, to, cx, out), written)
         }
         Statement::Drop { roles, missing_ok } => {
-            cx.roles.change(|catalog| drop(catalog, roles, *missing_ok, cx, out), written)
+            let tag =
+                cx.roles.change(|catalog| drop(catalog, roles, *missing_ok, cx, out), written)?;
+            // `DropSetting` for each role that went.
+            let catalog = cx.roles.snapshot();
+            cx.settings.change(
+                |settings| {
+                    settings.rows.retain(|row| row.role == 0 || catalog.by_oid(row.role).is_some());
+                    Ok(())
+                },
+                written,
+            )?;
+            Ok(tag)
+        }
+        Statement::Set { role, database, clause } => {
+            alter_set(role.as_ref(), database.as_deref(), clause, cx, out)?;
+            Ok(CommandTag::AlterRole)
         }
         Statement::Unsupported(message) => Err(failure("0A000", *message)),
     }
@@ -934,6 +958,69 @@ fn oid_of(catalog: &Catalog, spec: &Spec, cx: &Context<'_>) -> Result<u32, Failu
     }
 }
 
+/// `AlterRoleSet`: a user that may alter a role keeps a value for its sessions, in one database
+/// or in each; the owner of a database keeps a value for each role in it; and a superuser keeps a
+/// value for each role in each database.
+fn alter_set(
+    spec: Option<&Spec>,
+    database: Option<&str>,
+    clause: &Clause,
+    cx: &Context<'_>,
+    out: &mut OutBuf,
+) -> Result<(), Failure> {
+    let catalog = cx.roles.snapshot();
+    let me = cx.current;
+    let mut role = 0;
+    if let Some(spec) = spec {
+        if let Spec::Name(name) = spec
+            && name.starts_with("pg_")
+        {
+            return Err(reserved(name, "Cannot alter reserved roles."));
+        }
+        role = oid_of(&catalog, spec, cx)?;
+        let target =
+            catalog.by_oid(role).ok_or_else(|| failure("XX000", "cache lookup failed for role"))?;
+        if target.superuser {
+            if !catalog.superuser(me) {
+                return Err(denied(
+                    "alter role",
+                    "Only roles with the SUPERUSER attribute may alter roles with the SUPERUSER \
+                     attribute."
+                        .to_owned(),
+                ));
+            }
+        } else if (!catalog.createrole(me) || !catalog.is_admin(me, role)) && role != me {
+            return Err(denied(
+                "alter role",
+                format!(
+                    "Only roles with the CREATEROLE attribute and the ADMIN option on role \
+                     \"{}\" may alter this role.",
+                    target.name
+                ),
+            ));
+        }
+    }
+    let mut oid = 0;
+    if let Some(name) = database {
+        let row = cx
+            .databases
+            .find(name)
+            .ok_or_else(|| failure("3D000", format!("database \"{name}\" does not exist")))?;
+        oid = row.oid;
+        if spec.is_none() && !catalog.has_privs(me, row.owner) {
+            return Err(failure("42501", format!("must be owner of database {name}")));
+        }
+    }
+    if spec.is_none() && database.is_none() && !catalog.superuser(me) {
+        return Err(denied(
+            "alter setting",
+            "Only roles with the SUPERUSER attribute may alter settings globally.".to_owned(),
+        ));
+    }
+    let keep = Keep { settings: cx.settings, guc: cx.guc, roles: &catalog, session: cx.session };
+    setting::keep(clause, oid, role, &keep, out)
+}
+
 /// `AlterRole`.
 fn alter(
     catalog: &mut Catalog,
@@ -1192,7 +1279,7 @@ fn drop(
 
 #[cfg(test)]
 mod tests {
-    use super::{Attribute, Invalid, Opt, Spec, Statement, Value, parse};
+    use super::{Attribute, Clause, Invalid, Opt, Spec, Statement, Value, parse};
 
     fn statement(sql: &str) -> Result<Statement, Invalid> {
         parse(sql).expect("a statement on roles").statement
@@ -1251,10 +1338,33 @@ mod tests {
                 missing_ok: true
             })
         );
-        assert!(matches!(
-            statement("alter role all in database d set x = 1"),
-            Ok(Statement::Unsupported(_))
-        ));
+        assert_eq!(
+            statement("alter role all in database d set x.y = 1"),
+            Ok(Statement::Set {
+                role: None,
+                database: Some("d".to_owned()),
+                clause: Clause::Set {
+                    name: "x.y".to_owned(),
+                    value: Some(vec![rudb_common::guc::Arg::Integer("1".to_owned())]),
+                },
+            })
+        );
+        assert_eq!(
+            statement("alter user current_user reset all"),
+            Ok(Statement::Set {
+                role: Some(Spec::CurrentUser),
+                database: None,
+                clause: Clause::ResetAll
+            })
+        );
+        assert_eq!(
+            statement("alter role a set role from current"),
+            Ok(Statement::Set {
+                role: Some(Spec::Name("a".to_owned())),
+                database: None,
+                clause: Clause::Current("role".to_owned()),
+            })
+        );
     }
 
     #[test]
