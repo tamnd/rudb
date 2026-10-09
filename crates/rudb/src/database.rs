@@ -4,13 +4,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
 use rudb_catalog::{
-    Alteration, Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName, View,
-    same_name,
+    Alteration, Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName,
+    TEMP_CATALOG, View, same_name,
 };
 use rudb_common::session::Postgres;
 use rudb_common::stat::Provenance;
@@ -648,13 +648,14 @@ pub(crate) struct Shared {
 impl Shared {
     /// A handle on a new database, speaking for its first connection.
     fn first(inner: Inner) -> Self {
-        let conn = Arc::new(Conn::new(Arc::clone(&inner.registry)));
-        Self { inner: Arc::new(inner), conn }
+        let inner = Arc::new(inner);
+        let conn = Arc::new(Conn::new(&inner));
+        Self { inner, conn }
     }
 
     /// A handle on the same database for a new connection.
     fn another(&self) -> Self {
-        let conn = Arc::new(Conn::new(Arc::clone(&self.inner.registry)));
+        let conn = Arc::new(Conn::new(&self.inner));
         Self { inner: Arc::clone(&self.inner), conn }
     }
 }
@@ -701,6 +702,16 @@ struct Conn {
     /// whose foreign key points into one of them is in the list too, so a delete from one of them
     /// leaves nobody's parent behind and does not look.
     truncating: Mutex<Vec<QualifiedName>>,
+    /// The temporary table, view or sequence the statement that runs now makes, set before the
+    /// statement changes the catalog and taken by [`Shared::keep_temporary`] once it is done.
+    making: Mutex<Option<QualifiedName>>,
+    /// The temporary tables, views and sequences this connection made, with the oid each had, in
+    /// the order they were made. They belong to the session that made them, so the connection
+    /// removes the ones still there when it closes.
+    temporary: Mutex<Vec<(QualifiedName, i64)>>,
+    /// The database, so a connection that closes can remove its temporary objects. Weak, so that
+    /// the connection alone does not keep the database open.
+    database: Weak<Inner>,
 }
 
 /// How many plans a connection keeps by the text of their query.
@@ -734,7 +745,8 @@ struct Named {
 }
 
 impl Conn {
-    fn new(registry: Arc<Board>) -> Self {
+    fn new(inner: &Arc<Inner>) -> Self {
+        let registry = Arc::clone(&inner.registry);
         Self {
             open: Mutex::default(),
             // Only the thread of the connection reads it, so one reader slot is enough.
@@ -751,18 +763,74 @@ impl Conn {
             postgres: Mutex::default(),
             begun: AtomicI64::new(0),
             received: AtomicI64::new(0),
+            making: Mutex::default(),
+            temporary: Mutex::default(),
+            database: Arc::downgrade(inner),
+        }
+    }
+
+    /// Removes the temporary objects this connection made that are still the ones it made, last
+    /// first, so a view goes before the table it reads. One that another session dropped and made
+    /// again under the same name has another oid and stays.
+    fn drop_temporary(&mut self) {
+        let made = std::mem::take(self.temporary.get_mut().unwrap_or_else(PoisonError::into_inner));
+        if made.is_empty() {
+            return;
+        }
+        let Some(inner) = self.database.upgrade() else { return };
+        let _writing = inner.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut catalog = inner.catalog.write();
+        for (name, oid) in made.iter().rev() {
+            // A failure leaves the object where it is, which is what the session had before.
+            let _ = match temporary_oid(&catalog, name) {
+                Some((Some(Entry::Table), found)) if found == *oid => {
+                    catalog.trigger_dependents(name, true).and_then(|()| catalog.drop_table(name))
+                }
+                Some((Some(Entry::View), found)) if found == *oid => {
+                    catalog.trigger_dependents(name, true).and_then(|()| catalog.drop_view(name))
+                }
+                Some((None, found)) if found == *oid => catalog.drop_sequence(name, true),
+                _ => Ok(()),
+            };
         }
     }
 }
 
+/// What a name in the temporary database is now and its oid: a table, a view, or a sequence for
+/// `None`.
+fn temporary_oid(catalog: &Catalog, name: &QualifiedName) -> Option<(Option<Entry>, i64)> {
+    match catalog.entry(name) {
+        Ok(Entry::Table) => catalog.table(name).ok().map(|table| (Some(Entry::Table), table.oid())),
+        Ok(Entry::View) => catalog.view(name).ok().map(|view| (Some(Entry::View), view.oid())),
+        Err(_) => catalog.sequence(name).ok().map(|sequence| (None, sequence.oid())),
+    }
+}
+
+/// The temporary table, view or sequence a statement makes, if it makes one.
+fn temporary_made(bound: &Bound) -> Option<QualifiedName> {
+    let name = match bound {
+        Bound::CreateTable(create) => &create.name,
+        Bound::CreateView(create) => &create.name,
+        Bound::Sequence(change) if !change.drop && change.owner.is_none() => {
+            change.name.as_ref()?
+        }
+        _ => return None,
+    };
+    same_name(&name.catalog, TEMP_CATALOG).then(|| name.clone())
+}
+
 /// A transaction still open when its connection goes away never committed, so what it changed
 /// goes with it, and the rows it claimed are free for the others.
+///
+/// The temporary objects it made go too, as they do when a PostgreSQL session or a DuckDB
+/// connection ends.
 impl Drop for Conn {
     fn drop(&mut self) {
         let open = self.open.get_mut().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(snapshot) = open.and_then(|open| open.snapshot) {
             self.registry.end(snapshot.id, false);
         }
+        self.drop_temporary();
     }
 }
 
@@ -6563,6 +6631,7 @@ impl Shared {
         loop {
             self.conn.blocked.store(0, Ordering::Release);
             let result = self.execute_once(ast, sql, parameters, cancel, parse_ns);
+            self.keep_temporary(result.is_ok());
             let holder = self.conn.blocked.swap(0, Ordering::AcqRel);
             if result.is_ok() || holder == 0 {
                 return result;
@@ -6575,6 +6644,17 @@ impl Shared {
             if !self.inner.registry.wait_for(holder, deadline) {
                 return result;
             }
+        }
+    }
+
+    /// Records the temporary object the statement made, when it made one, with its oid, so the
+    /// connection can tell it from another made later under the same name.
+    fn keep_temporary(&self, done: bool) {
+        let made = self.conn.making.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let Some(name) = made.filter(|_| done) else { return };
+        let found = temporary_oid(&self.read(), &name);
+        if let Some((_, oid)) = found {
+            self.conn.temporary.lock().unwrap_or_else(PoisonError::into_inner).push((name, oid));
         }
     }
 
@@ -6908,6 +6988,7 @@ impl Shared {
         if writes && !logged {
             self.unlogged();
         }
+        *self.conn.making.lock().unwrap_or_else(PoisonError::into_inner) = temporary_made(&bound);
         match bound {
             Bound::Query(mut plan) => {
                 let (optimize_ns, rewrite_ns) = optimized(&mut plan, &context)?;
