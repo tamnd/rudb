@@ -1434,6 +1434,16 @@ fn the_runnable_count_is_read_off_the_fourth_field_of_loadavg() {
 }
 
 #[test]
+fn a_shared_machine_lends_the_cores_a_thread_on_each_would_get_and_never_none() {
+    assert_eq!(crate::pool::shared(6, 0), 6);
+    assert_eq!(crate::pool::shared(6, 5), 3);
+    assert_eq!(crate::pool::shared(6, 27), 1);
+    assert_eq!(crate::pool::shared(16, 4), 12);
+    assert_eq!(crate::pool::shared(1, 4), 1);
+    assert_eq!(crate::pool::shared(0, 0), 1);
+}
+
+#[test]
 fn a_yielding_pool_still_lends_the_caller_and_never_more_than_it_has() {
     let pool = Pool::new(4).yielding();
     let lease = pool.lease(16);
