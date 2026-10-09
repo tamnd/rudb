@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.6
+
+In the PostgreSQL dialect, #2968 makes `extract` the call `pg_catalog.extract(text, x)` and gives a `numeric` with the value and the scale of PostgreSQL, through new kernels that follow the part functions of `date.c` and `timestamp.c`, with their unit errors. #2971 moves `date_part` to the same code with `float8` answers computed in `double` as the C code computes them. It also binds a function whose forms are kernels or bodies in SQL through `pg_proc`, so `date_part(text, date)`, `round`, `log`, `log10`, `lpad`, `rpad`, `quote_literal` and `quote_nullable` bind as PostgreSQL binds them. #2962 computes the windows of one query in the order that `select_active_windows` puts them in, which decides the order of the rows when there is no `ORDER BY`. With these changes, the replay of `test_setup`, `with`, `subquery`, `select`, `union`, `window`, `aggregates`, `join` and `limit` gives 1773 of 2588 statements the same as PostgreSQL 19.
+
+For the pin, #2969 answers an `ORDER BY` inside the arguments of `rank`, `percent_rank`, `cume_dist`, `row_number`, `ntile`, `lead` and `lag`, which then read the frame and not the partition. #2960 answers a `CREATE` statement with the `Count` column of the pin.
+
+On the engine side, #2964 counts a filter on a small dimension table over the whole table when it plans, and does not estimate it from the sample. #2965 caps a join estimate with the most rows that one key value holds. #2966 drops a join to a parent that is read only for its key when the counts are kept without their link. #2967 tests a key once at a join whose inputs already hold two of its conditions equal. #2961 opens a packed key a block at a time, as flatten does. #2970 lays out the hot text by the set of runs each function serves. #2963 fixes the footprint test that stopped the release run.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.5
 
 In the PostgreSQL dialect, #2957 leaves the rows that tie on every sort key in the order that the sort of PostgreSQL leaves them in. Under forty rows that is the quicksort of `sort_template.h`, and from forty rows on with an integer first key it is the radix sort of `tuplesort.c`, with the abbreviated keys of text and the abort of their abbreviation. This covers `ORDER BY` and the sort of a window. #2954 refuses a window function or an aggregate in the WHERE, the SET values and the RETURNING list of an UPDATE or a DELETE, so `DELETE ... RETURNING rank() OVER (...)` no longer deletes the rows, and gives the PostgreSQL text for a window function in a clause that cannot hold one. #2958 gives the errors of PostgreSQL for `RESPECT NULLS`, `IGNORE NULLS` or `OVER` on a function that cannot take them, for `count()` and for an `nth_value` count that is not positive.
