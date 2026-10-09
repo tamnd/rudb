@@ -1311,7 +1311,10 @@ pub(crate) fn found_for(
         Held { keyed, chunks, by_key: by_key.as_ref().map(|(domain, _)| domain), made: None };
     let (own_rows, planned) = match exact.filter(|_| placed) {
         Some(exact) if exact.own => (owned(exact, keyed, chunks)?, None),
-        Some(exact) => (None, listed(exact, chunks, &mut held)?),
+        Some(exact) => {
+            let parents = by_key.as_ref().map(|(_, held)| *held);
+            (None, listed(exact, chunks, parents, &mut held)?)
+        }
         None => (None, None),
     };
     // The lists are left for the scan to read when it chooses to, see [`listed`], and that needs
@@ -1598,13 +1601,21 @@ fn reduce(exact: &Exact, held: &mut Held<'_, '_>) -> Result<Option<Pushing>> {
 /// for nothing. On TPC-H q07 the 798 suppliers of France and Germany reach 478,523 rows of
 /// `lineitem` through lists in no order, about 44 instructions a row to push, and the orders of
 /// the two years whose customers are in one of the two reach 173 thousand in runs of the link.
-fn listed(exact: &Exact, chunks: &[Chunk], held: &mut Held<'_, '_>) -> Result<Option<Planned>> {
+fn listed(
+    exact: &Exact,
+    chunks: &[Chunk],
+    parents: Option<u64>,
+    held: &mut Held<'_, '_>,
+) -> Result<Option<Planned>> {
     let rows: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
     let Some(children) = exact.children.filter(|&children| children > 0) else { return Ok(None) };
     // A build row is at most one parent, and a parent has children / parents of them on average,
     // so a side holding more than a LISTED'th of the parents is expected to reach more than a
-    // LISTED'th of the children and is not worth reading the adjacency for.
-    if rows.saturating_mul(LISTED) >= exact.parents.min(children) {
+    // LISTED'th of the children and is not worth reading the adjacency for. The parents the bitmap
+    // over the key values counted, when there is one, because a side can hold one parent many
+    // times. TPC-H q09 joins `lineitem` to the pairs of `partsupp` whose part is green, which are
+    // 42,656 rows and 10,664 parts, and counting the rows sent the scan to test all six million.
+    if parents.unwrap_or(rows).saturating_mul(LISTED) >= exact.parents.min(children) {
         return Ok(None);
     }
     let Some(adjacency) = exact.adjacency() else { return Ok(None) };
