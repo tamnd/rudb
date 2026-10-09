@@ -502,6 +502,72 @@ pub enum Write {
     Delete,
 }
 
+/// A clause of a writing statement that is worked out once for each row, so that an aggregate or a
+/// window function in it has no group of rows to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowClause {
+    /// The `WHERE` of an `UPDATE` or a `DELETE`.
+    Where,
+    /// The values of the `SET` of an `UPDATE`.
+    Set,
+    /// The `RETURNING` list.
+    Returning,
+}
+
+/// Refuses the first aggregate or window function written in one clause of a writing statement.
+///
+/// The source of an `UPDATE` or a `DELETE` holds the condition and the values as columns of a
+/// `SELECT`, and the `RETURNING` list is a `SELECT` too, where both kinds of call are allowed. So the
+/// written expressions are read here, before they are bound. The pin words each clause the way its
+/// binder for that clause does, and PostgreSQL names the clause. An aggregate in the arguments of
+/// a window function is found first, because PostgreSQL transforms the arguments before the call.
+fn per_row(ast: &Ast, catalog: &Catalog, exprs: &[ast::ExprRef], clause: RowClause) -> Result<()> {
+    let user = |name: &str| catalog.aggregating_macro(name);
+    for &expr in exprs {
+        let aggregate = crate::expr::first_aggregate(ast, expr, &user);
+        let window = crate::expr::first_window(ast, expr);
+        let windowed = match (aggregate, window) {
+            (None, None) => continue,
+            (Some(aggregate), Some(window)) => {
+                let (inner, outer) = (ast.expr_span(aggregate), ast.expr_span(window));
+                let inside = outer.start <= inner.start && inner.end <= outer.end;
+                !inside && outer.start < inner.start
+            }
+            (aggregate, _) => aggregate.is_none(),
+        };
+        let (call, state, what) = match (aggregate, window) {
+            (_, Some(window)) if windowed => (window, SqlState::WINDOWING_ERROR, "window"),
+            (Some(aggregate), _) => (aggregate, SqlState::GROUPING_ERROR, "aggregate"),
+            _ => continue,
+        };
+        let (error, place) = match (clause, windowed) {
+            (RowClause::Where, true) => {
+                (Error::binder("WHERE clause cannot contain window functions!"), "WHERE")
+            }
+            (RowClause::Where, false) => {
+                (Error::binder("WHERE clause cannot contain aggregates!"), "WHERE")
+            }
+            (RowClause::Set, _) => {
+                (Error::binder(format!("{what} functions are not allowed in UPDATE")), "UPDATE")
+            }
+            (RowClause::Returning, true) => (
+                Error::not_implemented(
+                    "Unimplemented expression class in ExpressionBinder::BindExpression: WINDOW",
+                ),
+                "RETURNING",
+            ),
+            (RowClause::Returning, false) => {
+                (Error::binder("Aggregate functions are not supported here"), "RETURNING")
+            }
+        };
+        return Err(error
+            .state(state)
+            .pg(format!("{what} functions are not allowed in {place}"))
+            .with_span(ast.expr_span(call)));
+    }
+    Ok(())
+}
+
 /// The `RETURNING` query of a writing statement, bound over the table it writes.
 ///
 /// Only a `DELETE` reads the `rowid` of that table there. The pin has none for the rows an
@@ -515,6 +581,11 @@ fn returning(
     rowid: bool,
 ) -> Result<Option<Box<Plan>>> {
     let Some(query) = query else { return Ok(None) };
+    if let ast::QueryBody::Select(select) = ast.query(query).body {
+        let items = ast.target_list(ast.select(select).targets);
+        let exprs: Vec<ast::ExprRef> = items.iter().map(|item| item.expr).collect();
+        per_row(ast, catalog, &exprs, RowClause::Returning)?;
+    }
     let mut binder = Binder::with(catalog, parameters, session);
     binder.unnumbered = !rowid;
     let (root, scope) = binder.bind_query(ast, query)?;
@@ -4014,6 +4085,8 @@ fn change(
             .unplaced());
         }
     }
+    per_row(ast, catalog, &[written.filter], RowClause::Where)?;
+    per_row(ast, catalog, ast.expr_list(written.values), RowClause::Set)?;
     let mut binder = Binder::with(catalog, parameters, session);
     binder.default_as_null = defaulted.contains(&true);
     binder.unknowns_kept = true;

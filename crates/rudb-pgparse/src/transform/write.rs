@@ -155,6 +155,8 @@ impl Transform<'_> {
             copy: false,
             overriding,
             truncate: None,
+            filter: NONE,
+            values: Slice::default(),
         });
         Ok(Statement::Insert(index))
     }

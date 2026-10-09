@@ -3230,7 +3230,7 @@ impl<'a> Binder<'a> {
         if written == NONE {
             return Ok(Bound::All);
         }
-        self.clause = "LIMIT clause";
+        self.clause = if clause == "OFFSET" { "OFFSET clause" } else { "LIMIT clause" };
         let scope = Scope::empty();
         let bound = self.bind_expr(ast, written, &scope)?;
         // PostgreSQL casts the count to `bigint`, and a parameter takes that type.
@@ -5856,8 +5856,7 @@ impl<'a> Binder<'a> {
                 .state(SqlState::GROUPING_ERROR));
         }
         if self.aggregation.is_none() {
-            // A join condition is the `WHERE` clause here too, the way it is for a window.
-            let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
+            let clause = pin_clause(self.clause);
             let error = Error::binder(format!("{clause} cannot contain aggregates!"))
                 .state(SqlState::GROUPING_ERROR);
             return Err(match postgres_clause(self.clause) {
@@ -6421,12 +6420,14 @@ impl<'a> Binder<'a> {
         {
             return Err(error);
         }
-        // A join condition is part of the `WHERE` clause as far as this one sentence is concerned,
-        // which is upstream's wording and not a simplification: `ON sum(a.i) OVER () = b.i` is
-        // refused there with the words a window in a `WHERE` is refused with.
-        let clause = if self.clause == "JOIN condition" { "WHERE clause" } else { self.clause };
+        let clause = pin_clause(self.clause);
         if clause != "SELECT clause" && clause != "ORDER BY clause" && clause != "QUALIFY clause" {
-            return Err(Error::binder(format!("{clause} cannot contain window functions!")));
+            let error = Error::binder(format!("{clause} cannot contain window functions!"))
+                .state(SqlState::WINDOWING_ERROR);
+            return Err(match postgres_clause(self.clause) {
+                Some(place) => error.pg(format!("window functions are not allowed in {place}")),
+                None => error,
+            });
         }
 
         // `count(*)` is a different function from `count(x)` here for the reason it is a different
@@ -6974,6 +6975,18 @@ fn mirror_target(paths: &[String]) -> Option<(String, FileStamp)> {
     Some((canonical.to_str()?.to_string(), stamp))
 }
 
+/// How the pin names the clause that the binder is in, in an error about what the clause cannot
+/// contain. A join condition is the `WHERE` clause there, which is upstream's wording and not a
+/// simplification: `ON sum(a.i) OVER () = b.i` is refused with the words a window in a `WHERE` is
+/// refused with. An `OFFSET` is bound the way a `LIMIT` is and has its name.
+fn pin_clause(clause: &'static str) -> &'static str {
+    match clause {
+        "JOIN condition" => "WHERE clause",
+        "OFFSET clause" => "LIMIT clause",
+        clause => clause,
+    }
+}
+
 /// How PostgreSQL names the clause that the binder is in, in an error about what the clause cannot
 /// contain. This is `ParseExprKindName` and the special cases of `check_agglevels_and_constraints`.
 /// A clause that PostgreSQL does not have gives `None`.
@@ -6982,7 +6995,9 @@ fn postgres_clause(clause: &str) -> Option<&'static str> {
         "WHERE clause" => "WHERE",
         "JOIN condition" => "JOIN conditions",
         "GROUP BY clause" => "GROUP BY",
+        "HAVING clause" => "HAVING",
         "LIMIT clause" => "LIMIT",
+        "OFFSET clause" => "OFFSET",
         "VALUES clause" => "VALUES",
         "table function arguments" => "functions in FROM",
         _ => return None,

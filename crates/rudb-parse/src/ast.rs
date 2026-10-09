@@ -779,6 +779,12 @@ pub struct Insert {
     pub overriding: Overriding,
     /// The options of the `TRUNCATE` of a PostgreSQL session that this `DELETE` stands for.
     pub truncate: Option<Truncate>,
+    /// The `WHERE` of an `UPDATE` or a `DELETE` as it was written, or `NONE`. The source holds it
+    /// as one of its columns, and the binder reads it here to refuse an aggregate or a window
+    /// function in it, which a condition on one row cannot hold.
+    pub filter: ExprRef,
+    /// The values of the `SET` of an `UPDATE` as they were written, for the same reason.
+    pub values: Slice,
 }
 
 /// `ON CONFLICT`, `INSERT OR REPLACE` or `INSERT OR IGNORE`.

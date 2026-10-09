@@ -322,6 +322,7 @@ impl Ast {
             Some(from) => self.changed_rows_using(interned, name, alias, &sets, filter, from, span),
         };
         let columns = self.placed_part_slice(columns);
+        let values = self.expr_slice(sets.iter().map(|set| set.value));
         let index = self.push_insert(Insert {
             name,
             columns,
@@ -331,6 +332,8 @@ impl Ast {
             copy: false,
             overriding: Overriding::None,
             truncate,
+            filter,
+            values,
         });
         if delete { Statement::Delete(index) } else { Statement::Update(index) }
     }

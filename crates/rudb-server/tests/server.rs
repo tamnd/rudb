@@ -1275,6 +1275,74 @@ fn the_functions_of_postgres_have_its_result_types() {
 }
 
 #[test]
+fn a_window_or_an_aggregate_where_postgres_refuses_one_has_its_error() {
+    let dirs = Dirs::new("misplaced");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create temp table t (a int)");
+    // The texts, the codes and the places are the ones that PostgreSQL 19 gives.
+    for (sql, code, message, place) in [
+        (
+            "delete from t where rank() over () > 1",
+            "42P20",
+            "window functions are not allowed in WHERE",
+            "21",
+        ),
+        (
+            "delete from t where sum(a) > 1",
+            "42803",
+            "aggregate functions are not allowed in WHERE",
+            "21",
+        ),
+        (
+            "update t set a = rank() over ()",
+            "42P20",
+            "window functions are not allowed in UPDATE",
+            "18",
+        ),
+        ("update t set a = sum(a)", "42803", "aggregate functions are not allowed in UPDATE", "18"),
+        (
+            "delete from t returning rank() over ()",
+            "42P20",
+            "window functions are not allowed in RETURNING",
+            "25",
+        ),
+        (
+            "insert into t values (1) returning sum(a)",
+            "42803",
+            "aggregate functions are not allowed in RETURNING",
+            "36",
+        ),
+        (
+            "select a from t group by a having rank() over () > 1",
+            "42P20",
+            "window functions are not allowed in HAVING",
+            "35",
+        ),
+        (
+            "select a from t offset rank() over ()",
+            "42P20",
+            "window functions are not allowed in OFFSET",
+            "24",
+        ),
+        (
+            "select a from t join t s on rank() over () = 1",
+            "42P20",
+            "window functions are not allowed in JOIN conditions",
+            "29",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(place), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_ordered_set_aggregates_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("orderedset");
     let server = Server::start(dirs.config()).unwrap();
