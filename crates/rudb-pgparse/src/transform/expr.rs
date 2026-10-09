@@ -596,21 +596,28 @@ impl Transform<'_> {
         let order = self.ast.order_slice(items);
         let filter = self.optional(call.agg_filter.as_ref())?;
         let distinct = call.agg_distinct;
+        // `IGNORE NULLS` is 1 and `RESPECT NULLS` is 2, which is the default. The binder refuses
+        // either one on a call that cannot have it, so the call is kept to one side when it has
+        // one.
+        let treated = call.ignore_nulls != 0;
         let Some(over) = &call.over else {
-            if call.ignore_nulls != 0 {
-                return clause("IgnoreNulls");
-            }
-            let call = self.push(Expr::Function { name, args, distinct, filter }, location);
+            let made = self.push(Expr::Function { name, args, distinct, filter }, location);
             if order.len > 0 {
-                self.ast.aggregate_orders.push((call, order));
+                self.ast.aggregate_orders.push((made, order));
             }
-            return Ok(call);
+            if treated {
+                self.ast.null_treated.push(made);
+            }
+            return Ok(made);
         };
         let spec = self.over(over)?;
-        // `IGNORE NULLS` is 1 and `RESPECT NULLS` is 2, which is the default.
         let ignore_nulls = call.ignore_nulls == 1;
         let window = Expr::Window { name, args, distinct, filter, ignore_nulls, order, spec };
-        Ok(self.push(window, location))
+        let made = self.push(window, location);
+        if treated {
+            self.ast.null_treated.push(made);
+        }
+        Ok(made)
     }
 
     /// An ordered-set call, `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`. The grammar keeps the

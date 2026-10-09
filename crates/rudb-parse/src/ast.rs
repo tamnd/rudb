@@ -1870,6 +1870,11 @@ pub struct Ast {
     /// The `WITHIN GROUP` calls written with an `OVER` after them, which PostgreSQL refuses once
     /// it knows the name is an ordered-set aggregate.
     pub windowed_within_groups: Vec<ExprRef>,
+    /// The calls written with `RESPECT NULLS` or `IGNORE NULLS` after them, which is where
+    /// PostgreSQL puts the null treatment. PostgreSQL refuses either one on a call that is not a
+    /// window function that reads values, so the binder needs to know that `RESPECT NULLS` was
+    /// written even though it is the default.
+    pub null_treated: Vec<ExprRef>,
     /// The aggregate calls written with `EXPORT_STATE` after them, which answer with the state
     /// they reached rather than with their result.
     pub exported: Vec<ExprRef>,
@@ -2166,6 +2171,11 @@ impl Ast {
     /// Whether a `WITHIN GROUP` call was written with an `OVER` after it.
     pub fn within_group_over(&self, call: ExprRef) -> bool {
         self.windowed_within_groups.contains(&call)
+    }
+
+    /// Whether a call was written with `RESPECT NULLS` or `IGNORE NULLS` after it.
+    pub fn null_treated(&self, call: ExprRef) -> bool {
+        self.null_treated.contains(&call)
     }
 
     /// The `EXCLUDE` and `RENAME` lists of a star, both empty for a star written with neither.

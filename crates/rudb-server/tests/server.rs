@@ -1446,6 +1446,92 @@ fn the_ordered_set_aggregates_of_postgres_give_its_values_and_its_errors() {
     server.stop().unwrap();
 }
 
+/// A call whose `OVER` or `RESPECT NULLS` or `IGNORE NULLS` does not fit the function is refused
+/// with the errors of PostgreSQL 19, once the function is found.
+#[test]
+fn a_window_or_a_null_treatment_on_the_wrong_function_is_refused_as_postgres_refuses_it() {
+    let dirs = Dirs::new("pgovercall");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "select string_agg(coalesce(l::text, '-'), ',' order by i) from (select i, \
+         lag(v) ignore nulls over (order by i) l, first_value(v) respect nulls over (order by i) f \
+         from (values (1, 1), (2, null), (3, 3), (4, null)) t(i, v)) s",
+    );
+    assert_eq!(data_row(&messages[1]), vec![Some(b"-,1,1,3".to_vec())]);
+    for (sql, code, message, place) in [
+        (
+            "select abs(1) ignore nulls",
+            "42809",
+            "RESPECT/IGNORE NULLS specified, but abs is not a window function",
+            Some("8"),
+        ),
+        (
+            "select sum(x) respect nulls from generate_series(1, 3) x",
+            "42809",
+            "aggregate functions do not accept RESPECT/IGNORE NULLS",
+            Some("8"),
+        ),
+        (
+            "select sum(x) ignore nulls over () from generate_series(1, 3) x",
+            "42809",
+            "aggregate functions do not accept RESPECT/IGNORE NULLS",
+            Some("8"),
+        ),
+        (
+            "select row_number() respect nulls over () from generate_series(1, 3) x",
+            "0A000",
+            "function row_number does not allow RESPECT/IGNORE NULLS",
+            None,
+        ),
+        (
+            "select first_value(x) ignore nulls from generate_series(1, 3) x",
+            "42809",
+            "window function first_value requires an OVER clause",
+            Some("8"),
+        ),
+        (
+            "select abs(x) over () from generate_series(1, 3) x",
+            "42809",
+            "OVER specified, but abs is not a window function nor an aggregate function",
+            Some("8"),
+        ),
+        (
+            "select lower(x) over () from generate_series(1, 3) x",
+            "42883",
+            "function lower(integer) does not exist",
+            Some("8"),
+        ),
+        (
+            "select nosuch(x) ignore nulls over () from generate_series(1, 3) x",
+            "42883",
+            "function nosuch(integer) does not exist",
+            Some("8"),
+        ),
+        (
+            "select count() over () from generate_series(1, 3) x",
+            "42809",
+            "count(*) must be used to call a parameterless aggregate function",
+            Some("8"),
+        ),
+        (
+            "select nth_value(x, 0) over () from generate_series(1, 3) x",
+            "22016",
+            "argument of nth_value must be greater than zero",
+            None,
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert!(tags(&messages).ends_with("EZ"), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), place, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn the_math_functions_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("pgmath");

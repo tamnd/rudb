@@ -36,6 +36,7 @@ mod macros;
 mod maps;
 mod orderedset;
 mod ordinality;
+mod overcall;
 mod parameters;
 mod pgcalls;
 mod pivot;
