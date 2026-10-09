@@ -5946,6 +5946,29 @@ impl<'a> Transform<'a> {
     }
 
     /// A one part function name, for the calls the transformer invents rather than reads.
+    /// The name a call with an `OVER` goes by.
+    ///
+    /// The reference binary reads `first` and `last` with an `OVER` as the window functions
+    /// `first_value` and `last_value`, so they take `IGNORE NULLS` and an order inside the
+    /// brackets, refuse `DISTINCT` and `FILTER` the way those do, and name their column after them.
+    /// A qualifier stays where it was written, so `main.first(x) OVER ()` is `main.first_value`.
+    fn window_name(&mut self, name: Slice) -> Slice {
+        let mut parts = self.ast.parts[name.range()].to_vec();
+        let Some(last) = parts.pop() else {
+            return name;
+        };
+        let written = self.ast.string(last);
+        let renamed = if written.eq_ignore_ascii_case("first") {
+            "first_value"
+        } else if written.eq_ignore_ascii_case("last") {
+            "last_value"
+        } else {
+            return name;
+        };
+        parts.push(self.intern(renamed));
+        self.part_slice(parts)
+    }
+
     fn function_name(&mut self, name: &str) -> Slice {
         let interned = self.intern(name);
         self.part_slice(vec![interned])
@@ -6321,6 +6344,7 @@ impl<'a> Transform<'a> {
         if over != NONE {
             let args = self.expr_slice(args);
             let spec = self.over(over)?;
+            let name = self.window_name(name);
             let call = self.push(Expr::Window {
                 name,
                 args,
