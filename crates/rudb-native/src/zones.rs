@@ -141,6 +141,10 @@ impl Zones for Stripes {
         self.reader.matched(column, function, pattern)
     }
 
+    fn counted(&self, column: usize, branches: &[(&str, &str)]) -> Option<u64> {
+        self.reader.counted(column, branches)
+    }
+
     fn picked(
         &self,
         column: usize,

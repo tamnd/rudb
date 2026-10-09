@@ -8460,6 +8460,46 @@ impl Reader {
         self.read_rows(part, &[column], &positions, false).ok().map(Some)
     }
 
+    /// How many rows of the table hold a value of `column` any of `branches` keeps, run over every
+    /// row when the table has no more than [`PICKED_PARTS`] parts, the tables [`Self::picked`] runs
+    /// a condition over whole. `None` for a larger table and for a column that is not a string.
+    /// Kept for as long as the reader is, as [`Self::matched`] keeps its shares.
+    #[must_use]
+    pub fn counted(&self, column: usize, branches: &[(&str, &str)]) -> Option<u64> {
+        let key = (column, "every".to_owned(), format!("{branches:?}"));
+        if let Some(&count) = self.matched.lock().ok()?.get(&key) {
+            #[expect(clippy::cast_possible_truncation, reason = "a count stored as an f64")]
+            #[expect(clippy::cast_sign_loss, reason = "a count stored as an f64")]
+            return Some(count as u64);
+        }
+        let field = self.table.fields.get(column)?;
+        if field.ty != LogicalType::Varchar || branches.is_empty() || self.parts() > PICKED_PARTS {
+            return None;
+        }
+        let recipes: Vec<Recipe> = branches
+            .iter()
+            .map(|&(function, pattern)| {
+                Recipe::new(function, &[None, Some(Value::Varchar(pattern.into()))])
+            })
+            .collect();
+        let mut kept = 0_u64;
+        for part in 0..self.parts() {
+            let chunk = self.read_sparse(part, &[column]).ok()?;
+            let values = chunk.column(0).ok()?;
+            let mut held = vec![false; values.len()];
+            for (&(function, pattern), recipe) in branches.iter().zip(&recipes) {
+                let passed = passing(values, function, pattern, recipe)?;
+                for (held, passed) in held.iter_mut().zip(passed) {
+                    *held |= passed;
+                }
+            }
+            kept += held.iter().filter(|&&held| held).count() as u64;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "a row count of a small table")]
+        self.matched.lock().ok()?.insert(key, kept as f64);
+        Some(kept)
+    }
+
     /// The values of `key` in every row of the table `function` keeps, run as [`Self::matched`]
     /// runs it, when the table has no more than `PICKED_PARTS` parts and the rows kept are no more
     /// than `most`.

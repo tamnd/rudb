@@ -513,6 +513,9 @@ pub fn rows_stat_into(
         // how many the call gives back for each of them.
         Node::LateralFunction { .. } => Stat::Unknown,
         Node::Filter { input, predicate } => {
+            if let Some(count) = evaluated(plan, input, predicate) {
+                return Stat::exact(count, Provenance::Evaluated);
+            }
             let (kept, from) = kept(plan, input, predicate, stats, reads);
             // The bounds are a ceiling over the guess and not a new thing to guess about. A store
             // that keeps a minimum and a maximum per part can say which parts this filter rules
@@ -972,6 +975,37 @@ fn sampled(plan: &Plan, input: NodeRef, conjunct: ExprRef) -> Option<f64> {
         return Some(f64::min(total, 1.0));
     }
     sampled_one(plan, input, conjunct).map(|(_, share)| share)
+}
+
+/// How many rows a filter straight on a scan keeps, counted by the store over every row, where the
+/// filter is one condition [`condition`] reads or an `OR` of them over one column. See
+/// [`Zones::counted`].
+///
+/// Ahead of everything else, because it is the one answer that is not about the filter but the
+/// filter's own result. Only a filter of one condition, since two over different columns are
+/// counted together or not at all, and the conjunctions of JOB's dimension filters are on tables
+/// whose other conditions the synopsis counts.
+fn evaluated(plan: &Plan, input: NodeRef, predicate: ExprRef) -> Option<u64> {
+    let [conjunct] = conjuncts(plan, predicate)[..] else { return None };
+    let branches = match *plan.expr(conjunct) {
+        Expr::Conjunction { op: ConjunctionOp::Or, children } => plan.expr_list(children),
+        _ => std::slice::from_ref(&conjunct),
+    };
+    // Capped for the reason [`common`] caps.
+    if branches.is_empty() || branches.len() > 32 {
+        return None;
+    }
+    let mut store = None;
+    let mut asked = Vec::with_capacity(branches.len());
+    for &branch in branches {
+        let (zones, function, column, constant) = condition(plan, input, branch)?;
+        if store.get_or_insert((zones, column)).1 != column {
+            return None;
+        }
+        asked.push((function, constant));
+    }
+    let (zones, column) = store?;
+    zones.counted(column, &asked)
 }
 
 /// [`sampled`] for one condition, with the store's number for the column it reads.
