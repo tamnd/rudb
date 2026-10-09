@@ -47,6 +47,7 @@ use rudb_plan::{
 };
 
 use crate::pass::producer;
+use crate::tables::{self, TableSet};
 use crate::{bounds, walk};
 
 /// What one conjunct of a filter is assumed to keep.
@@ -613,14 +614,23 @@ pub fn rows_stat_into(
                 }
                 _ => (None, None),
             };
-            join(
-                Both { rows: of(left), base: unfiltered(plan, left, stats) },
-                Both { rows: of(right), base: unfiltered(plan, right, stats) },
+            let rows = (of(left), of(right));
+            let joined = join(
+                Both { rows: rows.0, base: unfiltered(plan, left, stats) },
+                Both { rows: rows.1, base: unfiltered(plan, right, stats) },
                 kind,
                 tested.len(),
                 keyspace(plan, conditions, stats, reads),
                 named,
-            )
+            );
+            // A semi join keeps no more than the inner join of the same sides makes, so the one cap
+            // holds both of them.
+            match (kind, rows.0.value(), rows.1.value()) {
+                (JoinKind::Inner | JoinKind::Semi, Some(&near), Some(&far)) => {
+                    held_under(joined, most_matched(plan, (left, right), tested, (near, far)))
+                }
+                _ => joined,
+            }
         }
         // The one join in the engine whose shape is known before any number is. A forward link
         // answers at most one parent per child row, so the child's count is the answer rather than
@@ -2199,6 +2209,141 @@ pub fn named(plan: &Plan, near: NodeRef, conditions: &[ExprRef]) -> Option<(f64,
     }
 }
 
+/// The most rows an inner join of `sides` can make, from the most rows one key value holds.
+///
+/// A row on one side meets no more rows on the other than its key value holds there, so the join is
+/// at most one side's rows times the other's [`degree`] on the column the condition compares, and
+/// the smaller of the two ways round over every equality the join tests. That is the bound of
+/// SafeBound and LpBound in its plainest form, and section 12.5 of `bench/job/12-cardinality.md`
+/// takes it as a cap and never as the estimate. Containment says a join is as tall as its larger
+/// side, which is right when the larger side holds the foreign key and is as wrong as it can be
+/// when it holds the key: JOB 20a meets six people grouped out of `cast_info` with `name` and was
+/// put at all 4,167,491 rows of it.
+///
+/// The rows are the estimates of the two sides and not counts, so this is a bound only as far as
+/// they are. `None` where no equality has a degree on either side.
+fn most_matched(
+    plan: &Plan,
+    sides: (NodeRef, NodeRef),
+    conditions: &[ExprRef],
+    rows: (u64, u64),
+) -> Option<u64> {
+    let held = (tables::produced(plan, sides.0), tables::produced(plan, sides.1));
+    let mut most: Option<u64> = None;
+    for &condition in conditions {
+        let Some((near, far)) = split(plan, condition, &held) else {
+            continue;
+        };
+        for bound in [
+            degree(plan, sides.1, far, DEGREE_DEPTH).map(|value| rows.0.saturating_mul(value)),
+            degree(plan, sides.0, near, DEGREE_DEPTH).map(|value| rows.1.saturating_mul(value)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            most = Some(most.map_or(bound, |held| held.min(bound)));
+        }
+    }
+    most
+}
+
+/// How deep [`degree`] goes, which is against a malformed plan rather than against a deep one.
+const DEGREE_DEPTH: u32 = 64;
+
+/// The columns `condition` makes equal, the one `held.0` produces first, where it is an equality
+/// between a column of each side. Not `IS NOT DISTINCT FROM`, whose nulls meet each other and which
+/// the counts of [`Frequencies::most`] leave out.
+fn split(
+    plan: &Plan,
+    condition: ExprRef,
+    held: &(TableSet, TableSet),
+) -> Option<(ColumnBinding, ColumnBinding)> {
+    let Expr::Compare { op: CompareOp::Equal, left, right } = *plan.expr(condition) else {
+        return None;
+    };
+    let (&Expr::Column(left), &Expr::Column(right)) = (plan.expr(left), plan.expr(right)) else {
+        return None;
+    };
+    if held.0.contains(left.table) && held.1.contains(right.table) {
+        Some((left, right))
+    } else if held.0.contains(right.table) && held.1.contains(left.table) {
+        Some((right, left))
+    } else {
+        None
+    }
+}
+
+/// The most rows of what `at` produces that hold any one value of `column`.
+///
+/// At a scan it is what the table's synopsis says, and a filter can only take rows away. A join
+/// multiplies it by the most rows the other side has for any one row of this side, which is the
+/// smallest degree among the equalities it tests, so `cast_info.person_id` joined to `name` on its
+/// key keeps the degree it had. A semi or an anti join is a filter on its left side. A group is one
+/// row per value when it is the only group, and otherwise no more rows than the value had going in.
+/// A projection carries a column through as it found it. Anything else is `None`.
+fn degree(plan: &Plan, at: NodeRef, column: ColumnBinding, depth: u32) -> Option<u64> {
+    let depth = depth.checked_sub(1)?;
+    match *plan.node(at) {
+        Node::Filter { input, .. } => degree(plan, input, column, depth),
+        Node::Get { index, columns, .. } if index == column.table => {
+            let name = &plan.field_list(columns).get(column.column as usize)?.name;
+            let frequencies = plan.frequencies(index)?;
+            frequencies.most(frequencies.column(name)?)
+        }
+        Node::Join { left, kind: JoinKind::Semi | JoinKind::Anti, .. } => {
+            degree(plan, left, column, depth)
+        }
+        Node::Join { left, right, kind: JoinKind::Inner, conditions, .. } => {
+            let held = (tables::produced(plan, left), tables::produced(plan, right));
+            let (near, far, held) = if held.0.contains(column.table) {
+                (left, right, held)
+            } else {
+                (right, left, (held.1, held.0))
+            };
+            let own = degree(plan, near, column, depth)?;
+            let mut fanout: Option<u64> = None;
+            for &condition in plan.expr_list(conditions) {
+                let Some((_, other)) = split(plan, condition, &held) else {
+                    continue;
+                };
+                if let Some(most) = degree(plan, far, other, depth) {
+                    fanout = Some(fanout.map_or(most, |held| held.min(most)));
+                }
+            }
+            Some(own.saturating_mul(fanout?))
+        }
+        Node::Aggregate { input, index, groups, .. } if index == column.table => {
+            let groups = plan.expr_list(groups);
+            let group = *groups.get(column.column as usize)?;
+            if groups.len() == 1 {
+                return Some(1);
+            }
+            let &Expr::Column(under) = plan.expr(group) else {
+                return None;
+            };
+            degree(plan, input, under, depth)
+        }
+        Node::Project { input, index, exprs, .. } if index == column.table => {
+            let carried = *plan.expr_list(exprs).get(column.column as usize)?;
+            let &Expr::Column(carried) = plan.expr(carried) else {
+                return None;
+            };
+            degree(plan, input, carried, depth)
+        }
+        _ => None,
+    }
+}
+
+/// `joined` held under `most` where it is above it, said as coming from the synopses `most` read.
+fn held_under(joined: Stat<u64>, most: Option<u64>) -> Stat<u64> {
+    match (joined, most) {
+        (Stat::Known { value, class, .. }, Some(most)) if most.max(1) < value => {
+            Stat::Known { value: most.max(1), class, provenance: Provenance::FrequencySynopsis }
+        }
+        _ => joined,
+    }
+}
+
 /// A side as the two numbers [`join`] reads: what it produces and what it would produce unfiltered.
 #[derive(Clone, Copy)]
 struct Both {
@@ -3767,6 +3912,12 @@ mod tests {
             self.tail.filter(|_| column == 1)
         }
 
+        fn most(&self, column: usize) -> Option<u64> {
+            let listed = self.held.get(column)?.as_ref()?.iter().map(|&(_, of)| of).max();
+            let left = self.tail.filter(|_| column == 1).map_or(0, |tail| tail.most);
+            Some(listed.unwrap_or(0).max(left))
+        }
+
         fn rows_passing(&self, column: usize, tests: &[(Op, Bound)]) -> Stat<u64> {
             let (Some(Some(list)), None) = (self.held.get(column), self.tail) else {
                 return Stat::Unknown;
@@ -3792,6 +3943,36 @@ mod tests {
         plan.set_frequencies(0, Arc::clone(held) as Arc<dyn Frequencies>);
         plan.measure_distinct(0, "a", Stat::exact(distinct, Provenance::Dictionary));
         rows_stat(&plan, plan.root(), &stats)
+    }
+
+    /// The estimate of a few groups out of a ten row table `s` joined to `t` on the column of `t`
+    /// whose counts `held` keeps.
+    fn grouped_join(held: &Arc<Counted>) -> Stat<u64> {
+        let text = "Join INNER on=[(#2.0::INTEGER = #0.0::INTEGER)::BOOLEAN]\n  \
+                    Aggregate #2 groups=[#1.0::INTEGER] aggregates=[]\n    \
+                    Get memory.main.s AS s #1 [x::INTEGER]\n  \
+                    Get memory.main.t AS t #0 [a::INTEGER, b::INTEGER]\n";
+        let stats = facts(&[("t", 1_500_000), ("s", 10)]);
+        let mut plan =
+            Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
+        plan.set_frequencies(0, Arc::clone(held) as Arc<dyn Frequencies>);
+        rows_stat(&plan, plan.root(), &stats)
+    }
+
+    #[test]
+    fn a_join_to_a_key_is_held_under_the_rows_one_value_of_it_holds() {
+        // JOB 20a in small. A handful of groups meets `t` on a column where no value holds more
+        // than one row, so the join makes no more rows than there are groups, where containment
+        // calls it as tall as `t`.
+        let held = Counted::of(Some(vec![(3, 1), (4, 1), (5, 1)]));
+        let joined = grouped_join(&held);
+        assert!(joined.value().is_some_and(|&rows| rows <= 10), "{joined:?}");
+        assert!(matches!(joined, Stat::Known { provenance: Provenance::FrequencySynopsis, .. }));
+        // A column whose values hold a thousand rows each lets each group meet a thousand, and a
+        // column with no synopsis bounds nothing, which leaves the join where containment put it.
+        let wide = grouped_join(&Counted::of(Some(vec![(3, 1000), (4, 1000)])));
+        assert!(wide.value().is_some_and(|&rows| rows > 10 && rows <= 10_000), "{wide:?}");
+        assert_eq!(grouped_join(&Counted::of(None)).value(), Some(&1_500_000));
     }
 
     #[test]
