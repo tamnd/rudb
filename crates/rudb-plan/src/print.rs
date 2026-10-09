@@ -264,6 +264,7 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             key,
             aggregates,
             folds,
+            wanted,
             ..
         } => {
             out.write_char(' ')?;
@@ -289,6 +290,9 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
                     write!(out, " {} {}", fold[1], call.ty)?;
                 }
                 out.write_str(") ")?;
+            }
+            if let Some(wanted) = wanted {
+                write!(out, "WANTED {wanted} ")?;
             }
             write!(out, "#{index} ")?;
             write_schema(plan, out, columns)

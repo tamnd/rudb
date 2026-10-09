@@ -2177,6 +2177,9 @@ const fn both(stat: Stat<u64>) -> Both {
     Both { rows: stat, base: stat }
 }
 
+/// What [`named`] finds for the left and for the right side of a join.
+type Named = (Option<(f64, Provenance)>, Option<(f64, Provenance)>);
+
 /// The join kinds, each of which is a different question.
 fn join(
     left: Both,
@@ -2184,7 +2187,7 @@ fn join(
     kind: JoinKind,
     conditions: usize,
     keys: Option<(u64, bool)>,
-    named: (Option<(f64, Provenance)>, Option<(f64, Provenance)>),
+    named: Named,
 ) -> Stat<u64> {
     let (left, right, bases) = (left.rows, right.rows, (left.base, right.base));
     match kind {

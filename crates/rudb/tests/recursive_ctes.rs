@@ -224,3 +224,81 @@ fn what_the_pin_refuses_is_refused_in_its_words() {
         assert_eq!(refused(&database, sql), expected, "{sql}");
     }
 }
+
+/// A limit over a recursion that never ends on its own ends it, as PostgreSQL and the pin end it by
+/// producing rows only as the query reads them. Here the rounds stop once the rows the limit reads
+/// are produced, and the rows are the first ones in the order the rounds made them.
+#[test]
+fn a_limit_ends_a_recursion_that_would_not_end_on_its_own() {
+    let database = Database::new();
+    let endless = "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM t)";
+    assert_eq!(
+        rows(&database, &format!("{endless} SELECT * FROM t LIMIT 10")),
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+    );
+    assert_eq!(
+        rows(&database, &format!("{endless} SELECT * FROM t LIMIT 3 OFFSET 2")),
+        ["3", "4", "5"]
+    );
+    assert_eq!(rows(&database, &format!("{endless} SELECT n * 2 FROM t LIMIT 3")), ["2", "4", "6"]);
+    assert_eq!(
+        rows(&database, &format!("{endless} SELECT * FROM t LIMIT 0")),
+        Vec::<String>::new()
+    );
+    // What reads the limit can be anything.
+    assert_eq!(
+        rows(&database, &format!("{endless} SELECT sum(n) FROM (SELECT * FROM t LIMIT 100) AS s")),
+        ["5050"]
+    );
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(n) AS (VALUES (1) UNION SELECT n + 1 FROM t) SELECT * FROM t LIMIT 4"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    // A round can make more rows than the limit reads, and only the first ones are kept.
+    assert_eq!(
+        rows(
+            &database,
+            "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n * 10 + k FROM t, \
+             (VALUES (1), (2), (3)) AS v(k)) SELECT * FROM t LIMIT 5"
+        ),
+        ["1", "11", "12", "13", "111"]
+    );
+}
+
+/// The recursion learns how many rows it has to make only when nothing but projections stands
+/// between the limit and the read of it, since a filter, a sort or a second read of it needs an
+/// unknown number of its rows.
+#[test]
+fn only_a_limit_that_reads_the_recursion_alone_bounds_it() {
+    let database = Database::new();
+    let plan = |sql: &str| {
+        database.plan(sql).unwrap_or_else(|error| panic!("{sql} did not plan: {error}"))
+    };
+    let finite = "WITH RECURSIVE t(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM t WHERE n < 20)";
+    assert!(plan(&format!("{finite} SELECT n + 1 FROM t LIMIT 3 OFFSET 4")).contains("WANTED 7 "));
+    assert!(
+        plan(&format!("{finite} SELECT max(n) FROM (SELECT n FROM t LIMIT 6) AS s"))
+            .contains("WANTED 6 ")
+    );
+    for read in [
+        "SELECT * FROM t WHERE n % 2 = 0 LIMIT 3",
+        "SELECT * FROM t ORDER BY n DESC LIMIT 3",
+        "SELECT a.n FROM t AS a, t AS b LIMIT 3",
+        "SELECT count(*) FROM (SELECT n FROM t LIMIT 7) AS s, t AS u",
+        "SELECT * FROM t",
+    ] {
+        let sql = format!("{finite} {read}");
+        assert!(!plan(&sql).contains("WANTED"), "{sql}");
+    }
+    assert_eq!(
+        rows(&database, &format!("{finite} SELECT * FROM t WHERE n % 2 = 0 LIMIT 3")),
+        ["2", "4", "6"]
+    );
+    assert_eq!(
+        rows(&database, &format!("{finite} SELECT * FROM t ORDER BY n DESC LIMIT 3")),
+        ["20", "19", "18"]
+    );
+}

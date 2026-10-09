@@ -1008,6 +1008,7 @@ impl<'a> Binder<'a> {
             key,
             aggregates,
             folds,
+            wanted: None,
         }))
     }
 
