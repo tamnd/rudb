@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.2
+
+With the consistent reduction turned off, rudb now answers all 113 JOB queries as DuckDB does in 12.7 s of hot median time against DuckDB's 58.8 s on server2, 4.6 times faster in total and 7.1 times by geometric mean. Three changes to join ordering did it. #2886 charges a join to a dimension the rows its named key values hold on the other side, instead of the share of its own rows the filter kept, and lets an order that builds fewer cross products win outright. #2887 tests an inner join's key for null at its scan when at least one row in a hundred is null there, which takes 10c from about 800 ms to about 25. #2888 searches every connected order of a region of up to 14 leaves with DPccp and keeps greedy above that. Two queries are still slower than DuckDB with the reduction off, 19d and 7c. With it on the plans are unchanged.
+
+#2879 folds MIN and MAX over string views on the views. #2875 reads graph sections where the mapped file holds them, which takes most of the page faults out of a cold run. #2873 holds a set of row ids as a list below one member in 256 rows, #2877 makes a column's part slots thirty two parts at a time, #2883 keeps a count group's weight where its hash was, and #2884 builds the lengths of a stored text column from its packed ends a run at a time.
+
+#2871 counts the rows of a relation for `count(t.*)` and not the rows an outer join made up. #2878 compares a row against a query of as many columns in `IN`, `ANY` and `ALL`, #2880 parses `JOIN BY (TYPE x)`, #2881 answers a correlated aggregate's projection over an empty group, and #2882 compares unnamed structs with `<>` a field at a time in a mark join. In the PostgreSQL server, #2874 reads all of a query with the grammar before any of it runs, #2876 gives 25P02 for a `COPY` in a failed transaction block, and #2885 keeps the values of `ALTER DATABASE SET` and `ALTER ROLE SET`.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.1
 
 #2870 writes `EXPLAIN` in a PostgreSQL session the way `explain.c` writes it, in text, JSON, YAML and XML. The options give the errors of PostgreSQL, the costs are the defaults PostgreSQL uses for a table it has not analyzed, and `ANALYZE` runs the query and writes the actual rows and times. The plan is still rudb's plan, so a node that PostgreSQL does not have keeps the closest PostgreSQL name and says its own name. #2868 compiles the time zones from the IANA release of each pin, the 2026e data of PostgreSQL 19 for the PostgreSQL dialect and the 2026c data of the ICU in DuckDB v2.0 for the DuckDB dialect, and removes chrono-tz.
