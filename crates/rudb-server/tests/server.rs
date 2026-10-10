@@ -7458,3 +7458,57 @@ fn a_join_takes_the_names_postgres_gives_it() {
     );
     server.stop().unwrap();
 }
+
+#[test]
+fn a_row_compares_a_pair_at_a_time_as_postgres() {
+    let dirs = Dirs::new("pgrowcompare");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in [
+        "create temp table rc (f1 int, f2 int)",
+        "insert into rc values (1, 2), (2, 3), (1, 1), (8, null)",
+    ] {
+        assert!(tags(&client.query(sql)).ends_with("CZ"), "{sql}");
+    }
+    // The values and the errors are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "select string_agg(coalesce((row(1, 2) = (select f1, f2))::text, 'null'), ' ' \
+             order by f1, f2) from rc",
+            "false true false false",
+        ),
+        ("select row(1, 2) = (select f1, f2 from rc where f1 = 1 and f2 = 2)", "t"),
+        (
+            "select coalesce((row(1, 2) = (select f1, f2 from rc where false))::text, 'null')",
+            "null",
+        ),
+        ("select row(1, 2) < (select 1, 3)", "t"),
+        ("select coalesce((row(1, null) = row(2, 2))::text, 'null')", "false"),
+        ("select coalesce((row(1, null) = row(1, 2))::text, 'null')", "null"),
+        ("select row(1, null) < row(2, null)", "t"),
+        ("select coalesce((row(1, null) < row(1, 2))::text, 'null')", "null"),
+        ("select row(1, 2) >= row(1, 2)", "t"),
+        ("select row(2, 0) > row(1, 9)", "t"),
+        ("select coalesce((row(1, 2) <> row(1, null::int))::text, 'null')", "null"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    for (sql, message) in [
+        (
+            "select row(1, 2) = (select f1, f2 from rc)",
+            "more than one row returned by a subquery used as an expression",
+        ),
+        ("select (1, 2) = (select 1, 2, 3)", "subquery has too many columns"),
+        ("select (1, 2, 3) = (select 1, 2)", "subquery has too few columns"),
+        ("select row(1, 2) = row(1, 2, 3)", "unequal number of entries in row expressions"),
+        ("select row() = row()", "cannot compare rows of zero length"),
+    ] {
+        let messages = client.query(sql);
+        let tags = tags(&messages);
+        assert!(tags.ends_with("EZ"), "{sql}");
+        let error = &messages[tags.len() - 2];
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
