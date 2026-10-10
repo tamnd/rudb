@@ -585,3 +585,37 @@ fn a_dictionary_column_loaded_into_a_native_file_reads_back_as_the_file_has_it()
     drop(database);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_partition_key_takes_over_a_file_column_of_its_name_and_goes_after_the_row_number() {
+    let database = Database::new();
+    let root = format!("{}/hive-parquet", env!("CARGO_TARGET_TMPDIR"));
+    for (dir, rows) in
+        [("a=7", "SELECT 1 AS a, 2 AS z UNION ALL SELECT 3, 4"), ("a=8", "SELECT 5 AS a, 6 AS z")]
+    {
+        std::fs::create_dir_all(format!("{root}/{dir}")).expect("makes it");
+        let sql = format!("COPY ({rows}) TO '{root}/{dir}/x.parquet' (FORMAT PARQUET)");
+        database.execute(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    let sql = format!(
+        "SELECT * FROM read_parquet('{root}/*/*.parquet', file_row_number=true, filename='fn') \
+         ORDER BY ALL"
+    );
+    let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result.names(), ["a", "z", "file_row_number", "fn"]);
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["BIGINT", "INTEGER", "BIGINT", "VARCHAR"]);
+    let sql = format!(
+        "SELECT string_agg(concat_ws(':', a, z, file_row_number, replace(fn, '{root}/', '')), ' ' \
+         ORDER BY a, z) FROM read_parquet('{root}/*/*.parquet', file_row_number=true, \
+         filename='fn')"
+    );
+    let rows = Value::Varchar("7:2:0:a=7/x.parquet 7:4:1:a=7/x.parquet 8:6:0:a=8/x.parquet".into());
+    assert_eq!(database.value(&sql).expect("runs"), rows);
+    // A filter on the key reads the files whose directory holds the value, whatever the file's own
+    // statistics say about the column it took over.
+    let sql = format!("SELECT count(*) FROM '{root}/*/*.parquet' WHERE a = 7");
+    assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(2));
+    let sql = format!("SELECT count(*) FROM '{root}/a=8/*.parquet' WHERE a = 8");
+    assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(1));
+}

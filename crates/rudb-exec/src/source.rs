@@ -8,7 +8,7 @@
 //! numbers and not rows.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,8 +19,8 @@ use rudb_common::{Error, Field, LogicalType, Result, Session, SessionTimeZone, V
 use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
-    FILE_ROW_NUMBER, Given, TableFunction, csv_given, json_text, open_csv, open_parquet,
-    series_length,
+    FILE_ROW_NUMBER, Given, TableFunction, csv_given, hive_value, json_text, open_csv,
+    open_parquet, partitions, series_length,
 };
 use rudb_graph::{NO_PARENT, Rid, Rids};
 use rudb_kernels::json::scan;
@@ -3645,19 +3645,23 @@ pub(crate) struct FileScan<'a> {
     /// What a JSON read's parameters say and how its bind settled, and `None` for any other read.
     json: Option<Arc<(scan::Options, scan::Settled)>>,
     wanted: Vec<Field>,
-    /// Whether the last column the scan produces is the row's ordinal inside its own file.
+    /// Whether one of the columns the scan produces is the row's ordinal inside its own file.
     ///
-    /// `file_row_number=True`, which is a column no file holds and the scan counts. It is last
-    /// because the binder puts it last, and it is a flag rather than a position because everything
-    /// else here indexes [`Self::wanted`] and that list is the file's columns only.
+    /// `file_row_number=True`, which is a column no file holds and the scan counts. Where it goes
+    /// is in [`Self::slots`], and this is what a file being cut into ranges has to ask, since a
+    /// range cannot know how many rows came before it.
     numbered: bool,
+    /// Where each produced column comes from, and empty when every one is the file column at the
+    /// same place, which is every scan with no ordinal, no filename and no partitions.
+    slots: Vec<Slot>,
     schema: Schema,
     /// The comparisons a row group's bounds can be checked against before it is handed out.
     ///
-    /// Written in terms of this scan's own output positions, because that is what the filter above
-    /// it is written in terms of and what the builder can read without knowing which file is open.
-    /// [`Self::advance`] turns them into the file's column numbers, once per file, since two files
-    /// of one glob are allowed to hold the same columns in a different order.
+    /// Handed over in terms of this scan's own output positions, because that is what the filter
+    /// above it is written in terms of and what the builder can read without knowing which file is
+    /// open, and kept in terms of [`Self::wanted`]. [`Self::advance`] turns them into the file's
+    /// column numbers, once per file, since two files of one glob are allowed to hold the same
+    /// columns in a different order.
     ///
     /// Empty when there is no filter above the scan, when the filter has no conjunct a bound can
     /// answer, or when the source is a CSV, and empty means every row group is handed out, which is
@@ -3993,13 +3997,35 @@ impl<'a> FileScan<'a> {
             None => None,
         };
         let produced = plan.field_list(columns).to_vec();
-        // The binder puts the counted column last and nothing between here and there reorders a
-        // scan's columns, so the flag is whether the last one is it. Pruning can drop it, in which
-        // case there is nothing to count, and pruning can drop everything else, in which case the
-        // file is opened for its row count and no column of it is read.
-        let numbered = produced.last().is_some_and(|field| field.name == FILE_ROW_NUMBER);
-        let wanted =
-            if numbered { produced[..produced.len() - 1].to_vec() } else { produced.clone() };
+        // The binder puts the counted column after the file's and the filename and partition
+        // columns after that, and nothing between here and there reorders a scan's columns. Pruning
+        // can drop any of them, and pruning can drop every file column, in which case the file is
+        // opened for its row count and no column of it is read. A JSON read adds its filename
+        // column itself.
+        let named = if function.json().is_some() {
+            Vec::new()
+        } else {
+            named_options(plan, options, settings)?
+        };
+        let slots = slots(&produced, &named, &paths);
+        let numbered = slots.contains(&Slot::Number);
+        let wanted: Vec<Field> = produced
+            .iter()
+            .zip(&slots)
+            .filter(|(_, slot)| matches!(slot, Slot::File(_)))
+            .map(|(field, _)| field.clone())
+            .collect();
+        // The tests are written against what the scan produces and the file is asked about its
+        // own columns, so a test on a column no file holds is dropped, which reads every row group
+        // and is what a scan with no test does.
+        let tests = tests
+            .into_iter()
+            .filter_map(|(at, op, bound)| match slots.get(at)? {
+                Slot::File(column) => Some((*column, op, bound)),
+                _ => None,
+            })
+            .collect();
+        let plain = slots.iter().enumerate().all(|(at, slot)| *slot == Slot::File(at));
         let scan = Self {
             function,
             paths,
@@ -4007,6 +4033,7 @@ impl<'a> FileScan<'a> {
             json,
             wanted,
             numbered,
+            slots: if plain { Vec::new() } else { slots },
             schema: Schema::numbered(produced, index),
             tests,
             cutting: Mutex::new(Cutting {
@@ -4283,24 +4310,43 @@ impl<'a> FileScan<'a> {
             .ok_or_else(|| Error::internal(format!("a file scan was read at morsel {index}")))
     }
 
-    /// The chunk with the row number column on the end of it.
+    /// The chunk with the columns no file holds put in among the file's, in the order the scan
+    /// produces them.
     ///
-    /// Built rather than read, because no file holds it. The values are a run, and the reason this
-    /// is a loop over a range rather than a sequence vector is that the scan's consumer is free to
-    /// slice or gather the chunk and a flat column survives both without a case.
-    fn number(&self, chunk: Chunk, piece: &mut Piece) -> Result<Chunk> {
+    /// Built rather than read. The row numbers are a run, and the reason that is a loop over a
+    /// range rather than a sequence vector is that the scan's consumer is free to slice or gather
+    /// the chunk and a flat column survives both without a case. The filename and the partition
+    /// values are the same for every row of a file, so each is one value held once.
+    fn place(&self, chunk: Chunk, piece: &mut Piece) -> Result<Chunk> {
         let rows = chunk.len();
-        let mut columns = Vec::with_capacity(chunk.width() + 1);
-        for at in 0..chunk.width() {
-            columns.push(chunk.column(at)?.clone());
+        let path = self.paths.get(piece.file).map_or("", String::as_str);
+        let found = if self.slots.iter().any(|slot| matches!(slot, Slot::Hive(_))) {
+            partitions(path)
+        } else {
+            BTreeMap::new()
+        };
+        let types = self.schema.types();
+        let mut columns = Vec::with_capacity(self.slots.len());
+        for (slot, ty) in self.slots.iter().zip(types) {
+            columns.push(match slot {
+                Slot::File(at) => chunk.column(*at)?.clone(),
+                Slot::Number => {
+                    let first = piece.row;
+                    let mut data = Vec::with_capacity(rows);
+                    for at in 0..rows {
+                        data.push(first.saturating_add(i64::try_from(at).unwrap_or(i64::MAX)));
+                    }
+                    Vector::flat(LogicalType::BigInt, Data::Int64(data.into()))?
+                }
+                Slot::Filename => Vector::constant(ty, Value::Varchar(path.to_string()), rows),
+                Slot::Hive(key) => {
+                    let text = found.get(key).map_or("", String::as_str);
+                    let value = hive_value(key, text, &ty)?;
+                    Vector::constant(ty, value, rows)
+                }
+            });
         }
-        let first = piece.row;
         piece.row = piece.row.saturating_add(i64::try_from(rows).unwrap_or(i64::MAX));
-        let mut data = Vec::with_capacity(rows);
-        for at in 0..rows {
-            data.push(first.saturating_add(i64::try_from(at).unwrap_or(i64::MAX)));
-        }
-        columns.push(Vector::flat(LogicalType::BigInt, Data::Int64(data.into()))?);
         Chunk::with_rows(columns, rows)
     }
 
@@ -4414,8 +4460,8 @@ impl Source for FileScan<'_> {
                 continue;
             };
             let mut chunk = self.conform(chunk, file)?;
-            if self.numbered {
-                chunk = self.number(chunk, &mut piece)?;
+            if !self.slots.is_empty() {
+                chunk = self.place(chunk, &mut piece)?;
             }
             // After the row numbers rather than before them, because the number a row carries is
             // its ordinal in the file and dropping rows first would renumber the ones that are
@@ -4633,14 +4679,82 @@ fn csv_options(plan: &Plan, options: Slice, settings: Slice) -> Result<Given> {
     if options.len == 0 {
         return Ok(Given::default());
     }
+    csv_given(&named_options(plan, options, settings)?)
+}
+
+/// The named parameters of a table function call, each with its value.
+fn named_options(plan: &Plan, options: Slice, settings: Slice) -> Result<Vec<(&str, Value)>> {
+    if options.len == 0 {
+        return Ok(Vec::new());
+    }
     let exprs: Vec<ExprRef> = plan.expr_list(settings).to_vec();
     let source = Schema::empty();
     let one = Chunk::with_rows(Vec::new(), 1)?;
     let evaluated = evaluate_all(plan, &exprs, &source, &one)?;
-    let names: Vec<&str> = plan.name_list(options).iter().map(|name| plan.string(*name)).collect();
-    let written: Vec<(&str, Value)> =
-        names.into_iter().zip(evaluated.iter().map(|vector| vector.value_at(0))).collect();
-    csv_given(&written)
+    let names = plan.name_list(options).iter().map(|name| plan.string(*name));
+    Ok(names.zip(evaluated.iter().map(|vector| vector.value_at(0))).collect())
+}
+
+/// Where each column a file scan produces comes from.
+#[derive(Debug, Clone, PartialEq)]
+enum Slot {
+    /// The file column at this place in [`FileScan::wanted`].
+    File(usize),
+    /// The row's ordinal inside its own file, which `file_row_number` asks for.
+    Number,
+    /// The path of the file the row came out of, which `filename` asks for.
+    Filename,
+    /// The value of this partition key in the path of the file the row came out of.
+    Hive(String),
+}
+
+/// Where each of the fields `produced` comes from, given the options the binder settled.
+///
+/// The binder writes `hive_partitioning=true` and `filename='<column>'` into the options when it
+/// adds those columns and leaves them out otherwise, see `rudb_functions::hive`. A partition key
+/// is found by name whatever its place, since a key that is also a column of the file took that
+/// column's place, and the ordinal is the last column that is neither.
+fn slots(produced: &[Field], named: &[(&str, Value)], paths: &[String]) -> Vec<Slot> {
+    let mut filename = None;
+    let mut keys = Vec::new();
+    for (name, value) in named {
+        match (*name, value) {
+            ("filename", Value::Varchar(column)) => filename = Some(column.as_str()),
+            ("hive_partitioning", Value::Boolean(true)) => {
+                keys = paths
+                    .first()
+                    .map(|path| partitions(path))
+                    .unwrap_or_default()
+                    .into_keys()
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    let mut slots: Vec<Slot> = produced
+        .iter()
+        .map(|field| {
+            if let Some(key) = keys.iter().find(|key| key.eq_ignore_ascii_case(&field.name)) {
+                Slot::Hive(key.clone())
+            } else if filename.is_some_and(|column| column.eq_ignore_ascii_case(&field.name)) {
+                Slot::Filename
+            } else {
+                Slot::File(0)
+            }
+        })
+        .collect();
+    let last = slots.iter().rposition(|slot| *slot == Slot::File(0));
+    if let Some(at) = last.filter(|&at| produced[at].name == FILE_ROW_NUMBER) {
+        slots[at] = Slot::Number;
+    }
+    let mut next = 0;
+    for slot in &mut slots {
+        if *slot == Slot::File(0) {
+            *slot = Slot::File(next);
+            next += 1;
+        }
+    }
+    slots
 }
 
 /// The file names a file reading table function was called with.
