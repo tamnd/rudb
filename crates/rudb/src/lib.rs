@@ -232,6 +232,16 @@ pub mod generate {
     pub use rudb_parse::generate::{Catalog, Generator, Table};
 }
 
+/// What a native file holds beside its rows, for a tool that checks a file without it.
+///
+/// [`native::strip_sections`] drops the sections of the kinds it is given from a file, so a run can
+/// show that an answer does not depend on a graph or statistics section, which the settings that
+/// turn those off cannot show because they only keep a plan from using one.
+pub mod native {
+    pub use rudb_native::section::{GRAPH_KINDS, LINK_COUNTS, STATISTICS_KINDS};
+    pub use rudb_native::strip_sections;
+}
+
 /// Arrow interchange, which is what [`QueryResult::to_arrow`] hands back.
 ///
 /// A module rather than a flat re-export because Arrow has a `Field` and a `Schema` of its own and

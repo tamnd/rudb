@@ -67,6 +67,9 @@ pub fn run(arguments: &[String], out: Box<dyn Write>, err: Box<dyn Write>) -> Ex
             ExitCode::FAILURE
         }
         Action::Run(options) => {
+            if let Some(kinds) = &options.strip {
+                return strip(&options.database, kinds, out, err);
+            }
             // The library decides what a database name means, here and behind `.open`, so there is
             // one rule about it rather than a copy of the rule in the shell.
             let config = Config::default().with_read_only(options.readonly);
@@ -132,6 +135,32 @@ fn read_input(shell: &mut Shell, options: &Options) -> Stop {
     }
     shell.greet();
     shell.prompt(&stdin)
+}
+
+/// Drops the sections `kinds` names from the file at `database` and says how many went.
+///
+/// `graph` is the kinds the graph document owns and the counts the link build writes beside them,
+/// `statistics` is the kinds the statistics document owns, and `all` is every section, including
+/// the ones neither document owns.
+fn strip(database: &str, kinds: &str, out: Box<dyn Write>, err: Box<dyn Write>) -> ExitCode {
+    let (mut out, mut err) = (out, err);
+    let kinds: Vec<&str> = kinds.split(',').collect();
+    let picked = |kind: &[u8; 8]| {
+        kinds.contains(&"all")
+            || (kinds.contains(&"graph")
+                && (rudb::native::GRAPH_KINDS.contains(&kind) || kind == rudb::native::LINK_COUNTS))
+            || (kinds.contains(&"statistics") && rudb::native::STATISTICS_KINDS.contains(&kind))
+    };
+    match rudb::native::strip_sections(database, picked) {
+        Ok(dropped) => {
+            let _ = writeln!(out, "dropped {dropped} sections from {database}");
+            ExitCode::SUCCESS
+        }
+        Err(problem) => {
+            let _ = writeln!(err, "rudb: {problem}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// The settled decisions from `spec/00-README.md` that a reader would otherwise have to take on
