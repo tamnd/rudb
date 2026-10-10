@@ -873,9 +873,9 @@ pub(crate) fn bind_one(
 }
 
 /// The type and the value one `COPY ... TO` option was written as.
-struct Written {
-    ty: LogicalType,
-    value: Option<Value>,
+pub(crate) struct Written {
+    pub(crate) ty: LogicalType,
+    pub(crate) value: Option<Value>,
 }
 
 impl Written {
@@ -1026,7 +1026,7 @@ fn copy_to(
         return Err(Error::catalog(format!("Copy Function with name {format} does not exist!")));
     }
     refuse_written(copy, typed, &format)?;
-    let (partitioned, rest) = crate::partition::partitioning(copy, names, &format)?;
+    let (partitioned, rest) = crate::partition::partitioning(copy, typed, names, &format)?;
     let mut out = match format.as_str() {
         "json" => json_to(&rest, plan)?,
         "parquet" => parquet_to(&rest, plan)?,
@@ -1100,9 +1100,8 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                 }
             }
             "compression" | "dateformat" | "date_format" | "timestampformat"
-            | "timestamp_format" | "new_line" | "prefix" | "suffix" | "per_thread_output"
-            | "file_size_bytes" | "return_files" | "preserve_order" | "force_not_null"
-            | "encoding" => {
+            | "timestamp_format" | "new_line" | "prefix" | "suffix" | "return_files"
+            | "preserve_order" | "force_not_null" | "encoding" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
                 )));
@@ -1166,8 +1165,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     "Option \"encoding\" is not supported for writing - only for reading",
                 ));
             }
-            "compression" | "per_thread_output" | "file_size_bytes" | "return_files"
-            | "preserve_order" => {
+            "compression" | "return_files" | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
                 )));
@@ -1258,7 +1256,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                 out.row_group_size = out.row_group_size.max(1);
             }
             "row_group_size_bytes"
-            | "row_groups_per_file"
             | "compression_level"
             | "field_ids"
             | "kv_metadata"
@@ -1268,8 +1265,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             | "bloom_filter_false_positive_ratio"
             | "parquet_version"
             | "geoparquet_version"
-            | "per_thread_output"
-            | "file_size_bytes"
             | "return_files"
             | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
