@@ -105,6 +105,7 @@ pub mod pgproc;
 pub mod pgregexp;
 mod pgstring;
 mod pgunicode;
+mod pgregression;
 mod pgvariance;
 pub mod prepare;
 mod printf;

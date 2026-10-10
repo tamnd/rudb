@@ -30,6 +30,7 @@ use crate::histogram::Binned;
 use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
 use crate::pgorderedset::OrderedSet;
+use crate::pgregression::FloatPairs;
 use crate::pgvariance::{ExactSpread, FloatSpread};
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
@@ -119,6 +120,9 @@ pub(crate) enum General {
     ExactSpread(Box<ExactSpread>),
     /// The variance family of a PostgreSQL session over a double, in [`crate::pgvariance`].
     FloatSpread(FloatSpread),
+    /// `corr`, the covariances and the `regr_*` family of a PostgreSQL session, in
+    /// [`crate::pgregression`].
+    FloatPairs(FloatPairs),
     /// `fsum` and `favg`, a sum with Kahan's running error, in the pin's steps.
     Kahan { value: f64, err: f64, count: u64, average: bool },
     /// `count_if`, the rows that were true, and whether any row was not null.
@@ -225,6 +229,9 @@ impl General {
         if let Some(state) = FloatSpread::named(name) {
             return Some(Self::FloatSpread(state));
         }
+        if let Some(state) = FloatPairs::named(name) {
+            return Some(Self::FloatPairs(state));
+        }
         if name == "avg" {
             return Timed::new(returns).map(Self::Timed);
         }
@@ -320,6 +327,7 @@ impl General {
             Self::Ordered { rows, .. } => rows.push(args.to_vec()),
             Self::Set(state) => state.update(args)?,
             Self::Paired(state) => state.update(args)?,
+            Self::FloatPairs(state) => state.update(args)?,
             _ if value.is_null() => {}
             Self::Counted { key, .. } if args.len() > 1 => {
                 let mut binned = Binned::new(false, key.clone());
@@ -515,7 +523,7 @@ impl General {
     pub(crate) const fn takes_reals(&self, arguments: usize) -> bool {
         matches!(
             (self, arguments),
-            (Self::Paired(_), 2) | (Self::Powers(_) | Self::FloatSpread(_), 1)
+            (Self::Paired(_) | Self::FloatPairs(_), 2) | (Self::Powers(_) | Self::FloatSpread(_), 1)
         )
     }
 
@@ -523,6 +531,7 @@ impl General {
     pub(crate) fn push_reals(&mut self, row: &[f64]) {
         match (self, row) {
             (Self::Paired(state), [y, x]) => state.add(*y, *x),
+            (Self::FloatPairs(state), [y, x]) => state.add(*y, *x),
             (Self::Powers(state), [input]) => state.add(*input),
             (Self::FloatSpread(state), [input]) => state.add(*input),
             _ => {}
@@ -760,6 +769,7 @@ impl General {
             (Self::Powers(state), Self::Powers(theirs)) => state.combine(theirs),
             (Self::ExactSpread(state), Self::ExactSpread(theirs)) => state.combine(theirs)?,
             (Self::FloatSpread(state), Self::FloatSpread(theirs)) => state.combine(theirs)?,
+            (Self::FloatPairs(state), Self::FloatPairs(theirs)) => state.combine(theirs)?,
             (
                 Self::Kahan { value, err, count, .. },
                 Self::Kahan { value: theirs, err: their_err, count: more, .. },
@@ -910,6 +920,7 @@ impl General {
             Self::Powers(state) => state.finish()?,
             Self::ExactSpread(state) => state.finish()?,
             Self::FloatSpread(state) => state.finish()?,
+            Self::FloatPairs(state) => state.finish()?,
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
             Self::Ordered { .. }
