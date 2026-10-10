@@ -4212,7 +4212,7 @@ impl<'a> Binder<'a> {
         let fields = match resolved.columns {
             // The whole file readers take their patterns the way the file readers do, and like
             // them hand the executor one name per file, though their columns never change.
-            Columns::Fixed(fields) if resolved.function.reads_contents() => {
+            Columns::Fixed(fields) if resolved.function.lists_files() => {
                 let paths = self.content_paths(cast[0], resolved.function.name())?;
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
