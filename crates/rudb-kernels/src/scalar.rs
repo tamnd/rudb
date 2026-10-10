@@ -1375,6 +1375,12 @@ pub const PG_FLOAT_MULTIPLY: &str = "__rudb_pg_float_multiply";
 /// See [`PG_FLOAT_ADD`].
 pub const PG_FLOAT_DIVIDE: &str = "__rudb_pg_float_divide";
 
+/// The number of rows an end of a limit asks for, as a `BIGINT`, or a null. See
+/// [`cast::bound_rows`].
+pub const LIMIT_ROWS: &str = "__rudb_limit_rows";
+/// See [`LIMIT_ROWS`].
+pub const OFFSET_ROWS: &str = "__rudb_offset_rows";
+
 /// What an arithmetic operator checks besides the operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Checks {
@@ -4532,6 +4538,9 @@ pub fn call_values(
     }
     if let Some(value) = crate::variant::call(name, args)? {
         return Ok(value);
+    }
+    if let (LIMIT_ROWS | OFFSET_ROWS, [value]) = (name, args) {
+        return cast::bound_rows(value, if name == LIMIT_ROWS { "LIMIT" } else { "OFFSET" });
     }
     if let ("__rudb_zero_to_null", [value]) = (name, args) {
         return Ok(if approximate(value) == Some(0.0) { Value::Null } else { value.clone() });

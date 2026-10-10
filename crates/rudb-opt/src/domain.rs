@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use rudb_common::{Field, LogicalType, Value};
+use rudb_common::{Field, LogicalType, Span, Value};
 use rudb_plan::{
     Arm, Bound, BuildSide, ColumnBinding, CompareOp, ConjunctionOp, Expr, ExprRef, JoinKind, Node,
     NodeRef, Plan, Slice, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
@@ -296,12 +296,8 @@ pub(crate) fn unsupported(plan: &Plan, at: NodeRef, outer: &TableSet) -> Option<
             Some("a recursive definition with aggregates and no key".to_owned())
         }
         Node::RecursiveCte { .. } => None,
-        Node::Limit { count, offset, .. } => match (count, offset) {
-            (Bound::All | Bound::Rows(_), Bound::Rows(_)) => None,
-            _ => Some("a LIMIT holding a value that is not known until the query runs".to_owned()),
-        },
         Node::LimitPercent { .. } => Some("a LIMIT written as a percentage".to_owned()),
-        Node::LimitTies { .. } => Some("a FETCH FIRST WITH TIES".to_owned()),
+        Node::Limit { .. } | Node::LimitTies { .. } => None,
         Node::Join { kind: JoinKind::Positional, .. } => Some("a positional join".to_owned()),
         Node::Join { .. } => None,
         ref held => Some(format!("a {}", held.keyword())),
@@ -423,17 +419,18 @@ fn push(
             let below = push(plan, input, domain, index, keys, outer)?;
             window(plan, below, at_index, partition, order, frame, expressions, keys)
         }
-        // A bound the query reads off its own rows cannot come along. What replaces a limit down
-        // here is a row number per domain value compared against the count, and the count has to
-        // be a number to be written into that comparison.
+        // What replaces a limit down here is a row number per domain value compared against the
+        // count. A count that is not a number reads a column, often the outer row's, which the
+        // domain carries now, so each domain value is compared against its own count.
         Node::Limit { input, count, offset } => {
-            let (count, offset) = match (count, offset) {
-                (Bound::All, Bound::Rows(offset)) => (None, offset),
-                (Bound::Rows(count), Bound::Rows(offset)) => (Some(count), offset),
-                _ => return None,
-            };
             let below = push(plan, input, domain, index, keys, outer)?;
-            limited(plan, below, None, count, offset, keys)
+            let (count, offset) = ends(plan, count, offset, &mapping(keys, &below));
+            limited(plan, below, None, count, offset, false, keys)
+        }
+        Node::LimitTies { input, keys: order, count, offset } => {
+            let below = push(plan, input, domain, index, keys, outer)?;
+            let (count, offset) = ends(plan, count, offset, &mapping(keys, &below));
+            limited(plan, below, Some(order), count, offset, true, keys)
         }
         // A share cannot be pushed the way a row count can. Crossing the input with the domain
         // makes it as many times longer as there are domain values, and a fixed share of the long
@@ -441,7 +438,8 @@ fn push(
         Node::LimitPercent { .. } => None,
         Node::TopN { input, keys: order, count, offset } => {
             let below = push(plan, input, domain, index, keys, outer)?;
-            limited(plan, below, Some(order), Some(count), offset, keys)
+            let (count, offset) = (Some(End::Rows(count)), End::Rows(offset));
+            limited(plan, below, Some(order), count, offset, false, keys)
         }
         Node::SetOp { left, right, kind, all, index: at_index } => {
             let width = walk::outputs(plan, left)?.len();
@@ -811,17 +809,23 @@ fn branch(
 /// everything where the operator it replaces was not. That is the same trade the sort rule makes
 /// and it is the one worth making, because the alternative on offer is not a cheaper plan, it is
 /// refusing the query.
+///
+/// An end that reads the outer row, `LIMIT o.n`, is compared the same way with the number it reads
+/// for each domain value. It goes through [`LIMIT_ROWS`] or [`OFFSET_ROWS`] first, which casts it
+/// and refuses a negative number the way the limit operator does. A null count is every row and a
+/// null offset skips none, as they are for the operator.
 fn limited(
     plan: &mut Plan,
     below: Pushed,
     order: Option<Slice>,
-    count: Option<u64>,
-    offset: u64,
+    count: Option<End>,
+    offset: End,
+    ties: bool,
     keys: &[Key],
 ) -> Option<Pushed> {
     // `LIMIT ALL` with no offset keeps every row of every outer row's matches, which is what the
     // relation under it already holds, so there is nothing to number and nothing to drop.
-    if count.is_none() && offset == 0 {
+    if count.is_none() && offset == End::Rows(0) {
         return Some(below);
     }
     let map = mapping(keys, &below);
@@ -852,21 +856,24 @@ fn limited(
         end: WindowBound::CurrentRow,
         exclude: WindowExclude::NoOthers,
     };
-    let name = plan.intern("row_number");
-    let args = plan.add_expr_list(&[]);
-    let call = plan.add_expr_at(
-        Expr::Window {
-            name,
-            args,
-            distinct: false,
-            filter: None,
-            ignore_nulls: false,
-            order: Slice::EMPTY,
-        },
-        LogicalType::BigInt,
-        span,
-    );
-    let expressions = plan.add_expr_list(&[call]);
+    let mut calls = Vec::new();
+    for function in if ties { &["row_number", "rank"][..] } else { &["row_number"] } {
+        let name = plan.intern(function);
+        let args = plan.add_expr_list(&[]);
+        calls.push(plan.add_expr_at(
+            Expr::Window {
+                name,
+                args,
+                distinct: false,
+                filter: None,
+                ignore_nulls: false,
+                order: Slice::EMPTY,
+            },
+            LogicalType::BigInt,
+            span,
+        ));
+    }
+    let expressions = plan.add_expr_list(&calls);
     let at_index = walk::fresh_index(plan);
     let node = plan.add_node(Node::Window {
         input: below.node,
@@ -879,28 +886,71 @@ fn limited(
 
     let numbered =
         plan.add_expr_at(Expr::Column(ColumnBinding::new(at_index, 0)), LogicalType::BigInt, span);
+    // With ties the upper bound is on the rank and not the row number. A row past the count ties
+    // with the last row the count took exactly when no more rows than the count sort before it.
+    // A count of nought takes no row and so leaves none to tie with.
+    let ranked = match ties {
+        true => plan.add_expr_at(
+            Expr::Column(ColumnBinding::new(at_index, 1)),
+            LogicalType::BigInt,
+            span,
+        ),
+        false => numbered,
+    };
+    let upper = |count: u64| if count == 0 { numbered } else { ranked };
     let mut bounds = Vec::new();
-    if offset > 0 {
-        let at = i64::try_from(offset).ok()?;
-        let value = plan.add_value(Value::BigInt(at));
-        let right = plan.add_expr_at(Expr::Constant(value), LogicalType::BigInt, span);
+    let mut compare = |plan: &mut Plan, op, left, right| {
         bounds.push(plan.add_expr_at(
-            Expr::Compare { op: CompareOp::Greater, left: numbered, right },
+            Expr::Compare { op, left, right },
             LogicalType::Boolean,
             span,
         ));
-    }
-    if let Some(count) = count {
-        // The offset rows are skipped by being numbered and then dropped, so the upper bound counts
-        // from the start of the partition and not from where the query starts reading.
-        let at = i64::try_from(offset.saturating_add(count)).ok()?;
-        let value = plan.add_value(Value::BigInt(at));
-        let right = plan.add_expr_at(Expr::Constant(value), LogicalType::BigInt, span);
-        bounds.push(plan.add_expr_at(
-            Expr::Compare { op: CompareOp::LessOrEqual, left: numbered, right },
-            LogicalType::Boolean,
-            span,
-        ));
+    };
+    match (count, offset) {
+        (count, End::Rows(offset)) if !matches!(count, Some(End::Read(_))) => {
+            if offset > 0 {
+                let right = rows(plan, offset, span)?;
+                compare(plan, CompareOp::Greater, numbered, right);
+            }
+            if let Some(End::Rows(count)) = count {
+                // The offset rows are skipped by being numbered and then dropped, so the upper
+                // bound counts from the start of the partition and not from where the query starts
+                // reading.
+                let right = rows(plan, offset.saturating_add(count), span)?;
+                compare(plan, CompareOp::LessOrEqual, upper(count), right);
+            }
+        }
+        (count, offset) => {
+            // The same two comparisons, `n > offset` and `n - offset <= count`, written as
+            // expressions. The subtraction cannot overflow, because neither side is negative.
+            let skipped = match offset {
+                End::Rows(offset) => rows(plan, offset, span)?,
+                End::Read(expr) => {
+                    let read = big_call(plan, OFFSET_ROWS, &[expr], span);
+                    let none = rows(plan, 0, span)?;
+                    big_call(plan, "coalesce", &[read, none], span)
+                }
+            };
+            compare(plan, CompareOp::Greater, numbered, skipped);
+            let taken = match count {
+                None => None,
+                Some(End::Rows(count)) => Some((rows(plan, count, span)?, upper(count))),
+                Some(End::Read(expr)) => {
+                    let read = big_call(plan, LIMIT_ROWS, &[expr], span);
+                    let every = rows(plan, i64::MAX.unsigned_abs(), span)?;
+                    let taken = big_call(plan, "coalesce", &[read, every], span);
+                    if ties {
+                        let none = rows(plan, 0, span)?;
+                        compare(plan, CompareOp::Greater, taken, none);
+                    }
+                    Some((taken, ranked))
+                }
+            };
+            if let Some((taken, upper)) = taken {
+                let counted = big_call(plan, "-", &[upper, skipped], span);
+                compare(plan, CompareOp::LessOrEqual, counted, taken);
+            }
+        }
     }
     let predicate = match bounds.len() {
         // Both bounds absent is the early return at the top of this, so there is always one here.
@@ -917,6 +967,46 @@ fn limited(
     };
     let node = plan.add_node(Node::Filter { input: node, predicate });
     Some(Pushed { node, keys: below.keys, moved: below.moved })
+}
+
+/// One end of a limit pushed under the domain, which is a number or an expression to read it from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Rows(u64),
+    Read(ExprRef),
+}
+
+/// The two ends of a limit pushed under the domain, with what they read rewritten to read the
+/// domain columns. `None` is no count, and an offset the query left off is nought rows.
+fn ends(
+    plan: &mut Plan,
+    count: Bound,
+    offset: Bound,
+    map: &HashMap<ColumnBinding, ColumnBinding>,
+) -> (Option<End>, End) {
+    let mut end = |bound: Bound| match bound {
+        Bound::All => None,
+        Bound::Rows(rows) => Some(End::Rows(rows)),
+        Bound::Read(expr) => Some(End::Read(remap(plan, expr, map))),
+    };
+    (end(count), end(offset).unwrap_or(End::Rows(0)))
+}
+
+/// The scalar calls that read an end of a limit, `LIMIT_ROWS` and `OFFSET_ROWS` of the kernels.
+const LIMIT_ROWS: &str = "__rudb_limit_rows";
+const OFFSET_ROWS: &str = "__rudb_offset_rows";
+
+/// A number of rows as a `BIGINT` constant.
+fn rows(plan: &mut Plan, rows: u64, span: Span) -> Option<ExprRef> {
+    let value = plan.add_value(Value::BigInt(i64::try_from(rows).ok()?));
+    Some(plan.add_expr_at(Expr::Constant(value), LogicalType::BigInt, span))
+}
+
+/// A call that answers a `BIGINT`, which every call a limit is written with does.
+fn big_call(plan: &mut Plan, name: &str, args: &[ExprRef], span: Span) -> ExprRef {
+    let name = plan.intern(name);
+    let args = plan.add_expr_list(args);
+    plan.add_expr_at(Expr::Function { name, args }, LogicalType::BigInt, span)
 }
 
 /// One end of a frame with its expression rewritten, when it has one.

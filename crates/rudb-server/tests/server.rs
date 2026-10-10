@@ -7568,3 +7568,56 @@ fn fetch_first_with_ties_keeps_the_rows_that_tie_as_postgres() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_limit_in_a_correlated_subquery_reads_the_outer_row_as_postgres() {
+    let dirs = Dirs::new("pgcorrlim");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers and the errors are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "select string_agg((select n from generate_series(1, 10) n order by n \
+             limit 1 offset s - 1)::text, ' ' order by s) from generate_series(1, 3) s",
+            "1 2 3",
+        ),
+        (
+            "select string_agg((select count(*) from (select n from generate_series(1, 10) n \
+             limit nullif(s, 3)) t)::text, ' ' order by s) from generate_series(2, 4) s",
+            "2 10 4",
+        ),
+        (
+            "select string_agg((select count(*) from (select n from generate_series(1, 10) n \
+             offset nullif(s, 3)) t)::text, ' ' order by s) from generate_series(2, 4) s",
+            "8 10 6",
+        ),
+        (
+            "select string_agg((select string_agg(n::text, ',') from (select n \
+             from generate_series(1, 10) n order by n / 3 fetch first s rows with ties) t), ' ' \
+             order by s) from generate_series(1, 3) s",
+            "1,2 1,2 1,2,3,4,5",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    for (sql, message) in [
+        (
+            "select (select count(*) from (select n from generate_series(1, 10) n \
+             limit s - 3) t) from generate_series(2, 4) s",
+            "LIMIT must not be negative",
+        ),
+        (
+            "select (select count(*) from (select n from generate_series(1, 10) n \
+             offset s - 3) t) from generate_series(2, 4) s",
+            "OFFSET must not be negative",
+        ),
+    ] {
+        let messages = client.query(sql);
+        let tags = tags(&messages);
+        assert!(tags.ends_with("EZ"), "{sql}");
+        let error = &messages[tags.len() - 2];
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
