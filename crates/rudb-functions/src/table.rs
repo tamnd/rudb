@@ -332,6 +332,11 @@ impl TableFunction {
     /// goes for `column_names` and `names`. `columns` takes a struct of any shape and is listed
     /// with no type, which is how the pin's `ANY` is written here, and so do `types`, `dtypes` and
     /// `column_types`, which take a struct or a list.
+    ///
+    /// `null_padding=true` asks for a row that is short to be read with nulls for the columns it is
+    /// missing, which is what this reader does with every short row, so it is listed for being
+    /// what already happens. The pin refuses a short row when it is false, and this reader does not
+    /// refuse it yet, which is the one place a setting here is not followed to the letter.
     #[must_use]
     pub fn parameters(self) -> &'static [(&'static str, LogicalType)] {
         static READ_PARQUET: &[(&str, LogicalType)] = &[
@@ -356,6 +361,7 @@ impl TableFunction {
                     ("max_line_size", LogicalType::Varchar),
                     ("maximum_line_size", LogicalType::Varchar),
                     ("names", LogicalType::list(LogicalType::Varchar)),
+                    ("null_padding", LogicalType::Boolean),
                     ("nullstr", LogicalType::Varchar),
                     ("quote", LogicalType::Varchar),
                     ("sep", LogicalType::Varchar),

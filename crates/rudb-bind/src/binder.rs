@@ -7527,7 +7527,7 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         return format!("Cannot use NULL as argument to key \"{parameter}\"");
     }
     match parameter {
-        "header" | "auto_detect" => {
+        "header" | "auto_detect" | "null_padding" => {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
         "buffer_size" | "max_line_size" | "maximum_line_size" | "skip" => {

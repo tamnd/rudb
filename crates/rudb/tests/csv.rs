@@ -321,6 +321,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    max_line_size VARCHAR\n",
         "    maximum_line_size VARCHAR\n",
         "    names VARCHAR[]\n",
+        "    null_padding BOOLEAN\n",
         "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
         "    sep VARCHAR\n",
@@ -599,4 +600,20 @@ fn skip_steps_over_lines_before_the_file_is_sniffed_and_they_still_count() {
     ] {
         assert_eq!(read(options).unwrap_err(), expected, "{options}");
     }
+}
+
+#[test]
+fn null_padding_reads_a_short_row_with_nulls_for_what_it_is_missing() {
+    let database = Database::new();
+    let file = written("padding.csv", "a,b,c\n1,x,2\n3,y\n4\n");
+    let sql = format!(
+        "SELECT string_agg(concat_ws(':', a, b, c), ' ') FROM read_csv({file}, null_padding=true)"
+    );
+    assert_eq!(database.value(&sql).expect("runs"), Value::Varchar("1:x:2 3:y 4".into()));
+    let sql = format!("SELECT * FROM read_csv({file}, null_padding=NULL)");
+    let error = database.query(&sql).unwrap_err();
+    assert_eq!(
+        error.message(),
+        "\"null_padding\" expects a non-null boolean value (e.g. TRUE or 1)"
+    );
 }
