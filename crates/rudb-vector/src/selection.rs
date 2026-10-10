@@ -9,6 +9,7 @@
 //! copied five columns to save the next operator a redirection. On a query that filters and then
 //! projects two of those columns, three of the copies were free work.
 
+use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 
 /// Which positions of a vector are still in play, as indices into it.
@@ -182,9 +183,7 @@ impl Selection {
     /// The positions, in order.
     #[must_use]
     pub fn indices(&self) -> &[u32] {
-        self.list.get_or_init(|| {
-            self.mask.as_deref().map_or_else(Vec::new, |words| listed(words, self.kept))
-        })
+        self.list.get_or_init(|| self.mask.as_deref().map_or_else(Vec::new, listed))
     }
 
     /// The positions as `usize`, in order.
@@ -296,50 +295,113 @@ impl Selection {
 /// How many dropped rows a word may have and still be walked by the rows it drops.
 const DENSE_WORD: u32 = 8;
 
-/// The positions whose bits are set in `words`, `kept` of them, in order.
+/// How many rows of a sparse word are written before asking whether it holds more.
+///
+/// A filter that keeps a few rows in a hundred leaves most words with none, one or two, so the
+/// first four are written whether the word has them or not and the answer only counts the ones it
+/// has. What that saves is the branch on whether a word is empty and the branch that ends the walk
+/// of its rows, and with words that are empty about as often as not, both were taken at random.
+const SPARSE_WORD: u32 = 4;
+
+/// For each byte, the rows its set bits name, lowest first, and zeroes after them.
+///
+/// Held as `u32` rather than as the bytes they fit in, so that a byte's rows are one load, one add
+/// and one store of eight lanes, with nothing to widen on the way.
+const BYTE_ROWS: [[u32; 8]; 256] = {
+    let mut table = [[0_u32; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut bit = 0;
+        let mut at = 0;
+        while bit < 8 {
+            if byte >> bit & 1 == 1 {
+                table[byte][at] = bit;
+                at += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
+/// The positions whose bits are set in `words`, in order.
+///
+/// Every word is written into room the answer already has rather than pushed, in one of three
+/// ways chosen by how many rows it keeps, and none of them has a branch a row. A sparse word writes
+/// [`SPARSE_WORD`] rows whatever it holds, or twice that when it holds more, so an empty word costs
+/// a few stores past the end of the answer, which the next word writes over. A word that keeps most of its rows is written as the
+/// runs between the rows it drops. Anything between goes a byte at a time through [`BYTE_ROWS`],
+/// eight rows written for each byte and the answer moved on by the ones it has, which costs the
+/// same whatever the byte holds. The walk this replaces stepped through the set bits of every word,
+/// and a branch a row and one a word taken at random were most of what it cost: on TPC-H q14, whose
+/// filter keeps one row in eighty, it was 5 percent of the query, and under a filter that keeps
+/// half the rows it was a third of a `sum` over the rest.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "a mask is over a chunk, whose rows fit in a u32"
 )]
-fn listed(words: &[u64], kept: usize) -> Vec<u32> {
-    let mut out = Vec::with_capacity(kept + 64);
+#[allow(unsafe_code)]
+fn listed(words: &[u64]) -> Vec<u32> {
+    // Counted from the words rather than taken from the selection's count, because the room below
+    // is written into unchecked and a count that came out wrong somewhere else must not matter.
+    let total: usize = words.iter().map(|word| word.count_ones() as usize).sum();
+    // Room for every row, and for the 64 a word may write past the last of them.
+    let mut out = Vec::with_capacity(total + 2 * 64);
+    let room = out.spare_capacity_mut();
+    let mut len = 0;
     for (block, &word) in words.iter().enumerate() {
-        if word == 0 {
-            continue;
-        }
         let base = (block * 64) as u32;
-        if word == u64::MAX {
-            out.extend(base..base + 64);
-            continue;
-        }
-        // A word that keeps most of its rows is walked by the rows it drops. Each run between two
-        // of them is written as a whole 64 rows and cut back to its own, so it is a copy of fixed
-        // width with no tail to finish a row at a time, and what it writes past its rows is
-        // written over by the next run. A filter that keeps nearly every row would otherwise pay
-        // a step for every row it keeps.
-        if word.count_zeros() <= DENSE_WORD {
+        let count = word.count_ones();
+        if count <= SPARSE_WORD {
+            lowest(&mut room[len..len + SPARSE_WORD as usize], base, word);
+        } else if count <= 2 * SPARSE_WORD {
+            lowest(&mut room[len..len + 2 * SPARSE_WORD as usize], base, word);
+        } else if 64 - count <= DENSE_WORD {
+            // Each run between two dropped rows is written as a whole 64 rows and cut back to its
+            // own, so it is a copy of fixed width with no tail to finish a row at a time, and what
+            // it writes past its rows is written over by the next run.
             let mut dropped = !word;
-            let mut from = 0;
+            let (mut from, mut at) = (0, len);
             loop {
-                let at = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
-                let listed = out.len() + (at - from) as usize;
-                out.extend(base + from..base + from + 64);
-                out.truncate(listed);
+                let to = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
+                for (slot, row) in room[at..at + 64].iter_mut().zip(base + from..) {
+                    slot.write(row);
+                }
+                at += (to - from) as usize;
                 if dropped == 0 {
                     break;
                 }
-                from = at + 1;
+                from = to + 1;
                 dropped &= dropped - 1;
             }
-            continue;
+        } else {
+            // Written through a pointer as one store of eight lanes, since through the slots the
+            // compiler kept a bounds check a byte and wrote the lanes one at a time.
+            let mut at = len;
+            for (byte, first) in word.to_le_bytes().into_iter().zip((base..).step_by(8)) {
+                let rows = BYTE_ROWS[usize::from(byte)].map(|row| first + row);
+                // SAFETY: `at` is at most the `len` this word leaves, which is at most `total`, so
+                // the eight slots from it are inside the room made for `total` and 128 more.
+                unsafe { room.as_mut_ptr().add(at).cast::<[u32; 8]>().write_unaligned(rows) };
+                at += byte.count_ones() as usize;
+            }
         }
-        let mut word = word;
-        while word != 0 {
-            out.push(base + word.trailing_zeros());
-            word &= word - 1;
-        }
+        len += count as usize;
     }
+    // SAFETY: `len` is the rows listed, and every slot under it was written above, since each word
+    // writes the slots from the `len` it found up to the `len` it leaves.
+    unsafe { out.set_len(len) };
     out
+}
+
+/// Writes the rows of the lowest set bits of `word` into every slot of `slots`, as `base` and
+/// past, and whatever is left once the word runs out of bits, for the next word to write over.
+fn lowest(slots: &mut [MaybeUninit<u32>], base: u32, mut word: u64) {
+    for slot in slots {
+        slot.write(base + word.trailing_zeros());
+        word &= word.wrapping_sub(1);
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +432,30 @@ mod tests {
         assert_eq!(pushed.mask(), None);
         assert_eq!(pushed.len(), wanted.len() + 1);
         assert_eq!(selection.into_indices(), wanted);
+    }
+
+    /// The listing writes past its rows and counts only the ones it has, so every way a word can
+    /// hold rows is tried: empty, one to five rows, about half, and dense with a few dropped.
+    #[test]
+    fn a_mask_of_any_density_lists_its_positions() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for keep in [0, 1, 3, 9, 30, 64, 128, 192, 250, 255, 256] {
+            let words: Vec<u64> = (0..128)
+                .map(|_| (0..64).fold(0, |word, bit| word | u64::from(next() % 256 < keep) << bit))
+                .collect();
+            let kept = words.iter().map(|word| word.count_ones() as usize).sum();
+            let wanted: Vec<u32> = (0..words.len() * 64)
+                .filter(|&at| words[at / 64] >> (at % 64) & 1 == 1)
+                .map(|at| at as u32)
+                .collect();
+            assert_eq!(Selection::from_mask(words, kept).indices(), wanted.as_slice(), "{keep}");
+        }
     }
 
     #[test]
