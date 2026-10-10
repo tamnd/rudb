@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+pub use rudb_common::parse_size;
 use rudb_common::{Error, Result};
 
 /// The fewest rows a Parquet file has to hold before a mirror of it is made, by default.
@@ -266,71 +267,6 @@ impl Config {
         ]
     }
 }
-
-/// A size written the way a person writes one, in bytes.
-///
-/// `KB`, `MB`, `GB` and `TB` are powers of a thousand, and `KiB`, `MiB`, `GiB` and `TiB` are powers
-/// of 1024. That is what DuckDB does, measured on the pinned binary: `SET memory_limit='1GB'` reads
-/// back as `953.6 MiB` and `SET memory_limit='1GiB'` reads back as `1.0 GiB`. A script that says
-/// `10GB` has to get the same number from both engines, so the two spellings are two numbers here
-/// even though treating them as one is tidier.
-///
-/// A number with no unit is bytes, which DuckDB refuses and this accepts, because this is also the
-/// function a harness calls to turn a number it already has into a limit. `SET memory_limit` does
-/// not take that path, so the statement still refuses a bare number the way the binary does.
-///
-/// Case does not matter, a space before the unit is allowed and the number may have a fraction,
-/// because all three appear in the wild and DuckDB takes all three. The messages are word for word
-/// the ones the binary prints, so a script that matches on them matches on both engines.
-///
-/// # Errors
-///
-/// For text that is not a number, a number below zero, a unit that is not one of the nine, and a
-/// size that does not fit in a `u64`.
-pub fn parse_size(text: &str) -> Result<u64> {
-    let text = text.trim();
-    let digits = text.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c.is_whitespace());
-    let unit = text[digits.len()..].trim().to_ascii_uppercase();
-    let number: f64 =
-        digits.trim().parse().map_err(|_| Error::parser("Memory must have a number (e.g. 1GB)"))?;
-    let scale: f64 = match unit.as_str() {
-        "" | "B" => 1.0,
-        "KB" => 1e3,
-        "MB" => 1e6,
-        "GB" => 1e9,
-        "TB" => 1e12,
-        "KIB" => 1024.0,
-        "MIB" => 1024f64.powi(2),
-        "GIB" => 1024f64.powi(3),
-        "TIB" => 1024f64.powi(4),
-        other => {
-            let other = other.to_ascii_lowercase();
-            return Err(Error::parser(format!(
-                "Unknown unit for memory: '{other}' (expected: KB, MB, GB, TB for 1000^i units or KiB, MiB, GiB, TiB for 1024^i units)"
-            )));
-        }
-    };
-    let bytes = number * scale;
-    if !bytes.is_finite() || bytes < 0.0 {
-        return Err(Error::parser(format!("\"{text}\" is not a size")));
-    }
-    if bytes >= SIZE_CEILING {
-        return Err(Error::parser(format!("\"{text}\" is larger than a 64 bit size")));
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the range is checked on the line above and a size is a whole number of bytes"
-    )]
-    Ok(bytes as u64)
-}
-
-/// The first size that does not survive the trip through an `f64` and back.
-///
-/// A size is parsed as a float so that `1.5GB` is a size, and a float at or past this cannot be
-/// turned into a `u64`. Two to the sixty fourth rather than `u64::MAX`, because `u64::MAX` is not a
-/// float and comparing against the nearest one that is would let a value through that does not fit.
-const SIZE_CEILING: f64 = 18_446_744_073_709_551_616.0;
 
 /// A size in bytes, written the way a person reads one.
 ///

@@ -7149,7 +7149,8 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 let result = run(sql, &copy.plan, &catalog, cancel, under)?;
                 let zone = session.session_time_zone();
-                QueryResult::changed(crate::export::write(&copy, &result, zone)?)
+                let threads = self.inner.pool.threads();
+                QueryResult::changed(crate::export::write(&copy, &result, zone, threads)?)
             }
             Bound::Setting(setting)
                 if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>

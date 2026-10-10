@@ -18,12 +18,18 @@
 //!
 //! With `PARTITION_BY`, the rows are split by the values of the partition columns into a directory
 //! a value, laid out the way Hive lays them out, with a file of the chosen format in each.
+//!
+//! With `FILE_SIZE_BYTES` or `ROW_GROUPS_PER_FILE`, the path is a directory and a file is closed
+//! once it is big enough, the next rows going to the next one, numbered on. `PER_THREAD_OUTPUT`
+//! makes it a directory too, with the rows shared out over a file for each thread.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::rc::Rc;
 
 use rudb_bind::{CopyTo, Existing, NamePiece};
 use rudb_common::{Error, Field, LogicalType, Memory, Result, SessionTimeZone, Value};
@@ -35,43 +41,27 @@ use rudb_vector::{Chunk, Vector};
 
 use crate::QueryResult;
 
-/// Writes the rows of `result` the way `copy` asks, to the one file or split over a directory,
-/// and answers how many there were.
-pub(crate) fn write(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone) -> Result<usize> {
-    if copy.partitioned.columns.is_empty() {
-        write_file(copy, &copy.path, result, zone)
-    } else {
-        write_partitioned(copy, result, zone)
-    }
-}
+/// How many rows a batch holds. The pin counts the batches of a file in these and closes a file
+/// only between two of them.
+const BATCH: usize = 2048;
 
-/// Writes the rows of `result` to the one file at `path`, in the format `copy` names.
-fn write_file(
+/// Writes the rows of `result` the way `copy` asks, to the one file or to a directory of them,
+/// and answers how many there were.
+pub(crate) fn write(
     copy: &CopyTo,
-    path: &str,
     result: &QueryResult,
     zone: SessionTimeZone,
+    threads: usize,
 ) -> Result<usize> {
-    if copy.parquet {
-        write_parquet(copy, path, result)
-    } else if copy.json {
-        write_json(copy, path, result, zone)
-    } else {
-        write_csv(copy, path, result, zone)
-    }
-}
-
-/// What a directory is called for a NULL partition value, which is the name Hive gave it.
-const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
-
-/// Writes the rows of `result` split by the values of the partition columns, a directory a
-/// column named `column=value`, both percent encoded, with a file in each of the deepest ones.
-///
-/// The rows of a partition keep their order. A partition's file is numbered 0 in its own
-/// directory, or, with the files side by side, by the order of the partition values, a column at
-/// a time with a NULL last, which is how the pin numbers them.
-fn write_partitioned(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone) -> Result<usize> {
     let split = &copy.partitioned;
+    if split.skip_empty && result.is_empty() {
+        return Ok(0);
+    }
+    if !split.directory() {
+        let mut sink = Sink::open(copy, &copy.path, result, zone)?;
+        sink.write(result.chunks())?;
+        return sink.finish();
+    }
     let root = Path::new(&copy.path);
     match split.existing {
         Existing::Refuse if holds_files(root) => {
@@ -83,12 +73,146 @@ fn write_partitioned(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone)
         Existing::Overwrite => remove_files(root)?,
         _ => {}
     }
-    let made = |path: &Path| {
-        std::fs::create_dir_all(path).map_err(|error| {
-            Error::io(format!("Failed to create directory \"{}\": {error}", path.display()))
-        })
+    make_directory(root)?;
+    if split.columns.is_empty() {
+        return Ok(write_files(copy, root, 0, result, zone, threads)?.0);
+    }
+    write_partitioned(copy, root, result, zone)
+}
+
+/// Makes a directory and the ones above it.
+fn make_directory(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        Error::io(format!("Failed to create directory \"{}\": {error}", path.display()))
+    })
+}
+
+/// Writes the rows of `result` into `directory`, the files numbered from `first`, and answers how
+/// many rows and how many files there were.
+///
+/// When the `COPY` rotates, a file is closed before the next batch once it holds one and has
+/// reached the size or the count of batches asked for, so a file is never left empty, where the
+/// pin goes on opening empty files for good when a size is below that of an empty file. No rows
+/// at all still write the one file.
+fn write_files(
+    copy: &CopyTo,
+    directory: &Path,
+    first: usize,
+    result: &QueryResult,
+    zone: SessionTimeZone,
+    threads: usize,
+) -> Result<(usize, usize)> {
+    let split = &copy.partitioned;
+    let path = |number: usize| -> Result<String> {
+        let name = format!("{}.{}", file_name(&split.pattern, number, zone)?, split.extension);
+        Ok(directory.join(name).to_string_lossy().into_owned())
     };
-    made(root)?;
+    if split.per_thread && !split.rotates() {
+        return write_threads(copy, &path, first, result, zone, threads);
+    }
+    let mut sink = Sink::open(copy, &path(first)?, result, zone)?;
+    if !split.rotates() {
+        sink.write(result.chunks())?;
+        return Ok((sink.finish()?, 1));
+    }
+    let least = if copy.parquet { copy.row_group_size } else { 0 };
+    let (mut rows, mut files, mut held) = (0, 1, 0);
+    for batch in batches(result.chunks(), least)? {
+        let full = held > 0
+            && (split.file_size.is_some_and(|most| sink.size() >= most)
+                || split.batches.is_some_and(|most| held >= most));
+        if full {
+            rows += sink.finish()?;
+            sink = Sink::open(copy, &path(first + files)?, result, zone)?;
+            files += 1;
+            held = 0;
+        }
+        sink.write(&batch)?;
+        held += 1;
+    }
+    Ok((rows + sink.finish()?, files))
+}
+
+/// Writes the rows of `result` the way `PER_THREAD_OUTPUT` does, a file for each of `threads`
+/// that gets rows, each taking the next run of batches, and answers how many rows and files there
+/// were.
+///
+/// The pin writes a file for each thread that ends up with rows, so how many there are depends on
+/// how its scan was split, and a source that one thread reads, such as `range`, gives it one file.
+/// Here the batches are shared out evenly, which gives the same rows in as many files as threads,
+/// at most, and one file for no rows.
+fn write_threads(
+    copy: &CopyTo,
+    path: &dyn Fn(usize) -> Result<String>,
+    first: usize,
+    result: &QueryResult,
+    zone: SessionTimeZone,
+    threads: usize,
+) -> Result<(usize, usize)> {
+    let batches = batches(result.chunks(), 0)?;
+    let each = batches.len().div_ceil(threads.max(1)).max(1);
+    let mut runs = batches.chunks(each).peekable();
+    if runs.peek().is_none() {
+        let sink = Sink::open(copy, &path(first)?, result, zone)?;
+        return Ok((sink.finish()?, 1));
+    }
+    let (mut rows, mut files) = (0, 0);
+    for run in runs {
+        let mut sink = Sink::open(copy, &path(first + files)?, result, zone)?;
+        for batch in run {
+            sink.write(batch)?;
+        }
+        rows += sink.finish()?;
+        files += 1;
+    }
+    Ok((rows, files))
+}
+
+/// The rows cut into the batches the pin closes a file between: [`BATCH`] rows each, or as many of
+/// those as it takes to reach `least` rows, which for Parquet is a row group.
+fn batches(chunks: &[Chunk], least: u64) -> Result<Vec<Vec<Chunk>>> {
+    let mut out = Vec::new();
+    let (mut batch, mut held) = (Vec::new(), 0);
+    for chunk in chunks {
+        let mut at = 0;
+        while at < chunk.len() {
+            let take = (BATCH - held % BATCH).min(chunk.len() - at);
+            batch.push(if take == chunk.len() {
+                chunk.clone()
+            } else {
+                let columns = chunk.columns().iter().map(|column| column.slice(at, take));
+                Chunk::new(columns.collect::<Result<Vec<_>>>()?)?
+            });
+            at += take;
+            held += take;
+            if held % BATCH == 0 && held as u64 >= least {
+                out.push(std::mem::take(&mut batch));
+                held = 0;
+            }
+        }
+    }
+    if !batch.is_empty() {
+        out.push(batch);
+    }
+    Ok(out)
+}
+
+/// What a directory is called for a NULL partition value, which is the name Hive gave it.
+const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+
+/// Writes the rows of `result` split by the values of the partition columns, a directory a
+/// column named `column=value`, both percent encoded, with the files in each of the deepest ones.
+///
+/// The rows of a partition keep their order. A partition's files are numbered from 0 in its own
+/// directory, or, with the files side by side, on from the last partition's, the partitions in the
+/// order of their values, a column at a time with a NULL last, which is how the pin numbers them.
+fn write_partitioned(
+    copy: &CopyTo,
+    root: &Path,
+    result: &QueryResult,
+    zone: SessionTimeZone,
+) -> Result<usize> {
+    let split = &copy.partitioned;
     let names = result.names();
     let chunks = result.chunks();
     let mut found: HashMap<String, usize> = HashMap::new();
@@ -145,8 +269,8 @@ fn write_partitioned(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone)
                 .unwrap_or(Ordering::Equal)
         });
     }
-    let mut rows = 0;
-    for (number, (directory, _, picked)) in partitions.iter().enumerate() {
+    let (mut rows, mut next) = (0, 0);
+    for (directory, _, picked) in &partitions {
         let mut parts = Vec::new();
         for (chunk, rows) in chunks.iter().zip(picked) {
             if rows.is_empty() {
@@ -164,11 +288,12 @@ fn write_partitioned(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone)
             parts,
             Memory::unlimited().reservation(),
         );
-        let (place, number) =
-            if split.flat { (root.to_path_buf(), number) } else { (root.join(directory), 0) };
-        made(&place)?;
-        let name = format!("{}.{}", file_name(&split.pattern, number, zone)?, split.extension);
-        rows += write_file(copy, &place.join(name).to_string_lossy(), &part, zone)?;
+        let (place, first) =
+            if split.flat { (root.to_path_buf(), next) } else { (root.join(directory), 0) };
+        make_directory(&place)?;
+        let (written, files) = write_files(copy, &place, first, &part, zone, 1)?;
+        rows += written;
+        next += files;
     }
     Ok(rows)
 }
@@ -239,75 +364,261 @@ fn file_name(pattern: &[NamePiece], number: usize, zone: SessionTimeZone) -> Res
     Ok(out)
 }
 
-/// Writes the rows of `result` to the CSV file at `path` and answers how many there were.
-fn write_csv(
-    copy: &CopyTo,
-    path: &str,
-    result: &QueryResult,
+/// One file of the format a `COPY` names, written a batch of rows at a time.
+struct Sink<'a> {
+    copy: &'a CopyTo,
+    path: String,
     zone: SessionTimeZone,
-) -> Result<usize> {
-    let file = File::create(path)
-        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
-    let mut out = BufWriter::new(file);
-    let names = result.names();
-    let forced = names
-        .iter()
-        .map(|name| {
-            copy.force_quote_all
-                || copy.force_quote.iter().any(|column| column.eq_ignore_ascii_case(name))
-        })
-        .collect::<Vec<_>>();
-    for column in &copy.force_quote {
-        if !names.iter().any(|name| name.eq_ignore_ascii_case(column)) {
-            return Err(Error::binder(format!(
-                "\"force_quote\" expected to find {column}, but it was not found in the table"
-            )));
-        }
+    names: &'a [String],
+    types: &'a [LogicalType],
+    /// How many bytes have gone to the file so far, buffered or not.
+    size: Rc<Cell<u64>>,
+    rows: usize,
+    body: Body,
+}
+
+/// What a [`Sink`] holds for its format.
+enum Body {
+    Csv {
+        out: Counted,
+        /// Whether every value of a column is quoted.
+        forced: Vec<bool>,
+    },
+    Json {
+        out: Counted,
+        moments: Moments,
+    },
+    Parquet {
+        writer: rudb_parquet::Writer<Counted>,
+        /// The type each column is cast to before it is stored.
+        stored: Vec<LogicalType>,
+        /// The chunks of the row group not written yet, and how many rows they hold.
+        group: Vec<Chunk>,
+        waiting: usize,
+    },
+}
+
+/// A buffered file that counts the bytes written to it.
+struct Counted {
+    out: BufWriter<File>,
+    size: Rc<Cell<u64>>,
+}
+
+impl Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.out.write(bytes)?;
+        self.size.set(self.size.get() + written as u64);
+        Ok(written)
     }
-    let written =
-        |error: std::io::Error| Error::io(format!("Could not write file \"{path}\": {error}"));
-    let mut line = String::new();
-    if copy.header {
-        for (column, name) in names.iter().enumerate() {
-            if column > 0 {
-                line.push_str(&copy.delimiter);
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+impl<'a> Sink<'a> {
+    /// Makes the file at `path` for rows of the columns of `result`, and writes what comes before
+    /// the first row: the header of a CSV file, or the opening of a JSON array.
+    fn open(
+        copy: &'a CopyTo,
+        path: &str,
+        result: &'a QueryResult,
+        zone: SessionTimeZone,
+    ) -> Result<Self> {
+        let file = File::create(path)
+            .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
+        let size = Rc::new(Cell::new(0));
+        let mut out = Counted { out: BufWriter::new(file), size: Rc::clone(&size) };
+        let (names, types) = (result.names(), result.types());
+        let written = failed(path);
+        let body = if copy.parquet {
+            let mut stored = Vec::with_capacity(types.len());
+            let mut fields = Vec::with_capacity(types.len());
+            for (name, ty) in names.iter().zip(types) {
+                let ty = rudb_parquet::storage(ty)?;
+                fields.push(Field::new(name.clone(), ty.clone()));
+                stored.push(ty);
             }
-            field(&mut line, name, false, copy);
-        }
-        line.push('\n');
-        out.write_all(line.as_bytes()).map_err(written)?;
-    }
-    let mut rows = 0;
-    for chunk in result.chunks() {
-        let mut columns = Vec::with_capacity(chunk.width());
-        for column in 0..chunk.width() {
-            columns.push(cast_in_time_zone(
-                chunk.column(column)?,
-                &LogicalType::Varchar,
-                false,
-                Some(zone),
-            )?);
-        }
-        // row at a time: a CSV file is written a line per row, and every column is already text.
-        for row in 0..chunk.len() {
-            line.clear();
-            for (column, vector) in columns.iter().enumerate() {
-                if column > 0 {
-                    line.push_str(&copy.delimiter);
-                }
-                match vector.try_value_at(row)? {
-                    Value::Null => line.push_str(&copy.null),
-                    Value::Varchar(text) => field(&mut line, &text, forced[column], copy),
-                    other => field(&mut line, &other.to_string(), forced[column], copy),
+            let codec =
+                if copy.compression == "snappy" { Codec::Snappy } else { Codec::Uncompressed };
+            let writer = rudb_parquet::Writer::new(out, &fields, codec, CREATED_BY)?;
+            Body::Parquet { writer, stored, group: Vec::new(), waiting: 0 }
+        } else if copy.json {
+            let moments = Moments {
+                zone,
+                date: copy.date_format.as_deref().map(Format::parse).transpose()?,
+                timestamp: copy.timestamp_format.as_deref().map(Format::parse).transpose()?,
+            };
+            if copy.array {
+                out.write_all(b"[\n").map_err(written)?;
+            }
+            Body::Json { out, moments }
+        } else {
+            let forced = names
+                .iter()
+                .map(|name| {
+                    copy.force_quote_all
+                        || copy.force_quote.iter().any(|column| column.eq_ignore_ascii_case(name))
+                })
+                .collect::<Vec<_>>();
+            for column in &copy.force_quote {
+                if !names.iter().any(|name| name.eq_ignore_ascii_case(column)) {
+                    return Err(Error::binder(format!(
+                        "\"force_quote\" expected to find {column}, but it was not found in the \
+                         table"
+                    )));
                 }
             }
-            line.push('\n');
-            out.write_all(line.as_bytes()).map_err(written)?;
-        }
-        rows += chunk.len();
+            if copy.header {
+                let mut line = String::new();
+                for (column, name) in names.iter().enumerate() {
+                    if column > 0 {
+                        line.push_str(&copy.delimiter);
+                    }
+                    field(&mut line, name, false, copy);
+                }
+                line.push('\n');
+                out.write_all(line.as_bytes()).map_err(written)?;
+            }
+            Body::Csv { out, forced }
+        };
+        Ok(Self { copy, path: path.to_string(), zone, names, types, size, rows: 0, body })
     }
-    out.flush().map_err(written)?;
-    Ok(rows)
+
+    /// How many bytes the file holds so far.
+    fn size(&self) -> u64 {
+        self.size.get()
+    }
+
+    /// Writes the rows of `chunks`.
+    fn write(&mut self, chunks: &[Chunk]) -> Result<()> {
+        let Self { copy, path, zone, names, types, rows, body, .. } = self;
+        let (copy, zone) = (*copy, *zone);
+        let written = failed(path);
+        match body {
+            Body::Csv { out, forced } => {
+                let mut line = String::new();
+                for chunk in chunks {
+                    let mut columns = Vec::with_capacity(chunk.width());
+                    for column in 0..chunk.width() {
+                        columns.push(cast_in_time_zone(
+                            chunk.column(column)?,
+                            &LogicalType::Varchar,
+                            false,
+                            Some(zone),
+                        )?);
+                    }
+                    // row at a time: a CSV file is written a line per row, and every column is
+                    // already text.
+                    for row in 0..chunk.len() {
+                        line.clear();
+                        for (column, vector) in columns.iter().enumerate() {
+                            if column > 0 {
+                                line.push_str(&copy.delimiter);
+                            }
+                            match vector.try_value_at(row)? {
+                                Value::Null => line.push_str(&copy.null),
+                                Value::Varchar(text) => {
+                                    field(&mut line, &text, forced[column], copy);
+                                }
+                                other => {
+                                    field(&mut line, &other.to_string(), forced[column], copy);
+                                }
+                            }
+                        }
+                        line.push('\n');
+                        out.write_all(line.as_bytes()).map_err(written)?;
+                    }
+                    *rows += chunk.len();
+                }
+            }
+            Body::Json { out, moments } => {
+                let mut line = String::new();
+                for chunk in chunks {
+                    let mut columns = Vec::with_capacity(chunk.width());
+                    for (column, ty) in types.iter().enumerate() {
+                        let vector = chunk.column(column)?;
+                        columns.push(if quoted(ty) && !moments.formats(ty) {
+                            cast_in_time_zone(vector, &LogicalType::Varchar, false, Some(zone))?
+                        } else {
+                            vector.clone()
+                        });
+                    }
+                    for row in 0..chunk.len() {
+                        line.clear();
+                        if copy.array {
+                            line.push_str(if *rows == 0 { "\t" } else { ",\n\t" });
+                        }
+                        line.push('{');
+                        for (column, vector) in columns.iter().enumerate() {
+                            if column > 0 {
+                                line.push(',');
+                            }
+                            string(&mut line, &names[column]);
+                            line.push(':');
+                            json(&mut line, &vector.try_value_at(row)?, &types[column], moments)?;
+                        }
+                        line.push('}');
+                        if !copy.array {
+                            line.push('\n');
+                        }
+                        out.write_all(line.as_bytes()).map_err(written)?;
+                        *rows += 1;
+                    }
+                }
+            }
+            Body::Parquet { writer, stored, group, waiting } => {
+                for chunk in chunks {
+                    let mut columns = Vec::with_capacity(chunk.width());
+                    for (column, ty) in types.iter().enumerate() {
+                        let vector = chunk.column(column)?;
+                        columns.push(if *ty == stored[column] {
+                            vector.clone()
+                        } else {
+                            cast_in_time_zone(vector, &stored[column], false, None)?
+                        });
+                    }
+                    group.push(Chunk::new(columns)?);
+                    *waiting += chunk.len();
+                    *rows += chunk.len();
+                    // A group ends at the end of the chunk that fills it, so it holds
+                    // `ROW_GROUP_SIZE` rows or a little more.
+                    if *waiting as u64 >= copy.row_group_size {
+                        writer.write_group(group)?;
+                        group.clear();
+                        *waiting = 0;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes what comes after the last row and closes the file, and answers how many rows it
+    /// holds.
+    fn finish(self) -> Result<usize> {
+        let written = failed(&self.path);
+        match self.body {
+            Body::Csv { mut out, .. } => out.flush().map_err(written)?,
+            Body::Json { mut out, .. } => {
+                if self.copy.array {
+                    let end: &[u8] = if self.rows == 0 { b"\t\n]\n" } else { b"\n]\n" };
+                    out.write_all(end).map_err(written)?;
+                }
+                out.flush().map_err(written)?;
+            }
+            Body::Parquet { mut writer, group, .. } => {
+                writer.write_group(&group)?;
+                writer.finish()?;
+            }
+        }
+        Ok(self.rows)
+    }
+}
+
+/// The error a failed write to the file at `path` is reported as.
+fn failed(path: &str) -> impl Fn(std::io::Error) -> Error + Copy + '_ {
+    move |error| Error::io(format!("Could not write file \"{path}\": {error}"))
 }
 
 /// Appends one value, quoted if it has to be or was asked to be.
@@ -345,110 +656,6 @@ fn field(line: &mut String, text: &str, forced: bool, copy: &CopyTo) {
         }
     }
     line.push_str(&copy.quote);
-}
-
-/// Writes the rows of `result` to the JSON file at `path` and answers how many there were.
-fn write_json(
-    copy: &CopyTo,
-    path: &str,
-    result: &QueryResult,
-    zone: SessionTimeZone,
-) -> Result<usize> {
-    let file = File::create(path)
-        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
-    let mut out = BufWriter::new(file);
-    let written =
-        |error: std::io::Error| Error::io(format!("Could not write file \"{path}\": {error}"));
-    let moments = Moments {
-        zone,
-        date: copy.date_format.as_deref().map(Format::parse).transpose()?,
-        timestamp: copy.timestamp_format.as_deref().map(Format::parse).transpose()?,
-    };
-    let names = result.names();
-    let types = result.types();
-    if copy.array {
-        out.write_all(b"[\n").map_err(written)?;
-    }
-    let mut line = String::new();
-    let mut rows = 0;
-    for chunk in result.chunks() {
-        let mut columns = Vec::with_capacity(chunk.width());
-        for (column, ty) in types.iter().enumerate() {
-            let vector = chunk.column(column)?;
-            columns.push(if quoted(ty) && !moments.formats(ty) {
-                cast_in_time_zone(vector, &LogicalType::Varchar, false, Some(zone))?
-            } else {
-                vector.clone()
-            });
-        }
-        for row in 0..chunk.len() {
-            line.clear();
-            if copy.array {
-                line.push_str(if rows == 0 { "\t" } else { ",\n\t" });
-            }
-            line.push('{');
-            for (column, vector) in columns.iter().enumerate() {
-                if column > 0 {
-                    line.push(',');
-                }
-                string(&mut line, &names[column]);
-                line.push(':');
-                json(&mut line, &vector.try_value_at(row)?, &types[column], &moments)?;
-            }
-            line.push('}');
-            if !copy.array {
-                line.push('\n');
-            }
-            out.write_all(line.as_bytes()).map_err(written)?;
-            rows += 1;
-        }
-    }
-    if copy.array {
-        out.write_all(if rows == 0 { b"\t\n]\n" } else { b"\n]\n" }).map_err(written)?;
-    }
-    out.flush().map_err(written)?;
-    Ok(rows)
-}
-
-/// Writes a result as a Parquet file, a row group every `ROW_GROUP_SIZE` rows or so, since a
-/// group ends at the end of the chunk that fills it.
-fn write_parquet(copy: &CopyTo, path: &str, result: &QueryResult) -> Result<usize> {
-    let file = File::create(path)
-        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
-    let types = result.types();
-    let mut stored = Vec::with_capacity(types.len());
-    let mut fields = Vec::with_capacity(types.len());
-    for (name, ty) in result.names().iter().zip(types) {
-        let ty = rudb_parquet::storage(ty)?;
-        fields.push(Field::new(name.clone(), ty.clone()));
-        stored.push(ty);
-    }
-    let codec = if copy.compression == "snappy" { Codec::Snappy } else { Codec::Uncompressed };
-    let mut writer = rudb_parquet::Writer::new(BufWriter::new(file), &fields, codec, CREATED_BY)?;
-    let mut group = Vec::new();
-    let (mut waiting, mut rows) = (0, 0);
-    for chunk in result.chunks() {
-        let mut columns = Vec::with_capacity(chunk.width());
-        for (column, ty) in types.iter().enumerate() {
-            let vector = chunk.column(column)?;
-            columns.push(if *ty == stored[column] {
-                vector.clone()
-            } else {
-                cast_in_time_zone(vector, &stored[column], false, None)?
-            });
-        }
-        group.push(Chunk::new(columns)?);
-        waiting += chunk.len();
-        rows += chunk.len();
-        if waiting as u64 >= copy.row_group_size {
-            writer.write_group(&group)?;
-            group.clear();
-            waiting = 0;
-        }
-    }
-    writer.write_group(&group)?;
-    writer.finish()?;
-    Ok(rows)
 }
 
 /// What a Parquet file written here says wrote it.

@@ -613,3 +613,186 @@ fn a_partitioned_copy_refuses_what_the_pin_refuses() {
         assert_eq!(error.to_string(), want, "{sql}");
     }
 }
+
+/// Every file under `root`, as its path below it with how many lines and bytes it holds, the way
+/// `wc -lc` counts them, in path order.
+fn sizes(root: &std::path::Path) -> Vec<String> {
+    let listed = files(root);
+    let mut out: Vec<String> = Vec::new();
+    for part in listed.split("== ").filter(|part| !part.is_empty()) {
+        let (name, text) = part.split_once('\n').expect("a name line");
+        out.push(format!("{name} {} {}", text.matches('\n').count(), text.len()));
+    }
+    out
+}
+
+#[test]
+fn file_size_bytes_and_row_groups_per_file_split_the_rows_over_numbered_files_as_the_pin_does() {
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.display().to_string();
+    let db = Database::new();
+    let run = |sql: &str| db.execute(&sql.replace("DIR", &dir));
+
+    // A file is closed between batches of 2048 rows once it has reached the size.
+    let copied = run("COPY (FROM range(5000)) TO 'DIR/d' (FORMAT csv, FILE_SIZE_BYTES 1.5e3)")
+        .expect("copies");
+    assert_eq!(copied.changes(), Some(5000));
+    let want = ["data_0.csv 2049 9136", "data_1.csv 2049 10246", "data_2.csv 905 4526"];
+    assert_eq!(sizes(&root.join("d")), want);
+    run(
+        "COPY (FROM range(5000)) TO 'DIR/r' (FORMAT csv, PER_THREAD_OUTPUT, FILE_SIZE_BYTES '1kb')",
+    )
+    .expect("copies");
+    assert_eq!(sizes(&root.join("r")), want);
+    run(
+        "COPY (FROM range(5000)) TO 'DIR/n.csv' (FILE_SIZE_BYTES '1kb', FILENAME_PATTERN 'x_{i}', \
+         FILE_EXTENSION 'txt')",
+    )
+    .expect("copies");
+    assert_eq!(
+        sizes(&root.join("n.csv")),
+        ["x_0.txt 2049 9136", "x_1.txt 2049 10246", "x_2.txt 905 4526"]
+    );
+
+    // PER_THREAD_OUTPUT alone shares the rows out over a file for each thread, numbered from 0.
+    run("SET threads = 4").expect("sets");
+    run("COPY (FROM range(10000)) TO 'DIR/t' (FORMAT csv, PER_THREAD_OUTPUT)").expect("copies");
+    assert!(std::fs::read_dir(root.join("t")).expect("lists").count() > 1);
+    let threads = db
+        .query(&format!("SELECT count(*), sum(range) FROM read_csv('{dir}/t/data_*.csv')"))
+        .expect("reads back");
+    assert_eq!(threads.value_at(0, 0), rudb_common::Value::BigInt(10000));
+    assert_eq!(threads.value_at(0, 1), rudb_common::Value::HugeInt(49_995_000));
+
+    // OVERWRITE_OR_IGNORE writes over the files of the same name and leaves the rest.
+    run("COPY (FROM range(5000)) TO 'DIR/i' (FORMAT csv, ROW_GROUPS_PER_FILE 1)").expect("copies");
+    run("COPY (FROM range(100)) TO 'DIR/i' (FORMAT csv, ROW_GROUPS_PER_FILE 1, \
+         OVERWRITE_OR_IGNORE)")
+    .expect("copies");
+    assert_eq!(
+        sizes(&root.join("i")),
+        ["data_0.csv 101 296", "data_1.csv 2049 10246", "data_2.csv 905 4526"]
+    );
+
+    // No rows still write the one file, unless WRITE_EMPTY_FILE is off.
+    run("COPY (SELECT 1 AS a WHERE false) TO 'DIR/e' (FORMAT csv, FILE_SIZE_BYTES '1kb')")
+        .expect("copies");
+    assert_eq!(sizes(&root.join("e")), ["data_0.csv 1 2"]);
+    run("COPY (SELECT 1 AS a WHERE false) TO 'DIR/e.csv' (WRITE_EMPTY_FILE false)")
+        .expect("copies");
+    assert!(!root.join("e.csv").exists());
+
+    // JSON has no header, so a file of no bytes takes a batch however small the size.
+    run("COPY (FROM range(10000)) TO 'DIR/j' (FORMAT json, FILE_SIZE_BYTES 1)").expect("copies");
+    let lines = sizes(&root.join("j"))
+        .iter()
+        .map(|file| file.split(' ').nth(1).expect("a count").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, ["2048", "2048", "2048", "2048", "1808"]);
+
+    // A Parquet batch is as many batches of 2048 rows as it takes to fill a row group.
+    run("COPY (FROM range(10000)) TO 'DIR/p' (FORMAT parquet, ROW_GROUP_SIZE 2000, \
+         ROW_GROUPS_PER_FILE 2)")
+    .expect("copies");
+    let counts = db
+        .query(&format!(
+            "SELECT count(*) FROM read_parquet('{dir}/p/*.parquet', filename = true) \
+             GROUP BY filename ORDER BY filename"
+        ))
+        .expect("reads back");
+    let counts = (0..counts.len()).map(|row| counts.value_at(row, 0)).collect::<Vec<_>>();
+    assert_eq!(counts, [4096, 4096, 1808].map(rudb_common::Value::BigInt));
+
+    // A partition rotates in its own directory, or numbered on when the files are side by side.
+    let pairs = "SELECT i % 2 AS k, i FROM range(5000) t(i)";
+    run(&format!("COPY ({pairs}) TO 'DIR/k' (FORMAT csv, PARTITION_BY k, FILE_SIZE_BYTES '1kb')"))
+        .expect("copies");
+    assert_eq!(
+        sizes(&root.join("k")),
+        [
+            "k=0/data_0.csv 2049 9687",
+            "k=0/data_1.csv 453 2262",
+            "k=1/data_0.csv 2049 9687",
+            "k=1/data_1.csv 453 2262"
+        ]
+    );
+    run(&format!(
+        "COPY ({pairs}) TO 'DIR/f' (FORMAT csv, PARTITION_BY k, HIVE_FILE_PATTERN false, \
+         ROW_GROUPS_PER_FILE 1)"
+    ))
+    .expect("copies");
+    assert_eq!(
+        sizes(&root.join("f")),
+        [
+            "data_0.csv 2049 9687",
+            "data_1.csv 453 2262",
+            "data_2.csv 2049 9687",
+            "data_3.csv 453 2262"
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_rotating_copy_refuses_what_the_pin_refuses() {
+    let db = Database::new();
+    for (sql, want) in [
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (USE_TMP_FILE false, PER_THREAD_OUTPUT)",
+            "Not implemented Error: Can't combine USE_TMP_FILE and PER_THREAD_OUTPUT for COPY",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (USE_TMP_FILE, FILE_SIZE_BYTES '1kb')",
+            "Not implemented Error: Can't combine USE_TMP_FILE and \
+             FILE_SIZE_BYTES/BATCHES_PER_FILE for COPY",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (OVERWRITE false, APPEND true)",
+            "Binder Error: Can only set one of OVERWRITE_OR_IGNORE, OVERWRITE or APPEND",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (PER_THREAD_OUTPUT, PARTITION_BY \"range\", \
+             WRITE_EMPTY_FILE false)",
+            "Not implemented Error: Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (PER_THREAD_OUTPUT, WRITE_EMPTY_FILE false)",
+            "Not implemented Error: Can't combine WRITE_EMPTY_FILE false with PER_THREAD_OUTPUT",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (FILE_SIZE_BYTES)",
+            "Binder Error: FILE_SIZE_BYTES cannot be empty",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (FILE_SIZE_BYTES 'abc')",
+            "Parser Error: Memory must have a number (e.g. 1GB)",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (FILE_SIZE_BYTES -1)",
+            "Binder Error: Unable to parse bytes from \"-1\" for copy option \"FILE_SIZE_BYTES\" ",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (ROW_GROUPS_PER_FILE)",
+            "Invalid Input Error: Copy option \"row_groups_per_file\" requires an argument of type \
+             UBIGINT",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (ROW_GROUPS_PER_FILE 'x')",
+            "Invalid Input Error: Copy option \"row_groups_per_file\" expected an argument of type \
+             UBIGINT - the argument \"x\" of type VARCHAR could not be cast as this type",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.csv' (ROW_GROUPS_PER_FILE -1)",
+            "Invalid Input Error: Copy option \"row_groups_per_file\" expected an argument of type \
+             UBIGINT - the argument \"-1\" of type INTEGER could not be cast as this type",
+        ),
+        (
+            "COPY (FROM range(5)) TO 'e.json' (ROW_GROUPS_PER_FILE 1)",
+            "Binder Error: Unknown option for COPY ... TO ... (FORMAT JSON): row_groups_per_file.",
+        ),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert_eq!(error.to_string(), want, "{sql}");
+    }
+}

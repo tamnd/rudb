@@ -7,9 +7,14 @@
 //! The checks are made in the pin's order: a column the query does not have and a column named
 //! twice as the options are read, then the options that cannot go together, then a partition
 //! that leaves nothing to write.
+//!
+//! `FILE_SIZE_BYTES`, `ROW_GROUPS_PER_FILE` and `PER_THREAD_OUTPUT` are read here too, since they
+//! also turn the path into a directory of numbered files, which is what the pin calls rotating.
 
-use rudb_common::{Error, Result};
+use rudb_common::{Error, LogicalType, Result, Value, parse_size};
 use rudb_parse::ast;
+
+use crate::statement::Written;
 
 /// How a `COPY ... TO` splits its rows over files. With no columns it writes the one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -27,6 +32,31 @@ pub struct Partitioned {
     pub pattern: Vec<NamePiece>,
     /// The extension of a file, after the dot.
     pub extension: String,
+    /// The size in bytes at which a file is closed and the next one begun, which is
+    /// `FILE_SIZE_BYTES`.
+    pub file_size: Option<u64>,
+    /// How many batches of rows a file holds before the next one is begun, which is
+    /// `ROW_GROUPS_PER_FILE` or `BATCHES_PER_FILE`.
+    pub batches: Option<u64>,
+    /// Whether the rows go to a directory of files even when one file holds them all, which is
+    /// `PER_THREAD_OUTPUT`.
+    pub per_thread: bool,
+    /// Whether no file at all is written for no rows, which is `WRITE_EMPTY_FILE false`.
+    pub skip_empty: bool,
+}
+
+impl Partitioned {
+    /// Whether a file is closed once it holds enough, and the rest go to the next one.
+    #[must_use]
+    pub fn rotates(&self) -> bool {
+        self.file_size.is_some() || self.batches.is_some()
+    }
+
+    /// Whether the path names a directory the files are written into rather than the one file.
+    #[must_use]
+    pub fn directory(&self) -> bool {
+        !self.columns.is_empty() || self.rotates() || self.per_thread
+    }
 }
 
 /// What a partitioned `COPY ... TO` does about the files a directory already holds.
@@ -58,7 +88,7 @@ pub enum NamePiece {
 }
 
 /// The options read here, which the format never sees.
-const READ_HERE: [&str; 9] = [
+const READ_HERE: [&str; 12] = [
     "partition_by",
     "write_partition_columns",
     "overwrite",
@@ -68,15 +98,22 @@ const READ_HERE: [&str; 9] = [
     "file_extension",
     "hive_file_pattern",
     "use_tmp_file",
+    "per_thread_output",
+    "file_size_bytes",
+    "write_empty_file",
 ];
+
+/// The options that count the batches of a file, which JSON does not take.
+const BATCHES: [&str; 2] = ["row_groups_per_file", "batches_per_file"];
 
 /// Reads the partitioning options of `copy` against the columns the query has, and answers
 /// them with the copy left holding only the options the format reads.
 ///
-/// Without `PARTITION_BY`, the options about the files of a directory have nothing to act on
-/// and are taken and dropped, as the pin drops them for one file.
+/// Without `PARTITION_BY` or one of the options that rotate, the options about the files of a
+/// directory have nothing to act on and are taken and dropped, as the pin drops them for one file.
 pub(crate) fn partitioning(
     copy: &ast::CopyTo,
+    typed: &[Option<Written>],
     names: &[String],
     format: &str,
 ) -> Result<(Partitioned, ast::CopyTo)> {
@@ -86,31 +123,49 @@ pub(crate) fn partitioning(
     rest.options.clear();
     rest.values.clear();
     let (mut overwrite, mut ignore, mut append) = (false, false, false);
-    let (mut pattern, mut tmp, mut per_thread) = (None, false, false);
+    let (mut pattern, mut tmp, mut chosen) = (None, false, false);
     for (index, (name, value)) in copy.options.iter().enumerate() {
-        let here = READ_HERE.contains(&name.as_str()) || partitioned && name == "per_thread_output";
+        let name = name.as_str();
+        let here = READ_HERE.contains(&name) || format != "json" && BATCHES.contains(&name);
         if !here {
-            rest.options.push((name.clone(), value.clone()));
+            rest.options.push((name.to_string(), value.clone()));
             if let Some(&expr) = copy.values.get(index) {
                 rest.values.push(expr);
             }
             continue;
         }
-        match name.as_str() {
+        let written = typed.get(index).and_then(Option::as_ref);
+        match name {
             "partition_by" => out.columns = columns(value.as_deref(), names)?,
             "write_partition_columns" => out.write_columns = boolean(name, value.as_deref())?,
-            "overwrite" => overwrite = boolean(name, value.as_deref())?,
-            "overwrite_or_ignore" => ignore = boolean(name, value.as_deref())?,
-            "append" => append = boolean(name, value.as_deref())?,
+            // The pin takes one of the three, whether it is on or off.
+            "overwrite" | "overwrite_or_ignore" | "append" => {
+                if chosen {
+                    return Err(Error::binder(
+                        "Can only set one of OVERWRITE_OR_IGNORE, OVERWRITE or APPEND",
+                    ));
+                }
+                chosen = true;
+                let on = boolean(name, value.as_deref())?;
+                match name {
+                    "overwrite" => overwrite = on,
+                    "overwrite_or_ignore" => ignore = on,
+                    _ => append = on,
+                }
+            }
             "filename_pattern" => pattern = Some(value.clone().unwrap_or_default()),
             "file_extension" => out.extension = value.clone().unwrap_or_default(),
             "hive_file_pattern" => out.flat = !boolean(name, value.as_deref())?,
-            "use_tmp_file" => tmp = boolean(name, value.as_deref())?,
-            _ => per_thread = boolean(name, value.as_deref())?,
+            // Written at all, even off, is what the pin checks against the options below.
+            "use_tmp_file" => {
+                boolean(name, value.as_deref())?;
+                tmp = true;
+            }
+            "per_thread_output" => out.per_thread = boolean(name, value.as_deref())?,
+            "file_size_bytes" => out.file_size = Some(bytes(value.as_deref(), written)?),
+            "write_empty_file" => out.skip_empty = !boolean(name, value.as_deref())?,
+            _ => out.batches = Some(unsigned(name, value.as_deref(), written)?),
         }
-    }
-    if [overwrite, ignore, append].iter().filter(|&&set| set).count() > 1 {
-        return Err(Error::binder("Can only set one of OVERWRITE_OR_IGNORE, OVERWRITE or APPEND"));
     }
     out.existing = if overwrite {
         Existing::Overwrite
@@ -131,26 +186,91 @@ pub(crate) fn partitioning(
     {
         return Err(Error::binder("APPEND mode requires a {uuid} label in filename_pattern"));
     }
-    if !partitioned {
-        return Ok((out, rest));
-    }
-    if tmp {
-        return Err(Error::not_implemented(
-            "Can't combine USE_TMP_FILE and PARTITIONED BY for COPY",
-        ));
-    }
-    if per_thread {
-        return Err(Error::not_implemented(
-            "Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
-        ));
-    }
-    if !out.write_columns && out.columns.len() == names.len() {
+    refuse_together(&out, tmp, partitioned)?;
+    if partitioned && !out.write_columns && out.columns.len() == names.len() {
         return Err(Error::not_implemented(
             "No column to write as all columns are specified as partition columns. \
              WRITE_PARTITION_COLUMNS option can be used to write partition columns.",
         ));
     }
     Ok((out, rest))
+}
+
+/// Refuses the options that cannot go together, in the pin's order.
+fn refuse_together(out: &Partitioned, tmp: bool, partitioned: bool) -> Result<()> {
+    let refused = [
+        (tmp && out.per_thread, "Can't combine USE_TMP_FILE and PER_THREAD_OUTPUT for COPY"),
+        (
+            tmp && out.rotates(),
+            "Can't combine USE_TMP_FILE and FILE_SIZE_BYTES/BATCHES_PER_FILE for COPY",
+        ),
+        (tmp && partitioned, "Can't combine USE_TMP_FILE and PARTITIONED BY for COPY"),
+        (
+            out.per_thread && partitioned,
+            "Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
+        ),
+        (
+            out.skip_empty && out.per_thread,
+            "Can't combine WRITE_EMPTY_FILE false with PER_THREAD_OUTPUT",
+        ),
+        (out.skip_empty && partitioned, "Can't combine WRITE_EMPTY_FILE false with PARTITIONED BY"),
+    ];
+    match refused.iter().find(|(refused, _)| *refused) {
+        Some((_, message)) => Err(Error::not_implemented(*message)),
+        None => Ok(()),
+    }
+}
+
+/// The size a `FILE_SIZE_BYTES` asks for. Text is a size the way `memory_limit` reads one, and
+/// anything else is cast to an unsigned number, which is how the pin reads it.
+fn bytes(text: Option<&str>, written: Option<&Written>) -> Result<u64> {
+    let Some(text) = text else {
+        return Err(Error::binder("FILE_SIZE_BYTES cannot be empty"));
+    };
+    match written.and_then(|written| written.value.as_ref().map(|value| (&written.ty, value))) {
+        Some((ty, value)) if *ty != LogicalType::Varchar => match cast_unsigned(value) {
+            Some(size) => Ok(size),
+            None => Err(Error::binder(format!(
+                "Unable to parse bytes from \"{value}\" for copy option \"FILE_SIZE_BYTES\" "
+            ))),
+        },
+        _ => parse_size(text.trim_matches('\'')),
+    }
+}
+
+/// The unsigned number an option of that type is written as, in the pin's words when it is not
+/// one.
+fn unsigned(name: &str, text: Option<&str>, written: Option<&Written>) -> Result<u64> {
+    let Some(text) = text else {
+        return Err(Error::invalid_input(format!(
+            "Copy option \"{name}\" requires an argument of type UBIGINT"
+        )));
+    };
+    let (ty, number, shown) = match written
+        .and_then(|written| written.value.as_ref().map(|value| (&written.ty, value)))
+    {
+        Some((ty, value)) if *ty != LogicalType::Varchar => {
+            (ty.clone(), cast_unsigned(value), value.to_string())
+        }
+        _ => {
+            let text = text.trim_matches('\'');
+            (LogicalType::Varchar, text.trim().parse().ok(), text.to_string())
+        }
+    };
+    number.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Copy option \"{name}\" expected an argument of type UBIGINT - the argument \
+             \"{shown}\" of type {ty} could not be cast as this type"
+        ))
+    })
+}
+
+/// A value cast to an unsigned 64 bit number, if it is one.
+fn cast_unsigned(value: &Value) -> Option<u64> {
+    match rudb_kernels::cast_value(value, &LogicalType::UBigInt, true) {
+        Ok(Value::UBigInt(number)) => Some(number),
+        _ => None,
+    }
 }
 
 /// The columns a `PARTITION_BY` names, as a list in parentheses or a single name, each bare or
