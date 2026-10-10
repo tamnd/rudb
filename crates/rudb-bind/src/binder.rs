@@ -23,9 +23,10 @@ use rudb_common::{
     StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
-    Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
-    content_files, csv_columns, csv_fields, csv_given, files, is_file, is_pattern, json_text,
-    kind_of, parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
+    Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, Retype, TYPES_SET,
+    TableFunction, content_files, csv_columns, csv_fields, csv_given, csv_types, files, is_file,
+    is_pattern, json_text, kind_of, parquet_footers, parquet_outline, resolve, resolve_pragma,
+    resolve_table,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -4282,17 +4283,6 @@ impl<'a> Binder<'a> {
                         footers.fields
                     }
                 };
-                // Types the call set stay what it set them to, which was measured: `INTEGER`
-                // columns read with `all_varchar=true` as well are still `INTEGER`.
-                if options.all_varchar && options.given.types.is_none() {
-                    // The sniffer still ran, because the names come out of the same pass over the
-                    // front of the file and only the types are being overruled. The executor reads
-                    // the text as VARCHAR because this is the schema it is told to read into, which
-                    // is the same road a file in a glob takes when the set is wider than the file.
-                    for field in &mut fields {
-                        field.ty = LogicalType::Varchar;
-                    }
-                }
                 if options.binary_as_string {
                     // A byte array column with no annotation on it is a BLOB, and this is the caller
                     // saying that the file's writer meant text. The reader already holds both in the
@@ -4737,6 +4727,32 @@ impl<'a> Binder<'a> {
             );
             let at = self.plan.add_value(value.clone());
             let expr = self.plan.add_expr(Expr::Constant(at), LogicalType::Struct(fields));
+            return Ok((parameter, value, expr));
+        }
+        if matches!(*parameter, "types" | "dtypes" | "column_types") {
+            // The same for the types set over the sniffer's, by name or by position.
+            let catalog = self.catalog;
+            let mut read = |text: &str| crate::statement::read_type(catalog, text);
+            let written = |ty: LogicalType| Value::Varchar(ty.to_string());
+            let (value, ty) = match csv_types(parameter, &value, &mut read)? {
+                Retype::Named(named) => {
+                    let fields = named
+                        .iter()
+                        .map(|(name, _)| Field::new(name.clone(), LogicalType::Varchar))
+                        .collect();
+                    let named = named.into_iter().map(|(name, ty)| (name, written(ty)));
+                    (Value::Struct(named.collect()), LogicalType::Struct(fields))
+                }
+                Retype::Positional(types) => (
+                    Value::List {
+                        element: LogicalType::Varchar,
+                        values: types.into_iter().map(written).collect(),
+                    },
+                    LogicalType::list(LogicalType::Varchar),
+                ),
+            };
+            let at = self.plan.add_value(value.clone());
+            let expr = self.plan.add_expr(Expr::Constant(at), ty);
             return Ok((parameter, value, expr));
         }
         let given = self.plan.expr_type(expr).clone();
@@ -7184,8 +7200,6 @@ struct Options {
     /// `binary_as_string`, which says an unannotated byte array column in a Parquet file holds
     /// text. The ClickBench file has twenty eight of those and every query reads them as strings.
     binary_as_string: bool,
-    /// `all_varchar`, which reads every column of a CSV file as text rather than sniffing a type.
-    all_varchar: bool,
     /// `file_row_number`, which adds a column holding each row's ordinal inside its own file.
     ///
     /// The one Parquet option here that the executor has to act on rather than the binder, since
@@ -7207,7 +7221,6 @@ impl Options {
         for (parameter, value, _) in written {
             match (*parameter, value) {
                 ("binary_as_string", Value::Boolean(on)) => options.binary_as_string = *on,
-                ("all_varchar", Value::Boolean(on)) => options.all_varchar = *on,
                 ("file_row_number", Value::Boolean(on)) => options.file_row_number = *on,
                 _ => {}
             }
@@ -7518,6 +7531,9 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
         "columns" => format!("{} columns requires a struct as input", function.name()),
+        "types" | "dtypes" | "column_types" => {
+            format!("{} \"{parameter}\" requires a struct or list as input", function.name())
+        }
         "all_varchar" => format!("{} \"{parameter}\" cannot be NULL", function.name()),
         _ => format!("Cannot use NULL as argument to \"{parameter}\""),
     }

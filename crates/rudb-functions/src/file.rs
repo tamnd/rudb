@@ -30,7 +30,7 @@ use rudb_common::bounds::Zones;
 use rudb_common::stat::Direction;
 use rudb_common::{Error, Field, LogicalType, Provenance, Result, Stat, Value};
 use rudb_compress::{gzip, zstd};
-use rudb_csv::{Given, Reader as CsvReader};
+use rudb_csv::{Given, Reader as CsvReader, Retype};
 use rudb_io::glob::has_magic;
 use rudb_io::{File, Filesystem, OpenMode, RealFilesystem, expand};
 use rudb_kernels::json::scan;
@@ -86,6 +86,15 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             }
             (TYPES_SET, Value::Boolean(on)) => given.typed = *on,
             ("auto_detect", Value::Boolean(on)) => given.fixed = !*on,
+            ("all_varchar", Value::Boolean(on)) => given.all_varchar = *on,
+            ("types" | "dtypes" | "column_types", value) => {
+                if given.retype.is_some() {
+                    return Err(Error::binder(
+                        "read_csv column_types/types/dtypes can only be supplied once",
+                    ));
+                }
+                given.retype = Some(csv_types(name, value, &mut LogicalType::parse)?);
+            }
             ("columns", value) => {
                 let (names, types) = csv_columns(value, &mut LogicalType::parse)?;
                 given.names = Some(names);
@@ -98,6 +107,17 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
     if named && options.iter().any(|(name, _)| *name == "columns") {
         return Err(Error::binder("read_csv column_names/names can only be supplied once"));
     }
+    // Types set twice have to agree, and the ones `columns` set are the ones read, under the names
+    // it gave, whatever the other names them.
+    if let Some(set) = &given.types
+        && let Some(retype) = given.retype.take()
+    {
+        let types = match retype {
+            Retype::Named(named) => named.into_iter().map(|(_, ty)| ty).collect(),
+            Retype::Positional(types) => types,
+        };
+        agree(set, &types)?;
+    }
     // Types the call set are the caller's, except that the pin calls them auto-detected in a
     // conversion error once nothing was sniffed, which is its slip and is kept so the message is
     // the one a test of it expects.
@@ -105,6 +125,77 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
         given.typed = true;
     }
     Ok(given)
+}
+
+/// Refuses types that `types`, `dtypes` or `column_types` set for a read that `columns` set them
+/// for as well, unless they are the same ones in the same order, in the pin's words.
+fn agree(columns: &[LogicalType], types: &[LogicalType]) -> Result<()> {
+    if columns.len() != types.len() {
+        return Err(Error::binder(format!(
+            "read_csv: the 'columns' option specifies {} column(s), but \
+             'types'/'dtypes'/'column_types' specifies {} type(s). When both are provided they \
+             must agree. Consider removing the 'type' option.",
+            columns.len(),
+            types.len()
+        )));
+    }
+    for (at, (column, ty)) in columns.iter().zip(types).enumerate() {
+        if column != ty {
+            return Err(Error::binder(format!(
+                "read_csv: column type mismatch at position {}: 'columns' specifies '{column}' but \
+                 'types'/'dtypes'/'column_types' specifies '{ty}'. When both are provided they \
+                 must agree. Consider removing the 'type' option.",
+                at + 1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The types a `types`, `dtypes` or `column_types` parameter sets, which is a struct of a type
+/// name for each column it names or a list of type names for the first columns, with `read` making
+/// a type of each name. `parameter` is the spelling the call used, which the errors repeat.
+///
+/// The binder reads the names against the catalog and writes them back out, the way it does for
+/// [`csv_columns`]. A list with a null in it is refused the way a struct with one is, where
+/// `v2.0.0-dev84237` raises an internal error (tamnd/duckdb#47).
+///
+/// # Errors
+///
+/// When the value is neither a struct nor a list of strings, when an entry is not a string, and
+/// whatever `read` says about a name.
+pub fn csv_types(
+    parameter: &str,
+    value: &Value,
+    read: &mut dyn FnMut(&str) -> Result<LogicalType>,
+) -> Result<Retype> {
+    let not_a_name = || {
+        Error::binder(format!("read_csv \"{parameter}\" requires a type specification as string"))
+    };
+    match value {
+        Value::Struct(children) => {
+            let mut named = Vec::with_capacity(children.len());
+            for (name, child) in children {
+                let Value::Varchar(written) = child else { return Err(not_a_name()) };
+                named.push((name.clone(), read(written)?));
+            }
+            Ok(Retype::Named(named))
+        }
+        Value::List { element: LogicalType::Varchar, values } if !values.is_empty() => {
+            let mut types = Vec::with_capacity(values.len());
+            for child in values {
+                let Value::Varchar(written) = child else { return Err(not_a_name()) };
+                types.push(read(written)?);
+            }
+            Ok(Retype::Positional(types))
+        }
+        Value::List { .. } => Err(Error::binder(format!(
+            "read_csv \"{parameter}\" requires a list of types (varchar) as input"
+        ))),
+        _ => Err(Error::binder(format!(
+            "read_csv \"{parameter}\" requires a struct or list as input"
+        ))),
+    }
 }
 
 /// The names and the types a `columns` parameter gives, which is a struct of one type name each,

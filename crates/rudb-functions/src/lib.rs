@@ -29,14 +29,14 @@ pub use entrycatalog::{
     show_expanded_fields, show_table_fields, table_fields, trigger_fields, view_fields,
 };
 pub use file::{
-    Footers, TYPES_SET, content_files, csv_columns, csv_fields, csv_given, files, is_file,
-    is_pattern, json_text, open_csv, open_parquet, parquet_footers, parquet_outline,
+    Footers, TYPES_SET, content_files, csv_columns, csv_fields, csv_given, csv_types, files,
+    is_file, is_pattern, json_text, open_csv, open_parquet, parquet_footers, parquet_outline,
 };
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
 };
 pub use pragmacatalog::{PRAGMAS, PragmaEntry, pragma_named};
-pub use rudb_csv::Given;
+pub use rudb_csv::{Given, Retype};
 pub use settingcatalog::{
     Behaviour, GLOBAL, Kept, LOCAL, SETTINGS, SettingEntry, UNLISTED, UNSET, every_setting, kept,
     setting_fields, setting_named, unknown_enum_value, unknown_setting,

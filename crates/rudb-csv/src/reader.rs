@@ -20,7 +20,7 @@ use rudb_io::File;
 use rudb_vector::{Chunk, VECTOR_SIZE};
 
 use crate::convert::{self, Cells};
-use crate::dialect::{self, Dialect, Given};
+use crate::dialect::{self, Dialect, Given, Retype};
 use crate::infer;
 use crate::scan::{Records, Span};
 
@@ -166,6 +166,17 @@ impl Reader {
             for (field, name) in fields.iter_mut().zip(names) {
                 field.name.clone_from(name);
             }
+        }
+        // The sniffer still ran, because the names come out of the same pass over the front of the
+        // file and only the types are overruled. Types the call set stay what it set them to, which
+        // was measured: `INTEGER` columns read with `all_varchar=true` as well are still `INTEGER`.
+        if reader.given.all_varchar && reader.given.types.is_none() {
+            for field in &mut fields {
+                field.ty = LogicalType::Varchar;
+            }
+        }
+        if let Some(set) = &reader.given.retype {
+            retype(&mut fields, set)?;
         }
         reader.dialect.header = header;
         reader.fields = fields;
@@ -335,9 +346,8 @@ impl Reader {
         while start < rows {
             let end = rows.min(start + BLOCK_ROWS);
             for (build, &at) in builders.iter_mut().zip(&self.projection) {
-                let field = &self.fields[at];
                 let refuse = |text: &str, row: usize| {
-                    Error::conversion(self.conversion_error(text, field, first + row as u64))
+                    Error::conversion(self.conversion_error(text, at, first + row as u64))
                 };
                 if let Err(error) = build.rows(&cells, at, start..end, &refuse) {
                     return Err(self.first_bad_value(&cells, first).unwrap_or(error));
@@ -359,7 +369,7 @@ impl Reader {
         self.projection.iter().find_map(|&at| {
             let field = &self.fields[at];
             let refuse = |text: &str, row: usize| {
-                Error::conversion(self.conversion_error(text, field, first + row as u64))
+                Error::conversion(self.conversion_error(text, at, first + row as u64))
             };
             convert::column(cells, at, &field.ty, &refuse).err()
         })
@@ -516,11 +526,15 @@ impl Reader {
     /// User)` rather than `(Auto-Detected)`, measured on `v2.0.0-dev84237` by reading a file with
     /// `delim=';'` past the sample. Telling somebody that what they wrote down was auto-detected is
     /// the one thing the block could say that would send them looking in the wrong place.
-    fn conversion_error(&self, text: &str, field: &Field, line: u64) -> String {
+    fn conversion_error(&self, text: &str, at: usize, line: u64) -> String {
+        let field = &self.fields[at];
         // A type the caller set, which is every column of a `COPY t FROM`, gets the binary's other
         // paragraph, since telling somebody to set the type they set is no help. Measured on
-        // `v2.0.0-dev84237` with a `COPY` of a file whose second row does not fit the table.
-        let advice = if self.given.typed {
+        // `v2.0.0-dev84237` with a `COPY` of a file whose second row does not fit the table, and
+        // with `types` setting one column, where only that column gets it.
+        let retyped =
+            self.given.retype.as_ref().is_some_and(|set| set.of(at, &field.name).is_some());
+        let advice = if self.given.typed || retyped {
             "This type was either manually set or derived from an existing table. Select a \
              different type to correctly parse this column."
                 .to_string()
@@ -574,11 +588,7 @@ impl Reader {
             let mut values = Vec::with_capacity(rows.len());
             for (row, held) in rows.iter().enumerate() {
                 let text = held.get(at).and_then(Option::as_deref);
-                values.push(self.convert(
-                    text,
-                    field,
-                    self.line - rows.len() as u64 + row as u64,
-                )?);
+                values.push(self.convert(text, at, self.line - rows.len() as u64 + row as u64)?);
             }
             columns.push(rudb_vector::Vector::from_values(field.ty.clone(), &values)?);
         }
@@ -587,15 +597,16 @@ impl Reader {
 
     /// One value, cast from its text to the column's type.
     #[cfg(test)]
-    fn convert(&self, text: Option<&str>, field: &Field, line: u64) -> Result<rudb_common::Value> {
+    fn convert(&self, text: Option<&str>, at: usize, line: u64) -> Result<rudb_common::Value> {
         let Some(text) = text else { return Ok(rudb_common::Value::Null) };
+        let field = &self.fields[at];
         if field.ty == LogicalType::Varchar {
             return Ok(rudb_common::Value::Varchar(text.to_string()));
         }
         let value = rudb_common::Value::Varchar(text.to_string());
         match rudb_kernels::cast_value(&value, &field.ty, false) {
             Ok(converted) => Ok(converted),
-            Err(_) => Err(Error::conversion(self.conversion_error(text, field, line))),
+            Err(_) => Err(Error::conversion(self.conversion_error(text, at, line))),
         }
     }
 
@@ -754,6 +765,49 @@ fn describe(
     let names = unique(&rows[0], width);
     let fields = body.into_iter().zip(names).map(|(ty, name)| Field::new(name, ty)).collect();
     (true, fields)
+}
+
+/// Puts the types a call set in place of the ones the sniffer found, refusing a set that names a
+/// column the file does not have or that has more types than the file has columns, in the pin's
+/// words.
+///
+/// The names that are not there are listed last given first, which is the order the pin's hash map
+/// gave two of them in on `v2.0.0-dev84237`. It is not an order anybody chose, and with one name it
+/// does not matter.
+fn retype(fields: &mut [Field], set: &Retype) -> Result<()> {
+    match set {
+        Retype::Positional(types) if types.len() > fields.len() => {
+            return Err(Error::binder(format!(
+                "read_csv: {} types were provided, but CSV file only has {} columns",
+                types.len(),
+                fields.len()
+            )));
+        }
+        Retype::Named(types) => {
+            let missing: Vec<String> = types
+                .iter()
+                .rev()
+                .filter(|(name, _)| {
+                    let name = name.to_lowercase();
+                    !fields.iter().any(|field| field.name.to_lowercase() == name)
+                })
+                .map(|(name, _)| format!("\"{name}\""))
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::binder(format!(
+                    "COLUMN_TYPES error: Columns with names: {} do not exist in the CSV File",
+                    missing.join(",")
+                )));
+            }
+        }
+        Retype::Positional(_) => {}
+    }
+    for (at, field) in fields.iter_mut().enumerate() {
+        if let Some(ty) = set.of(at, &field.name) {
+            field.ty = ty.clone();
+        }
+    }
+    Ok(())
 }
 
 /// The column names a header row gives, with the collisions resolved the way DuckDB resolves them.

@@ -330,7 +330,8 @@ impl TableFunction {
     /// `delim` and is a separate row rather than an alias, because the list is also what the
     /// candidates on a misspelling are read out of and the binary prints both of them. The same
     /// goes for `column_names` and `names`. `columns` takes a struct of any shape and is listed
-    /// with no type, which is how the pin's `ANY` is written here.
+    /// with no type, which is how the pin's `ANY` is written here, and so do `types`, `dtypes` and
+    /// `column_types`, which take a struct or a list.
     #[must_use]
     pub fn parameters(self) -> &'static [(&'static str, LogicalType)] {
         static READ_PARQUET: &[(&str, LogicalType)] = &[
@@ -345,14 +346,17 @@ impl TableFunction {
                     ("all_varchar", LogicalType::Boolean),
                     ("auto_detect", LogicalType::Boolean),
                     ("column_names", LogicalType::list(LogicalType::Varchar)),
+                    ("column_types", LogicalType::Null),
                     ("columns", LogicalType::Null),
                     ("delim", LogicalType::Varchar),
+                    ("dtypes", LogicalType::Null),
                     ("escape", LogicalType::Varchar),
                     ("header", LogicalType::Boolean),
                     ("names", LogicalType::list(LogicalType::Varchar)),
                     ("nullstr", LogicalType::Varchar),
                     ("quote", LogicalType::Varchar),
                     ("sep", LogicalType::Varchar),
+                    ("types", LogicalType::Null),
                 ]
             });
         static READ_CONTENTS: &[(&str, LogicalType)] = &[("allow_empty", LogicalType::Boolean)];

@@ -38,7 +38,7 @@ pub mod scan;
 pub mod split;
 
 pub use combine::{across, mismatch, widen};
-pub use dialect::{Dialect, Given};
+pub use dialect::{Dialect, Given, Retype};
 pub use reader::Reader;
 pub use split::{Part, Split};
 

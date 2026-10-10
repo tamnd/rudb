@@ -311,14 +311,17 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    all_varchar BOOLEAN\n",
         "    auto_detect BOOLEAN\n",
         "    column_names VARCHAR[]\n",
+        "    column_types ANY\n",
         "    columns ANY\n",
         "    delim VARCHAR\n",
+        "    dtypes ANY\n",
         "    escape VARCHAR\n",
         "    header BOOLEAN\n",
         "    names VARCHAR[]\n",
         "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
         "    sep VARCHAR\n",
+        "    types ANY\n",
     );
     assert_eq!(error.message(), expected);
 }
@@ -439,4 +442,82 @@ fn columns_that_are_not_a_struct_of_type_names_are_refused_in_the_pins_words() {
         error.message(),
         "\"auto_detect\" expects a non-null boolean value (e.g. TRUE or 1)"
     );
+}
+
+#[test]
+fn types_set_some_columns_over_the_sniffer_by_name_or_by_position() {
+    let database = Database::new();
+    let file = written("types.csv", "a,b,c\n1,x,2.5\n2,y,3\n");
+    let types = |options: &str| {
+        let sql = format!("SELECT * FROM read_csv({file}, {options})");
+        let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+        (result.names().to_vec(), types)
+    };
+    // A name is matched without regard to case, a list sets the first columns, and the header is
+    // still the sniffer's.
+    let (names, set) = types("dtypes={'A': 'DOUBLE'}");
+    assert_eq!(names, ["a", "b", "c"]);
+    assert_eq!(set, ["DOUBLE", "VARCHAR", "DOUBLE"]);
+    assert_eq!(types("types=['INT']").1, ["INTEGER", "VARCHAR", "DOUBLE"]);
+    assert_eq!(types("column_types={'c': 'DECIMAL'}").1, ["BIGINT", "VARCHAR", "DECIMAL(18,3)"]);
+    // They come after the names and they beat `all_varchar`.
+    let (names, set) = types("types={'p': 'INT'}, names=['p', 'q']");
+    assert_eq!(names, ["p", "q", "c"]);
+    assert_eq!(set, ["INTEGER", "VARCHAR", "DOUBLE"]);
+    assert_eq!(types("types={'a': 'INT'}, all_varchar=true").1, ["INTEGER", "VARCHAR", "VARCHAR"]);
+    // Set with `columns` as well they have to agree, and the names are the ones `columns` gave.
+    let (names, set) = types(
+        "columns={'p': 'INT', 'q': 'VARCHAR', 'r': 'DOUBLE'}, \
+         types={'x': 'INT', 'y': 'VARCHAR', 'z': 'DOUBLE'}",
+    );
+    assert_eq!(names, ["p", "q", "r"]);
+    assert_eq!(set, ["INTEGER", "VARCHAR", "DOUBLE"]);
+    // A value that does not convert is the caller's mistake for a column they set, and the
+    // sniffer's for one they did not.
+    let sql = format!("SELECT * FROM read_csv({file}, types={{'b': 'INT'}})");
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().contains("This type was either manually set"), "{error}");
+}
+
+#[test]
+fn types_that_do_not_fit_the_file_or_the_columns_are_refused_in_the_pins_words() {
+    let database = Database::new();
+    let file = written("types-refused.csv", "a,b,c\n1,x,2.5\n2,y,3\n");
+    for (options, expected) in [
+        ("types=42", "read_csv \"types\" requires a struct or list as input"),
+        ("dtypes=NULL", "read_csv \"dtypes\" requires a struct or list as input"),
+        ("types=[1, 2]", "read_csv \"types\" requires a list of types (varchar) as input"),
+        ("types={'a': 1}", "read_csv \"types\" requires a type specification as string"),
+        ("types=['INT', NULL]", "read_csv \"types\" requires a type specification as string"),
+        (
+            "types=['INT'], dtypes=['INT']",
+            "read_csv column_types/types/dtypes can only be supplied once",
+        ),
+        (
+            "types=['INT', 'VARCHAR', 'INT', 'INT']",
+            "read_csv: 4 types were provided, but CSV file only has 3 columns",
+        ),
+        (
+            "types={'aa': 'INT', 'zz': 'INT'}",
+            "COLUMN_TYPES error: Columns with names: \"zz\",\"aa\" do not exist in the CSV File",
+        ),
+        (
+            "columns={'p': 'INT', 'q': 'VARCHAR', 'r': 'DOUBLE'}, types=['INT']",
+            "read_csv: the 'columns' option specifies 3 column(s), but \
+             'types'/'dtypes'/'column_types' specifies 1 type(s). When both are provided they \
+             must agree. Consider removing the 'type' option.",
+        ),
+        (
+            "columns={'p': 'INT', 'q': 'VARCHAR', 'r': 'DOUBLE'}, \
+             types={'r': 'DOUBLE', 'q': 'VARCHAR', 'p': 'INT'}",
+            "read_csv: column type mismatch at position 1: 'columns' specifies 'INTEGER' but \
+             'types'/'dtypes'/'column_types' specifies 'DOUBLE'. When both are provided they \
+             must agree. Consider removing the 'type' option.",
+        ),
+    ] {
+        let sql = format!("SELECT * FROM read_csv({file}, {options})");
+        let error = database.query(&sql).unwrap_err();
+        assert_eq!(error.message(), expected, "{options}");
+    }
 }
