@@ -323,6 +323,27 @@ impl QueryResult {
         Ok(result)
     }
 
+    /// What a `COPY ... TO` with `RETURN_FILES` answers: how many rows it wrote and the list of
+    /// the files it wrote them to, as a query's one row rather than a count of changes.
+    pub(crate) fn copied_files(rows: usize, files: Vec<String>) -> Result<Self> {
+        let count = i64::try_from(rows).unwrap_or(i64::MAX);
+        let list = LogicalType::list(LogicalType::Varchar);
+        let files = Value::List {
+            element: LogicalType::Varchar,
+            values: files.into_iter().map(Value::Varchar).collect(),
+        };
+        let chunk = Chunk::new(vec![
+            Vector::from_values(LogicalType::BigInt, &[Value::BigInt(count)])?,
+            Vector::from_values(list.clone(), &[files])?,
+        ])?;
+        Ok(Self::new(
+            vec!["Count".to_owned(), "Files".to_owned()],
+            vec![LogicalType::BigInt, list],
+            vec![chunk],
+            Memory::unlimited().reservation(),
+        ))
+    }
+
     /// How many rows the statement wrote, when it was an `INSERT`, `UPDATE`, `DELETE` or `CREATE
     /// TABLE`, and `None` when the rows are the answer to a query.
     #[must_use]

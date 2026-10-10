@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use rudb_bind::{Bound, Described, Parameters, Placeholders, Write};
+use rudb_bind::{Bound, Described, Parameters, Placeholders, Returns, Write};
 use rudb_catalog::{
     Alteration, Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName,
     TEMP_CATALOG, View, same_name,
@@ -7150,7 +7150,12 @@ impl Shared {
                 let result = run(sql, &copy.plan, &catalog, cancel, under)?;
                 let zone = session.session_time_zone();
                 let threads = self.inner.pool.threads();
-                QueryResult::changed(crate::export::write(&copy, &result, zone, threads)?)
+                let (rows, files) = crate::export::write(&copy, &result, zone, threads)?;
+                if copy.partitioned.returns == Returns::Files {
+                    QueryResult::copied_files(rows, files)
+                } else {
+                    QueryResult::changed(rows)
+                }
             }
             Bound::Setting(setting)
                 if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>

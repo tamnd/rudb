@@ -1100,8 +1100,8 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                 }
             }
             "compression" | "dateformat" | "date_format" | "timestampformat"
-            | "timestamp_format" | "new_line" | "prefix" | "suffix" | "return_files"
-            | "preserve_order" | "force_not_null" | "encoding" => {
+            | "timestamp_format" | "new_line" | "prefix" | "suffix" | "preserve_order"
+            | "force_not_null" | "encoding" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
                 )));
@@ -1165,7 +1165,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     "Option \"encoding\" is not supported for writing - only for reading",
                 ));
             }
-            "compression" | "return_files" | "preserve_order" => {
+            "compression" | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
                 )));
@@ -1265,7 +1265,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             | "bloom_filter_false_positive_ratio"
             | "parquet_version"
             | "geoparquet_version"
-            | "return_files"
             | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
