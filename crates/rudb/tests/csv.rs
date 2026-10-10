@@ -310,6 +310,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "Candidates:\n",
         "    all_varchar BOOLEAN\n",
         "    auto_detect BOOLEAN\n",
+        "    buffer_size UBIGINT\n",
         "    column_names VARCHAR[]\n",
         "    column_types ANY\n",
         "    columns ANY\n",
@@ -317,6 +318,8 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    dtypes ANY\n",
         "    escape VARCHAR\n",
         "    header BOOLEAN\n",
+        "    max_line_size VARCHAR\n",
+        "    maximum_line_size VARCHAR\n",
         "    names VARCHAR[]\n",
         "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
@@ -519,5 +522,51 @@ fn types_that_do_not_fit_the_file_or_the_columns_are_refused_in_the_pins_words()
         let sql = format!("SELECT * FROM read_csv({file}, {options})");
         let error = database.query(&sql).unwrap_err();
         assert_eq!(error.message(), expected, "{options}");
+    }
+}
+
+#[test]
+fn a_line_longer_than_max_line_size_or_buffer_size_is_refused_in_the_pins_words() {
+    let database = Database::new();
+    let file = written("long-line.csv", "abcd,fghij\nab,c\n");
+    let read = |options: &str| {
+        let sql = format!("SELECT * FROM read_csv({file}, {options})");
+        database.query(&sql).map(|result| result.len()).map_err(|error| error.message().to_string())
+    };
+    // The line ending counts in a line that was sniffed and not in one that was not.
+    assert_eq!(read("max_line_size=11"), Ok(1));
+    assert_eq!(read("buffer_size=11"), Ok(1));
+    for options in ["max_line_size=10", "maximum_line_size='10'", "buffer_size=10"] {
+        let error = read(options).unwrap_err();
+        assert!(
+            error.starts_with(
+                "CSV Error on Line: 1\nOriginal Line: abcd,fghij\n\nMaximum line size of 10 bytes \
+                 exceeded. Actual Size:11 bytes.\n\nPossible Solution: Change the maximum length \
+                 size, e.g., max_line_size=13\n"
+            ),
+            "{options}: {error}"
+        );
+    }
+    let fixed = "auto_detect=false, columns={'x': 'VARCHAR', 'y': 'VARCHAR'}";
+    assert_eq!(read(&format!("{fixed}, max_line_size=10")), Ok(2));
+    let error = read(&format!("{fixed}, max_line_size=9")).unwrap_err();
+    assert!(
+        error.contains("Maximum line size of 9 bytes exceeded. Actual Size:10 bytes."),
+        "{error}"
+    );
+    for (options, expected) in [
+        ("buffer_size=0", "Buffer Size option must be higher than 0"),
+        (
+            "max_line_size=-1",
+            "Invalid value for MAX_LINE_SIZE parameter: it cannot be smaller than 0",
+        ),
+        (
+            "buffer_size=5, max_line_size=10",
+            "Buffer Size of 5 must be a higher value than the maximum line size 10",
+        ),
+        ("max_line_size=NULL", "\"max_line_size\" expects a non-null integer value"),
+        ("buffer_size=NULL", "\"buffer_size\" expects a non-null integer value"),
+    ] {
+        assert_eq!(read(options).unwrap_err(), expected, "{options}");
     }
 }

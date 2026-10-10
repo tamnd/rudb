@@ -48,7 +48,7 @@ pub struct Dialect {
 /// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
 /// rather than folded into a [`Dialect`] and forgotten.
 ///
-/// The last six are not punctuation, and they are here because they travel the same road: the
+/// The last seven are not punctuation, and they are here because they travel the same road: the
 /// binder works them out from the call to sniff the file with and the executor works them out again
 /// from the plan to read it with, and a second struct beside this one would be a second thing for
 /// the two ends to keep in step.
@@ -105,6 +105,9 @@ pub struct Given {
     /// Whether every column the call did not set a type for is read as text, which is
     /// `all_varchar` on a call.
     pub all_varchar: bool,
+    /// How many bytes a line may have, which is `max_line_size` on a call, or `buffer_size` when
+    /// only that is given. `None` is the pin's default of [`Given::MAX_LINE`].
+    pub max_line: Option<usize>,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.
@@ -133,6 +136,15 @@ impl Retype {
 }
 
 impl Given {
+    /// The pin's longest line when the call does not say, which is two million bytes.
+    pub const MAX_LINE: usize = 2_000_000;
+
+    /// How many bytes a line may have.
+    #[must_use]
+    pub fn line_limit(&self) -> usize {
+        self.max_line.unwrap_or(Self::MAX_LINE)
+    }
+
     /// How a byte is written in the block under a conversion error, and where it came from.
     #[must_use]
     pub fn shown(given: Option<u8>, sniffed: Option<u8>) -> String {

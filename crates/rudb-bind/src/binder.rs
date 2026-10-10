@@ -7530,6 +7530,9 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         "header" | "auto_detect" => {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
+        "buffer_size" | "max_line_size" | "maximum_line_size" => {
+            format!("\"{parameter}\" expects a non-null integer value")
+        }
         "columns" => format!("{} columns requires a struct as input", function.name()),
         "types" | "dtypes" | "column_types" => {
             format!("{} \"{parameter}\" requires a struct or list as input", function.name())

@@ -428,6 +428,7 @@ impl Reader {
             self.records.shift(start);
             start = 0;
         }
+        self.long_line(start)?;
         Ok(self.records.len())
     }
 
@@ -552,12 +553,20 @@ impl Reader {
             "CSV Error on Line: {line}\nOriginal Line: {text}\nError when converting column \
              \"{}\". Could not convert string \"{text}\" to '{}'\n\nColumn {} is being converted \
              as type {}\n{advice}\n* Check whether the null string value is set correctly (e.g., \
-             nullstr = 'N/A')\n\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  \
-             header = {} {}\n  sample_size = {}\n",
+             nullstr = 'N/A')\n{}",
             field.name,
             field.ty,
             field.name,
             field.ty,
+            self.settings(),
+        )
+    }
+
+    /// The block of settings at the bottom of DuckDB's errors about a line of the file.
+    fn settings(&self) -> String {
+        format!(
+            "\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  header = {} {}\n  \
+             sample_size = {}\n",
             self.path,
             Given::shown(self.given.delimiter, Some(self.dialect.delimiter)),
             Given::shown(self.given.quote, self.dialect.quote),
@@ -566,6 +575,66 @@ impl Reader {
             Given::source(self.given.header.is_some()),
             infer::SAMPLE,
         )
+    }
+
+    /// Refuses the first of the records just split that is longer than the call allows, in the
+    /// pin's words, where `from` is where the first of them starts in the buffer.
+    ///
+    /// A chunk no longer than the limit cannot hold a line that is, which is nearly every chunk, so
+    /// the records are only measured when the chunk is longer. Each is first measured from where
+    /// its first field starts to where the next one's does, which can be out by the quotes around
+    /// those two fields, and only a record that comes within two bytes of the limit is split again
+    /// to measure it exactly.
+    ///
+    /// The pin counts the line ending in a line it sniffed and leaves it out of one it did not,
+    /// which was measured on `v2.0.0-dev84237`: `abcd,fghij` and a newline is eleven bytes long
+    /// there, and ten with `auto_detect=false`. The line number is this file's, where the pin's
+    /// sniffer calls every such line line 1.
+    fn long_line(&self, from: usize) -> Result<()> {
+        let most = self.given.line_limit();
+        let rows = self.records.len();
+        if rows == 0 || self.at - from <= most {
+            return Ok(());
+        }
+        let starts = |row: usize| self.records.fields(row).first().map(|span| span.start());
+        let mut start = from;
+        let mut scratch = Vec::new();
+        for row in 0..rows {
+            let next = if row + 1 < rows { starts(row + 1).unwrap_or(self.at) } else { self.at };
+            if next.saturating_sub(start) + 2 > most {
+                // The record's own bytes, split again from where the records started, since the
+                // ranges say where fields are and not where lines are.
+                let mut at = from;
+                for _ in 0..row {
+                    at = crate::scan::record(&self.buffer, at, self.dialect, true, &mut scratch)?
+                        .unwrap_or(self.at);
+                }
+                let end = crate::scan::record(&self.buffer, at, self.dialect, true, &mut scratch)?
+                    .unwrap_or(self.at);
+                self.refuse_long(&self.buffer[at..end], self.line + row as u64)?;
+            }
+            start = next;
+        }
+        Ok(())
+    }
+
+    /// Refuses one line, with its line ending, that is longer than the limit allows.
+    fn refuse_long(&self, line: &[u8], number: u64) -> Result<()> {
+        let most = self.given.line_limit();
+        let bare = line.strip_suffix(b"\n").unwrap_or(line);
+        let bare = bare.strip_suffix(b"\r").unwrap_or(bare);
+        let size = if self.given.fixed { bare.len() } else { line.len() };
+        if size <= most {
+            return Ok(());
+        }
+        Err(Error::invalid_input(format!(
+            "CSV Error on Line: {number}\nOriginal Line: {}\n\nMaximum line size of {most} bytes \
+             exceeded. Actual Size:{size} bytes.\n\nPossible Solution: Change the maximum length \
+             size, e.g., max_line_size={}\n{}",
+            String::from_utf8_lossy(bare),
+            size + 2,
+            self.settings(),
+        )))
     }
 
     /// The next chunk the way it was read before the records were split a chunk at a time, one
@@ -650,8 +719,15 @@ impl Reader {
     }
 
     /// Reads one record and throws it away, which is what a header is.
+    ///
+    /// The header is held to the line limit too, as the pin's sniffer holds it: a refill keeps the
+    /// buffer from where the record starts, so its bytes are the ones just before where it ends.
     fn skip_record(&mut self) -> Result<()> {
-        self.advance()?;
+        let (number, from) = (self.line, self.here());
+        if self.advance()?.is_some() {
+            let size = usize::try_from(self.here() - from).unwrap_or(usize::MAX);
+            self.refuse_long(&self.buffer[self.at - size..self.at], number)?;
+        }
         Ok(())
     }
 
