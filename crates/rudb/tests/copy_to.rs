@@ -863,3 +863,99 @@ fn return_files_answers_the_count_and_the_files_written_as_the_pin_does() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn return_stats_answers_what_each_parquet_file_holds_as_the_pin_does() {
+    use rudb_common::Value;
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-stats-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("makes the directory");
+    let dir = root.display().to_string();
+    let db = Database::new();
+    db.execute(
+        "CREATE TABLE s AS SELECT range i, range % 2 = 0 b, NULLIF(range, 3)::VARCHAR \"a\"\"b\", \
+         CASE WHEN range = 1 THEN 'nan'::DOUBLE ELSE range / 2 END f FROM range(5)",
+    )
+    .expect("creates");
+    // The sizes are the writer's own and differ from the pin's, so they are masked.
+    let mask = |text: String| {
+        let mut out = String::new();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("column_size_bytes=") {
+            let start = at + "column_size_bytes=".len();
+            out.push_str(&rest[..start]);
+            rest = &rest[start..];
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            out.push_str(if &rest[..digits] == "0" { "0" } else { "N" });
+            rest = &rest[digits..];
+        }
+        out.push_str(rest);
+        out
+    };
+    let stats = |sql: &str| {
+        let sql = sql.replace("DIR", &dir);
+        let result = db.execute(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let names = [
+            "filename",
+            "count",
+            "file_size_bytes",
+            "footer_size_bytes",
+            "column_statistics",
+            "partition_keys",
+            "extra_info",
+        ];
+        assert_eq!(result.names(), names, "{sql}");
+        let mut rows = (0..result.len())
+            .map(|row| {
+                let (Value::UBigInt(size), Value::UBigInt(footer)) =
+                    (result.value_at(row, 2), result.value_at(row, 3))
+                else {
+                    panic!("{sql}: sizes")
+                };
+                assert!(size > footer && footer > 0, "{sql}: {size} {footer}");
+                [0, 1, 4, 5, 6].map(|column| {
+                    mask(result.value_at(row, column).to_string().replace(&dir, "DIR"))
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+
+    assert_eq!(
+        stats("COPY s TO 'DIR/s.parquet' (RETURN_STATS)"),
+        [[
+            "DIR/s.parquet".into(),
+            "5".into(),
+            "{'\"a\"\"b\"'={column_size_bytes=N, max=4, max_is_exact=true, min=0, \
+             min_is_exact=true, null_count=1, num_values=5}, '\"b\"'={column_size_bytes=N, max=1, \
+             max_is_exact=true, min=0, min_is_exact=true, null_count=0, num_values=5}, \
+             '\"f\"'={column_size_bytes=N, has_nan=true, max=2.0, max_is_exact=true, min=0.0, \
+             min_is_exact=true, nan_count=1, null_count=0, num_values=5}, \
+             '\"i\"'={column_size_bytes=N, max=4, max_is_exact=true, min=0, min_is_exact=true, \
+             null_count=0, num_values=5}}"
+                .to_string(),
+            "NULL".into(),
+            "{row_group_count=1}".into(),
+        ]]
+    );
+    // A partitioned copy names the partition of each file and leaves its column out.
+    let parts = stats(
+        "COPY (SELECT i, b FROM s) TO 'DIR/p' (FORMAT parquet, PARTITION_BY b, RETURN_STATS)",
+    );
+    let keys = parts.iter().map(|row| row[3].clone()).collect::<Vec<_>>();
+    assert_eq!(keys, ["{b=false}", "{b=true}"]);
+    assert!(parts[0][2].starts_with("{'\"i\"'=") && !parts[0][2].contains("\"b\""), "{parts:?}");
+    // A column with no values has no bounds and no NaN count.
+    assert_eq!(
+        stats("COPY (SELECT f FROM s LIMIT 0) TO 'DIR/e.parquet' (RETURN_STATS)"),
+        [[
+            "DIR/e.parquet".to_string(),
+            "0".to_string(),
+            "{'\"f\"'={column_size_bytes=0, null_count=0, num_values=0}}".to_string(),
+            "NULL".to_string(),
+            "{row_group_count=0}".to_string(),
+        ]]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

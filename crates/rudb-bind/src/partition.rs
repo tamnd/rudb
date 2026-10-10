@@ -223,11 +223,6 @@ pub(crate) fn partitioning(
             "RETURN_STATS is not supported for the \"csv\" copy format",
         ));
     }
-    if out.returns == Returns::Stats {
-        return Err(Error::not_implemented(
-            "COPY TO with the option return_stats is not supported yet",
-        ));
-    }
     if partitioned && !out.write_columns && out.columns.len() == names.len() {
         return Err(Error::not_implemented(
             "No column to write as all columns are specified as partition columns. \

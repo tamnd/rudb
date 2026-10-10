@@ -51,4 +51,4 @@ pub use metadata::{
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
 pub use prune::{Bound, Footer, Op, Test, skips};
 pub use reader::{Reader, read};
-pub use write::{Writer, storage};
+pub use write::{ColumnStatistics, Writer, storage};

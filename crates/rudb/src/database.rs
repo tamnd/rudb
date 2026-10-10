@@ -7152,10 +7152,13 @@ impl Shared {
                 let zone = session.session_time_zone();
                 let threads = self.inner.pool.threads();
                 let (rows, files) = crate::export::write(&copy, &result, zone, threads)?;
-                if copy.partitioned.returns == Returns::Files {
-                    QueryResult::copied_files(rows, files)
-                } else {
-                    QueryResult::changed(rows)
+                match copy.partitioned.returns {
+                    Returns::Count => QueryResult::changed(rows),
+                    Returns::Files => QueryResult::copied_files(
+                        rows,
+                        files.into_iter().map(|file| file.path).collect(),
+                    ),
+                    Returns::Stats => crate::export::statistics(files),
                 }
             }
             Bound::Setting(setting)
