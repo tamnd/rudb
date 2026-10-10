@@ -329,6 +329,7 @@ pub(super) fn outputs(plan: &Plan, at: NodeRef) -> Vec<(ColumnBinding, LogicalTy
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. }
         | Node::MaterializedCte { body: input, .. } => outputs(plan, input),
@@ -846,6 +847,14 @@ impl Builder<'_> {
                 self.limit(sort, Some(count), offset, at)
             }
             Node::Limit { input, count, offset } => {
+                let child = self.node(input, None);
+                let rows = child.cost.rows;
+                let count = self.bound(count, rows);
+                let offset = self.bound(offset, rows).unwrap_or(0.0);
+                self.limit(child, count, offset, at)
+            }
+            // PostgreSQL shows `WITH TIES` as a plain limit.
+            Node::LimitTies { input, count, offset, .. } => {
                 let child = self.node(input, None);
                 let rows = child.cost.rows;
                 let count = self.bound(count, rows);

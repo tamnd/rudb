@@ -7512,3 +7512,59 @@ fn a_row_compares_a_pair_at_a_time_as_postgres() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn fetch_first_with_ties_keeps_the_rows_that_tie_as_postgres() {
+    let dirs = Dirs::new("pgwithties");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers and the errors are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "select string_agg(x::text, ' ') from (select x from generate_series(1, 9) x \
+             order by x / 3 fetch first 3 rows with ties) s",
+            "1 2 3 4 5",
+        ),
+        (
+            "select string_agg(x::text, ' ') from (select x from generate_series(1, 9) x \
+             order by x / 3 offset 3 fetch first 1 row with ties) s",
+            "4 5",
+        ),
+        (
+            "select count(*)::text from (select x from generate_series(1, 9) x \
+             order by x / 3 fetch first 0 rows with ties) s",
+            "0",
+        ),
+        (
+            "select count(*)::text from (select x from generate_series(1, 9) x \
+             order by x / 3 fetch first (select null::int) rows with ties) s",
+            "9",
+        ),
+        // The rows that tie run on past the end of the first chunk.
+        (
+            "select count(*)::text from (select x from generate_series(1, 9000) x \
+             order by x / 3000 fetch first 1 row with ties) s",
+            "2999",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    for (sql, message) in [
+        (
+            "select x from generate_series(1, 9) x order by x fetch first null rows with ties",
+            "row count cannot be null in FETCH FIRST ... WITH TIES clause",
+        ),
+        (
+            "select x from generate_series(1, 9) x fetch first 1 row with ties",
+            "WITH TIES cannot be specified without ORDER BY clause",
+        ),
+    ] {
+        let messages = client.query(sql);
+        let tags = tags(&messages);
+        assert!(tags.ends_with("EZ"), "{sql}");
+        let error = &messages[tags.len() - 2];
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}

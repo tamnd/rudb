@@ -73,6 +73,7 @@ pub(crate) fn replace_children(node: &mut Node, children: &[NodeRef]) {
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::TopN { input, .. }
         | Node::Fetch { input, .. }
         | Node::TableFetch { input, .. }
@@ -161,6 +162,7 @@ pub(crate) fn outputs(plan: &Plan, at: NodeRef) -> Option<Vec<(ColumnBinding, Lo
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => outputs(plan, input),
         // A materialisation produces what the query reading it produces. The held columns go to the

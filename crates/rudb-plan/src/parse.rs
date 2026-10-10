@@ -311,6 +311,14 @@ impl Reader<'_> {
                 let offset = read_bound(plan, c)?;
                 Ok(Built::unary(move |input| Node::Limit { input, count, offset }))
             }
+            "LimitTies" => {
+                let keys = read_sort_keys(plan, c)?;
+                c.expect_word("count")?;
+                let count = read_bound(plan, c)?;
+                c.expect_word("offset")?;
+                let offset = read_bound(plan, c)?;
+                Ok(Built::unary(move |input| Node::LimitTies { input, keys, count, offset }))
+            }
             "LimitPercent" => {
                 let percent = read_share(plan, c)?;
                 c.expect_word("offset")?;

@@ -310,6 +310,9 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Keys]) -> Keys {
             Bound::All | Bound::Rows(_) | Bound::Read(_) => below(input),
         },
         Node::LimitPercent { input, .. } => below(input),
+        // Ties can make any count more rows than it says, so even a count of one keeps only the
+        // keys of the input.
+        Node::LimitTies { input, .. } => below(input),
         Node::TopN { input, count, .. } => {
             if count <= 1 {
                 Keys::single()

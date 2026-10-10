@@ -363,6 +363,17 @@ fn node(plan: &mut Plan, at: NodeRef, pending: Vec<ExprRef>, tables: &mut Tables
             };
             filter(plan, above, pending)
         }
+        // A filter moved under a limit with ties changes which rows tie as well as which rows come
+        // out, so this holds the line the same way.
+        Node::LimitTies { input, keys, count, offset } => {
+            let rebuilt = node(plan, input, Vec::new(), tables);
+            let above = if rebuilt == input {
+                at
+            } else {
+                plan.add_node(Node::LimitTies { input: rebuilt, keys, count, offset })
+            };
+            filter(plan, above, pending)
+        }
         Node::TopN { input, keys, count, offset } => {
             let rebuilt = node(plan, input, Vec::new(), tables);
             let above = if rebuilt == input {

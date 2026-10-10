@@ -134,7 +134,9 @@ fn compute(plan: &Plan, at: NodeRef, known: &[Carried]) -> Carried {
         Node::Window { input, .. } => below(input),
 
         // A prefix of the rows, in the order they arrived.
-        Node::Limit { input, .. } | Node::LimitPercent { input, .. } => below(input),
+        Node::Limit { input, .. }
+        | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. } => below(input),
 
         // A materialisation produces the rows of its body.
         Node::MaterializedCte { body, .. } => below(body),

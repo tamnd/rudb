@@ -301,6 +301,7 @@ pub(crate) fn unsupported(plan: &Plan, at: NodeRef, outer: &TableSet) -> Option<
             _ => Some("a LIMIT holding a value that is not known until the query runs".to_owned()),
         },
         Node::LimitPercent { .. } => Some("a LIMIT written as a percentage".to_owned()),
+        Node::LimitTies { .. } => Some("a FETCH FIRST WITH TIES".to_owned()),
         Node::Join { kind: JoinKind::Positional, .. } => Some("a positional join".to_owned()),
         Node::Join { .. } => None,
         ref held => Some(format!("a {}", held.keyword())),

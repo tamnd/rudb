@@ -745,6 +745,7 @@ impl RangeRead {
             || query.order_by_all
             || query.limit == rudb_parse::NONE
             || query.limit_percent
+            || query.with_ties
             || query.offset != rudb_parse::NONE
         {
             return None;

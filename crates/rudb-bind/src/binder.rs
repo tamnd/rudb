@@ -3187,10 +3187,39 @@ impl<'a> Binder<'a> {
             };
             return self.over_subqueries(waiting, input, scope, node);
         }
+        if query.with_ties {
+            let count = self.count_bound(ast, query.limit, "LIMIT")?;
+            let offset = self.skipped(ast, query.offset)?;
+            let keys = self.tied_on(input);
+            let node = |binder: &mut Self, input| match count {
+                // A count that is null when the plan is built is every row, and then no row is
+                // left over to tie with the last one.
+                Bound::All => binder.limited(input, Bound::All, offset),
+                count => binder.add_node(Node::LimitTies { input, keys, count, offset }),
+            };
+            return self.over_subqueries(waiting, input, scope, node);
+        }
         let count = self.count_bound(ast, query.limit, "LIMIT")?;
         let offset = self.skipped(ast, query.offset)?;
         let node = |binder: &mut Self, input| binder.limited(input, count, offset);
         self.over_subqueries(waiting, input, scope, node)
+    }
+
+    /// The sort keys a `WITH TIES` compares rows on, which are the ones of the `ORDER BY` just below
+    /// the limit.
+    ///
+    /// A `DISTINCT ON` has its sort below the distinct, and the distinct keeps the order. An
+    /// `ORDER BY` that left no key, which is one of constants only, is no keys at all, and then
+    /// every row ties with every other one.
+    fn tied_on(&self, input: NodeRef) -> rudb_plan::Slice {
+        match self.plan.node(input) {
+            Node::Sort { keys, .. } => *keys,
+            Node::Distinct { input, .. } => match self.plan.node(*input) {
+                Node::Sort { keys, .. } => *keys,
+                _ => rudb_plan::Slice::default(),
+            },
+            _ => rudb_plan::Slice::default(),
+        }
     }
 
     /// The offset a query wrote, as nought rows skipped when it wrote none.

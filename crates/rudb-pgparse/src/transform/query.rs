@@ -58,7 +58,18 @@ impl Transform<'_> {
         }
         query.order_by = self.ast.order_slice(items);
         if select.limitOption == LimitOption::LIMIT_OPTION_WITH_TIES {
-            return clause("WithTies");
+            // `transformLimitClause`: a null written out is refused here, and one that only turns
+            // out null when the query runs is every row.
+            if let Some(Node::A_Const(constant)) = select.limitCount.as_ref()
+                && constant.isnull
+            {
+                return Err(Error::parser(
+                    "row count cannot be null in FETCH FIRST ... WITH TIES clause",
+                )
+                .state(SqlState::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE)
+                .into());
+            }
+            query.with_ties = true;
         }
         query.limit = self.limit(select.limitCount.as_ref())?;
         query.offset = self.limit(select.limitOffset.as_ref())?;

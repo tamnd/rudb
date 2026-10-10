@@ -338,6 +338,7 @@ impl Binder<'_> {
                 | Node::Sort { input, .. }
                 | Node::Limit { input, .. }
                 | Node::LimitPercent { input, .. }
+                | Node::LimitTies { input, .. }
                 | Node::TopN { input, .. }
                 | Node::Distinct { input, .. } => input,
                 Node::MaterializedCte { body, .. } => body,

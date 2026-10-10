@@ -215,6 +215,7 @@ fn collect(plan: &Plan, at: NodeRef, set: &mut TableSet) {
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => collect(plan, input, set),
         Node::Join { left, right, .. }

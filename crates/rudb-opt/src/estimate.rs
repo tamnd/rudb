@@ -590,6 +590,11 @@ pub fn rows_stat_into(
                 },
             }
         }
+        // Ties can add any number of rows past the count, so the input less the offset is the only
+        // ceiling there is.
+        Node::LimitTies { input, offset, .. } => {
+            of(input).map(|n| n.saturating_sub(offset.rows().unwrap_or(0)))
+        }
         // A share of an unknown number of rows is still unknown, which is the difference from the
         // arm above: a row count is a ceiling whatever feeds it and a percentage is not.
         Node::LimitPercent { input, percent, offset } => of(input).map(|n| {

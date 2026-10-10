@@ -1171,6 +1171,14 @@ impl Plan {
                     self.read_columns(key.expr, found);
                 }
             }
+            Node::LimitTies { keys, count, offset, .. } => {
+                for key in self.sort_key_list(keys) {
+                    self.read_columns(key.expr, found);
+                }
+                for expr in [count.read(), offset.read()].into_iter().flatten() {
+                    self.read_columns(expr, found);
+                }
+            }
             Node::Fetch { args, row, .. } => {
                 self.each_column(args, found);
                 self.read_columns(row, found);
@@ -1588,6 +1596,23 @@ impl Plan {
                     return fail("skips ALL rows, which is not an offset");
                 }
             }
+            Node::LimitTies { keys, count, offset, .. } => {
+                let end = keys.start as usize + keys.len as usize;
+                if end > self.sort_keys.len() {
+                    return fail("names a sort key run that is not in the pool");
+                }
+                for key in self.sort_key_list(keys) {
+                    self.checked_expr(key.expr, reference)?;
+                }
+                for expr in [count.read(), offset.read()].into_iter().flatten() {
+                    self.checked_expr(expr, reference)?;
+                }
+                // Ties are the rows after the last one counted, so there has to be a count, and
+                // the offset is the same rule as for a plain limit.
+                if count == Bound::All || offset == Bound::All {
+                    return fail("has no count or skips ALL rows, which is not a limit with ties");
+                }
+            }
             Node::LimitPercent { percent, offset, .. } => {
                 for expr in percent.read().into_iter().chain(offset.read()) {
                     self.checked_expr(expr, reference)?;
@@ -1769,6 +1794,14 @@ impl Plan {
             }
             Node::LimitPercent { percent, offset, .. } => {
                 plain(&[percent.read(), offset.read()].into_iter().flatten().collect::<Vec<_>>())
+            }
+            Node::LimitTies { keys, count, offset, .. } => {
+                let mut all: Vec<(ExprRef, bool, bool)> =
+                    self.sort_key_list(keys).iter().map(|key| (key.expr, false, false)).collect();
+                all.extend(plain(
+                    &[count.read(), offset.read()].into_iter().flatten().collect::<Vec<_>>(),
+                ));
+                all
             }
             Node::Values { rows, .. } => {
                 self.row_list(rows).iter().flat_map(|row| plain(self.expr_list(*row))).collect()

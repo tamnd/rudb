@@ -12,7 +12,7 @@
 //! drives them is the serial driver in `rudb-pipeline`, which pushes one chunk through every stream
 //! of a pipeline in the order `build.rs` stacked them.
 
-use rudb_common::{Error, Field, Result, Session};
+use rudb_common::{Error, Field, Result, Session, Value};
 use rudb_kernels::row_count;
 use rudb_pipeline::{Compaction, Gauge, Progress, Stream, narrow};
 use rudb_plan::{ExprRef, Node, NodeRef, Plan, Slice};
@@ -198,6 +198,7 @@ fn reads(node: &Node) -> u32 {
         | Node::Window { .. }
         | Node::Distinct { .. }
         | Node::LimitPercent { .. }
+        | Node::LimitTies { .. }
         | Node::SetOp { .. }
         | Node::RecursiveCte { .. } => 2,
         Node::TopN { .. } | Node::CrossProduct { .. } => 2,
@@ -360,10 +361,18 @@ impl Stream for Project {
 /// the value in a column of every row, and the number is read off the first chunk and kept for the
 /// rest of the query. Read once and not per chunk: a volatile call would otherwise answer a
 /// different limit every chunk, and the pin reads it once too.
+///
+/// `FETCH FIRST n ROWS WITH TIES` is the same operator with the sort keys to compare on. Once the
+/// count is reached it keeps reading, and it keeps every row whose keys are equal to those of the
+/// last row the count took, which is `LIMIT_WINDOWEND_TIES` in `nodeLimit.c`. The input is sorted
+/// on those keys, so the first row that differs ends the answer.
 #[derive(Debug)]
 pub(crate) struct Limit {
     count: Edge,
     offset: Edge,
+    /// The keys of the `ORDER BY` for `WITH TIES`, and `None` for any other limit. No keys at all
+    /// is an `ORDER BY` of constants, where every row ties.
+    ties: Option<Prepared>,
     /// A negative end gives the error of PostgreSQL.
     postgres: bool,
 }
@@ -389,11 +398,22 @@ pub(crate) struct Taken {
     /// Working space for whichever ends are read off the rows. Empty for the ends that are not.
     counting: Scratch,
     skipping: Scratch,
+    /// Working space for the keys of `WITH TIES`, and the keys of the last row the count took once
+    /// it has taken it.
+    tying: Scratch,
+    last: Option<Vec<Value>>,
 }
 
 impl Limit {
     pub(crate) fn new(count: Edge, offset: Edge) -> Self {
-        Self { count, offset, postgres: false }
+        Self { count, offset, ties: None, postgres: false }
+    }
+
+    /// The same limit, which also keeps the rows that tie with the last one on `keys`.
+    #[must_use]
+    pub(crate) fn with_ties(mut self, keys: Prepared) -> Self {
+        self.ties = Some(keys);
+        self
     }
 
     /// Applies the session semantics to whatever casts the two ends hold.
@@ -401,6 +421,7 @@ impl Limit {
     pub(crate) fn in_session(mut self, session: &Session) -> Self {
         self.count = self.count.in_session(session);
         self.offset = self.offset.in_session(session);
+        self.ties = self.ties.map(|keys| keys.in_session(session));
         self.postgres = session.postgres().is_some();
         self
     }
@@ -460,6 +481,7 @@ impl Stream for Limit {
         Taken {
             counting: self.count.scratch(),
             skipping: self.offset.scratch(),
+            tying: self.ties.as_ref().map(Prepared::scratch).unwrap_or_default(),
             ..Taken::default()
         }
     }
@@ -508,18 +530,52 @@ impl Stream for Limit {
             None => available,
         };
         taken.emitted += taking;
-        if skipping != 0 || taking != rows {
-            let mut kept = Selection::with_capacity(taking as usize);
-            for row in skipping..skipping + taking {
+        let mut end = skipping + taking;
+        let mut progress = match Self::room(count, taken) {
+            Some(0) => Progress::Done,
+            _ => Progress::More,
+        };
+        if let (Some(keys), Progress::Done) = (&self.ties, progress) {
+            // A count of nought takes no row, so there is no last row to tie with.
+            if taking != 0 || (taken.last.is_some() && end < rows) {
+                let mut columns = Vec::with_capacity(keys.len());
+                keys.evaluate(chunk, &mut taken.tying, &mut columns)?;
+                let at = |row: u64| -> Vec<Value> {
+                    columns.iter().map(|column| column.value_at(row as usize)).collect()
+                };
+                if taking != 0 {
+                    taken.last = Some(at(end - 1));
+                }
+                let last = taken.last.as_deref().unwrap_or_default();
+                while end < rows && same(&at(end), last)? {
+                    end += 1;
+                }
+                // Every row to the end of the chunk tied, so the next chunk can tie too.
+                if end == rows {
+                    progress = Progress::More;
+                }
+            }
+        }
+        if skipping != 0 || end != rows {
+            let mut kept = Selection::with_capacity((end - skipping) as usize);
+            for row in skipping..end {
                 kept.push(row as usize);
             }
             keep(chunk, &kept)?;
         }
-        match Self::room(count, taken) {
-            Some(0) => Ok(Progress::Done),
-            _ => Ok(Progress::More),
+        Ok(progress)
+    }
+}
+
+/// Whether two rows of sort keys tie, which a null does with a null, the way two rows are peers
+/// in a window.
+fn same(left: &[Value], right: &[Value]) -> Result<bool> {
+    for (left, right) in left.iter().zip(right) {
+        if rudb_kernels::order_with_nulls(left, right, false)? != std::cmp::Ordering::Equal {
+            return Ok(false);
         }
     }
+    Ok(true)
 }
 
 /// Narrow a chunk to the rows a selection kept, in place.

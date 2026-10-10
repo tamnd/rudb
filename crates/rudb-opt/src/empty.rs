@@ -160,6 +160,7 @@ fn columns_of(plan: &mut Plan, at: NodeRef) -> Option<(u32, Slice)> {
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => columns_of(plan, input),
         _ => None,

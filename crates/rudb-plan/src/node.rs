@@ -358,6 +358,24 @@ pub enum Node {
         /// How many rows to skip first. Never [`Bound::All`], which is not an offset.
         offset: Bound,
     },
+    /// A row count limit over sorted rows that also emits the rows after the last one that tie with
+    /// it, which is `FETCH FIRST n ROWS WITH TIES`. Two rows tie when they agree on every key, and
+    /// a null agrees with a null.
+    ///
+    /// A node of its own rather than a [`Node::Limit`] with another field, because the rewrites
+    /// that fire on a plain limit are wrong here. The sort under it cannot become a top n, which
+    /// would cut the ties off, and a filter pushed under it changes which rows tie. The keys are
+    /// the keys of the sort under it, over the same columns.
+    LimitTies {
+        /// The input, which is in the order of the keys.
+        input: NodeRef,
+        /// The keys the input is sorted on, into the sort key pool.
+        keys: Slice,
+        /// How many rows to emit before the ties.
+        count: Bound,
+        /// How many rows to skip first.
+        offset: Bound,
+    },
     /// A sort with a limit over it, which never holds more rows than the limit can emit.
     ///
     /// The same answer as a [`Node::Limit`] over a [`Node::Sort`] and a different amount of work.
@@ -673,6 +691,7 @@ impl Node {
             Self::Sort { .. } => "Sort",
             Self::Limit { .. } => "Limit",
             Self::LimitPercent { .. } => "LimitPercent",
+            Self::LimitTies { .. } => "LimitTies",
             Self::TopN { .. } => "TopN",
             Self::Fetch { .. } => "Fetch",
             Self::TableFetch { .. } => "TableFetch",
@@ -710,6 +729,7 @@ impl Node {
             | Self::Sort { input, .. }
             | Self::Limit { input, .. }
             | Self::LimitPercent { input, .. }
+            | Self::LimitTies { input, .. }
             | Self::TopN { input, .. }
             | Self::Fetch { input, .. }
             | Self::TableFetch { input, .. }
@@ -935,6 +955,12 @@ mod tests {
             Node::Sort { input: 0, keys: Slice::EMPTY },
             Node::Limit { input: 0, count: Bound::All, offset: Bound::Rows(0) },
             Node::LimitPercent { input: 0, percent: Share::Percent(50.0), offset: Bound::Rows(0) },
+            Node::LimitTies {
+                input: 0,
+                keys: Slice::EMPTY,
+                count: Bound::Rows(1),
+                offset: Bound::Rows(0),
+            },
             Node::Distinct { input: 0, on: Slice::EMPTY },
             Node::Join {
                 left: 0,

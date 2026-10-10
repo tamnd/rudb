@@ -911,6 +911,9 @@ pub struct Query {
     pub limit: ExprRef,
     /// Whether the limit was a percentage rather than a row count.
     pub limit_percent: bool,
+    /// Whether the limit was `FETCH FIRST n ROWS WITH TIES`, which also keeps every row that ties
+    /// on the `ORDER BY` with the last row the count takes. Only the PostgreSQL dialect writes it.
+    pub with_ties: bool,
     /// The `OFFSET` expression, or `NONE`.
     pub offset: ExprRef,
 }
@@ -925,6 +928,7 @@ impl Query {
             order_by_all: false,
             limit: NONE,
             limit_percent: false,
+            with_ties: false,
             offset: NONE,
         }
     }
