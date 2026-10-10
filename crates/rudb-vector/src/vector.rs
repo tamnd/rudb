@@ -5080,7 +5080,26 @@ impl Packed<'_> {
         }
         let Some((low, high)) = extent(at) else { return Vec::new() };
         let (low, high) = (low as usize, high as usize);
-        if high - low >= at.len().saturating_mul(4) {
+        static KNOB: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+        let (factor, blockwise) = *KNOB.get_or_init(|| {
+            let get = |n: &str, d| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+            (get("RUDB_GK", 4), get("RUDB_GB", 0))
+        });
+        if blockwise > 0 && high - low >= at.len().saturating_mul(factor) {
+            let mut out = vec![T::default(); at.len()];
+            let mut block = [0_u64; 64];
+            let mut current = usize::MAX;
+            for (slot, &row) in out.iter_mut().zip(at) {
+                let row = row as usize;
+                if row / 64 != current {
+                    current = row / 64;
+                    self.unpack(current * 64, &mut block);
+                }
+                *slot = value(block[row % 64]);
+            }
+            return out;
+        }
+        if high - low >= at.len().saturating_mul(factor) {
             let (words, width, offset) = (self.words, self.width, self.offset);
             let wide = width as usize;
             let mut out = vec![T::default(); at.len()];
