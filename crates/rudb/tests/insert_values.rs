@@ -58,3 +58,33 @@ fn a_value_that_does_not_fit_its_column_is_refused_in_the_pins_words() {
         assert!(error.starts_with(expected), "{insert}: {error}");
     }
 }
+
+#[test]
+fn a_row_can_read_a_scalar_query() {
+    assert_eq!(
+        after(
+            &[],
+            "SELECT * FROM (VALUES (1, 'a'), ((SELECT 2), 'b'), (3, 'c'), \
+            ((SELECT max(x) FROM range(9) r(x)), (SELECT 'e'))) t"
+        ),
+        "1|a\n2|b\n3|c\n8|e"
+    );
+    assert_eq!(
+        after(
+            &[],
+            "SELECT * FROM range(1, 3) a(x), LATERAL (VALUES ((SELECT x * 10)), (x)) b(y) \
+            ORDER BY x, y"
+        ),
+        "1|1\n1|10\n2|2\n2|20"
+    );
+    assert_eq!(
+        after(
+            &[
+                "CREATE TABLE t (i INT, j VARCHAR)",
+                "INSERT INTO t VALUES ((SELECT 7), 'x'), (8, (SELECT 'y'))"
+            ],
+            "SELECT * FROM t"
+        ),
+        "7|x\n8|y"
+    );
+}

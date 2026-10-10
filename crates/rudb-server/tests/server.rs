@@ -7317,3 +7317,29 @@ fn a_recursive_query_takes_search_and_cycle_clauses() {
     assert_eq!(messages[0].field(b'M').as_deref(), Some("WITH query is not recursive"));
     server.stop().unwrap();
 }
+
+#[test]
+fn a_values_row_can_read_a_scalar_query() {
+    let dirs = Dirs::new("pgvaluesquery");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        ("values ((select 1))", "1"),
+        ("with cte(foo) as (values (42)) values ((select foo from cte))", "42"),
+        (
+            "select string_agg(a || b, ' ') from (values (1, 'a'), ((select 2), 'b'), (3, 'c'), \
+            ((select 5), (select 'e'))) t(a, b)",
+            "1a 2b 3c 5e",
+        ),
+        (
+            "select string_agg((select foo::text from (values (f1)) cte(foo)), ' ') \
+            from (values (1), (2)) t(f1)",
+            "1 2",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
