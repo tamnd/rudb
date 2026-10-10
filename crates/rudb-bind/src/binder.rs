@@ -1541,7 +1541,10 @@ impl<'a> Binder<'a> {
         inputs.truncate(width);
         let previous = std::mem::replace(&mut self.clause, "VALUES clause");
         let mut bound: Vec<Vec<ExprRef>> = Vec::with_capacity(written.len());
+        // The scalar queries of each row, which join into the one row that row is made from.
+        let mut waiting: Vec<Vec<PendingSubquery>> = Vec::with_capacity(written.len());
         for row in &written {
+            let before = self.scalar_subqueries.len();
             let mut items = Vec::with_capacity(width);
             for (at, &expr) in ast.expr_list(*row).iter().enumerate() {
                 let column = defaults.as_ref().and_then(|defaults| defaults.get(at));
@@ -1556,6 +1559,7 @@ impl<'a> Binder<'a> {
                 });
             }
             bound.push(items);
+            waiting.push(self.scalar_subqueries.split_off(before));
         }
         self.clause = previous;
         // The rows of an `INSERT ... VALUES` are cast to the columns they land in, one by one,
@@ -1564,7 +1568,7 @@ impl<'a> Binder<'a> {
         // neither pair has a type in common on its own.
         if let Some(defaults) = defaults.as_ref().filter(|defaults| defaults.len() == width) {
             let types = defaults.iter().map(|(ty, _)| ty.clone()).collect();
-            return self.values_node(ast, query, &bound, types);
+            return self.values_node(ast, query, &bound, waiting, types);
         }
         if self.semantics.common_types() == CommonTypes::Postgres {
             for at in 0..width {
@@ -1591,27 +1595,23 @@ impl<'a> Binder<'a> {
             }
             types.push(ty);
         }
-        self.values_node(ast, query, &bound, types)
+        self.values_node(ast, query, &bound, waiting, types)
     }
 
     /// The `VALUES` node over rows already bound, each cast to the type of its column.
+    ///
+    /// A row with a scalar query in it reads the result of that query, which a `VALUES` node has
+    /// no input to read from. Such a row is a projection over one row that the queries join into
+    /// instead, and the rows are put back together in the order they were written with a
+    /// `UNION ALL`. The rows between two such rows stay one `VALUES` node.
     fn values_node(
         &mut self,
         ast: &Ast,
         query: &ast::Query,
         bound: &[Vec<ExprRef>],
+        waiting: Vec<Vec<PendingSubquery>>,
         types: Vec<LogicalType>,
     ) -> Result<(NodeRef, Scope)> {
-        let mut slices = Vec::with_capacity(bound.len());
-        for row in bound {
-            let items: Vec<ExprRef> = row
-                .iter()
-                .zip(&types)
-                .map(|(&expr, ty)| self.checked_cast_to(expr, ty, false))
-                .collect::<Result<_>>()?;
-            slices.push(self.plan.add_expr_list(&items));
-        }
-        let rows = self.plan.add_rows(&slices);
         let (prefix, first) = match self.semantics.values_names() {
             ValuesNames::FromZero => ("col", 0),
             ValuesNames::FromOne => ("column", 1),
@@ -1622,8 +1622,45 @@ impl<'a> Binder<'a> {
             .map(|(at, ty)| Field::new(format!("{prefix}{}", at + first), ty.clone()))
             .collect();
         let columns = self.plan.add_fields(&fields);
-        let index = self.fresh_index();
-        let mut node = self.add_node(Node::Values { index, columns, rows });
+        let names: Vec<_> = fields.iter().map(|field| self.plan.intern(&field.name)).collect();
+        let names = self.plan.add_name_list(&names);
+        let mut parts: Vec<(NodeRef, u32)> = Vec::new();
+        let mut slices = Vec::with_capacity(bound.len());
+        for (row, pending) in bound.iter().zip(waiting) {
+            let items: Vec<ExprRef> = row
+                .iter()
+                .zip(&types)
+                .map(|(&expr, ty)| self.checked_cast_to(expr, ty, false))
+                .collect::<Result<_>>()?;
+            if pending.is_empty() {
+                slices.push(self.plan.add_expr_list(&items));
+                continue;
+            }
+            if !slices.is_empty() {
+                let rows = self.plan.add_rows(&std::mem::take(&mut slices));
+                let index = self.fresh_index();
+                parts.push((self.add_node(Node::Values { index, columns, rows }), index));
+            }
+            let mut input = self.add_node(Node::Dummy);
+            for pending in pending {
+                input = self.attach_subquery(input, pending);
+            }
+            let exprs = self.plan.add_expr_list(&items);
+            let index = self.fresh_index();
+            parts.push((self.add_node(Node::Project { input, index, exprs, names }), index));
+        }
+        if !slices.is_empty() || parts.is_empty() {
+            let rows = self.plan.add_rows(&slices);
+            let index = self.fresh_index();
+            parts.push((self.add_node(Node::Values { index, columns, rows }), index));
+        }
+        let mut parts = parts.into_iter();
+        let (mut node, mut index) = parts.next().expect("a VALUES has a part");
+        for (right, _) in parts {
+            index = self.fresh_index();
+            let (kind, all) = (SetOpKind::Union, true);
+            node = self.add_node(Node::SetOp { left: node, right, kind, all, index });
+        }
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {
             scope.push(Visible {
