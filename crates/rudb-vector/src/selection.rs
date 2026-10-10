@@ -303,11 +303,15 @@ const DENSE_WORD: u32 = 8;
 const SPARSE_WORD: u32 = 4;
 
 /// For each byte, the rows its set bits name, lowest first, and zeroes after them.
-const BYTE_ROWS: [[u8; 8]; 256] = {
-    let mut table = [[0_u8; 8]; 256];
+///
+/// Held as `u32` rather than as the bytes they fit in, so that a byte's rows are one load, one add
+/// and one store of eight lanes. Widened from bytes on the way, the compiler wrote them a lane at a
+/// time.
+const BYTE_ROWS: [[u32; 8]; 256] = {
+    let mut table = [[0_u32; 8]; 256];
     let mut byte = 0;
     while byte < 256 {
-        let mut bit: u8 = 0;
+        let mut bit = 0;
         let mut at = 0;
         while bit < 8 {
             if byte >> bit & 1 == 1 {
@@ -377,7 +381,7 @@ fn listed(words: &[u64]) -> Vec<u32> {
             let mut at = len;
             for (byte, first) in word.to_le_bytes().into_iter().zip((base..).step_by(8)) {
                 for (slot, &row) in room[at..at + 8].iter_mut().zip(&BYTE_ROWS[usize::from(byte)]) {
-                    slot.write(first + u32::from(row));
+                    slot.write(first + row);
                 }
                 at += byte.count_ones() as usize;
             }
