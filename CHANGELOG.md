@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.8
+
+In the PostgreSQL dialect, #2980 lets a join have a name, as `(a JOIN b USING (k)) AS j (x, y)` and as `a JOIN b USING (k) AS u`, with the columns and the reach that PostgreSQL gives each form. #2981 compares two rows one pair of values at a time, as `make_row_comparison_op` does, for `=`, `<>`, `<`, `<=`, `>` and `>=` and for a row against a query. #2983 keeps the rows that tie with the last row under `FETCH FIRST ... WITH TIES`, with the error of PostgreSQL for a null count. #2985 reads a `LIMIT`, `OFFSET` or `WITH TIES` count in a correlated subquery again for each outer row, with the errors of PostgreSQL for a negative count. With these changes, the replay of `test_setup`, `with`, `subquery`, `select`, `union`, `window`, `aggregates`, `join` and `limit` gives 1859 of 2588 statements the same as PostgreSQL 19.
+
+For the pin, #2979 refuses `RESPECT NULLS` in the same places where `IGNORE NULLS` is refused.
+
+On the engine side, #2982 lists the rows of a selection without a branch for each row. #2984 adds `--strip-sections`, which drops the graph and statistics sections from a native file, so the gate can run on a file that does not hold them.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.7
 
 In the PostgreSQL dialect, #2973 lets a `SELECT` have no targets, so `SELECT FROM t` gives one row with no columns for each row of `t` and the set operations compare such rows as equal. #2975 adds the `SEARCH` and `CYCLE` clauses of a recursive `WITH` query, with the sequence and cycle columns that a star does not show and the errors of PostgreSQL for a query that is not recursive. #2976 lets a row of `VALUES` read a scalar query. #2977 does not run a scalar query in a subquery in `FROM` whose value nothing reads, as PostgreSQL does not, so such a query no longer fails when it gives more than one row. With these changes, the replay of `test_setup`, `with`, `subquery`, `select`, `union`, `window`, `aggregates`, `join` and `limit` gives 1825 of 2588 statements the same as PostgreSQL 19.
