@@ -345,6 +345,7 @@ impl TableFunction {
                 vec![
                     ("all_varchar", LogicalType::Boolean),
                     ("auto_detect", LogicalType::Boolean),
+                    ("buffer_size", LogicalType::UBigInt),
                     ("column_names", LogicalType::list(LogicalType::Varchar)),
                     ("column_types", LogicalType::Null),
                     ("columns", LogicalType::Null),
@@ -352,6 +353,8 @@ impl TableFunction {
                     ("dtypes", LogicalType::Null),
                     ("escape", LogicalType::Varchar),
                     ("header", LogicalType::Boolean),
+                    ("max_line_size", LogicalType::Varchar),
+                    ("maximum_line_size", LogicalType::Varchar),
                     ("names", LogicalType::list(LogicalType::Varchar)),
                     ("nullstr", LogicalType::Varchar),
                     ("quote", LogicalType::Varchar),

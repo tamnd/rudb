@@ -71,6 +71,7 @@ pub fn open_csv(path: &str, given: Given) -> Result<CsvReader> {
 /// When a punctuation parameter was given something other than a single byte.
 pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
     let mut given = Given::default();
+    let mut buffer = None;
     for (name, value) in options {
         match (*name, value) {
             ("header", Value::Boolean(on)) => given.header = Some(*on),
@@ -87,6 +88,23 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             (TYPES_SET, Value::Boolean(on)) => given.typed = *on,
             ("auto_detect", Value::Boolean(on)) => given.fixed = !*on,
             ("all_varchar", Value::Boolean(on)) => given.all_varchar = *on,
+            ("buffer_size", Value::UBigInt(size)) => {
+                if *size == 0 {
+                    return Err(Error::invalid_input("Buffer Size option must be higher than 0"));
+                }
+                buffer = Some(usize::try_from(*size).unwrap_or(usize::MAX));
+            }
+            ("max_line_size" | "maximum_line_size", Value::Varchar(text)) => {
+                let size: i64 = text.trim().parse().map_err(|_| {
+                    Error::conversion(format!("Could not convert string '{text}' to INT64"))
+                })?;
+                let Ok(size) = usize::try_from(size) else {
+                    return Err(Error::binder(
+                        "Invalid value for MAX_LINE_SIZE parameter: it cannot be smaller than 0",
+                    ));
+                };
+                given.max_line = Some(size);
+            }
             ("types" | "dtypes" | "column_types", value) => {
                 if given.retype.is_some() {
                     return Err(Error::binder(
@@ -106,6 +124,17 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
     let named = options.iter().any(|(name, _)| matches!(*name, "names" | "column_names"));
     if named && options.iter().any(|(name, _)| *name == "columns") {
         return Err(Error::binder("read_csv column_names/names can only be supplied once"));
+    }
+    // A buffer is where a line has to fit, so it is the longest line unless the call said, and the
+    // call cannot say a longer one. The pin refuses that one either way round.
+    match (buffer, given.max_line) {
+        (Some(buffer), Some(most)) if most > buffer => {
+            return Err(Error::invalid_input(format!(
+                "Buffer Size of {buffer} must be a higher value than the maximum line size {most}"
+            )));
+        }
+        (Some(buffer), None) => given.max_line = Some(buffer),
+        _ => {}
     }
     // Types set twice have to agree, and the ones `columns` set are the ones read, under the names
     // it gave, whatever the other names them.
