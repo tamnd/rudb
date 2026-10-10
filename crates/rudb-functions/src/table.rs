@@ -359,6 +359,7 @@ impl TableFunction {
                     ("nullstr", LogicalType::Varchar),
                     ("quote", LogicalType::Varchar),
                     ("sep", LogicalType::Varchar),
+                    ("skip", LogicalType::BigInt),
                     ("types", LogicalType::Null),
                 ]
             });
