@@ -10,6 +10,7 @@
 //!
 //! `FILE_SIZE_BYTES`, `ROW_GROUPS_PER_FILE` and `PER_THREAD_OUTPUT` are read here too, since they
 //! also turn the path into a directory of numbered files, which is what the pin calls rotating.
+//! So are `RETURN_FILES` and `RETURN_STATS`, which say what the statement answers with.
 
 use rudb_common::{Error, LogicalType, Result, Value, parse_size};
 use rudb_parse::ast;
@@ -43,6 +44,8 @@ pub struct Partitioned {
     pub per_thread: bool,
     /// Whether no file at all is written for no rows, which is `WRITE_EMPTY_FILE false`.
     pub skip_empty: bool,
+    /// What the statement answers with.
+    pub returns: Returns,
 }
 
 impl Partitioned {
@@ -74,6 +77,19 @@ pub enum Existing {
     Append,
 }
 
+/// What a `COPY ... TO` answers with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Returns {
+    /// How many rows it wrote.
+    #[default]
+    Count,
+    /// How many rows it wrote and the list of the files, which is `RETURN_FILES`.
+    Files,
+    /// A row for each file it wrote, with the statistics of its columns, which is
+    /// `RETURN_STATS`.
+    Stats,
+}
+
 /// One piece of a `FILENAME_PATTERN`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamePiece {
@@ -88,7 +104,7 @@ pub enum NamePiece {
 }
 
 /// The options read here, which the format never sees.
-const READ_HERE: [&str; 12] = [
+const READ_HERE: [&str; 14] = [
     "partition_by",
     "write_partition_columns",
     "overwrite",
@@ -101,6 +117,8 @@ const READ_HERE: [&str; 12] = [
     "per_thread_output",
     "file_size_bytes",
     "write_empty_file",
+    "return_files",
+    "return_stats",
 ];
 
 /// The options that count the batches of a file, which JSON does not take.
@@ -164,6 +182,18 @@ pub(crate) fn partitioning(
             "per_thread_output" => out.per_thread = boolean(name, value.as_deref())?,
             "file_size_bytes" => out.file_size = Some(bytes(value.as_deref(), written)?),
             "write_empty_file" => out.skip_empty = !boolean(name, value.as_deref())?,
+            // Only an option that is on counts as set.
+            "return_files" | "return_stats" => {
+                if flag(name, value.as_deref(), written)? {
+                    if out.returns != Returns::Count {
+                        return Err(Error::binder(
+                            "Can only set one of RETURN_FILES or RETURN_STATS for COPY",
+                        ));
+                    }
+                    out.returns =
+                        if name == "return_files" { Returns::Files } else { Returns::Stats };
+                }
+            }
             _ => out.batches = Some(unsigned(name, value.as_deref(), written)?),
         }
     }
@@ -187,6 +217,17 @@ pub(crate) fn partitioning(
         return Err(Error::binder("APPEND mode requires a {uuid} label in filename_pattern"));
     }
     refuse_together(&out, tmp, partitioned)?;
+    // The pin writes JSON through its CSV writer, which is the name it gives.
+    if out.returns == Returns::Stats && format != "parquet" {
+        return Err(Error::not_implemented(
+            "RETURN_STATS is not supported for the \"csv\" copy format",
+        ));
+    }
+    if out.returns == Returns::Stats {
+        return Err(Error::not_implemented(
+            "COPY TO with the option return_stats is not supported yet",
+        ));
+    }
     if partitioned && !out.write_columns && out.columns.len() == names.len() {
         return Err(Error::not_implemented(
             "No column to write as all columns are specified as partition columns. \
@@ -263,6 +304,25 @@ fn unsigned(name: &str, text: Option<&str>, written: Option<&Written>) -> Result
              \"{shown}\" of type {ty} could not be cast as this type"
         ))
     })
+}
+
+/// An option that is on or off the way the pin reads a `BOOLEAN` copy option, where an option with
+/// no value is on and anything else is cast, in the pin's words when it cannot be.
+fn flag(name: &str, text: Option<&str>, written: Option<&Written>) -> Result<bool> {
+    let Some(text) = text else { return Ok(true) };
+    let (ty, value) = match written
+        .and_then(|written| written.value.as_ref().map(|value| (&written.ty, value)))
+    {
+        Some((ty, value)) if *ty != LogicalType::Varchar => (ty.clone(), value.clone()),
+        _ => (LogicalType::Varchar, Value::Varchar(text.trim_matches('\'').into())),
+    };
+    match rudb_kernels::cast_value(&value, &LogicalType::Boolean, true) {
+        Ok(Value::Boolean(on)) => Ok(on),
+        _ => Err(Error::invalid_input(format!(
+            "Copy option \"{name}\" expected an argument of type BOOLEAN - the argument \
+             \"{value}\" of type {ty} could not be cast as this type"
+        ))),
+    }
 }
 
 /// A value cast to an unsigned 64 bit number, if it is one.

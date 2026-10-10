@@ -46,21 +46,22 @@ use crate::QueryResult;
 const BATCH: usize = 2048;
 
 /// Writes the rows of `result` the way `copy` asks, to the one file or to a directory of them,
-/// and answers how many there were.
+/// and answers how many there were and the paths of the files, in the order they were written.
 pub(crate) fn write(
     copy: &CopyTo,
     result: &QueryResult,
     zone: SessionTimeZone,
     threads: usize,
-) -> Result<usize> {
+) -> Result<(usize, Vec<String>)> {
     let split = &copy.partitioned;
+    let mut files = Vec::new();
     if split.skip_empty && result.is_empty() {
-        return Ok(0);
+        return Ok((0, files));
     }
     if !split.directory() {
         let mut sink = Sink::open(copy, &copy.path, result, zone)?;
         sink.write(result.chunks())?;
-        return sink.finish();
+        return Ok((sink.finish(&mut files)?, files));
     }
     let root = Path::new(&copy.path);
     match split.existing {
@@ -74,10 +75,12 @@ pub(crate) fn write(
         _ => {}
     }
     make_directory(root)?;
-    if split.columns.is_empty() {
-        return Ok(write_files(copy, root, 0, result, zone, threads)?.0);
-    }
-    write_partitioned(copy, root, result, zone)
+    let rows = if split.columns.is_empty() {
+        write_files(copy, root, 0, result, zone, threads, &mut files)?
+    } else {
+        write_partitioned(copy, root, result, zone, &mut files)?
+    };
+    Ok((rows, files))
 }
 
 /// Makes a directory and the ones above it.
@@ -87,8 +90,8 @@ fn make_directory(path: &Path) -> Result<()> {
     })
 }
 
-/// Writes the rows of `result` into `directory`, the files numbered from `first`, and answers how
-/// many rows and how many files there were.
+/// Writes the rows of `result` into `directory`, the files numbered from `first`, adds their paths
+/// to `files` and answers how many rows there were.
 ///
 /// When the `COPY` rotates, a file is closed before the next batch once it holds one and has
 /// reached the size or the count of batches asked for, so a file is never left empty, where the
@@ -101,41 +104,42 @@ fn write_files(
     result: &QueryResult,
     zone: SessionTimeZone,
     threads: usize,
-) -> Result<(usize, usize)> {
+    files: &mut Vec<String>,
+) -> Result<usize> {
     let split = &copy.partitioned;
     let path = |number: usize| -> Result<String> {
         let name = format!("{}.{}", file_name(&split.pattern, number, zone)?, split.extension);
         Ok(directory.join(name).to_string_lossy().into_owned())
     };
     if split.per_thread && !split.rotates() {
-        return write_threads(copy, &path, first, result, zone, threads);
+        return write_threads(copy, &path, first, result, zone, threads, files);
     }
     let mut sink = Sink::open(copy, &path(first)?, result, zone)?;
     if !split.rotates() {
         sink.write(result.chunks())?;
-        return Ok((sink.finish()?, 1));
+        return sink.finish(files);
     }
     let least = if copy.parquet { copy.row_group_size } else { 0 };
-    let (mut rows, mut files, mut held) = (0, 1, 0);
+    let (mut rows, mut number, mut held) = (0, first, 0);
     for batch in batches(result.chunks(), least)? {
         let full = held > 0
             && (split.file_size.is_some_and(|most| sink.size() >= most)
                 || split.batches.is_some_and(|most| held >= most));
         if full {
-            rows += sink.finish()?;
-            sink = Sink::open(copy, &path(first + files)?, result, zone)?;
-            files += 1;
+            rows += sink.finish(files)?;
+            number += 1;
+            sink = Sink::open(copy, &path(number)?, result, zone)?;
             held = 0;
         }
         sink.write(&batch)?;
         held += 1;
     }
-    Ok((rows + sink.finish()?, files))
+    Ok(rows + sink.finish(files)?)
 }
 
 /// Writes the rows of `result` the way `PER_THREAD_OUTPUT` does, a file for each of `threads`
-/// that gets rows, each taking the next run of batches, and answers how many rows and files there
-/// were.
+/// that gets rows, each taking the next run of batches, adds their paths to `files` and answers
+/// how many rows there were.
 ///
 /// The pin writes a file for each thread that ends up with rows, so how many there are depends on
 /// how its scan was split, and a source that one thread reads, such as `range`, gives it one file.
@@ -148,24 +152,24 @@ fn write_threads(
     result: &QueryResult,
     zone: SessionTimeZone,
     threads: usize,
-) -> Result<(usize, usize)> {
+    files: &mut Vec<String>,
+) -> Result<usize> {
     let batches = batches(result.chunks(), 0)?;
     let each = batches.len().div_ceil(threads.max(1)).max(1);
     let mut runs = batches.chunks(each).peekable();
     if runs.peek().is_none() {
         let sink = Sink::open(copy, &path(first)?, result, zone)?;
-        return Ok((sink.finish()?, 1));
+        return sink.finish(files);
     }
-    let (mut rows, mut files) = (0, 0);
-    for run in runs {
-        let mut sink = Sink::open(copy, &path(first + files)?, result, zone)?;
+    let mut rows = 0;
+    for (number, run) in (first..).zip(runs) {
+        let mut sink = Sink::open(copy, &path(number)?, result, zone)?;
         for batch in run {
             sink.write(batch)?;
         }
-        rows += sink.finish()?;
-        files += 1;
+        rows += sink.finish(files)?;
     }
-    Ok((rows, files))
+    Ok(rows)
 }
 
 /// The rows cut into the batches the pin closes a file between: [`BATCH`] rows each, or as many of
@@ -211,6 +215,7 @@ fn write_partitioned(
     root: &Path,
     result: &QueryResult,
     zone: SessionTimeZone,
+    files: &mut Vec<String>,
 ) -> Result<usize> {
     let split = &copy.partitioned;
     let names = result.names();
@@ -291,9 +296,9 @@ fn write_partitioned(
         let (place, first) =
             if split.flat { (root.to_path_buf(), next) } else { (root.join(directory), 0) };
         make_directory(&place)?;
-        let (written, files) = write_files(copy, &place, first, &part, zone, 1)?;
-        rows += written;
-        next += files;
+        let before = files.len();
+        rows += write_files(copy, &place, first, &part, zone, 1, files)?;
+        next += files.len() - before;
     }
     Ok(rows)
 }
@@ -594,9 +599,9 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
-    /// Writes what comes after the last row and closes the file, and answers how many rows it
-    /// holds.
-    fn finish(self) -> Result<usize> {
+    /// Writes what comes after the last row and closes the file, adds its path to `files` and
+    /// answers how many rows it holds.
+    fn finish(self, files: &mut Vec<String>) -> Result<usize> {
         let written = failed(&self.path);
         match self.body {
             Body::Csv { mut out, .. } => out.flush().map_err(written)?,
@@ -612,6 +617,7 @@ impl<'a> Sink<'a> {
                 writer.finish()?;
             }
         }
+        files.push(self.path);
         Ok(self.rows)
     }
 }

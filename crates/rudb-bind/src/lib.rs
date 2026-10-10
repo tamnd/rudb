@@ -59,7 +59,7 @@ pub use collation::check_collation;
 pub use context::{is_session_word, micros_now};
 pub use macros::kept_macro;
 pub use parameters::{Capture, Caught, Described, Parameters, Placeholders, Written};
-pub use partition::{Existing, NamePiece, Partitioned};
+pub use partition::{Existing, NamePiece, Partitioned, Returns};
 pub use statement::{
     Attach, Bound, Call, Checks, Conflict, ConflictAction, CopyTo, CreateTable, CreateView,
     DropTable, Insert, MacroChange, SchemaChange, SequenceChange, TriggerChange, TypeChange, Write,

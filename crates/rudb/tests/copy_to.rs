@@ -796,3 +796,70 @@ fn a_rotating_copy_refuses_what_the_pin_refuses() {
         assert_eq!(error.to_string(), want, "{sql}");
     }
 }
+
+#[test]
+fn return_files_answers_the_count_and_the_files_written_as_the_pin_does() {
+    use rudb_common::Value;
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-files-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("makes the directory");
+    let dir = root.display().to_string();
+    let db = Database::new();
+    db.execute("CREATE TABLE t AS SELECT range i, range % 2 k FROM range(5)").expect("creates");
+    let files = |sql: &str| {
+        let sql = sql.replace("DIR", &dir);
+        let result = db.execute(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert_eq!(result.names(), ["Count", "Files"], "{sql}");
+        assert_eq!(result.changes(), None, "{sql}");
+        let Value::List { values, .. } = result.value_at(0, 1) else { panic!("{sql}: a list") };
+        let listed = values.iter().map(|value| value.to_string().replace(&dir, "DIR"));
+        (result.value_at(0, 0), listed.collect::<Vec<_>>())
+    };
+    let count = |rows| Value::BigInt(rows);
+
+    assert_eq!(files("COPY t TO 'DIR/a.csv' (RETURN_FILES)"), (count(5), vec!["DIR/a.csv".into()]));
+    assert_eq!(
+        files("COPY t TO 'DIR/p' (FORMAT csv, PARTITION_BY k, RETURN_FILES TRUE)"),
+        (count(5), vec!["DIR/p/k=0/data_0.csv".into(), "DIR/p/k=1/data_0.csv".into()])
+    );
+    // No rows still write the one file, unless WRITE_EMPTY_FILE says not to.
+    assert_eq!(
+        files("COPY (FROM t LIMIT 0) TO 'DIR/e.parquet' (RETURN_FILES 1)"),
+        (count(0), vec!["DIR/e.parquet".into()])
+    );
+    assert_eq!(
+        files("COPY (FROM t LIMIT 0) TO 'DIR/f.parquet' (RETURN_FILES, WRITE_EMPTY_FILE false)"),
+        (count(0), vec![])
+    );
+    assert_eq!(
+        files("COPY (FROM range(5000)) TO 'DIR/r' (FORMAT csv, FILE_SIZE_BYTES 1, RETURN_FILES)"),
+        (count(5000), ["0", "1", "2"].map(|i| format!("DIR/r/data_{i}.csv")).to_vec())
+    );
+    let off = db.execute(&format!("COPY t TO '{dir}/g.csv' (RETURN_FILES false)")).expect("copies");
+    assert_eq!(off.changes(), Some(5));
+
+    for (sql, message) in [
+        (
+            "COPY t TO 'DIR/x.csv' (RETURN_FILES, RETURN_STATS)",
+            "Binder Error: Can only set one of RETURN_FILES or RETURN_STATS for COPY",
+        ),
+        (
+            "COPY t TO 'DIR/x.csv' (RETURN_FILES 'x')",
+            "Invalid Input Error: Copy option \"return_files\" expected an argument of type \
+             BOOLEAN - the argument \"x\" of type VARCHAR could not be cast as this type",
+        ),
+        (
+            "COPY t TO 'DIR/x.csv' (RETURN_STATS)",
+            "Not implemented Error: RETURN_STATS is not supported for the \"csv\" copy format",
+        ),
+        (
+            "COPY t TO 'DIR/x.json' (RETURN_STATS)",
+            "Not implemented Error: RETURN_STATS is not supported for the \"csv\" copy format",
+        ),
+    ] {
+        let sql = sql.replace("DIR", &dir);
+        let error = db.execute(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
