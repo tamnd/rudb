@@ -38,7 +38,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rudb_common::{LogicalType, Result};
-use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
+use rudb_plan::{Arm, ColumnBinding, Expr, ExprRef, JoinKind, Node, NodeRef, Plan, Slice};
 
 use crate::pass::{Context, Pass, top_down};
 
@@ -51,11 +51,48 @@ impl Pass for UnusedColumns {
         "unused_columns"
     }
 
-    fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
+    fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
         prune(plan);
+        // A projection reads every column it lists until the pruning takes out what nothing above
+        // it reads, so the queries are looked at after it, and a join taken out leaves its right
+        // side's columns to prune again.
+        if context.skips_unread_queries() && unread_queries(plan) {
+            prune(plan);
+        }
         forward(plan);
         Ok(())
     }
+}
+
+/// Takes out the scalar queries whose value nothing reads, as PostgreSQL does.
+///
+/// A scalar query is joined into the rows of its expression with a single join, which keeps every
+/// row of its left side once and adds the one value of the query. When nothing outside the join
+/// reads that value, the join gives the rows of its left side and the only other thing it can do
+/// is fail on a query that gives more than one row. PostgreSQL does not run such a query: it takes
+/// the outputs of a subquery in `FROM` that nothing reads out of its target list, and the scalar
+/// query goes with them. The pin runs it and fails. The join has to be under something that
+/// states its own columns, because one that reads its input by position sees one column fewer.
+///
+/// Returns whether a join was taken out.
+pub fn unread_queries(plan: &mut Plan) -> bool {
+    let mut consumers = crate::link::consumers(plan);
+    let mut changed = false;
+    for at in 0..u32::try_from(plan.node_count()).unwrap_or(u32::MAX) {
+        let (Node::Join { left, right, kind: JoinKind::Single, .. }
+        | Node::DependentJoin { left, right, kind: JoinKind::Single, .. }) = *plan.node(at)
+        else {
+            continue;
+        };
+        if crate::link::absorbed(plan, &consumers, at) && crate::eliminate::unread(plan, right, at)
+        {
+            crate::eliminate::stand_in(plan, at, left, &consumers);
+            // What read the join reads its left side now, which a join above asks about.
+            consumers[left as usize] = consumers[at as usize];
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Narrows every scan and every interior projection in `plan` to the columns something above reads.

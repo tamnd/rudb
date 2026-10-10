@@ -277,7 +277,7 @@ pub(crate) fn verified(
 /// left behind a filter that reads both sides of it, and a walk that counted those read every parent
 /// of every comma join as read and eliminated nothing. All twenty two TPC-H queries are written with
 /// comma joins, which is how a rewrite that fires on `JOIN ... ON` fired on none of them.
-fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
+pub(crate) fn unread(plan: &Plan, parent: NodeRef, join: NodeRef) -> bool {
     let mut produced = Vec::new();
     indices(plan, parent, &mut produced);
     let mut running = vec![false; plan.node_count()];

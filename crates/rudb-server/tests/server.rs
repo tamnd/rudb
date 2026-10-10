@@ -7343,3 +7343,43 @@ fn a_values_row_can_read_a_scalar_query() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_scalar_query_nothing_reads_is_not_run() {
+    let dirs = Dirs::new("pgunreadquery");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("create temp table i8(q1 int8, q2 int8)");
+    assert_eq!(tags(&messages), "CZ");
+    let messages = client.query("insert into i8 values (123, 456), (123, 789), (5, 6)");
+    assert_eq!(tags(&messages), "CZ");
+    // The values and the errors are the ones that PostgreSQL 19 gives.
+    for sql in [
+        "select string_agg(q1::text, ' ' order by q1) from (select q1, \
+        (select q2 from i8 t where t.q1 = i8.q1) as t_sub from i8) s",
+        "select string_agg(q1::text, ' ' order by q1) from (with t_cte as materialized \
+        (select * from i8 t) select q1, (select q2 from t_cte where t_cte.q1 = i8.q1) as t_sub \
+        from i8) s",
+    ] {
+        assert_eq!(scalar(&mut client, sql), "5 123 123", "{sql}");
+    }
+    for sql in [
+        "select q1, (select q2 from i8 t where t.q1 = i8.q1) from i8",
+        "select q1 from (select q1, (select q2 from i8 t where t.q1 = i8.q1) as t_sub from i8) s \
+        where t_sub > 0",
+        "select q1 from (select distinct q1, (select q2 from i8 t where t.q1 = i8.q1) as t_sub \
+        from i8) s",
+    ] {
+        // The one without a query in `FROM` describes its rows before it fails, as there.
+        let messages = client.query(sql);
+        let tags = tags(&messages);
+        assert!(tags.ends_with("EZ"), "{sql}: {tags}");
+        assert_eq!(
+            messages[tags.len() - 2].field(b'M').as_deref(),
+            Some("more than one row returned by a subquery used as an expression"),
+            "{sql}"
+        );
+    }
+    server.stop().unwrap();
+}
