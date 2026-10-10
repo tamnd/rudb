@@ -3,9 +3,9 @@
 use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Cte, Cycle, Distinct, Expr, JoinKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody,
-    QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Target, WindowBound, WindowExclude,
-    WindowRef, WindowSpec, WindowUnit,
+    Cte, Cycle, Distinct, Expr, JoinKind, JoinNames, Nulls, Order, OrderItem, Quantifier, Query,
+    QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Target, WindowBound,
+    WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 
 use super::{Definition, Made, Refused, Transform, clause, not_yet};
@@ -571,9 +571,6 @@ impl Transform<'_> {
     }
 
     fn join(&mut self, join: &JoinExpr) -> Made<SourceRef> {
-        if join.alias.is_some() || join.join_using_alias.is_some() {
-            return clause("JoinAlias");
-        }
         let (Some(left), Some(right)) = (&join.larg, &join.rarg) else {
             return clause("JoinExpr");
         };
@@ -601,8 +598,14 @@ impl Transform<'_> {
             _ => return clause("JoinExpr"),
         };
         let natural = join.isNatural;
-        let join = Source::Join { left, right, kind, natural, on, using };
-        Ok(self.ast.push_source(join, self.span))
+        let (alias, columns) = self.alias(join.alias.as_deref())?;
+        let (named, _) = self.alias(join.join_using_alias.as_deref())?;
+        let source = Source::Join { left, right, kind, natural, on, using };
+        let source = self.ast.push_source(source, self.span);
+        if alias != NONE || named != NONE {
+            self.ast.join_names.push((source, JoinNames { alias, columns, using: named }));
+        }
+        Ok(source)
     }
 
     /// A function in `FROM`, with `WITH ORDINALITY` kept beside it. A column definition list is

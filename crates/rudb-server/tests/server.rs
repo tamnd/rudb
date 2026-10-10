@@ -7383,3 +7383,78 @@ fn a_scalar_query_nothing_reads_is_not_run() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_join_takes_the_names_postgres_gives_it() {
+    let dirs = Dirs::new("pgjoinnames");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in [
+        "create temp table j1 (i int, j int, t text)",
+        "create temp table j2 (i int, k int)",
+        "insert into j1 values (1, 4, 'one'), (2, 3, 'two'), (0, null, 'zero')",
+        "insert into j2 values (1, -1), (2, 2), (5, -5)",
+    ] {
+        assert!(tags(&client.query(sql)).ends_with("CZ"), "{sql}");
+    }
+    // The values and the errors are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "select string_agg(ii || tt || kk, ' ' order by ii, kk) from (j1 cross join j2) \
+          as tx (ii, jj, tt, ii2, kk) where ii > 0 and kk > 0",
+            "1one2 2two2",
+        ),
+        (
+            "select string_agg(x::text, ' ' order by x.i) from (j1 join j2 using (i)) x",
+            "(1,4,one,-1) (2,3,two,2)",
+        ),
+        (
+            "select string_agg(x.i || j1.t, ' ' order by x.i) from j1 join j2 using (i) as x",
+            "1one 2two",
+        ),
+        ("select string_agg(row(x.*)::text, ' ') from j1 join j2 using (i) as x", "(1) (2)"),
+        ("select count(*) from (j1 a join j2 b using (i)) as a", "2"),
+        (
+            "select string_agg(i::text, ' ' order by i) from (j1 full join j2 using (i)) as x",
+            "0 1 2 5",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    for (sql, message) in [
+        (
+            "select * from (j1 join j2 using (i)) as x where j1.t = 'one'",
+            "invalid reference to FROM-clause entry for table \"j1\"",
+        ),
+        ("select * from j1 join j2 using (i) as x where x.t = 'one'", "column x.t does not exist"),
+        (
+            "select * from (j1 join j2 using (i) as x) as xx where x.i = 1",
+            "missing FROM-clause entry for table \"x\"",
+        ),
+        (
+            "select * from j1 a1 join j2 a2 using (i) as a1",
+            "table name \"a1\" specified more than once",
+        ),
+        (
+            "select * from (j1 join j2 using (i)) as x (a, b, c, d, e)",
+            "join expression \"x\" has 4 columns available but 5 columns specified",
+        ),
+        (
+            "select * from (j1 t1 join j2 t2 on t1.i = t2.i) as x where x.i = 1",
+            "column reference \"i\" is ambiguous",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    let messages = client.query("select * from (j1 join j2 using (i)) as x where j1.t = 'one'");
+    assert_eq!(
+        messages[0].field(b'D').as_deref(),
+        Some(
+            "There is an entry for table \"j1\", but it cannot be referenced from this part of the query."
+        )
+    );
+    server.stop().unwrap();
+}
