@@ -115,6 +115,9 @@ pub(crate) struct Rowid {
 pub(crate) struct Scope {
     pub(crate) columns: Vec<Visible>,
     pub(crate) rowids: Vec<Rowid>,
+    /// The names of the tables inside a join that PostgreSQL gives a name, which a name outside it
+    /// does not reach. A qualified name that reaches for one is told so.
+    pub(crate) screened: Vec<String>,
 }
 
 impl Scope {
@@ -129,6 +132,7 @@ impl Scope {
         self.columns.extend(other.columns);
         self.rowids
             .extend(other.rowids.into_iter().map(|rowid| Rowid { at: rowid.at + start, ..rowid }));
+        self.screened.extend(other.screened);
         self
     }
 
@@ -292,12 +296,15 @@ impl Scope {
             [] => Ok(None),
             _ if table.is_some() => {
                 // A qualified name that still matches twice has two tables under one label, and
-                // the pin blames the label rather than the column.
+                // the pin blames the label rather than the column. In PostgreSQL that is a join
+                // given a name over two columns of one name, and the column is blamed.
                 let table = table.unwrap_or_default();
                 Err(Error::binder(format!(
                     "Ambiguous reference to table \"{table}\" (duplicate alias \"{table}\", \
                      explicitly alias one of the tables using \"AS my_alias\")"
-                )))
+                ))
+                .state(SqlState::AMBIGUOUS_COLUMN)
+                .pg(format!("column reference \"{column}\" is ambiguous")))
             }
             many => {
                 let candidates: Vec<String> =
@@ -338,11 +345,7 @@ impl Scope {
         };
         if matched.is_empty() {
             return Err(match qualifier {
-                Some(table) => {
-                    Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
-                        .state(SqlState::UNDEFINED_TABLE)
-                        .pg(format!("missing FROM-clause entry for table \"{table}\""))
-                }
+                Some(table) => self.missing_table(compare, table),
                 None => Error::binder("* is not allowed in a query without a FROM clause")
                     .state(SqlState::SYNTAX_ERROR)
                     .pg("SELECT * with no tables specified is not valid"),
@@ -454,9 +457,7 @@ impl Scope {
     fn not_found(&self, compare: IdentifierCompare, table: Option<&str>, column: &str) -> Error {
         match table {
             Some(table) if self.columns.iter().all(|held| !compare.same(&held.table, table)) => {
-                Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
-                    .state(SqlState::UNDEFINED_TABLE)
-                    .pg(format!("missing FROM-clause entry for table \"{table}\""))
+                self.missing_table(compare, table)
             }
             // The pin says `Values list` for a table that is not one, the `excluded` row among
             // them, and that row is the one whose columns only a qualified name reaches.
@@ -476,6 +477,24 @@ impl Scope {
             .state(SqlState::UNDEFINED_COLUMN)
             .pg(format!("column \"{column}\" does not exist")),
         }
+    }
+
+    /// The complaint about a qualifier that names no table in scope. One that names a table a
+    /// named join hides is told that it cannot reach it, as `errorMissingRTE` in
+    /// `parse_relation.c` says.
+    fn missing_table(&self, compare: IdentifierCompare, table: &str) -> Error {
+        let error =
+            Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
+                .state(SqlState::UNDEFINED_TABLE);
+        if self.screened.iter().any(|held| compare.same(held, table)) {
+            return error
+                .pg(format!("invalid reference to FROM-clause entry for table \"{table}\""))
+                .detail(format!(
+                    "There is an entry for table \"{table}\", but it cannot be referenced from \
+                     this part of the query."
+                ));
+        }
+        error.pg(format!("missing FROM-clause entry for table \"{table}\""))
     }
 
     /// The `Candidate bindings:` part of a complaint about a name that is not here, empty when

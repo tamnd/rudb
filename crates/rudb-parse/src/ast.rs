@@ -1306,6 +1306,22 @@ pub enum Source {
 
 /// A `PIVOT` or an `UNPIVOT`.
 ///
+/// The names a join of the PostgreSQL grammar is given, which the grammar of the pin has no place
+/// for.
+///
+/// `(a JOIN b USING (k)) AS j (x, y)` names the join `j` and its columns `x` and `y`, and then `a`
+/// and `b` are no longer reachable outside it. `a JOIN b USING (k) AS u` names only the joined-on
+/// columns `u`, and `a` and `b` stay reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinNames {
+    /// The name after the parentheses, or `NONE`.
+    pub alias: StrRef,
+    /// The column names after it, as a run of [`StrRef`].
+    pub columns: Slice,
+    /// The name after `USING (...)`, or `NONE`.
+    pub using: StrRef,
+}
+
 /// The statement forms, `PIVOT t ON a USING sum(b)` and `UNPIVOT t ON a, b`, are this under a
 /// `SELECT *`, the way the pin's transformer writes them. The binder turns it into an aggregate or
 /// an unnest over the source, which it can only do once it knows the source's columns.
@@ -1934,6 +1950,9 @@ pub struct Ast {
     /// The function sources written `WITH ORDINALITY`, which have one more column that numbers
     /// their rows from 1. Kept to one side because few sources have it.
     pub ordinal_sources: Vec<SourceRef>,
+    /// The joins of the PostgreSQL grammar that are given a name, each with its names. Kept to one
+    /// side because few joins have one.
+    pub join_names: Vec<(SourceRef, JoinNames)>,
     /// The text the statements were parsed from, which `current_query()` answers with. Shared,
     /// so the binder can keep it for the statement without copying it.
     pub source: Arc<str>,
@@ -2180,6 +2199,11 @@ impl Ast {
     /// The call of a function source as an expression, when the grammar kept one.
     pub fn source_call(&self, source: SourceRef) -> Option<ExprRef> {
         self.source_calls.iter().find(|(held, _)| *held == source).map(|&(_, call)| call)
+    }
+
+    /// The names a join is given, when it is given any.
+    pub fn join_names(&self, source: SourceRef) -> Option<JoinNames> {
+        self.join_names.iter().find(|(held, _)| *held == source).map(|&(_, names)| names)
     }
 
     /// Whether a function source was written `WITH ORDINALITY`.

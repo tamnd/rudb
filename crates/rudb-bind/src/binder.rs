@@ -3465,7 +3465,9 @@ impl<'a> Binder<'a> {
         let (node, mut scope) = self.bind_one_source(ast, source)?;
         // A join is made of sources that went through here on their own, and a table already has
         // its row number to count by.
-        let joined = matches!(ast.source(source), ast::Source::Join { .. });
+        // A join that PostgreSQL names is one relation outside, and `count(j.*)` counts its rows.
+        let joined = matches!(ast.source(source), ast::Source::Join { .. })
+            && ast.join_names(source).is_none_or(|names| names.alias == NONE);
         if joined || !scope.rowids.is_empty() || !self.counts_relations(ast) {
             return Ok((node, scope));
         }
@@ -3520,10 +3522,83 @@ impl<'a> Binder<'a> {
                 self.bind_cte_scan(ast, cte, alias, columns, recurring)
             }
             ast::Source::Join { left, right, kind, natural, on, using } => {
-                self.bind_join(ast, left, right, kind, natural, on, using)
+                let (node, scope) = self.bind_join(ast, left, right, kind, natural, on, using)?;
+                match ast.join_names(source) {
+                    Some(names) => Ok((node, self.name_join(ast, source, names, scope)?)),
+                    None => Ok((node, scope)),
+                }
             }
             ast::Source::Pivot { pivot } => self.bind_pivot(ast, pivot),
         }
+    }
+
+    /// The scope of a join that PostgreSQL gives a name, as `transformFromClauseItem` in
+    /// `parse_clause.c` leaves it.
+    ///
+    /// A name after `USING (...)` is the table name of the joined-on columns, which come first,
+    /// and the two sides stay reachable by their own names. A name after the parentheses is the
+    /// table name of every column the join gives, a column list renames them in order, and the
+    /// tables inside are no longer reachable: their own copies of the joined-on columns go, and a
+    /// name that reaches for one of them is told that it cannot.
+    fn name_join(
+        &self,
+        ast: &Ast,
+        source: ast::SourceRef,
+        names: ast::JoinNames,
+        mut scope: Scope,
+    ) -> Result<Scope> {
+        let ast::Source::Join { left, right, using, .. } = ast.source(source) else {
+            return Ok(scope);
+        };
+        let mut screened: Vec<String> = Vec::new();
+        for column in &scope.columns {
+            if !column.table.is_empty() && !screened.contains(&column.table) {
+                screened.push(column.table.clone());
+            }
+        }
+        if names.using != NONE {
+            let label = ast.string(names.using);
+            let mut held = Vec::new();
+            self.table_names(ast, left, &mut held);
+            self.table_names(ast, right, &mut held);
+            if held.iter().any(|(name, _)| name == label) {
+                return Err(Error::binder(format!(
+                    "table name \"{label}\" specified more than once"
+                ))
+                .state(SqlState::DUPLICATE_ALIAS)
+                .unplaced());
+            }
+            let merged = scope
+                .columns
+                .iter_mut()
+                .filter(|column| matches!(column.using, Some(Joined::Merged(_))) && !column.hidden);
+            for column in merged.take(ast.name(using).count()) {
+                column.table = label.to_string();
+            }
+        }
+        if names.alias == NONE {
+            return Ok(scope);
+        }
+        let label = ast.string(names.alias);
+        scope.columns.retain(|column| !column.hidden);
+        scope.rowids.clear();
+        scope.screened.extend(screened);
+        if names.columns.len as usize > scope.columns.len() {
+            return Err(Error::binder(format!(
+                "join expression \"{label}\" has {} columns available but {} columns specified",
+                scope.columns.len(),
+                names.columns.len
+            ))
+            .state(SqlState::INVALID_COLUMN_REFERENCE)
+            .unplaced());
+        }
+        for column in &mut scope.columns {
+            column.table = label.to_string();
+            column.using = None;
+        }
+        let renamed: Vec<&str> = ast.name(names.columns).collect();
+        scope.rename_prefix(&renamed);
+        Ok(scope)
     }
 
     /// The check of `checkNameSpaceConflicts` in a PostgreSQL session: an item of `FROM`, bound
@@ -3591,11 +3666,19 @@ impl<'a> Binder<'a> {
                 return;
             }
             ast::Source::Cte { cte, alias: NONE, .. } => ast.cte(cte).name,
-            ast::Source::Join { left, right, .. } => {
-                self.table_names(ast, left, names);
-                self.table_names(ast, right, names);
-                return;
-            }
+            // A join that PostgreSQL names is reached by that name alone, and one with a name for
+            // its joined-on columns is reached by that name too.
+            ast::Source::Join { left, right, .. } => match ast.join_names(source) {
+                Some(joined) if joined.alias != NONE => joined.alias,
+                joined => {
+                    self.table_names(ast, left, names);
+                    self.table_names(ast, right, names);
+                    match joined {
+                        Some(joined) => joined.using,
+                        None => return,
+                    }
+                }
+            },
             ast::Source::Pivot { pivot } => ast.pivot(pivot).alias,
             ast::Source::Table { alias, .. }
             | ast::Source::Function { alias, .. }
