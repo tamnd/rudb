@@ -1247,6 +1247,34 @@ pub fn row_count(value: &Value, clause: &str, postgres: bool) -> Result<u64> {
     })
 }
 
+/// [`row_count`] as a scalar call, for an end of a limit that the optimizer turned into a
+/// comparison. That is a limit in a correlated subquery whose number reads the outer row, where
+/// each outer row has its own number and a row number per outer row is compared with it.
+///
+/// A null is a null, which the caller reads as every row or none skipped. The call does not know
+/// the session, so a negative number gives an error with the text of both.
+///
+/// # Errors
+///
+/// The ones of [`row_count`].
+pub fn bound_rows(value: &Value, clause: &str) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let rows = row_count(value, clause, false).map_err(|error| {
+        if error.message() != "LIMIT/OFFSET cannot be negative" {
+            return error;
+        }
+        let state = if clause == "OFFSET" {
+            SqlState::INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
+        } else {
+            SqlState::INVALID_ROW_COUNT_IN_LIMIT_CLAUSE
+        };
+        error.state(state).pg(format!("{clause} must not be negative")).unplaced()
+    })?;
+    Ok(Value::BigInt(i64::try_from(rows).unwrap_or(i64::MAX)))
+}
+
 /// The share a `LIMIT` written as a percentage names, as a `DOUBLE`.
 ///
 /// The other kind of limit and the same shape as [`row_count`], with a different type at the end of

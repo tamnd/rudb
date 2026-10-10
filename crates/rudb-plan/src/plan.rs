@@ -1135,9 +1135,19 @@ impl Plan {
             | Node::MaterializedCte { .. }
             | Node::RecursiveCte { .. }
             | Node::CrossProduct { .. }
-            | Node::SetOp { .. }
-            | Node::Limit { .. }
-            | Node::LimitPercent { .. } => {}
+            | Node::SetOp { .. } => {}
+            // An end that is not a number reads a column, and in a correlated subquery that column
+            // can be one of the outer row.
+            Node::Limit { count, offset, .. } => {
+                for expr in [count.read(), offset.read()].into_iter().flatten() {
+                    self.read_columns(expr, found);
+                }
+            }
+            Node::LimitPercent { percent, offset, .. } => {
+                for expr in [percent.read(), offset.read()].into_iter().flatten() {
+                    self.read_columns(expr, found);
+                }
+            }
             Node::Values { rows, .. } => {
                 for &row in self.row_list(rows) {
                     self.each_column(row, found);
