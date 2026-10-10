@@ -300,14 +300,39 @@ const DENSE_WORD: u32 = 8;
 /// first four are written whether the word has them or not and the answer only counts the ones it
 /// has. What that saves is the branch on whether a word is empty and the branch that ends the walk
 /// of its rows, and with words that are empty about as often as not, both were taken at random.
-const SPARSE_WORD: usize = 4;
+const SPARSE_WORD: u32 = 4;
+
+/// For each byte, the rows its set bits name, lowest first, and zeroes after them.
+const BYTE_ROWS: [[u8; 8]; 256] = {
+    let mut table = [[0_u8; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut bit: u8 = 0;
+        let mut at = 0;
+        while bit < 8 {
+            if byte >> bit & 1 == 1 {
+                table[byte][at] = bit;
+                at += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
 
 /// The positions whose bits are set in `words`, in order.
 ///
-/// Every word is written into room the answer already has rather than pushed. A sparse word writes
+/// Every word is written into room the answer already has rather than pushed, in one of three
+/// ways chosen by how many rows it keeps, and none of them has a branch a row. A sparse word writes
 /// [`SPARSE_WORD`] rows whatever it holds, so an empty word costs a few stores past the end of the
-/// answer, which the next word writes over, and no branch. On TPC-H q14, whose filter keeps one
-/// row in eighty of `lineitem`, the branchy walk this replaces was 5 percent of the query.
+/// answer, which the next word writes over. A word that keeps most of its rows is written as the
+/// runs between the rows it drops. Anything between goes a byte at a time through [`BYTE_ROWS`],
+/// eight rows written for each byte and the answer moved on by the ones it has, which costs the
+/// same whatever the byte holds. The walk this replaces stepped through the set bits of every word,
+/// and a branch a row and one a word taken at random were most of what it cost: on TPC-H q14, whose
+/// filter keeps one row in eighty, it was 5 percent of the query, and under a filter that keeps
+/// half the rows it was a third of a `sum` over the rest.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "a mask is over a chunk, whose rows fit in a u32"
@@ -323,41 +348,41 @@ fn listed(words: &[u64]) -> Vec<u32> {
     let mut len = 0;
     for (block, &word) in words.iter().enumerate() {
         let base = (block * 64) as u32;
-        // A word that keeps most of its rows is walked by the rows it drops. Each run between two
-        // of them is written as a whole 64 rows and cut back to its own, so it is a copy of fixed
-        // width with no tail to finish a row at a time, and what it writes past its rows is
-        // written over by the next run. A filter that keeps nearly every row would otherwise pay
-        // a step for every row it keeps.
-        if word.count_zeros() <= DENSE_WORD {
+        let count = word.count_ones();
+        if count <= SPARSE_WORD {
+            let mut rest = word;
+            for slot in &mut room[len..len + SPARSE_WORD as usize] {
+                slot.write(base + rest.trailing_zeros());
+                rest &= rest.wrapping_sub(1);
+            }
+        } else if 64 - count <= DENSE_WORD {
+            // Each run between two dropped rows is written as a whole 64 rows and cut back to its
+            // own, so it is a copy of fixed width with no tail to finish a row at a time, and what
+            // it writes past its rows is written over by the next run.
             let mut dropped = !word;
-            let mut from = 0;
+            let (mut from, mut at) = (0, len);
             loop {
-                let at = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
-                for (slot, row) in room[len..len + 64].iter_mut().zip(base + from..) {
+                let to = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
+                for (slot, row) in room[at..at + 64].iter_mut().zip(base + from..) {
                     slot.write(row);
                 }
-                len += (at - from) as usize;
+                at += (to - from) as usize;
                 if dropped == 0 {
                     break;
                 }
-                from = at + 1;
+                from = to + 1;
                 dropped &= dropped - 1;
             }
-            continue;
-        }
-        let count = word.count_ones() as usize;
-        let mut rest = word;
-        for slot in &mut room[len..len + SPARSE_WORD] {
-            slot.write(base + rest.trailing_zeros());
-            rest &= rest.wrapping_sub(1);
-        }
-        if count > SPARSE_WORD {
-            for slot in &mut room[len + SPARSE_WORD..len + count] {
-                slot.write(base + rest.trailing_zeros());
-                rest &= rest - 1;
+        } else {
+            let mut at = len;
+            for (byte, first) in word.to_le_bytes().into_iter().zip((base..).step_by(8)) {
+                for (slot, &row) in room[at..at + 8].iter_mut().zip(&BYTE_ROWS[usize::from(byte)]) {
+                    slot.write(first + u32::from(row));
+                }
+                at += byte.count_ones() as usize;
             }
         }
-        len += count;
+        len += count as usize;
     }
     // SAFETY: `len` is the rows listed, and every slot under it was written above, since each word
     // writes the slots from the `len` it found up to the `len` it leaves.
