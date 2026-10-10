@@ -9,6 +9,7 @@
 //! copied five columns to save the next operator a redirection. On a query that filters and then
 //! projects two of those columns, three of the copies were free work.
 
+use std::mem::MaybeUninit;
 use std::sync::OnceLock;
 
 /// Which positions of a vector are still in play, as indices into it.
@@ -305,8 +306,7 @@ const SPARSE_WORD: u32 = 4;
 /// For each byte, the rows its set bits name, lowest first, and zeroes after them.
 ///
 /// Held as `u32` rather than as the bytes they fit in, so that a byte's rows are one load, one add
-/// and one store of eight lanes. Widened from bytes on the way, the compiler wrote them a lane at a
-/// time.
+/// and one store of eight lanes, with nothing to widen on the way.
 const BYTE_ROWS: [[u32; 8]; 256] = {
     let mut table = [[0_u32; 8]; 256];
     let mut byte = 0;
@@ -329,8 +329,8 @@ const BYTE_ROWS: [[u32; 8]; 256] = {
 ///
 /// Every word is written into room the answer already has rather than pushed, in one of three
 /// ways chosen by how many rows it keeps, and none of them has a branch a row. A sparse word writes
-/// [`SPARSE_WORD`] rows whatever it holds, so an empty word costs a few stores past the end of the
-/// answer, which the next word writes over. A word that keeps most of its rows is written as the
+/// [`SPARSE_WORD`] rows whatever it holds, or twice that when it holds more, so an empty word costs
+/// a few stores past the end of the answer, which the next word writes over. A word that keeps most of its rows is written as the
 /// runs between the rows it drops. Anything between goes a byte at a time through [`BYTE_ROWS`],
 /// eight rows written for each byte and the answer moved on by the ones it has, which costs the
 /// same whatever the byte holds. The walk this replaces stepped through the set bits of every word,
@@ -354,11 +354,9 @@ fn listed(words: &[u64]) -> Vec<u32> {
         let base = (block * 64) as u32;
         let count = word.count_ones();
         if count <= SPARSE_WORD {
-            let mut rest = word;
-            for slot in &mut room[len..len + SPARSE_WORD as usize] {
-                slot.write(base + rest.trailing_zeros());
-                rest &= rest.wrapping_sub(1);
-            }
+            lowest(&mut room[len..len + SPARSE_WORD as usize], base, word);
+        } else if count <= 2 * SPARSE_WORD {
+            lowest(&mut room[len..len + 2 * SPARSE_WORD as usize], base, word);
         } else if 64 - count <= DENSE_WORD {
             // Each run between two dropped rows is written as a whole 64 rows and cut back to its
             // own, so it is a copy of fixed width with no tail to finish a row at a time, and what
@@ -378,11 +376,14 @@ fn listed(words: &[u64]) -> Vec<u32> {
                 dropped &= dropped - 1;
             }
         } else {
+            // Written through a pointer as one store of eight lanes, since through the slots the
+            // compiler kept a bounds check a byte and wrote the lanes one at a time.
             let mut at = len;
             for (byte, first) in word.to_le_bytes().into_iter().zip((base..).step_by(8)) {
-                for (slot, &row) in room[at..at + 8].iter_mut().zip(&BYTE_ROWS[usize::from(byte)]) {
-                    slot.write(first + row);
-                }
+                let rows = BYTE_ROWS[usize::from(byte)].map(|row| first + row);
+                // SAFETY: `at` is at most the `len` this word leaves, which is at most `total`, so
+                // the eight slots from it are inside the room made for `total` and 128 more.
+                unsafe { room.as_mut_ptr().add(at).cast::<[u32; 8]>().write_unaligned(rows) };
                 at += byte.count_ones() as usize;
             }
         }
@@ -392,6 +393,15 @@ fn listed(words: &[u64]) -> Vec<u32> {
     // writes the slots from the `len` it found up to the `len` it leaves.
     unsafe { out.set_len(len) };
     out
+}
+
+/// Writes the rows of the lowest set bits of `word` into every slot of `slots`, as `base` and
+/// past, and whatever is left once the word runs out of bits, for the next word to write over.
+fn lowest(slots: &mut [MaybeUninit<u32>], base: u32, mut word: u64) {
+    for slot in slots {
+        slot.write(base + word.trailing_zeros());
+        word &= word.wrapping_sub(1);
+    }
 }
 
 #[cfg(test)]
