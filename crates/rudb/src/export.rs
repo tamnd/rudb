@@ -45,14 +45,30 @@ use crate::QueryResult;
 /// only between two of them.
 const BATCH: usize = 2048;
 
+/// One file a `COPY ... TO` wrote, with what `RETURN_FILES` and `RETURN_STATS` report of it.
+pub(crate) struct Wrote {
+    pub(crate) path: String,
+    pub(crate) rows: usize,
+    /// How many bytes the file holds.
+    pub(crate) size: u64,
+    /// How many bytes a Parquet file's footer metadata takes, and 0 for the other formats.
+    pub(crate) footer: u64,
+    /// For a Parquet file, what each column holds.
+    pub(crate) columns: Vec<rudb_parquet::ColumnStatistics>,
+    /// For a Parquet file, how many row groups it has.
+    pub(crate) row_groups: usize,
+    /// The partition columns and their values cast to VARCHAR, for a partitioned `COPY`.
+    pub(crate) partition: Option<Vec<(String, Value)>>,
+}
+
 /// Writes the rows of `result` the way `copy` asks, to the one file or to a directory of them,
-/// and answers how many there were and the paths of the files, in the order they were written.
+/// and answers how many there were and the files, in the order they were written.
 pub(crate) fn write(
     copy: &CopyTo,
     result: &QueryResult,
     zone: SessionTimeZone,
     threads: usize,
-) -> Result<(usize, Vec<String>)> {
+) -> Result<(usize, Vec<Wrote>)> {
     let split = &copy.partitioned;
     let mut files = Vec::new();
     if split.skip_empty && result.is_empty() {
@@ -83,6 +99,148 @@ pub(crate) fn write(
     Ok((rows, files))
 }
 
+/// What a `COPY ... TO` with `RETURN_STATS` answers: a row for each file, with its rows, its size,
+/// the size of its footer, what each column holds, the partition it is of and how many row groups
+/// it has, which is what the pin reports for a Parquet file.
+pub(crate) fn statistics(files: Vec<Wrote>) -> Result<QueryResult> {
+    let text = LogicalType::Varchar;
+    let stats = LogicalType::map(text.clone(), text.clone());
+    let types = vec![
+        text.clone(),
+        LogicalType::UBigInt,
+        LogicalType::UBigInt,
+        LogicalType::UBigInt,
+        LogicalType::map(text.clone(), stats.clone()),
+        stats.clone(),
+        LogicalType::map(text.clone(), LogicalType::Variant),
+    ];
+    // The statistics are keyed in order, the way the pin reports them, and the partition columns
+    // come in the order they were named.
+    let map = |value: &LogicalType, entries: Vec<(Value, Value)>| Value::Map {
+        key: Box::new(text.clone()),
+        value: Box::new(value.clone()),
+        entries,
+    };
+    let mut rows = vec![Vec::with_capacity(files.len()); types.len()];
+    for file in files {
+        let mut columns = Vec::with_capacity(file.columns.len());
+        for column in &file.columns {
+            let mut entries = vec![
+                ("column_size_bytes", column.size.to_string()),
+                ("null_count", column.nulls.to_string()),
+                ("num_values", column.values.to_string()),
+            ];
+            // A float column counts its NaNs over every row group, as the corpus expects of a
+            // DuckDB newer than the pin, which only kept the last group's has_nan and had no
+            // nan_count. A column with no values has neither, as in the pin.
+            if let Some(nans) = column.nans.filter(|_| column.values > 0) {
+                entries.push(("has_nan", (nans > 0).to_string()));
+                entries.push(("nan_count", nans.to_string()));
+            }
+            if let (Some(min), Some(max)) = (&column.min, &column.max) {
+                let (min, min_exact) = bound_text(min, false)?;
+                let (max, max_exact) = bound_text(max, true)?;
+                entries.push(("min", min));
+                entries.push(("min_is_exact", min_exact.to_string()));
+                entries.push(("max", max));
+                entries.push(("max_is_exact", max_exact.to_string()));
+            }
+            entries.sort_unstable_by_key(|&(key, _)| key);
+            let entries = entries
+                .into_iter()
+                .map(|(key, value)| (Value::Varchar(key.into()), Value::Varchar(value)))
+                .collect();
+            let name = format!("\"{}\"", column.name.replace('"', "\"\""));
+            columns.push((Value::Varchar(name), map(&text, entries)));
+        }
+        columns.sort_by_key(|(name, _)| name.to_string());
+        let partition = file.partition.map(|keys| {
+            let entries = keys.into_iter().map(|(key, value)| (Value::Varchar(key), value));
+            map(&text, entries.collect())
+        });
+        let groups = u64::try_from(file.row_groups).unwrap_or(u64::MAX);
+        let groups = cast_value(&Value::UBigInt(groups), &LogicalType::Variant, false)?;
+        let row = [
+            Value::Varchar(file.path),
+            Value::UBigInt(u64::try_from(file.rows).unwrap_or(u64::MAX)),
+            Value::UBigInt(file.size),
+            Value::UBigInt(file.footer),
+            map(&stats, columns),
+            partition.unwrap_or(Value::Null),
+            map(&LogicalType::Variant, vec![(Value::Varchar("row_group_count".into()), groups)]),
+        ];
+        for (column, value) in rows.iter_mut().zip(row) {
+            column.push(value);
+        }
+    }
+    let vectors = types
+        .iter()
+        .zip(&rows)
+        .map(|(ty, values)| Vector::from_values(ty.clone(), values))
+        .collect::<Result<Vec<_>>>()?;
+    let names = [
+        "filename",
+        "count",
+        "file_size_bytes",
+        "footer_size_bytes",
+        "column_statistics",
+        "partition_keys",
+        "extra_info",
+    ];
+    Ok(QueryResult::new(
+        names.map(str::to_owned).to_vec(),
+        types,
+        vec![Chunk::new(vectors)?],
+        Memory::unlimited().reservation(),
+    ))
+}
+
+/// How many bytes of a string or a blob a bound keeps, which is the pin's limit.
+const BOUND_BYTES: usize = 256;
+
+/// A bound of a column as the pin reports it, and whether it is exact. A bool is 1 or 0 and a blob
+/// is its bytes in hex. A string or a blob longer than [`BOUND_BYTES`] is cut short, a string on a
+/// character, and an upper bound then has its last character or byte raised by one so that it is
+/// still above every value, and neither is exact any more.
+fn bound_text(value: &Value, upper: bool) -> Result<(String, bool)> {
+    Ok(match value {
+        Value::Boolean(on) => (u8::from(*on).to_string(), true),
+        Value::Blob(bytes) if bytes.len() > BOUND_BYTES => {
+            let mut kept = bytes[..BOUND_BYTES].to_vec();
+            if upper {
+                while kept.last() == Some(&u8::MAX) {
+                    kept.pop();
+                }
+                if let Some(last) = kept.last_mut() {
+                    *last += 1;
+                }
+            }
+            (hex(&kept), false)
+        }
+        Value::Blob(bytes) => (hex(bytes), true),
+        Value::Varchar(text) if text.len() > BOUND_BYTES => {
+            let mut end = BOUND_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut kept = text[..end].to_string();
+            if upper && let Some(last) = kept.pop() {
+                kept.extend(char::from_u32(u32::from(last) + 1));
+            }
+            (kept, false)
+        }
+        other => match cast_value(other, &LogicalType::Varchar, false)? {
+            Value::Varchar(text) => (text, true),
+            cast => (cast.to_string(), true),
+        },
+    })
+}
+
+/// Bytes in upper case hex, two digits a byte.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
 /// Makes a directory and the ones above it.
 fn make_directory(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).map_err(|error| {
@@ -104,7 +262,7 @@ fn write_files(
     result: &QueryResult,
     zone: SessionTimeZone,
     threads: usize,
-    files: &mut Vec<String>,
+    files: &mut Vec<Wrote>,
 ) -> Result<usize> {
     let split = &copy.partitioned;
     let path = |number: usize| -> Result<String> {
@@ -152,7 +310,7 @@ fn write_threads(
     result: &QueryResult,
     zone: SessionTimeZone,
     threads: usize,
-    files: &mut Vec<String>,
+    files: &mut Vec<Wrote>,
 ) -> Result<usize> {
     let batches = batches(result.chunks(), 0)?;
     let each = batches.len().div_ceil(threads.max(1)).max(1);
@@ -204,6 +362,10 @@ fn batches(chunks: &[Chunk], least: u64) -> Result<Vec<Vec<Chunk>>> {
 /// What a directory is called for a NULL partition value, which is the name Hive gave it.
 const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
+/// A partition being written: its directory, the values of its columns, the rows it takes from
+/// each chunk, and its values as text, which RETURN_STATS names it by.
+type Partition = (String, Vec<Value>, Vec<Vec<u32>>, Vec<Value>);
+
 /// Writes the rows of `result` split by the values of the partition columns, a directory a
 /// column named `column=value`, both percent encoded, with the files in each of the deepest ones.
 ///
@@ -215,13 +377,13 @@ fn write_partitioned(
     root: &Path,
     result: &QueryResult,
     zone: SessionTimeZone,
-    files: &mut Vec<String>,
+    files: &mut Vec<Wrote>,
 ) -> Result<usize> {
     let split = &copy.partitioned;
     let names = result.names();
     let chunks = result.chunks();
     let mut found: HashMap<String, usize> = HashMap::new();
-    let mut partitions: Vec<(String, Vec<Value>, Vec<Vec<u32>>)> = Vec::new();
+    let mut partitions: Vec<Partition> = Vec::new();
     for (at, chunk) in chunks.iter().enumerate() {
         let mut keys = Vec::with_capacity(split.columns.len());
         for &column in &split.columns {
@@ -230,17 +392,20 @@ fn write_partitioned(
         }
         for row in 0..chunk.len() {
             let mut directory = String::new();
+            let mut texts = Vec::with_capacity(keys.len());
             for (key, &column) in keys.iter().zip(&split.columns) {
                 if !directory.is_empty() {
                     directory.push('/');
                 }
                 encode(&mut directory, &names[column]);
                 directory.push('=');
-                match key.try_value_at(row)? {
+                let text = key.try_value_at(row)?;
+                match &text {
                     Value::Null => directory.push_str(NULL_PARTITION),
-                    Value::Varchar(text) => encode_value(&mut directory, &text),
+                    Value::Varchar(text) => encode_value(&mut directory, text),
                     other => encode_value(&mut directory, &other.to_string()),
                 }
+                texts.push(text);
             }
             let partition = match found.get(&directory) {
                 Some(&partition) => partition,
@@ -251,7 +416,8 @@ fn write_partitioned(
                         .map(|&column| chunk.column(column)?.try_value_at(row))
                         .collect::<Result<Vec<_>>>()?;
                     found.insert(directory.clone(), partitions.len());
-                    partitions.push((directory, values, vec![Vec::new(); chunks.len()]));
+                    let picked = vec![Vec::new(); chunks.len()];
+                    partitions.push((directory, values, picked, texts));
                     partitions.len() - 1
                 }
             };
@@ -264,7 +430,7 @@ fn write_partitioned(
     let kept_names = kept.iter().map(|&column| names[column].clone()).collect::<Vec<_>>();
     let kept_types = kept.iter().map(|&column| result.types()[column].clone()).collect::<Vec<_>>();
     if split.flat {
-        partitions.sort_by(|(_, left, _), (_, right, _)| {
+        partitions.sort_by(|(_, left, ..), (_, right, ..)| {
             left.iter()
                 .zip(right)
                 .map(|(left, right)| {
@@ -275,7 +441,7 @@ fn write_partitioned(
         });
     }
     let (mut rows, mut next) = (0, 0);
-    for (directory, _, picked) in &partitions {
+    for (directory, _, picked, texts) in &partitions {
         let mut parts = Vec::new();
         for (chunk, rows) in chunks.iter().zip(picked) {
             if rows.is_empty() {
@@ -299,6 +465,11 @@ fn write_partitioned(
         let before = files.len();
         rows += write_files(copy, &place, first, &part, zone, 1, files)?;
         next += files.len() - before;
+        let keys = split.columns.iter().map(|&column| names[column].clone());
+        let keys = keys.zip(texts.iter().cloned()).collect::<Vec<_>>();
+        for wrote in &mut files[before..] {
+            wrote.partition = Some(keys.clone());
+        }
     }
     Ok(rows)
 }
@@ -599,10 +770,11 @@ impl<'a> Sink<'a> {
         Ok(())
     }
 
-    /// Writes what comes after the last row and closes the file, adds its path to `files` and
-    /// answers how many rows it holds.
-    fn finish(self, files: &mut Vec<String>) -> Result<usize> {
+    /// Writes what comes after the last row and closes the file, adds it to `files` and answers
+    /// how many rows it holds.
+    fn finish(self, files: &mut Vec<Wrote>) -> Result<usize> {
         let written = failed(&self.path);
+        let (mut footer, mut columns, mut row_groups) = (0, Vec::new(), 0);
         match self.body {
             Body::Csv { mut out, .. } => out.flush().map_err(written)?,
             Body::Json { mut out, .. } => {
@@ -614,10 +786,20 @@ impl<'a> Sink<'a> {
             }
             Body::Parquet { mut writer, group, .. } => {
                 writer.write_group(&group)?;
-                writer.finish()?;
+                columns = writer.statistics().to_vec();
+                row_groups = writer.row_groups();
+                footer = writer.finish_sized()?.1;
             }
         }
-        files.push(self.path);
+        files.push(Wrote {
+            path: self.path,
+            rows: self.rows,
+            size: self.size.get(),
+            footer,
+            columns,
+            row_groups,
+            partition: None,
+        });
         Ok(self.rows)
     }
 }

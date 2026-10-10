@@ -38,6 +38,7 @@ struct Column {
 struct Written {
     values: i64,
     nulls: i64,
+    nans: i64,
     compressed: i64,
     uncompressed: i64,
     min: Option<Value>,
@@ -54,6 +55,27 @@ pub struct Writer<W: Write> {
     groups: Vec<thrift::Writer>,
     rows: i64,
     created_by: String,
+    totals: Vec<ColumnStatistics>,
+}
+
+/// What one column of a file holds over all of its row groups, which is what a `COPY ... TO`
+/// with `RETURN_STATS` reports.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColumnStatistics {
+    /// The name of the column.
+    pub name: String,
+    /// How many values it holds, the nulls among them.
+    pub values: i64,
+    /// How many of them are null.
+    pub nulls: i64,
+    /// How many are NaN, for a `FLOAT` or a `DOUBLE` column, and `None` for any other.
+    pub nans: Option<i64>,
+    /// How many bytes its column chunks take in the file, page headers and all.
+    pub size: i64,
+    /// The smallest value that is neither null nor NaN, of the type it was stored as.
+    pub min: Option<Value>,
+    /// The largest.
+    pub max: Option<Value>,
 }
 
 /// The type a column of `ty` has to be cast to before it is handed to a [`Writer`].
@@ -147,6 +169,14 @@ impl<W: Write> Writer<W> {
             })?;
             columns.push(Column { name: field.name.clone(), ty: field.ty.clone(), physical });
         }
+        let totals = columns
+            .iter()
+            .map(|column| ColumnStatistics {
+                name: column.name.clone(),
+                nans: matches!(column.physical, Physical::Float | Physical::Double).then_some(0),
+                ..ColumnStatistics::default()
+            })
+            .collect();
         let mut writer = Self {
             out,
             at: 0,
@@ -155,6 +185,7 @@ impl<W: Write> Writer<W> {
             groups: Vec::new(),
             rows: 0,
             created_by: created_by.to_string(),
+            totals,
         };
         writer.put(b"PAR1")?;
         Ok(writer)
@@ -193,6 +224,17 @@ impl<W: Write> Writer<W> {
             total += written.uncompressed;
             compressed += written.compressed;
             columns.push(self.chunk_meta(column, first, &written));
+            let totals = &mut self.totals[column];
+            totals.values += written.values;
+            totals.nulls += written.nulls;
+            totals.nans = totals.nans.map(|nans| nans + written.nans);
+            totals.size += written.compressed;
+            if let Some(min) = &written.min {
+                bound(&mut totals.min, min, Ordering::Less);
+            }
+            if let Some(max) = &written.max {
+                bound(&mut totals.max, max, Ordering::Greater);
+            }
         }
         let mut group = thrift::Writer::default();
         group.list_of_nested(1, columns);
@@ -219,6 +261,11 @@ impl<W: Write> Writer<W> {
                 defined.push(false);
                 written.nulls += 1;
                 continue;
+            }
+            if matches!(value, Value::Double(value) if value.is_nan())
+                || matches!(value, Value::Float(value) if value.is_nan())
+            {
+                written.nans += 1;
             }
             defined.push(true);
             if column.physical == Physical::Boolean {
@@ -292,12 +339,34 @@ impl<W: Write> Writer<W> {
         chunk
     }
 
+    /// What each column holds over the row groups written so far, in the order of the columns.
+    #[must_use]
+    pub fn statistics(&self) -> &[ColumnStatistics] {
+        &self.totals
+    }
+
+    /// How many row groups have been written so far.
+    #[must_use]
+    pub fn row_groups(&self) -> usize {
+        self.groups.len()
+    }
+
     /// Writes the footer and hands back what the file was written to.
     ///
     /// # Errors
     ///
     /// If the write fails.
-    pub fn finish(mut self) -> Result<W> {
+    pub fn finish(self) -> Result<W> {
+        Ok(self.finish_sized()?.0)
+    }
+
+    /// Writes the footer and hands back what the file was written to and how many bytes the
+    /// footer's metadata took, which leaves out its length and the closing magic.
+    ///
+    /// # Errors
+    ///
+    /// If the write fails.
+    pub fn finish_sized(mut self) -> Result<(W, u64)> {
         let mut schema = Vec::with_capacity(self.columns.len() + 1);
         let mut root = thrift::Writer::default();
         root.i32(3, 0);
@@ -320,7 +389,7 @@ impl<W: Write> Writer<W> {
         self.out
             .flush()
             .map_err(|error| Error::io(format!("could not write a parquet file: {error}")))?;
-        Ok(self.out)
+        Ok((self.out, footer.len() as u64))
     }
 }
 
