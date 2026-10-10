@@ -23,10 +23,10 @@ use rudb_common::{
     StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
-    Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, Retype, TYPES_SET,
-    TableFunction, content_files, csv_columns, csv_fields, csv_given, csv_types, files, is_file,
-    is_pattern, json_text, kind_of, parquet_footers, parquet_outline, resolve, resolve_pragma,
-    resolve_table,
+    Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, Retype, TYPES_SET,
+    TableFunction, add_extras, content_files, csv_columns, csv_fields, csv_given, csv_types,
+    extras, files, is_file, is_pattern, json_text, kind_of, parquet_footers, parquet_outline,
+    resolve, resolve_pragma, resolve_table,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -4237,9 +4237,16 @@ impl<'a> Binder<'a> {
                 } else {
                     self.file_paths(cast[0], resolved.function.name())?
                 };
+                // Not for a `COPY t FROM`, whose columns are the table's.
+                let extras = if self.copy_into.is_some() {
+                    Extras::default()
+                } else {
+                    self.file_extras(resolved.function, &paths, &mut written_options)?
+                };
                 let mut mirrorable = None;
                 if resolved.function == TableFunction::ReadParquet
                     && !options.file_row_number
+                    && extras.is_empty()
                     && let Some((path, stamp)) = mirror_target(&paths)
                 {
                     if let Some(name) = self.catalog.mirror(&path, options.binary_as_string, stamp)
@@ -4307,6 +4314,13 @@ impl<'a> Binder<'a> {
                         )));
                     }
                     fields.push(Field::required(FILE_ROW_NUMBER.to_string(), LogicalType::BigInt));
+                }
+                // A file column a partition key took over holds the key's value now, so what the
+                // file's statistics say about it is about values nobody reads.
+                let taken = add_extras(&mut fields, &extras)?;
+                if !taken.is_empty() {
+                    bounded = None;
+                    counted.retain(|(name, _)| !taken.contains(name));
                 }
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
@@ -4697,8 +4711,11 @@ impl<'a> Binder<'a> {
                 "the named parameter {parameter} with a value that is not a constant"
             )));
         };
-        let shared =
-            (function.json().is_some() && *parameter == "filename") || function.reads_contents();
+        // The multi file options, which the pin parses in one place for every reader.
+        let shared = matches!(
+            *parameter,
+            "filename" | "hive_partitioning" | "hive_types" | "hive_types_autocast"
+        ) || function.reads_contents();
         if value == Value::Null && shared {
             // The ones the shared file options refuse rather than the reader's own list.
             return Err(Error::invalid_input(format!(
@@ -4710,8 +4727,11 @@ impl<'a> Binder<'a> {
         }
         // The JSON readers cast what they are given to the parameter's type themselves, and say
         // so in their own words when it does not cast.
-        if function.json().is_some() {
+        if function.json().is_some() || *parameter == "filename" {
             return Ok((parameter, value, expr));
+        }
+        if *parameter == "hive_types" {
+            return self.hive_types_argument(parameter, value, expr);
         }
         if *parameter == "columns" {
             // The type names are read here, against the catalog, and the plan keeps them written
@@ -4785,6 +4805,91 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// The `hive_types` struct, checked the way the pin checks it and kept with each type written
+    /// out as what it came to, so that [`Binder::hive_types`] reads it back without a doubt about
+    /// what a name meant.
+    fn hive_types_argument(
+        &mut self,
+        parameter: &'static str,
+        value: Value,
+        expr: ExprRef,
+    ) -> Result<(&'static str, Value, ExprRef)> {
+        let given = self.plan.expr_type(expr).clone();
+        let (LogicalType::Struct(fields), Value::Struct(values)) = (&given, &value) else {
+            return Err(Error::invalid_input(format!(
+                "'hive_types' only accepts a STRUCT('name':VARCHAR, ...), but '{given}' was \
+                 provided"
+            )));
+        };
+        let mut written = Vec::with_capacity(values.len());
+        for (field, (name, child)) in fields.iter().zip(values) {
+            let Value::Varchar(text) = child else {
+                return Err(Error::invalid_input(format!(
+                    "hive_types: \"{name}\" must be a VARCHAR, instead: '{}' was provided",
+                    field.ty
+                )));
+            };
+            let ty = crate::statement::read_type(self.catalog, text)?;
+            written.push((name.clone(), Value::Varchar(ty.to_string())));
+        }
+        let fields = written.iter().map(|(name, _)| Field::new(name.clone(), LogicalType::Varchar));
+        let ty = LogicalType::Struct(fields.collect());
+        let value = Value::Struct(written);
+        let at = self.plan.add_value(value.clone());
+        let expr = self.plan.add_expr(Expr::Constant(at), ty);
+        Ok((parameter, value, expr))
+    }
+
+    /// What `hive_types` sets each partition key to, from the struct [`Self::hive_types_argument`]
+    /// left in the options. Two of them add up, the later one winning a key they both set.
+    fn hive_types(&self, named: &[(&str, Value)]) -> Result<Vec<(String, LogicalType)>> {
+        let mut types: Vec<(String, LogicalType)> = Vec::new();
+        for (parameter, value) in named {
+            let ("hive_types", Value::Struct(fields)) = (*parameter, value) else { continue };
+            for (name, written) in fields {
+                let Value::Varchar(text) = written else { continue };
+                let ty = crate::statement::read_type(self.catalog, text)?;
+                types.retain(|(other, _)| other != name);
+                types.push((name.clone(), ty));
+            }
+        }
+        Ok(types)
+    }
+
+    /// The columns `filename` and the Hive partitions add to a read of `paths`, for the two readers
+    /// that take them, and nothing for the rest.
+    ///
+    /// The options are rewritten to say what was decided, `filename='<column>'` when there is a
+    /// filename column and `hive_partitioning=true` when there are partition columns, and neither
+    /// when there is not, because the executor works the values out from those two and the file
+    /// names and should not have to guess the layout a second time.
+    fn file_extras(
+        &mut self,
+        function: TableFunction,
+        paths: &[String],
+        written: &mut Vec<(&'static str, Value, ExprRef)>,
+    ) -> Result<Extras> {
+        if !matches!(function, TableFunction::ReadParquet | TableFunction::ReadCsv) {
+            return Ok(Extras::default());
+        }
+        let named: Vec<(&str, Value)> =
+            written.iter().map(|(parameter, value, _)| (*parameter, value.clone())).collect();
+        let types = self.hive_types(&named)?;
+        let extras = extras(&named, paths, &types)?;
+        written.retain(|(parameter, _, _)| !matches!(*parameter, "filename" | "hive_partitioning"));
+        if let Some(name) = &extras.filename {
+            let at = self.plan.add_value(Value::Varchar(name.clone()));
+            let expr = self.plan.add_expr(Expr::Constant(at), LogicalType::Varchar);
+            written.push(("filename", Value::Varchar(name.clone()), expr));
+        }
+        if !extras.hive.is_empty() {
+            let at = self.plan.add_value(Value::Boolean(true));
+            let expr = self.plan.add_expr(Expr::Constant(at), LogicalType::Boolean);
+            written.push(("hive_partitioning", Value::Boolean(true), expr));
+        }
+        Ok(extras)
+    }
+
     /// A file where a table name goes, which is what DuckDB calls a replacement scan.
     ///
     /// `SELECT * FROM 'hits.parquet'` is how most DuckDB queries in the wild are written, ClickBench
@@ -4840,8 +4945,11 @@ impl<'a> Binder<'a> {
         } else {
             ast.string(alias).to_string()
         };
+        let mut written = Vec::new();
+        let extras = self.file_extras(function, &paths, &mut written)?;
         let mut mirrorable = None;
         if function == TableFunction::ReadParquet
+            && extras.is_empty()
             && let Some((canonical, stamp)) = mirror_target(&paths)
         {
             if let Some(name) = self.catalog.mirror(&canonical, false, stamp) {
@@ -4850,8 +4958,7 @@ impl<'a> Binder<'a> {
             }
             mirrorable = Some(canonical);
         }
-        let mut written = Vec::new();
-        let read = match function {
+        let mut read = match function {
             TableFunction::ReadParquet => {
                 let footers = self.footers(&paths, mirrorable.as_deref())?;
                 if let Some(canonical) = mirrorable.as_deref() {
@@ -4869,6 +4976,11 @@ impl<'a> Binder<'a> {
             }
             _ => Read::uncounted(csv_fields(&paths, Given::default())?),
         };
+        let taken = add_extras(&mut read.fields, &extras)?;
+        if !taken.is_empty() {
+            read.zones = None;
+            read.distincts.retain(|(name, _)| !taken.contains(name));
+        }
         let arguments: Vec<ExprRef> = paths.iter().map(|path| self.path_constant(path)).collect();
         let names: Vec<&str> = ast.name(columns).collect();
         self.table_function_source(function, &arguments, &written, read, &label, &names)

@@ -317,7 +317,11 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    delim VARCHAR\n",
         "    dtypes ANY\n",
         "    escape VARCHAR\n",
+        "    filename ANY\n",
         "    header BOOLEAN\n",
+        "    hive_partitioning BOOLEAN\n",
+        "    hive_types ANY\n",
+        "    hive_types_autocast BOOLEAN\n",
         "    max_line_size VARCHAR\n",
         "    maximum_line_size VARCHAR\n",
         "    names VARCHAR[]\n",
@@ -616,4 +620,180 @@ fn null_padding_reads_a_short_row_with_nulls_for_what_it_is_missing() {
         error.message(),
         "\"null_padding\" expects a non-null boolean value (e.g. TRUE or 1)"
     );
+}
+
+/// A directory of CSV files laid out the way `PARTITION_BY` writes one, each file under the path
+/// it is given, as the directory's path.
+fn partitioned(name: &str, files: &[(&str, &str)]) -> String {
+    let root = format!("{}/hive-{name}", env!("CARGO_TARGET_TMPDIR"));
+    for (path, text) in files {
+        let path = std::path::Path::new(&root).join(path);
+        std::fs::create_dir_all(path.parent().expect("has a directory")).expect("makes it");
+        std::fs::write(&path, text).expect("writes");
+    }
+    root
+}
+
+#[test]
+fn a_hive_partitioned_directory_reads_its_keys_back_as_columns() {
+    let database = Database::new();
+    let root = partitioned(
+        "simple",
+        &[("k=1/d=2020-01-02/f.csv", "a,b\n1,2\n"), ("k=x/d=2020-01-03/f.csv", "a,b\n3,4\n")],
+    );
+    let read = |from: &str| {
+        let sql = format!("SELECT * FROM {} ORDER BY a", from.replace("ROOT", &root));
+        database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"))
+    };
+    // Found without being asked for, in key order after the file's columns, and typed from what
+    // the directories hold: `d` is a date in both and `k` is a number in one and text in the other.
+    let result = read("read_csv('ROOT/*/*/f.csv')");
+    assert_eq!(result.names(), ["a", "b", "d", "k"]);
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["BIGINT", "BIGINT", "DATE", "VARCHAR"]);
+    let sql = format!(
+        "SELECT string_agg(concat_ws(':', *COLUMNS(*)), ' ' ORDER BY a) FROM \
+         read_csv('{root}/*/*/f.csv')"
+    );
+    let text = Value::Varchar("1:2:2020-01-02:1 3:4:2020-01-03:x".into());
+    assert_eq!(database.value(&sql).expect("runs"), text);
+    // The same for a file name where a table goes.
+    assert_eq!(read("'ROOT/*/*/f.csv'").names(), ["a", "b", "d", "k"]);
+    let types: Vec<String> =
+        read("read_csv('ROOT/k=1/*/f.csv')").types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["BIGINT", "BIGINT", "DATE", "BIGINT"]);
+    let result = read("read_csv('ROOT/*/*/f.csv', hive_types_autocast=false)");
+    let types: Vec<String> = result.types().iter().map(ToString::to_string).collect();
+    assert_eq!(types, ["BIGINT", "BIGINT", "VARCHAR", "VARCHAR"]);
+    assert_eq!(read("read_csv('ROOT/*/*/f.csv', hive_partitioning=false)").names(), ["a", "b"]);
+    // The filename column goes before the keys, and `filename=0` is no column at all.
+    let result = read("read_csv('ROOT/k=1/*/f.csv', filename=true)");
+    assert_eq!(result.names(), ["a", "b", "filename", "d", "k"]);
+    assert_eq!(read("read_csv('ROOT/*/*/f.csv', filename=0)").names(), ["a", "b", "d", "k"]);
+    let sql = format!(
+        "SELECT string_agg(replace(path, '{root}/', ''), ' ' ORDER BY a) FROM \
+         read_csv('{root}/*/*/f.csv', filename='path')"
+    );
+    let paths = Value::Varchar("k=1/d=2020-01-02/f.csv k=x/d=2020-01-03/f.csv".into());
+    assert_eq!(database.value(&sql).expect("runs"), paths);
+    // A type that is set is cast to when the rows are read, and a value that does not cast says
+    // which key it was in capitals.
+    let sql = format!("SELECT * FROM read_csv('{root}/*/*/f.csv', hive_types={{'k': 'INTEGER'}})");
+    let error = database.query(&sql).unwrap_err();
+    assert_eq!(
+        error.message(),
+        "Unable to cast 'x' (from hive partition column 'K') to: 'INTEGER'"
+    );
+    let sql =
+        format!("SELECT max(k) FROM read_csv('{root}/k=1/*/f.csv', hive_types={{'k': 'INTEGER'}})");
+    assert_eq!(database.value(&sql).expect("runs"), Value::Integer(1));
+}
+
+#[test]
+fn hive_partition_values_decode_and_their_null_markers_read_as_nulls() {
+    let database = Database::new();
+    let root = partitioned(
+        "values",
+        &[
+            ("m/k=%41b/f.csv", "a\n1\n"),
+            ("m/k=NULL/f.csv", "a\n2\n"),
+            ("m/k=__HIVE_DEFAULT_PARTITION__/f.csv", "a\n3\n"),
+            ("n/k=5/f.csv", "a\n1\n"),
+            ("n/k=NULL/f.csv", "a\n2\n"),
+            ("n/k=/f.csv", "a\n3\n"),
+            ("t/k=2020-01-01 10:00:00/f.csv", "a\n1\n"),
+            ("t/k=1.5/f.csv", "a\n1\n"),
+        ],
+    );
+    let read = |from: &str| {
+        let sql = format!(
+            "SELECT string_agg(coalesce(k::VARCHAR, 'null'), ',' ORDER BY a) FROM read_csv({from})"
+        );
+        database.value(&sql.replace("ROOT", &root)).expect("runs")
+    };
+    // Text is URL decoded, and only the default partition name is a null in it, so `NULL` is the
+    // word.
+    assert_eq!(read("'ROOT/m/*/f.csv'"), Value::Varchar("Ab,NULL,null".into()));
+    // `NULL` has no say in the type, and an empty value is text in text.
+    assert_eq!(read("'ROOT/n/*/f.csv'"), Value::Varchar("5,NULL,".into()));
+    let types = |from: &str| {
+        let sql = format!("SELECT typeof(k) FROM read_csv({from}) LIMIT 1");
+        database.value(&sql.replace("ROOT", &root)).expect("runs")
+    };
+    assert_eq!(types("'ROOT/t/k=2020*/f.csv'"), Value::Varchar("TIMESTAMP".into()));
+    assert_eq!(types("'ROOT/t/k=1.5/f.csv'"), Value::Varchar("VARCHAR".into()));
+    assert_eq!(types("'ROOT/t/*/f.csv'"), Value::Varchar("VARCHAR".into()));
+    // Any other type reads both `NULL` and an empty value as a null.
+    assert_eq!(
+        read("'ROOT/n/*/f.csv', hive_types={'k': 'BIGINT'}"),
+        Value::Varchar("5,null,null".into())
+    );
+}
+
+#[test]
+fn hive_partitioning_and_filename_are_refused_where_the_pin_refuses_them() {
+    let database = Database::new();
+    let root = partitioned(
+        "refused",
+        &[("k=1/d=2/f.csv", "a,b\n1,2\n"), ("k=3/f.csv", "a,b\n3,4\n"), ("q.csv", "a,b\n5,6\n")],
+    );
+    let read = |options: &str| {
+        let sql = format!("SELECT * FROM read_csv({options})").replace("ROOT", &root);
+        let result = database.query(&sql).map_err(|error| error.message().to_string())?;
+        Ok(result.names().to_vec())
+    };
+    // Files that disagree on their keys are not partitioned unless that was asked for.
+    assert_eq!(
+        read("['ROOT/k=1/d=2/f.csv', 'ROOT/q.csv']"),
+        Ok(vec!["a".to_string(), "b".to_string()])
+    );
+    for (options, expected) in [
+        (
+            "['ROOT/k=1/d=2/f.csv', 'ROOT/k=3/f.csv'], hive_partitioning=true",
+            "Hive partition mismatch between file \"ROOT/k=1/d=2/f.csv\" and \"ROOT/k=3/f.csv\": \
+             key \"d\" not found",
+        ),
+        (
+            "['ROOT/q.csv', 'ROOT/k=3/f.csv'], hive_partitioning=true",
+            "Hive partition mismatch between file \"ROOT/q.csv\" and \"ROOT/k=3/f.csv\"",
+        ),
+        (
+            "'ROOT/k=1/*/f.csv', filename='a'",
+            "Option filename adds column \"a\", but a column with this name is also in the file. \
+             Try setting a different name: filename='<filename column name>'",
+        ),
+        (
+            "'ROOT/k=1/*/f.csv', filename='k'",
+            "Option filename adds column \"k\", but a hive partition column with this name also \
+             exists. Try setting a different name: filename='<filename column name>'",
+        ),
+        (
+            "'ROOT/k=1/*/f.csv', hive_types={'k': 3}",
+            "hive_types: \"k\" must be a VARCHAR, instead: 'INTEGER' was provided",
+        ),
+        (
+            "'ROOT/k=1/*/f.csv', hive_types=3",
+            "'hive_types' only accepts a STRUCT('name':VARCHAR, ...), but 'INTEGER' was provided",
+        ),
+        (
+            "'ROOT/k=1/*/f.csv', hive_types={'zz': 'INT'}",
+            "Unknown hive_type: \"zz\" does not appear to be a partition",
+        ),
+        (
+            "'ROOT/k=1/*/f.csv', hive_types={'k': 'INT'}, hive_partitioning=false",
+            "cannot disable hive_partitioning when hive_types is enabled",
+        ),
+        ("'ROOT/q.csv', filename=NULL", "Cannot use NULL as argument for \"filename\""),
+        (
+            "'ROOT/q.csv', hive_partitioning=NULL",
+            "Cannot use NULL as argument for \"hive_partitioning\"",
+        ),
+        ("'ROOT/q.csv', hive_types=NULL", "Cannot use NULL as argument for \"hive_types\""),
+        (
+            "'ROOT/q.csv', hive_types_autocast=NULL",
+            "Cannot use NULL as argument for \"hive_types_autocast\"",
+        ),
+    ] {
+        assert_eq!(read(options), Err(expected.replace("ROOT", &root)), "{options}");
+    }
 }

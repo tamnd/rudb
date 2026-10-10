@@ -16,6 +16,7 @@
 pub mod entrycatalog;
 pub mod file;
 pub mod functioncatalog;
+pub mod hive;
 pub use rudb_common::implicit;
 pub mod pragmacatalog;
 pub mod settingcatalog;
@@ -35,6 +36,7 @@ pub use file::{
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,
 };
+pub use hive::{Extras, add_extras, extras, filename_column, hive_value, partitions};
 pub use pragmacatalog::{PRAGMAS, PragmaEntry, pragma_named};
 pub use rudb_csv::{Given, Retype};
 pub use settingcatalog::{

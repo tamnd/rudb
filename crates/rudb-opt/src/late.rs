@@ -31,6 +31,9 @@
 //! More than one file, because a row ordinal inside a file says which row only when there is one
 //! file it could be in.
 //!
+//! A read with a `filename` column or Hive partition columns, which are in no file for the fetch to
+//! read them back from.
+//!
 //! A scan that already produces `file_row_number`, since the reader takes the last column being
 //! called that as meaning it counted it and two of them would make the second a column it went
 //! looking for in the file.
@@ -451,6 +454,11 @@ fn number(plan: &mut Plan, scan: NodeRef) -> Option<ColumnBinding> {
         return None;
     };
     if plan.string(function) != "read_parquet" || plan.expr_list(args).len() != 1 {
+        return None;
+    }
+    // A filename or a partition column is not in the file, so the fetch could not read it back.
+    let extra = |name: &u32| matches!(plan.string(*name), "filename" | "hive_partitioning");
+    if plan.name_list(options).iter().any(extra) {
         return None;
     }
     let mut fields = plan.field_list(columns).to_vec();
