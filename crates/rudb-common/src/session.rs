@@ -229,6 +229,8 @@ pub struct Semantics {
     sort_operators: SortOperators,
     tie_order: TieOrder,
     window_order: WindowOrder,
+    sorted_targets: SortedTargets,
+    skipped_rows: SkippedRows,
     empty_targets: EmptyTargets,
     unread_queries: UnreadQueries,
     row_comparisons: RowComparisons,
@@ -290,6 +292,8 @@ impl Default for Semantics {
             sort_operators: SortOperators::Pin,
             tie_order: TieOrder::Pin,
             window_order: WindowOrder::Pin,
+            sorted_targets: SortedTargets::Pin,
+            skipped_rows: SkippedRows::Pin,
             empty_targets: EmptyTargets::Pin,
             unread_queries: UnreadQueries::Pin,
             row_comparisons: RowComparisons::Pin,
@@ -496,6 +500,16 @@ impl Semantics {
     #[must_use]
     pub fn window_order(self) -> WindowOrder {
         self.window_order
+    }
+    /// Where a sorted query computes a target that it does not sort on.
+    #[must_use]
+    pub fn sorted_targets(self) -> SortedTargets {
+        self.sorted_targets
+    }
+    /// Whether a projection under a limit computes the rows that the offset skips.
+    #[must_use]
+    pub fn skipped_rows(self) -> SkippedRows {
+        self.skipped_rows
     }
     /// Whether a `SELECT` can have no targets.
     #[must_use]
@@ -1076,6 +1090,31 @@ pub enum WindowOrder {
     Postgres,
 }
 
+/// Where a query with an `ORDER BY` computes a target that it does not sort on and that calls
+/// something volatile, as `nextval` in `SELECT a, nextval('s') FROM t ORDER BY a LIMIT 10`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortedTargets {
+    /// As in DuckDB: with the other targets, before the sort, so every row calls it.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: after the sort, which `make_sort_input_target` arranges, so the rows call
+    /// it in the order of the `ORDER BY` and only the rows that the limit reads call it.
+    Postgres,
+}
+
+/// Whether a projection under a limit computes the rows that the offset skips, which shows when
+/// the projection calls something volatile, as `nextval` in `SELECT nextval('s') FROM t OFFSET 5`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SkippedRows {
+    /// As on the pin: the limit goes under the projection, so the skipped rows are not computed.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the limit reads the rows that it skips from the projection, so a
+    /// projection that calls something volatile computes them. A projection that does not cannot
+    /// show the difference, and the limit still goes under it.
+    Postgres,
+}
+
 /// Whether a `SELECT` can have no targets, as in `SELECT FROM t`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EmptyTargets {
@@ -1540,6 +1579,8 @@ impl Session {
             self.semantics.sort_operators = SortOperators::Postgres;
             self.semantics.tie_order = TieOrder::Postgres;
             self.semantics.window_order = WindowOrder::Postgres;
+            self.semantics.sorted_targets = SortedTargets::Postgres;
+            self.semantics.skipped_rows = SkippedRows::Postgres;
             self.semantics.empty_targets = EmptyTargets::Postgres;
             self.semantics.unread_queries = UnreadQueries::Postgres;
             self.semantics.row_comparisons = RowComparisons::Postgres;

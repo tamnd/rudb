@@ -25,6 +25,12 @@
 //! filter pushdown, where copying a volatile call into two places means the row that passed the test
 //! is not the row that comes out.
 //!
+//! A limit with an offset over a projection that calls something volatile stays where it is in a
+//! PostgreSQL session. The limit of PostgreSQL reads the rows that it skips from the node under it,
+//! so `SELECT nextval('s') FROM t OFFSET 5` takes a value of the sequence for the five rows it
+//! skips too, and gives the sixth value first. Under the limit, the projection would not see those
+//! rows at all.
+//!
 //! # A limit over a recursion
 //!
 //! A limit that is all the query reads of a recursive `WITH` tells the recursion how many rows it
@@ -67,8 +73,8 @@ impl Pass for LimitPushdown {
         "limit_pushdown"
     }
 
-    fn run(&self, plan: &mut Plan, _context: &Context) -> Result<()> {
-        push(plan);
+    fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
+        push_computing(plan, context.computes_skipped_rows());
         bound_recursions(plan);
         Ok(())
     }
@@ -149,10 +155,16 @@ fn limit_over(plan: &Plan, body: NodeRef, cte: u32) -> Option<u64> {
 /// Each limit is walked all the way down rather than one level per run, so a run of projections is
 /// crossed once and the plan this leaves behind is the plan it would leave behind again.
 pub fn push(plan: &mut Plan) {
+    push_computing(plan, false);
+}
+
+/// [`push`], keeping a limit with an offset over a projection that calls something volatile when
+/// `skipped` says that the projection computes the rows the offset skips. See the module.
+pub fn push_computing(plan: &mut Plan, skipped: bool) {
     let shared = shared(plan);
     for node in top_down(plan) {
         let mut at = node;
-        while let Some(below) = swap(plan, at, &shared) {
+        while let Some(below) = swap(plan, at, &shared, skipped) {
             at = below;
         }
     }
@@ -162,7 +174,7 @@ pub fn push(plan: &mut Plan) {
 ///
 /// `None` when there is nothing to do, which is anything that is not a limit over a projection, and
 /// a projection something other than this limit also points at.
-fn swap(plan: &mut Plan, at: NodeRef, shared: &[NodeRef]) -> Option<NodeRef> {
+fn swap(plan: &mut Plan, at: NodeRef, shared: &[NodeRef], skipped: bool) -> Option<NodeRef> {
     let Node::Limit { input, count, offset } = *plan.node(at) else {
         return None;
     };
@@ -182,6 +194,12 @@ fn swap(plan: &mut Plan, at: NodeRef, shared: &[NodeRef]) -> Option<NodeRef> {
     // reads more than its own row does not have that property: ten rows into an aggregate is a
     // different answer from ten rows out of one. The binder cannot build that projection today.
     if !plan.expr_list(exprs).iter().all(|&expr| walk::elementwise(plan, expr)) {
+        return None;
+    }
+    if skipped
+        && !matches!(offset, Bound::Rows(0) | Bound::All)
+        && plan.expr_list(exprs).iter().any(|&expr| walk::volatile(plan, expr))
+    {
         return None;
     }
     *plan.node_mut(input) = Node::Limit { input: under, count, offset };

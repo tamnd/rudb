@@ -80,6 +80,9 @@ pub struct Context {
     /// Whether a scalar query whose value nothing reads is run, which is a rule of the dialect
     /// rather than a choice of the optimizer. See [`crate::columns`].
     unread_queries: rudb_common::UnreadQueries,
+    /// Whether a projection under a limit computes the rows that the offset skips, which is a
+    /// rule of the dialect too. See [`crate::limit`].
+    skipped_rows: rudb_common::SkippedRows,
 }
 
 impl Context {
@@ -231,6 +234,18 @@ impl Context {
     /// Sets whether a scalar query whose value nothing reads is run.
     pub fn unread_queries(&mut self, unread: rudb_common::UnreadQueries) {
         self.unread_queries = unread;
+    }
+
+    /// Sets whether a projection under a limit computes the rows that the offset skips.
+    pub fn skipped_rows(&mut self, skipped: rudb_common::SkippedRows) {
+        self.skipped_rows = skipped;
+    }
+
+    /// Whether a projection under a limit computes the rows that the offset skips, as in
+    /// PostgreSQL.
+    #[must_use]
+    pub fn computes_skipped_rows(&self) -> bool {
+        self.skipped_rows == rudb_common::SkippedRows::Postgres
     }
 
     /// Whether a scalar query whose value nothing reads is skipped, as in PostgreSQL.

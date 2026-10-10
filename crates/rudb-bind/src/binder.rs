@@ -19,8 +19,8 @@ use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder,
     EmptyTargets, Error, ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin,
-    RecursiveUnion, Result, Semantics, Session, ShowBehavior, SortOperators, Span, SqlState, Stat,
-    StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
+    RecursiveUnion, Result, Semantics, Session, ShowBehavior, SortOperators, SortedTargets, Span,
+    SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
     Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, Retype, TYPES_SET,
@@ -33,8 +33,8 @@ use rudb_kernels::{percentage, row_count};
 use rudb_parse::ast::{self, Ast, Distinct, LiteralKind, Nulls, Order, Quantifier, SetOp};
 use rudb_parse::{NONE, identifier_parts, parse_ast_with_case};
 use rudb_plan::{
-    Bound, BuildSide, ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef, Plan,
-    SetOpKind, Share, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
+    Arm, Bound, BuildSide, ColumnBinding, ConjunctionOp, Expr, ExprRef, JoinKind, Node, NodeRef,
+    Plan, SetOpKind, Share, SortKey, WindowBound, WindowExclude, WindowFrame, WindowUnit,
 };
 
 use crate::expr::{describe, postgres_oid, written_oid};
@@ -2296,6 +2296,21 @@ impl<'a> Binder<'a> {
             node = self.plan_unnests(node, index, &unnests)?;
         }
 
+        let postponed = if unnests.is_empty() && written.distinct == Distinct::No {
+            self.postponed(
+                query,
+                &keys,
+                &sorted,
+                project,
+                visible,
+                &mut exprs,
+                &mut names,
+                &mut output,
+            )
+        } else {
+            Vec::new()
+        };
+
         let interned: Vec<u32> = names.iter().map(|name| self.plan.intern(name)).collect();
         let exprs_slice = self.plan.add_expr_list(&exprs);
         let names_slice = self.plan.add_name_list(&interned);
@@ -2325,13 +2340,18 @@ impl<'a> Binder<'a> {
             node = self.add_node(Node::Sort { input: node, keys });
         }
         node = self.apply_limit(ast, query, node, &mut output)?;
+        let mut skipped = None;
+        if !postponed.is_empty() {
+            (node, skipped) = self.split_offset(node);
+        }
 
-        if !extra {
+        if !extra && postponed.is_empty() {
             output.columns.truncate(visible);
             return Ok((node, output));
         }
         // An expression sorted on but not selected was carried this far to make the sort possible,
-        // and now it goes, because the query did not ask for it.
+        // and now it goes, because the query did not ask for it. A target that was postponed is
+        // computed here, from the columns that were carried for it.
         let index = self.fresh_index();
         let mut kept = Vec::with_capacity(visible);
         let mut kept_names = Vec::with_capacity(visible);
@@ -2342,7 +2362,18 @@ impl<'a> Binder<'a> {
             // joined in under it put a projection of its own over the top and these columns are
             // that projection's now.
             let binding = output.columns[at].binding;
-            kept.push(self.plan.add_expr(Expr::Column(binding), ty.clone()));
+            let expr = match postponed.iter().find(|target| target.at == at) {
+                Some(target) => {
+                    let carried: Vec<(ColumnBinding, ColumnBinding)> = target
+                        .reads
+                        .iter()
+                        .map(|&(read, held)| (read, output.columns[held].binding))
+                        .collect();
+                    self.moved(target.expr, &carried)
+                }
+                None => self.plan.add_expr(Expr::Column(binding), ty.clone()),
+            };
+            kept.push(expr);
             kept_names.push(self.plan.intern(name));
             scope.push(Visible {
                 table: String::new(),
@@ -2362,7 +2393,170 @@ impl<'a> Binder<'a> {
         let exprs = self.plan.add_expr_list(&kept);
         let names = self.plan.add_name_list(&kept_names);
         node = self.add_node(Node::Project { input: node, index, exprs, names });
+        if let Some(offset) = skipped {
+            node = self.add_node(Node::Limit { input: node, count: Bound::All, offset });
+        }
         Ok((node, scope))
+    }
+
+    /// The targets of a sorted query that are computed over the sorted rows and not before the
+    /// sort.
+    ///
+    /// PostgreSQL leaves a target that calls something volatile out of what its sort reads when
+    /// the query does not sort on that target, in `make_sort_input_target`, and computes it over
+    /// the rows that come out of the sort. With a limit, only the rows that the limit reads call
+    /// it, so `SELECT a, nextval('s') FROM t ORDER BY a LIMIT 10` takes ten values of the sequence
+    /// and gives them in the order of `a`.
+    ///
+    /// The place of the target in the projection under the sort holds a null of its type, and
+    /// each column that the target reads is carried through the sort in a hidden column of
+    /// `output`, so the projection over the limit can read it there. A `DISTINCT` compares every
+    /// target and a set-returning call makes rows of its own, so the caller does not ask then, and
+    /// a limit with ties or a share keeps every target where it was.
+    #[allow(clippy::too_many_arguments)]
+    fn postponed(
+        &mut self,
+        query: &ast::Query,
+        keys: &[SortKey],
+        sorted: &[Sorted],
+        project: u32,
+        visible: usize,
+        exprs: &mut Vec<ExprRef>,
+        names: &mut Vec<String>,
+        output: &mut Scope,
+    ) -> Vec<Postponed> {
+        if self.semantics.sorted_targets() != SortedTargets::Postgres
+            || keys.is_empty()
+            || query.with_ties
+            || query.limit_percent
+        {
+            return Vec::new();
+        }
+        let mut postponed = Vec::new();
+        let mut carried: Vec<(ColumnBinding, usize)> = Vec::new();
+        for at in 0..visible {
+            let expr = exprs[at];
+            if sorted.iter().any(|key| key.position == at)
+                || !crate::expr::volatile(&self.plan, expr)
+                || !movable(&self.plan, expr)
+            {
+                continue;
+            }
+            let mut read = Vec::new();
+            self.plan.read_columns(expr, &mut |column, binding| read.push((column, binding)));
+            let mut reads = Vec::with_capacity(read.len());
+            for (column, binding) in read {
+                if reads.iter().any(|&(held, _)| held == binding) {
+                    continue;
+                }
+                let held = match carried.iter().find(|&&(held, _)| held == binding) {
+                    Some(&(_, held)) => held,
+                    None => {
+                        let ty = self.plan.expr_type(column).clone();
+                        let position = exprs.len();
+                        exprs.push(self.plan.add_expr(Expr::Column(binding), ty.clone()));
+                        names.push(String::new());
+                        output.push(Visible {
+                            table: String::new(),
+                            name: String::new(),
+                            binding: ColumnBinding::new(project, position as u32),
+                            ty,
+                            not_null: false,
+                            key: None,
+                            default: None,
+                            origin: None,
+                            qualified: false,
+                            also: None,
+                            hidden: true,
+                            using: None,
+                        });
+                        carried.push((binding, output.columns.len() - 1));
+                        output.columns.len() - 1
+                    }
+                };
+                reads.push((binding, held));
+            }
+            let ty = self.plan.expr_type(expr).clone();
+            let null = self.plan.add_value(Value::Null);
+            exprs[at] = self.plan.add_expr(Expr::Constant(null), ty);
+            postponed.push(Postponed { at, expr, reads });
+        }
+        postponed
+    }
+
+    /// A limit with an offset, split so that a target computed over it is computed for the rows
+    /// that the offset skips too.
+    ///
+    /// The limit of PostgreSQL reads the rows it skips from the node under it, so a target
+    /// computed under the limit is computed for them. Here the target is computed over the limit,
+    /// so the limit under it keeps the rows it skips and a limit over the target skips them. A
+    /// bound read from the rows stays as it was.
+    fn split_offset(&mut self, node: NodeRef) -> (NodeRef, Option<Bound>) {
+        let Node::Limit { input, count, offset: Bound::Rows(offset) } = *self.plan.node(node)
+        else {
+            return (node, None);
+        };
+        if offset == 0 {
+            return (node, None);
+        }
+        match count {
+            Bound::All => (input, Some(Bound::Rows(offset))),
+            Bound::Rows(count) => {
+                let count = Bound::Rows(count.saturating_add(offset));
+                let kept = self.add_node(Node::Limit { input, count, offset: Bound::Rows(0) });
+                (kept, Some(Bound::Rows(offset)))
+            }
+            _ => (node, None),
+        }
+    }
+
+    /// A copy of `expr` that reads each column of `carried` from the column paired with it.
+    fn moved(&mut self, expr: ExprRef, carried: &[(ColumnBinding, ColumnBinding)]) -> ExprRef {
+        let ty = self.plan.expr_type(expr).clone();
+        let span = self.plan.expr_span(expr);
+        let copied = match *self.plan.expr(expr) {
+            Expr::Column(binding) => {
+                let found = carried.iter().find(|&&(read, _)| read == binding);
+                Expr::Column(found.map_or(binding, |&(_, held)| held))
+            }
+            Expr::Cast { input, try_cast } => {
+                Expr::Cast { input: self.moved(input, carried), try_cast }
+            }
+            Expr::Compare { op, left, right } => {
+                let left = self.moved(left, carried);
+                Expr::Compare { op, left, right: self.moved(right, carried) }
+            }
+            Expr::Conjunction { op, children } => {
+                let children = self.moved_list(children, carried);
+                Expr::Conjunction { op, children }
+            }
+            Expr::Function { name, args } => {
+                Expr::Function { name, args: self.moved_list(args, carried) }
+            }
+            Expr::Case { arms, otherwise } => {
+                let written = self.plan.arm_list(arms).to_vec();
+                let mut copied = Vec::with_capacity(written.len());
+                for arm in written {
+                    let when = self.moved(arm.when, carried);
+                    copied.push(Arm { when, then: self.moved(arm.then, carried) });
+                }
+                let otherwise = otherwise.map(|otherwise| self.moved(otherwise, carried));
+                Expr::Case { arms: self.plan.add_arms(&copied), otherwise }
+            }
+            ref other => other.clone(),
+        };
+        self.plan.add_expr_at(copied, ty, span)
+    }
+
+    fn moved_list(
+        &mut self,
+        list: rudb_plan::Slice,
+        carried: &[(ColumnBinding, ColumnBinding)],
+    ) -> rudb_plan::Slice {
+        let written = self.plan.expr_list(list).to_vec();
+        let copied: Vec<ExprRef> =
+            written.into_iter().map(|expr| self.moved(expr, carried)).collect();
+        self.plan.add_expr_list(&copied)
     }
 
     /// Binds the target list, expanding every star into the columns it stands for.
@@ -7280,7 +7474,7 @@ impl<'a> Binder<'a> {
                 for arm in written {
                     let when = self.over_aggregate(arm.when, scope)?;
                     let then = self.over_aggregate(arm.then, scope)?;
-                    rewritten.push(rudb_plan::Arm { when, then });
+                    rewritten.push(Arm { when, then });
                 }
                 let otherwise = match otherwise {
                     Some(expr) => Some(self.over_aggregate(expr, scope)?),
@@ -7422,6 +7616,32 @@ fn set_op_column(ast: &Ast, query: ast::QueryRef, at: usize, width: usize) -> Sp
     }
     written_column(ast, query, at, width)
         .map_or_else(|| first_column(ast, query), |expr| ast.leftmost_span(expr))
+}
+
+/// A target of a sorted `SELECT` that is computed over the sorted rows: its place in the select
+/// list, the expression, and each column it reads with the column of the output that carries it.
+struct Postponed {
+    at: usize,
+    expr: ExprRef,
+    reads: Vec<(ColumnBinding, usize)>,
+}
+
+/// Whether `Binder::moved` can copy an expression, which is one made of calls, casts,
+/// comparisons, conjunctions, cases, columns and constants.
+fn movable(plan: &Plan, expr: ExprRef) -> bool {
+    let here = matches!(
+        plan.expr(expr),
+        Expr::Column(_)
+            | Expr::Constant(_)
+            | Expr::Cast { .. }
+            | Expr::Compare { .. }
+            | Expr::Conjunction { .. }
+            | Expr::Function { .. }
+            | Expr::Case { .. }
+    );
+    let mut operands = true;
+    plan.for_each_operand(expr, &mut |operand| operands &= movable(plan, operand));
+    here && operands
 }
 
 /// A key of the `ORDER BY` of a `SELECT`: the column of the projection that it sorts on, the

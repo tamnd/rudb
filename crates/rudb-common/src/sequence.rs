@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
-use crate::{Error, Result};
+use crate::{Error, Result, SqlState};
 
 /// What a `CREATE SEQUENCE` settled, with every default already filled in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -230,9 +230,15 @@ impl Counter {
     ///
     /// None has been yet.
     pub fn current(&self) -> Result<i64> {
-        self.lock()
-            .last
-            .ok_or_else(|| Error::sequence("currval: sequence is not yet defined in this session"))
+        self.lock().last.ok_or_else(|| {
+            Error::sequence("currval: sequence is not yet defined in this session")
+                .state(SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)
+                .pg(format!(
+                    "currval of sequence \"{}\" is not yet defined in this session",
+                    self.name
+                ))
+                .unplaced()
+        })
     }
 
     /// `setval`: puts the counter at `value`, and with `called` hands that value out as `nextval`

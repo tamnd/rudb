@@ -5984,6 +5984,7 @@ impl Shared {
         context.size(self.inner.settings.sizes());
         context.govern(self.inner.settings.rules());
         context.unread_queries(self.session().semantics().unread_queries());
+        context.skipped_rows(self.session().semantics().skipped_rows());
         Ok(context)
     }
 
