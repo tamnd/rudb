@@ -7621,3 +7621,56 @@ fn a_limit_in_a_correlated_subquery_reads_the_outer_row_as_postgres() {
     }
     server.stop().unwrap();
 }
+
+#[test]
+fn a_volatile_target_is_computed_after_the_sort_as_postgres() {
+    let dirs = Dirs::new("pgsorttgt");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers are the ones that PostgreSQL 19 gives. A target that is not sorted on is
+    // computed for the rows that come out of the sort, and for the rows that an offset skips.
+    for (sql, expected) in [
+        ("create temp sequence s1", None),
+        (
+            "select string_agg(n::text, ' ' order by n) from (select g, nextval('s1') n \
+             from generate_series(1, 30) g order by (g * 7) % 13, g limit 3) q",
+            Some("1 2 3"),
+        ),
+        ("select currval('s1')", Some("3")),
+        ("create temp sequence s2", None),
+        (
+            "select string_agg(n::text, ' ' order by n) from (select g, nextval('s2') n \
+             from generate_series(1, 30) g order by g desc limit 2 offset 3) q",
+            Some("4 5"),
+        ),
+        ("select currval('s2')", Some("5")),
+        ("create temp sequence s3", None),
+        (
+            "select string_agg(n::text, ' ' order by n) from (select nextval('s3') n \
+             from generate_series(1, 30) g offset 27) q",
+            Some("28 29 30"),
+        ),
+        (
+            "select string_agg(g::text || ':' || n, ' ') from (select g, nextval('s3') - 30 n \
+             from generate_series(1, 30) g order by g desc limit 3) q",
+            Some("30:1 29:2 28:3"),
+        ),
+    ] {
+        match expected {
+            Some(expected) => assert_eq!(scalar(&mut client, sql), expected, "{sql}"),
+            None => assert!(tags(&client.query(sql)).ends_with("CZ"), "{sql}"),
+        }
+    }
+    client.query("create temp sequence s4");
+    let messages = client.query("select currval('s4')");
+    let tags = tags(&messages);
+    assert!(tags.ends_with("EZ"), "{tags}");
+    let error = &messages[tags.len() - 2];
+    assert_eq!(error.field(b'C').as_deref(), Some("55000"));
+    assert_eq!(
+        error.field(b'M').as_deref(),
+        Some("currval of sequence \"s4\" is not yet defined in this session")
+    );
+    server.stop().unwrap();
+}
