@@ -87,8 +87,14 @@ pub(crate) struct Local {
     memory: Reservation,
 }
 
-/// The counts, one array for the rows, one per call that counts values and one per sum, each
-/// `width + 2` long.
+/// The counts, one array of cells for the rows and the sums and one per call that counts values,
+/// each over `width + 2` places.
+///
+/// A place's row count and its sums sit together, `1 << shift` cells to a place, the count first
+/// and then each sum as its low and its high half. A chunk's rows land at places all over the
+/// range, so every add is a miss, and with the rows in one array and each sum in another a row of
+/// q10 missed twice, once for its count and once for its sum. A place is a power of two cells, so
+/// it never straddles two lines and the second add finds the line the first one brought in.
 ///
 /// A call that counts values keeps the nulls it saw rather than the values, and its array is empty
 /// until the first null comes, so a column with none costs no array and no pass at all.
@@ -98,9 +104,10 @@ pub(crate) struct Local {
 /// answer never reads keeps the loops over the places free of a branch.
 #[derive(Debug)]
 struct Tallies {
-    rows: Vec<i64>,
+    cells: Vec<i64>,
+    shift: u32,
+    sums: usize,
     nulls: Vec<Vec<i64>>,
-    sums: Vec<Vec<i128>>,
     outside: HashMap<i64, Vec<(i64, i128)>>,
 }
 
@@ -108,26 +115,47 @@ impl Tallies {
     fn new(width: usize, calls: &[Counted]) -> Self {
         let valid = calls.iter().filter(|call| call.counts_valid()).count();
         let sums = calls.iter().filter(|call| matches!(call, Counted::Sum(_))).count();
+        let stride = (1 + 2 * sums).next_power_of_two();
         Self {
-            rows: vec![0; width + 2],
+            cells: vec![0; (width + 2) * stride],
+            shift: stride.trailing_zeros(),
+            sums,
             nulls: vec![Vec::new(); valid],
-            sums: (0..sums).map(|_| vec![0; width + 2]).collect(),
             outside: HashMap::new(),
         }
     }
 
     fn footprint(&self) -> usize {
-        self.rows.len() * (size_of::<i64>() + self.sums.len() * size_of::<i128>())
+        self.cells.len() * size_of::<i64>()
+    }
+
+    /// The rows counted at `place`.
+    fn rows(&self, place: usize) -> i64 {
+        self.cells[place << self.shift]
+    }
+
+    /// The total of sum `sum` at `place`.
+    fn sum(&self, sum: usize, place: usize) -> i128 {
+        let at = (place << self.shift) + 1 + 2 * sum;
+        joined(self.cells[at], self.cells[at + 1])
     }
 
     /// The rows of `place` whose argument in the call counting into `lane` was not null.
     fn valid(&self, lane: usize, place: usize) -> i64 {
-        self.rows[place] - self.nulls[lane].get(place).copied().unwrap_or(0)
+        self.rows(place) - self.nulls[lane].get(place).copied().unwrap_or(0)
     }
 
     fn add(&mut self, other: Self) -> Result<()> {
-        for (into, from) in self.rows.iter_mut().zip(&other.rows) {
-            *into += from;
+        let stride = 1 << self.shift;
+        let places = self.cells.chunks_exact_mut(stride).zip(other.cells.chunks_exact(stride));
+        for (into, from) in places {
+            into[0] += from[0];
+            for at in (1..1 + 2 * self.sums).step_by(2) {
+                let total = joined(into[at], into[at + 1])
+                    .checked_add(joined(from[at], from[at + 1]))
+                    .ok_or_else(overflowed)?;
+                (into[at], into[at + 1]) = halves(total);
+            }
         }
         for (into, from) in self.nulls.iter_mut().zip(other.nulls) {
             if into.is_empty() {
@@ -136,11 +164,6 @@ impl Tallies {
             }
             for (into, from) in into.iter_mut().zip(from) {
                 *into += from;
-            }
-        }
-        for (into, from) in self.sums.iter_mut().zip(&other.sums) {
-            for (into, from) in into.iter_mut().zip(from) {
-                *into = into.checked_add(*from).ok_or_else(overflowed)?;
             }
         }
         for (key, counts) in other.outside {
@@ -232,21 +255,33 @@ impl Exchange {
                 }
             }
         }
-        for &place in places.iter() {
-            tallies.rows[place as usize] += 1;
+        let shift = tallies.shift;
+        // With no sum a place is one cell, and the shift each row would be for nothing.
+        if shift == 0 {
+            for &place in places.iter() {
+                tallies.cells[place as usize] += 1;
+            }
+        } else {
+            for &place in places.iter() {
+                tallies.cells[(place as usize) << shift] += 1;
+            }
         }
         for (lane, argument) in self.lanes.iter().zip(arguments) {
             let Some(nulls) = lane.nulls else { continue };
             let argument =
                 argument.ok_or_else(|| Error::internal("a ranged call with no argument"))?;
             if let Some(sum) = lane.sum {
-                let into = &mut tallies.sums[sum];
+                let (cells, at) = (&mut tallies.cells, 1 + 2 * sum);
                 if argument.logical_type().physical() == PhysicalType::Int128 {
-                    wide_sum(argument, rows, places, into)?;
+                    wide_sum(argument, rows, places, cells, shift, at)?;
                 } else {
                     read.read(rows, argument)?;
                     for (&place, &value) in places.iter().zip(read.cut(rows)?) {
-                        into[place as usize] += i128::from(value);
+                        let cell = ((place as usize) << shift) + at;
+                        let Some([low, high]) = cells.get_mut(cell..cell + 2) else {
+                            return Err(past_cells());
+                        };
+                        (*low, *high) = halves(joined(*low, *high) + i128::from(value));
                     }
                 }
             }
@@ -264,8 +299,8 @@ impl Exchange {
             }
         }
         // The rows the range did not cover, which should be none, counted again by their value.
-        if tallies.rows[outside] != 0 {
-            tallies.rows[outside] = 0;
+        if tallies.rows(outside) != 0 {
+            tallies.cells[outside << shift] = 0;
             for (row, &place) in places.iter().enumerate() {
                 if place as usize != outside {
                     continue;
@@ -321,7 +356,7 @@ impl Exchange {
         let mut chunks = Vec::new();
         let mut out = Out::new(self.calls.len());
         for place in 0..=self.width {
-            let rows = tallies.rows[place];
+            let rows = tallies.rows(place);
             if rows == 0 {
                 continue;
             }
@@ -329,7 +364,7 @@ impl Exchange {
             out.keys.push(key);
             for (call, lane) in self.lanes.iter().enumerate() {
                 let count = lane.nulls.map_or(rows, |nulls| tallies.valid(nulls, place));
-                let sum = lane.sum.map_or(0, |sum| tallies.sums[sum][place]);
+                let sum = lane.sum.map_or(0, |sum| tallies.sum(sum, place));
                 out.counts[call].push((count, sum));
             }
             if out.keys.len() == VECTOR_SIZE {
@@ -424,19 +459,32 @@ impl Out {
     }
 }
 
-/// Adds a column of 128 bit values into the sums at their places, checking every add.
+/// Adds a column of 128 bit values into the sums at their places, checking every add. Each place's
+/// total is the two cells `at` into its `1 << shift`.
 ///
 /// A flat column with no nulls is read as the slice it is. Any other form is asked a row at a time,
 /// where a null answers nothing and adds nothing.
-fn wide_sum(argument: &Vector, rows: usize, places: &[u32], into: &mut [i128]) -> Result<()> {
+fn wide_sum(
+    argument: &Vector,
+    rows: usize,
+    places: &[u32],
+    cells: &mut [i64],
+    shift: u32,
+    at: usize,
+) -> Result<()> {
+    let mut add = |place: u32, value: i128| {
+        let cell = ((place as usize) << shift) + at;
+        let Some([low, high]) = cells.get_mut(cell..cell + 2) else { return Err(past_cells()) };
+        (*low, *high) = halves(joined(*low, *high).checked_add(value).ok_or_else(overflowed)?);
+        Ok::<_, Error>(())
+    };
     if let (Some(Data::Int128(values)), true) = (argument.data(), argument.none_null()) {
         let values = values
             .as_slice()
             .get(..rows)
             .ok_or_else(|| Error::internal("a wide sum was read short of the chunk"))?;
         for (&place, &value) in places.iter().zip(values) {
-            let total = &mut into[place as usize];
-            *total = total.checked_add(value).ok_or_else(overflowed)?;
+            add(place, value)?;
         }
         return Ok(());
     }
@@ -446,10 +494,25 @@ fn wide_sum(argument: &Vector, rows: usize, places: &[u32], into: &mut [i128]) -
             None if argument.is_null_at(row) => continue,
             None => return Err(Error::internal("a wide sum has no signed representation")),
         };
-        let total = &mut into[place as usize];
-        *total = total.checked_add(value).ok_or_else(overflowed)?;
+        add(place, value)?;
     }
     Ok(())
+}
+
+/// The 128 bit total two cells hold, the low half first.
+#[expect(clippy::cast_sign_loss, reason = "the low half is its bits")]
+fn joined(low: i64, high: i64) -> i128 {
+    i128::from(high) << 64 | i128::from(low as u64)
+}
+
+/// The two cells that hold `total`, the low half first.
+#[expect(clippy::cast_possible_truncation, reason = "each half is 64 of its bits")]
+fn halves(total: i128) -> (i64, i64) {
+    (total as i64, (total >> 64) as i64)
+}
+
+fn past_cells() -> Error {
+    Error::internal("a ranged place is past the cells")
 }
 
 fn overflowed() -> Error {
@@ -595,6 +658,50 @@ mod tests {
                 vec![int(1), sum(300 + 2 * 999_999_999_999_999), big(4)],
                 vec![int(2), Value::Null, big(2)],
                 vec![int(7), sum(-10), big(2)],
+            ]
+        );
+    }
+
+    /// Two sums and a count share a place's cells, and a total that crosses zero or runs past 64
+    /// bits carries between the two halves the same within an instance and across two.
+    #[test]
+    fn two_sums_beside_a_count_carry_between_halves_across_instances() {
+        let memory = Memory::unlimited();
+        let returns = LogicalType::decimal(38, 2).expect("a decimal");
+        let exchange = Exchange::new(
+            LogicalType::Integer,
+            0,
+            2,
+            vec![Counted::Sum(returns.clone()), Counted::Rows, Counted::Sum(returns)],
+        );
+        let key = Vector::from_values(
+            LogicalType::Integer,
+            &[Value::Integer(0), Value::Integer(1), Value::Integer(0), Value::Integer(1)],
+        )
+        .expect("keys");
+        let narrow = LogicalType::decimal(15, 2).expect("a decimal");
+        let small = |unscaled| Value::Decimal { unscaled, width: 15, scale: 2 };
+        let first = Vector::from_values(narrow, &[small(3), small(-7), small(-1), small(2)])
+            .expect("arguments");
+        let wide = LogicalType::decimal(34, 2).expect("a decimal");
+        let large = |unscaled| Value::Decimal { unscaled, width: 34, scale: 2 };
+        let far = 1_i128 << 70;
+        let second =
+            Vector::from_values(wide, &[large(far), large(-1), large(-far - 1), large(far)])
+                .expect("arguments");
+        for _ in 0..2 {
+            let mut local = Local::new(&memory);
+            exchange
+                .count(&key, &[Some(&first), None, Some(&second)], 4, &mut local)
+                .expect("counts");
+            exchange.combine(local).expect("combines");
+        }
+        let sum = |unscaled| Value::Decimal { unscaled, width: 38, scale: 2 };
+        assert_eq!(
+            answer(&exchange, &memory),
+            vec![
+                vec![Value::Integer(0), sum(4), Value::BigInt(4), sum(-2)],
+                vec![Value::Integer(1), sum(-10), Value::BigInt(4), sum(2 * far - 2)],
             ]
         );
     }
