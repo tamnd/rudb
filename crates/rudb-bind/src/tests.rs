@@ -1033,6 +1033,15 @@ fn fill_asks_the_query_for_one_sort_key_and_a_type_it_can_subtract() {
         failure("SELECT fill(counter IGNORE NULLS) OVER (ORDER BY counter) FROM hits"),
         "RESPECT/IGNORE NULLS is not supported for the window function \"fill\""
     );
+    // The default written out is refused too, here and on a windowed aggregate.
+    assert_eq!(
+        failure("SELECT fill(counter RESPECT NULLS) OVER (ORDER BY counter) FROM hits"),
+        "RESPECT/IGNORE NULLS is not supported for the window function \"fill\""
+    );
+    assert_eq!(
+        failure("SELECT sum(counter RESPECT NULLS) OVER (ORDER BY counter) FROM hits"),
+        "RESPECT/IGNORE NULLS is not supported for windowed aggregates"
+    );
 }
 
 #[test]
