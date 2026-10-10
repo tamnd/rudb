@@ -42,7 +42,7 @@ const SAME: &[&str] = &[
     "select coalesce(a, b), nullif(a, b), greatest(a, b), least(a, b) from t",
     "select a[1], a[1:2], (a).b, a collate \"C\" from t",
     "select current_date, current_timestamp, current_user, localtime(3), session_user from t",
-    "select extract(year from a), substring(a from 1 for 2), position('a' in b), trim(both 'x' from a), trim(leading from a), overlay(a placing 'b' from 1 for 2), a at time zone 'UTC' from t",
+    "select substring(a from 1 for 2), position('a' in b), trim(both 'x' from a), trim(leading from a), overlay(a placing 'b' from 1 for 2), a at time zone 'UTC' from t",
     "select string_agg(a, ',' order by a) from t",
     "select distinct a from t",
     "select distinct on (a) a, b from t",
@@ -107,6 +107,19 @@ fn both_transforms_build_the_same_tree() {
         }
     }
     assert!(differ.is_empty(), "{}", differ.join("\n"));
+}
+
+/// `extract` is `pg_catalog.extract` with the field as lower case text, as in PostgreSQL 14 and
+/// later, which gives a `numeric`. The DuckDB transform reads it as `date_part` with the field in upper
+/// case, so it is not in [`SAME`].
+#[test]
+fn extract_is_the_catalog_function_with_its_field_as_text() {
+    let tree =
+        transform("select extract(year from a) from t").map(|ast| shape::script(&ast)).unwrap();
+    assert!(
+        tree.contains("call{['pg_catalog', 'extract'], [string{'year'}, column['a']]"),
+        "{tree}"
+    );
 }
 
 /// `SIMILAR TO` is `~` over what `similar_to_escape` makes of the pattern, as in PostgreSQL, where
