@@ -173,16 +173,36 @@ impl Numeric {
     /// `float8_numeric`: the value of the double printed with 15 significant digits, so that
     /// `0.1::float8::numeric` is `0.1`.
     pub fn from_f64(value: f64) -> Numeric {
-        if value.is_nan() {
-            return Numeric::NAN;
+        if value.is_nan() || value.is_infinite() {
+            return Numeric::from_special(value);
         }
-        if value.is_infinite() {
-            return if value > 0.0 { Numeric::INFINITY } else { Numeric::NEGATIVE_INFINITY };
+        Numeric::from_digits(&format!("{value:.14e}"))
+    }
+
+    /// `float4_numeric`: the value of the float printed with 6 significant digits, so that
+    /// `16777216::float4::numeric` is `16777200`.
+    pub fn from_f32(value: f32) -> Numeric {
+        if value.is_nan() || value.is_infinite() {
+            return Numeric::from_special(value.into());
         }
-        // `%.15g` with the trailing zeros dropped from the digits. The exponent form gives the
+        Numeric::from_digits(&format!("{value:.5e}"))
+    }
+
+    /// The `NaN` or the infinity of a float that is one of them.
+    fn from_special(value: f64) -> Numeric {
+        match value {
+            _ if value.is_nan() => Numeric::NAN,
+            _ if value > 0.0 => Numeric::INFINITY,
+            _ => Numeric::NEGATIVE_INFINITY,
+        }
+    }
+
+    /// The value of a float printed in the exponent form with the significant digits that
+    /// `%g` keeps.
+    fn from_digits(text: &str) -> Numeric {
+        // `%g` with the trailing zeros dropped from the digits. The exponent form gives the
         // same value and the same display scale as the plain form does.
-        let text = format!("{value:.14e}");
-        let (mantissa, exponent) = text.split_once('e').unwrap_or((&text, "0"));
+        let (mantissa, exponent) = text.split_once('e').unwrap_or((text, "0"));
         let mantissa = match mantissa.contains('.') {
             true => mantissa.trim_end_matches('0').trim_end_matches('.'),
             false => mantissa,
@@ -2477,6 +2497,18 @@ mod tests {
             (123456.789, "123456.789"),
         ] {
             assert_eq!(text(&Numeric::from_f64(input)), out);
+        }
+        for (input, out) in [
+            (16_777_216.0, "16777200"),
+            (1.0 / 3.0, "0.333333"),
+            (1e20, "100000000000000000000"),
+            (1.5e-7, "0.00000015"),
+            (-0.0, "0"),
+            (123_456.7, "123457"),
+            (0.000_001_234_567, "0.00000123457"),
+            (f32::INFINITY, "Infinity"),
+        ] {
+            assert_eq!(text(&Numeric::from_f32(input)), out);
         }
         assert_eq!(value("0.33333333333333333333").to_f64(), 1.0 / 3.0);
         assert_eq!(value("2.5").to_integer("integer").unwrap(), 3);
