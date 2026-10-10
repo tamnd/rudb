@@ -63,6 +63,8 @@ pub struct Reader {
     line: u64,
     scratch: Vec<String>,
     records: Records,
+    /// Where in the buffer the first of [`Self::records`] starts.
+    from: usize,
     block: usize,
     /// Where the reading started, so that what it has read is the offset less this.
     origin: u64,
@@ -123,12 +125,14 @@ impl Reader {
             line: 1,
             scratch: Vec::new(),
             records: Records::default(),
+            from: 0,
             block,
             origin: 0,
             end: u64::MAX,
             cap: u64::MAX,
         };
         reader.fill(0)?;
+        reader.skip_lines()?;
         let sample = reader.buffer.clone();
         let given = &reader.given;
         let (quote, delimiter, told) = if given.fixed {
@@ -315,6 +319,32 @@ impl Reader {
         self.dialect
     }
 
+    /// The line a record of the chunk was split from, without its line ending, which is what an
+    /// error shows as its original line.
+    ///
+    /// The pin shows the whole line rather than the value, measured on `v2.0.0-dev84237` with
+    /// `x,3` under a header of `a,b` read with `types={'a': 'INTEGER'}`, whose error has
+    /// `Original Line: x,3`. The ranges say where the fields are and not where the line is, so the
+    /// records are split again from where the chunk starts, which is only done for an error.
+    fn original_line(&self, row: usize) -> String {
+        let mut scratch = Vec::new();
+        let mut split = |at: usize| {
+            crate::scan::record(&self.buffer, at, self.dialect, true, &mut scratch)
+                .ok()
+                .flatten()
+                .unwrap_or(self.at)
+        };
+        let mut at = self.from;
+        for _ in 0..row {
+            at = split(at);
+        }
+        let end = split(at).max(at);
+        let line = &self.buffer[at..end];
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        String::from_utf8_lossy(line).into_owned()
+    }
+
     /// The next chunk, or `None` at the end of the file.
     ///
     /// The records are split first, all of them, and converted afterwards a column at a time, which
@@ -347,7 +377,13 @@ impl Reader {
             let end = rows.min(start + BLOCK_ROWS);
             for (build, &at) in builders.iter_mut().zip(&self.projection) {
                 let refuse = |text: &str, row: usize| {
-                    Error::conversion(self.conversion_error(text, at, first + row as u64))
+                    let original = self.original_line(row);
+                    Error::conversion(self.conversion_error(
+                        text,
+                        &original,
+                        at,
+                        first + row as u64,
+                    ))
                 };
                 if let Err(error) = build.rows(&cells, at, start..end, &refuse) {
                     return Err(self.first_bad_value(&cells, first).unwrap_or(error));
@@ -369,7 +405,8 @@ impl Reader {
         self.projection.iter().find_map(|&at| {
             let field = &self.fields[at];
             let refuse = |text: &str, row: usize| {
-                Error::conversion(self.conversion_error(text, at, first + row as u64))
+                let original = self.original_line(row);
+                Error::conversion(self.conversion_error(text, &original, at, first + row as u64))
             };
             convert::column(cells, at, &field.ty, &refuse).err()
         })
@@ -428,6 +465,7 @@ impl Reader {
             self.records.shift(start);
             start = 0;
         }
+        self.from = start;
         self.long_line(start)?;
         Ok(self.records.len())
     }
@@ -465,6 +503,7 @@ impl Reader {
             line,
             scratch: Vec::new(),
             records: Records::default(),
+            from: 0,
             block: self.block,
             origin: from,
             end,
@@ -527,7 +566,7 @@ impl Reader {
     /// User)` rather than `(Auto-Detected)`, measured on `v2.0.0-dev84237` by reading a file with
     /// `delim=';'` past the sample. Telling somebody that what they wrote down was auto-detected is
     /// the one thing the block could say that would send them looking in the wrong place.
-    fn conversion_error(&self, text: &str, at: usize, line: u64) -> String {
+    fn conversion_error(&self, text: &str, original: &str, at: usize, line: u64) -> String {
         let field = &self.fields[at];
         // A type the caller set, which is every column of a `COPY t FROM`, gets the binary's other
         // paragraph, since telling somebody to set the type they set is no help. Measured on
@@ -550,7 +589,7 @@ impl Reader {
             )
         };
         format!(
-            "CSV Error on Line: {line}\nOriginal Line: {text}\nError when converting column \
+            "CSV Error on Line: {line}\nOriginal Line: {original}\nError when converting column \
              \"{}\". Could not convert string \"{text}\" to '{}'\n\nColumn {} is being converted \
              as type {}\n{advice}\n* Check whether the null string value is set correctly (e.g., \
              nullstr = 'N/A')\n{}",
@@ -642,11 +681,18 @@ impl Reader {
     #[cfg(test)]
     fn next_chunk_by_record(&mut self) -> Result<Option<Chunk>> {
         let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+        let mut lines = Vec::new();
         while rows.len() < VECTOR_SIZE {
+            let from = self.here();
             match self.next_record()? {
                 Some(fields) => rows.push(fields),
                 None => break,
             }
+            let size = usize::try_from(self.here() - from).unwrap_or(usize::MAX);
+            let line = &self.buffer[self.at - size..self.at];
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            lines.push(String::from_utf8_lossy(line).into_owned());
         }
         if rows.is_empty() {
             return Ok(None);
@@ -657,7 +703,8 @@ impl Reader {
             let mut values = Vec::with_capacity(rows.len());
             for (row, held) in rows.iter().enumerate() {
                 let text = held.get(at).and_then(Option::as_deref);
-                values.push(self.convert(text, at, self.line - rows.len() as u64 + row as u64)?);
+                let line = self.line - rows.len() as u64 + row as u64;
+                values.push(self.convert(text, &lines[row], at, line)?);
             }
             columns.push(rudb_vector::Vector::from_values(field.ty.clone(), &values)?);
         }
@@ -666,7 +713,13 @@ impl Reader {
 
     /// One value, cast from its text to the column's type.
     #[cfg(test)]
-    fn convert(&self, text: Option<&str>, at: usize, line: u64) -> Result<rudb_common::Value> {
+    fn convert(
+        &self,
+        text: Option<&str>,
+        original: &str,
+        at: usize,
+        line: u64,
+    ) -> Result<rudb_common::Value> {
         let Some(text) = text else { return Ok(rudb_common::Value::Null) };
         let field = &self.fields[at];
         if field.ty == LogicalType::Varchar {
@@ -675,7 +728,7 @@ impl Reader {
         let value = rudb_common::Value::Varchar(text.to_string());
         match rudb_kernels::cast_value(&value, &field.ty, false) {
             Ok(converted) => Ok(converted),
-            Err(_) => Err(Error::conversion(self.conversion_error(text, at, line))),
+            Err(_) => Err(Error::conversion(self.conversion_error(text, original, at, line))),
         }
     }
 
@@ -727,6 +780,33 @@ impl Reader {
         if self.advance()?.is_some() {
             let size = usize::try_from(self.here() - from).unwrap_or(usize::MAX);
             self.refuse_long(&self.buffer[self.at - size..self.at], number)?;
+        }
+        Ok(())
+    }
+
+    /// Steps over the lines [`Given::skip`] asks for and starts the buffer where they end, so the
+    /// sniffer and everything after it see the file as if it began there.
+    fn skip_lines(&mut self) -> Result<()> {
+        let mut left = self.given.skip;
+        while left > 0 {
+            match self.buffer[self.at..].iter().position(|&byte| byte == b'\n') {
+                Some(end) => {
+                    self.at += end + 1;
+                    self.line += 1;
+                    left -= 1;
+                }
+                None if self.drained => {
+                    self.at = self.buffer.len();
+                    break;
+                }
+                None => {
+                    self.at = self.buffer.len();
+                    self.fill(self.at)?;
+                }
+            }
+        }
+        if self.at > 0 {
+            self.fill(self.at)?;
         }
         Ok(())
     }

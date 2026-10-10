@@ -324,6 +324,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
         "    sep VARCHAR\n",
+        "    skip BIGINT\n",
         "    types ANY\n",
     );
     assert_eq!(error.message(), expected);
@@ -566,6 +567,35 @@ fn a_line_longer_than_max_line_size_or_buffer_size_is_refused_in_the_pins_words(
         ),
         ("max_line_size=NULL", "\"max_line_size\" expects a non-null integer value"),
         ("buffer_size=NULL", "\"buffer_size\" expects a non-null integer value"),
+    ] {
+        assert_eq!(read(options).unwrap_err(), expected, "{options}");
+    }
+}
+
+#[test]
+fn skip_steps_over_lines_before_the_file_is_sniffed_and_they_still_count() {
+    let database = Database::new();
+    let file = written("skip.csv", "junk\na,b\n1,2\nx,3\n");
+    let read = |options: &str| {
+        let sql = format!(
+            "SELECT string_agg(concat_ws(':', *COLUMNS(*)), ' ') FROM read_csv({file}, {options})"
+        );
+        database.value(&sql).map_err(|error| error.message().to_string())
+    };
+    // The header is sniffed from what is left, and a line that is all of the file is one row.
+    assert_eq!(read("skip=1"), Ok(Value::Varchar("1:2 x:3".into())));
+    assert_eq!(read("skip=3"), Ok(Value::Varchar("x:3".into())));
+    assert_eq!(read("skip='2'"), Ok(Value::Varchar("1:2 x:3".into())));
+    // A quoted newline ends a skipped line all the same.
+    let quoted = written("skip-quoted.csv", "\"x\ny\",1\n2,3\n4,5\n");
+    let sql = format!("SELECT count(*) FROM read_csv({quoted}, skip=1)");
+    assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(2));
+    // The skipped line is line one of the file in an error.
+    let error = read("skip=1, types={'a': 'INTEGER'}").unwrap_err();
+    assert!(error.starts_with("CSV Error on Line: 4\nOriginal Line: x,3\n"), "{error}");
+    for (options, expected) in [
+        ("skip=-1", "skip_rows option from read_csv scanner, must be equal or higher than 0"),
+        ("skip=NULL", "\"skip\" expects a non-null integer value"),
     ] {
         assert_eq!(read(options).unwrap_err(), expected, "{options}");
     }

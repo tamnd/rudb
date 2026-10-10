@@ -48,7 +48,7 @@ pub struct Dialect {
 /// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
 /// rather than folded into a [`Dialect`] and forgotten.
 ///
-/// The last seven are not punctuation, and they are here because they travel the same road: the
+/// The last eight are not punctuation, and they are here because they travel the same road: the
 /// binder works them out from the call to sniff the file with and the executor works them out again
 /// from the plan to read it with, and a second struct beside this one would be a second thing for
 /// the two ends to keep in step.
@@ -108,6 +108,11 @@ pub struct Given {
     /// How many bytes a line may have, which is `max_line_size` on a call, or `buffer_size` when
     /// only that is given. `None` is the pin's default of [`Given::MAX_LINE`].
     pub max_line: Option<usize>,
+    /// How many lines at the front of the file are stepped over before anything looks at it, which
+    /// is `skip` on a call. A line here ends at a newline whatever quotes it has in it, and the
+    /// lines stepped over still count when an error names a line. Both were measured on
+    /// `v2.0.0-dev84237`, where `"x` then `y",1` read with `skip=1` starts at `y",1`.
+    pub skip: usize,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.

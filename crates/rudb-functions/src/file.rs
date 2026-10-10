@@ -105,6 +105,13 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
                 };
                 given.max_line = Some(size);
             }
+            ("skip", Value::BigInt(lines)) => {
+                given.skip = usize::try_from(*lines).map_err(|_| {
+                    Error::invalid_input(
+                        "skip_rows option from read_csv scanner, must be equal or higher than 0",
+                    )
+                })?;
+            }
             ("types" | "dtypes" | "column_types", value) => {
                 if given.retype.is_some() {
                     return Err(Error::binder(
