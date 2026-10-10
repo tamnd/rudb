@@ -169,6 +169,8 @@ pub struct CopyTo {
     pub date_format: Option<String>,
     /// For JSON, the `strftime` format a timestamp of any precision or zone is written with.
     pub timestamp_format: Option<String>,
+    /// How the rows are split over files, which by default they are not.
+    pub partitioned: crate::Partitioned,
 }
 
 /// A bound `SET` or `RESET`.
@@ -850,10 +852,11 @@ pub(crate) fn bind_one(
         ast::Statement::CopyTo(index) => {
             let copy = &ast.copies[index as usize];
             let mut binder = Binder::with(catalog, parameters, session);
-            let (root, _) = binder.bind_query(ast, copy.query)?;
+            let (root, scope) = binder.bind_query(ast, copy.query)?;
             let plan = finish(binder, root)?;
             let typed = copy_values(ast, copy, catalog, parameters, session);
-            copy_to(copy, &typed, plan).map(Bound::CopyTo)
+            let names = scope.columns.into_iter().map(|column| column.name).collect::<Vec<_>>();
+            copy_to(copy, &typed, &names, plan).map(Bound::CopyTo)
         }
         ast::Statement::Vacuum(index) => {
             crate::vacuum::vacuum(ast, &ast.vacuums[index as usize], catalog, session)
@@ -952,7 +955,8 @@ fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -
         let Some(written) = written else { continue };
         // A bare NULL for `HEADER` is refused here for every format, before JSON says it does
         // not know the option.
-        if written.null() && (!json || !bare(written) || name == "header") {
+        if written.null() && (!json || !bare(written) || name == "header") && name != "partition_by"
+        {
             return Err(Error::binder(format!(
                 "NULL is not supported as a valid option for COPY option \"{name}\""
             )));
@@ -1000,7 +1004,12 @@ fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -
 /// CSV, JSON and Parquet are written, the format picked by the file's extension unless `FORMAT`
 /// names one. An option the pin takes and this does not is
 /// refused by name, and one the pin does not take either gets the first line of its refusal.
-fn copy_to(copy: &ast::CopyTo, typed: &[Option<Written>], plan: Plan) -> Result<CopyTo> {
+fn copy_to(
+    copy: &ast::CopyTo,
+    typed: &[Option<Written>],
+    names: &[String],
+    plan: Plan,
+) -> Result<CopyTo> {
     let lowered = copy.path.to_ascii_lowercase();
     let mut format = if lowered.ends_with(".parquet") {
         "parquet"
@@ -1017,11 +1026,18 @@ fn copy_to(copy: &ast::CopyTo, typed: &[Option<Written>], plan: Plan) -> Result<
         return Err(Error::catalog(format!("Copy Function with name {format} does not exist!")));
     }
     refuse_written(copy, typed, &format)?;
-    match format.as_str() {
-        "json" => return json_to(copy, plan),
-        "parquet" => return parquet_to(copy, plan),
-        _ => {}
-    }
+    let (partitioned, rest) = crate::partition::partitioning(copy, names, &format)?;
+    let mut out = match format.as_str() {
+        "json" => json_to(&rest, plan)?,
+        "parquet" => parquet_to(&rest, plan)?,
+        _ => csv_to(&rest, plan)?,
+    };
+    out.partitioned = partitioned;
+    Ok(out)
+}
+
+/// Reads the options of a `COPY ... TO` a CSV file.
+fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     let mut out = CopyTo {
         plan,
         path: copy.path.clone(),
@@ -1039,6 +1055,7 @@ fn copy_to(copy: &ast::CopyTo, typed: &[Option<Written>], plan: Plan) -> Result<
         row_group_size: 0,
         date_format: None,
         timestamp_format: None,
+        partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
         let text = || {
@@ -1082,26 +1099,9 @@ fn copy_to(copy: &ast::CopyTo, typed: &[Option<Written>], plan: Plan) -> Result<
                     }
                 }
             }
-            "compression"
-            | "dateformat"
-            | "date_format"
-            | "timestampformat"
-            | "timestamp_format"
-            | "new_line"
-            | "prefix"
-            | "suffix"
-            | "per_thread_output"
-            | "file_size_bytes"
-            | "partition_by"
-            | "overwrite"
-            | "overwrite_or_ignore"
-            | "filename_pattern"
-            | "file_extension"
-            | "use_tmp_file"
-            | "return_files"
-            | "write_partition_columns"
-            | "preserve_order"
-            | "force_not_null"
+            "compression" | "dateformat" | "date_format" | "timestampformat"
+            | "timestamp_format" | "new_line" | "prefix" | "suffix" | "per_thread_output"
+            | "file_size_bytes" | "return_files" | "preserve_order" | "force_not_null"
             | "encoding" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
@@ -1140,6 +1140,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         row_group_size: 0,
         date_format: None,
         timestamp_format: None,
+        partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
         match name.as_str() {
@@ -1165,17 +1166,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     "Option \"encoding\" is not supported for writing - only for reading",
                 ));
             }
-            "compression"
-            | "per_thread_output"
-            | "file_size_bytes"
-            | "partition_by"
-            | "overwrite"
-            | "overwrite_or_ignore"
-            | "filename_pattern"
-            | "file_extension"
-            | "use_tmp_file"
-            | "return_files"
-            | "write_partition_columns"
+            "compression" | "per_thread_output" | "file_size_bytes" | "return_files"
             | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
@@ -1234,6 +1225,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         row_group_size: 122_880,
         date_format: None,
         timestamp_format: None,
+        partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
         let written = value.as_deref().unwrap_or_default().trim_matches('\'');
@@ -1278,14 +1270,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             | "geoparquet_version"
             | "per_thread_output"
             | "file_size_bytes"
-            | "partition_by"
-            | "overwrite"
-            | "overwrite_or_ignore"
-            | "filename_pattern"
-            | "file_extension"
-            | "use_tmp_file"
             | "return_files"
-            | "write_partition_columns"
             | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"

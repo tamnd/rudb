@@ -15,27 +15,239 @@
 //!
 //! A Parquet file is written by `rudb-parquet`, a row group at a time, with the columns cast first
 //! to the types that crate stores: an enum as its text, a coarse timestamp in microseconds.
+//!
+//! With `PARTITION_BY`, the rows are split by the values of the partition columns into a directory
+//! a value, laid out the way Hive lays them out, with a file of the chosen format in each.
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::Path;
 
-use rudb_bind::CopyTo;
-use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
+use rudb_bind::{CopyTo, Existing, NamePiece};
+use rudb_common::{Error, Field, LogicalType, Memory, Result, SessionTimeZone, Value};
 use rudb_compress::Codec;
 use rudb_kernels::cast::{cast_in_time_zone, cast_value};
+use rudb_kernels::compare::order_with_nulls;
 use rudb_kernels::strftime::Format;
 use rudb_vector::{Chunk, Vector};
 
 use crate::QueryResult;
 
-/// Writes the rows of `result` to the file `copy` names and answers how many there were.
-pub(crate) fn write_csv(
+/// Writes the rows of `result` the way `copy` asks, to the one file or split over a directory,
+/// and answers how many there were.
+pub(crate) fn write(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone) -> Result<usize> {
+    if copy.partitioned.columns.is_empty() {
+        write_file(copy, &copy.path, result, zone)
+    } else {
+        write_partitioned(copy, result, zone)
+    }
+}
+
+/// Writes the rows of `result` to the one file at `path`, in the format `copy` names.
+fn write_file(
     copy: &CopyTo,
+    path: &str,
     result: &QueryResult,
     zone: SessionTimeZone,
 ) -> Result<usize> {
-    let file = File::create(&copy.path)
-        .map_err(|error| Error::io(format!("Cannot open file \"{}\": {error}", copy.path)))?;
+    if copy.parquet {
+        write_parquet(copy, path, result)
+    } else if copy.json {
+        write_json(copy, path, result, zone)
+    } else {
+        write_csv(copy, path, result, zone)
+    }
+}
+
+/// What a directory is called for a NULL partition value, which is the name Hive gave it.
+const NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+
+/// Writes the rows of `result` split by the values of the partition columns, a directory a
+/// column named `column=value`, both percent encoded, with a file in each of the deepest ones.
+///
+/// The rows of a partition keep their order. A partition's file is numbered 0 in its own
+/// directory, or, with the files side by side, by the order of the partition values, a column at
+/// a time with a NULL last, which is how the pin numbers them.
+fn write_partitioned(copy: &CopyTo, result: &QueryResult, zone: SessionTimeZone) -> Result<usize> {
+    let split = &copy.partitioned;
+    let root = Path::new(&copy.path);
+    match split.existing {
+        Existing::Refuse if holds_files(root) => {
+            return Err(Error::io(format!(
+                "Directory \"{}\" is not empty! Enable OVERWRITE option to overwrite files",
+                copy.path
+            )));
+        }
+        Existing::Overwrite => remove_files(root)?,
+        _ => {}
+    }
+    let made = |path: &Path| {
+        std::fs::create_dir_all(path).map_err(|error| {
+            Error::io(format!("Failed to create directory \"{}\": {error}", path.display()))
+        })
+    };
+    made(root)?;
+    let names = result.names();
+    let chunks = result.chunks();
+    let mut found: HashMap<String, usize> = HashMap::new();
+    let mut partitions: Vec<(String, Vec<Value>, Vec<Vec<u32>>)> = Vec::new();
+    for (at, chunk) in chunks.iter().enumerate() {
+        let mut keys = Vec::with_capacity(split.columns.len());
+        for &column in &split.columns {
+            let vector = chunk.column(column)?;
+            keys.push(cast_in_time_zone(vector, &LogicalType::Varchar, false, Some(zone))?);
+        }
+        for row in 0..chunk.len() {
+            let mut directory = String::new();
+            for (key, &column) in keys.iter().zip(&split.columns) {
+                if !directory.is_empty() {
+                    directory.push('/');
+                }
+                encode(&mut directory, &names[column]);
+                directory.push('=');
+                match key.try_value_at(row)? {
+                    Value::Null => directory.push_str(NULL_PARTITION),
+                    Value::Varchar(text) => encode_value(&mut directory, &text),
+                    other => encode_value(&mut directory, &other.to_string()),
+                }
+            }
+            let partition = match found.get(&directory) {
+                Some(&partition) => partition,
+                None => {
+                    let values = split
+                        .columns
+                        .iter()
+                        .map(|&column| chunk.column(column)?.try_value_at(row))
+                        .collect::<Result<Vec<_>>>()?;
+                    found.insert(directory.clone(), partitions.len());
+                    partitions.push((directory, values, vec![Vec::new(); chunks.len()]));
+                    partitions.len() - 1
+                }
+            };
+            partitions[partition].2[at].push(u32::try_from(row).unwrap_or(u32::MAX));
+        }
+    }
+    let kept = (0..names.len())
+        .filter(|column| split.write_columns || !split.columns.contains(column))
+        .collect::<Vec<_>>();
+    let kept_names = kept.iter().map(|&column| names[column].clone()).collect::<Vec<_>>();
+    let kept_types = kept.iter().map(|&column| result.types()[column].clone()).collect::<Vec<_>>();
+    if split.flat {
+        partitions.sort_by(|(_, left, _), (_, right, _)| {
+            left.iter()
+                .zip(right)
+                .map(|(left, right)| {
+                    order_with_nulls(left, right, false).unwrap_or(Ordering::Equal)
+                })
+                .find(|&order| order != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        });
+    }
+    let mut rows = 0;
+    for (number, (directory, _, picked)) in partitions.iter().enumerate() {
+        let mut parts = Vec::new();
+        for (chunk, rows) in chunks.iter().zip(picked) {
+            if rows.is_empty() {
+                continue;
+            }
+            let columns = kept
+                .iter()
+                .map(|&column| chunk.column(column)?.gather(rows))
+                .collect::<Result<Vec<_>>>()?;
+            parts.push(Chunk::new(columns)?);
+        }
+        let part = QueryResult::new(
+            kept_names.clone(),
+            kept_types.clone(),
+            parts,
+            Memory::unlimited().reservation(),
+        );
+        let (place, number) =
+            if split.flat { (root.to_path_buf(), number) } else { (root.join(directory), 0) };
+        made(&place)?;
+        let name = format!("{}.{}", file_name(&split.pattern, number, zone)?, split.extension);
+        rows += write_file(copy, &place.join(name).to_string_lossy(), &part, zone)?;
+    }
+    Ok(rows)
+}
+
+/// Whether a directory holds a file at any depth.
+fn holds_files(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else { return false };
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| !kind.is_dir()) || holds_files(&entry.path())
+    })
+}
+
+/// Removes every file under a directory and leaves the directories, which is what the pin's
+/// `OVERWRITE` does.
+fn remove_files(directory: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(directory) else { return Ok(()) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_files(&path)?;
+        } else {
+            std::fs::remove_file(&path).map_err(|error| {
+                Error::io(format!("Could not remove file \"{}\": {error}", path.display()))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Appends `text` percent encoded, where everything but a letter, a digit and `_-~.` is a `%`
+/// and two upper case hex digits a byte.
+fn encode(out: &mut String, text: &str) {
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'~' | b'.') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+}
+
+/// Appends a partition value percent encoded, where a value that would read as the NULL
+/// directory has its first character encoded as well so that it gets a directory of its own.
+fn encode_value(out: &mut String, text: &str) {
+    let start = out.len();
+    encode(out, text);
+    if out[start..].eq_ignore_ascii_case(NULL_PARTITION) {
+        let first = out.as_bytes()[start];
+        out.replace_range(start..=start, &format!("%{first:02X}"));
+    }
+}
+
+/// The name of a file before its extension, from the pieces of a `FILENAME_PATTERN`.
+fn file_name(pattern: &[NamePiece], number: usize, zone: SessionTimeZone) -> Result<String> {
+    let mut out = String::new();
+    for piece in pattern {
+        match piece {
+            NamePiece::Text(text) => out.push_str(text),
+            NamePiece::Offset => out.push_str(&number.to_string()),
+            NamePiece::Uuid | NamePiece::Uuid7 => {
+                let kind = if *piece == NamePiece::Uuid { "uuidv4" } else { "uuidv7" };
+                let drawn = rudb_kernels::drawn(kind, 1)?;
+                let value = drawn.try_value_at(0)?;
+                out.push_str(&text(&value, &LogicalType::Uuid, zone)?.unwrap_or_default());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Writes the rows of `result` to the CSV file at `path` and answers how many there were.
+fn write_csv(
+    copy: &CopyTo,
+    path: &str,
+    result: &QueryResult,
+    zone: SessionTimeZone,
+) -> Result<usize> {
+    let file = File::create(path)
+        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
     let mut out = BufWriter::new(file);
     let names = result.names();
     let forced = names
@@ -52,9 +264,8 @@ pub(crate) fn write_csv(
             )));
         }
     }
-    let written = |error: std::io::Error| {
-        Error::io(format!("Could not write file \"{}\": {error}", copy.path))
-    };
+    let written =
+        |error: std::io::Error| Error::io(format!("Could not write file \"{path}\": {error}"));
     let mut line = String::new();
     if copy.header {
         for (column, name) in names.iter().enumerate() {
@@ -136,18 +347,18 @@ fn field(line: &mut String, text: &str, forced: bool, copy: &CopyTo) {
     line.push_str(&copy.quote);
 }
 
-/// Writes the rows of `result` to the JSON file `copy` names and answers how many there were.
-pub(crate) fn write_json(
+/// Writes the rows of `result` to the JSON file at `path` and answers how many there were.
+fn write_json(
     copy: &CopyTo,
+    path: &str,
     result: &QueryResult,
     zone: SessionTimeZone,
 ) -> Result<usize> {
-    let file = File::create(&copy.path)
-        .map_err(|error| Error::io(format!("Cannot open file \"{}\": {error}", copy.path)))?;
+    let file = File::create(path)
+        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
     let mut out = BufWriter::new(file);
-    let written = |error: std::io::Error| {
-        Error::io(format!("Could not write file \"{}\": {error}", copy.path))
-    };
+    let written =
+        |error: std::io::Error| Error::io(format!("Could not write file \"{path}\": {error}"));
     let moments = Moments {
         zone,
         date: copy.date_format.as_deref().map(Format::parse).transpose()?,
@@ -201,9 +412,9 @@ pub(crate) fn write_json(
 
 /// Writes a result as a Parquet file, a row group every `ROW_GROUP_SIZE` rows or so, since a
 /// group ends at the end of the chunk that fills it.
-pub(crate) fn write_parquet(copy: &CopyTo, result: &QueryResult) -> Result<usize> {
-    let file = File::create(&copy.path)
-        .map_err(|error| Error::io(format!("Cannot open file \"{}\": {error}", copy.path)))?;
+fn write_parquet(copy: &CopyTo, path: &str, result: &QueryResult) -> Result<usize> {
+    let file = File::create(path)
+        .map_err(|error| Error::io(format!("Cannot open file \"{path}\": {error}")))?;
     let types = result.types();
     let mut stored = Vec::with_capacity(types.len());
     let mut fields = Vec::with_capacity(types.len());

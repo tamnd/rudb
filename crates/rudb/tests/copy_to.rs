@@ -469,3 +469,147 @@ fn an_exported_state_is_written_as_its_layout_and_reads_back_into_a_state() {
     assert_eq!(got, vec![vec![text("42"), text("42")]]);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Every file under `root`, as its path below it and what it holds, in path order.
+fn files(root: &std::path::Path) -> String {
+    fn walk(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).expect("lists the directory").flatten() {
+            if entry.file_type().expect("has a type").is_dir() {
+                walk(&entry.path(), out);
+            } else {
+                out.push(entry.path());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    found.sort();
+    let mut out = String::new();
+    for path in found {
+        let name = path.strip_prefix(root).expect("is below the root").display().to_string();
+        let text = std::fs::read_to_string(&path).expect("reads the file");
+        out.push_str(&format!("== {name}\n{text}"));
+    }
+    out
+}
+
+#[test]
+fn partition_by_writes_a_directory_a_value_the_way_the_pin_lays_them_out() {
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-hive-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.display().to_string();
+    let db = Database::new();
+    db.execute(
+        "CREATE TABLE p AS SELECT * FROM (VALUES (1, 'x', DATE '2020-01-01'), (2, 'a b', NULL), \
+         (3, 'x', DATE '2020-01-01'), (4, '__hive_default_partition__', DATE '2020-01-02')) \
+         v(id, k, d)",
+    )
+    .expect("creates");
+    let run = |sql: &str| db.execute(&sql.replace("DIR", &dir));
+    let copied = run("COPY p TO 'DIR/a' (FORMAT csv, PARTITION_BY (k, d))").expect("copies");
+    assert_eq!(copied.changes(), Some(4));
+    assert_eq!(
+        files(&root.join("a")),
+        "== k=%5F_hive_default_partition__/d=2020-01-02/data_0.csv\nid\n4\n\
+         == k=a%20b/d=__HIVE_DEFAULT_PARTITION__/data_0.csv\nid\n2\n\
+         == k=x/d=2020-01-01/data_0.csv\nid\n1\n3\n"
+    );
+    let again = run("COPY p TO 'DIR/a' (FORMAT csv, PARTITION_BY (k, d))").unwrap_err();
+    assert_eq!(
+        again.to_string(),
+        format!(
+            "IO Error: Directory \"{dir}/a\" is not empty! Enable OVERWRITE option to overwrite \
+             files"
+        )
+    );
+    run("COPY (SELECT 9 AS id, 'x' AS k, DATE '2020-01-01' AS d) TO 'DIR/a' \
+         (FORMAT csv, PARTITION_BY (k, d), OVERWRITE_OR_IGNORE)")
+    .expect("writes over the one file");
+    let read = "SELECT string_agg(id || ':' || k || ':' || coalesce(d::VARCHAR, '-'), ' ' \
+                ORDER BY id) FROM read_csv('DIR/a/*/*/*.csv', hive_partitioning = true)";
+    let read = db.query(&read.replace("DIR", &dir)).expect("reads back");
+    assert_eq!(
+        read.value_at(0, 0),
+        rudb_common::Value::Varchar(
+            "2:a b:- 4:__hive_default_partition__:2020-01-02 9:x:2020-01-01".into()
+        )
+    );
+
+    // Side by side, the files are numbered by the order of the values.
+    run("COPY p TO 'DIR/b' (FORMAT csv, PARTITION_BY k, HIVE_FILE_PATTERN false, \
+         FILENAME_PATTERN 'out_{i}', FILE_EXTENSION 'txt', WRITE_PARTITION_COLUMNS)")
+    .expect("copies");
+    assert_eq!(
+        files(&root.join("b")),
+        "== out_0.txt\nid,k,d\n4,__hive_default_partition__,2020-01-02\n\
+         == out_1.txt\nid,k,d\n2,a b,\n\
+         == out_2.txt\nid,k,d\n1,x,2020-01-01\n3,x,2020-01-01\n"
+    );
+    run("COPY (SELECT * FROM (VALUES (1, 30), (2, 10), (3, 20), (4, 5)) v(id, k)) TO 'DIR/n' \
+         (FORMAT csv, PARTITION_BY 'k', HIVE_FILE_PATTERN false)")
+    .expect("copies");
+    assert_eq!(
+        files(&root.join("n")),
+        "== data_0.csv\nid\n4\n== data_1.csv\nid\n2\n== data_2.csv\nid\n3\n== data_3.csv\nid\n1\n"
+    );
+
+    // OVERWRITE takes away every file that was there.
+    run("COPY p TO 'DIR/c' (FORMAT json, PARTITION_BY (d))").expect("copies");
+    run("COPY (SELECT 1 AS id, 'q' AS k) TO 'DIR/c' (FORMAT json, PARTITION_BY (k), OVERWRITE)")
+        .expect("copies");
+    assert_eq!(files(&root.join("c")), "== k=q/data_0.json\n{\"id\":1}\n");
+
+    // APPEND names its files with a UUID, so a second copy adds to the first.
+    for _ in 0..2 {
+        run("COPY p TO 'DIR/e' (FORMAT parquet, PARTITION_BY (k), APPEND)").expect("appends");
+    }
+    let count = db
+        .query(&format!("SELECT count(*) FROM read_parquet('{dir}/e/*/*.parquet')"))
+        .expect("reads back");
+    assert_eq!(count.value_at(0, 0), rudb_common::Value::BigInt(8));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_partitioned_copy_refuses_what_the_pin_refuses() {
+    let db = Database::new();
+    db.execute("CREATE TABLE p AS SELECT 1 AS id, 'x' AS k").expect("creates");
+    for (sql, want) in [
+        (
+            "COPY p TO 'e' (PARTITION_BY (k), APPEND, FILENAME_PATTERN 'f')",
+            "Binder Error: APPEND mode requires a {uuid} label in filename_pattern",
+        ),
+        (
+            "COPY p TO 'e.csv' (APPEND, FILENAME_PATTERN 'x')",
+            "Binder Error: APPEND mode requires a {uuid} label in filename_pattern",
+        ),
+        (
+            "COPY p TO 'e' (PARTITION_BY (k), APPEND, OVERWRITE)",
+            "Binder Error: Can only set one of OVERWRITE_OR_IGNORE, OVERWRITE or APPEND",
+        ),
+        (
+            "COPY p TO 'e' (PARTITION_BY (k), USE_TMP_FILE)",
+            "Not implemented Error: Can't combine USE_TMP_FILE and PARTITIONED BY for COPY",
+        ),
+        (
+            "COPY p TO 'e' (PARTITION_BY (k), PER_THREAD_OUTPUT)",
+            "Not implemented Error: Can't combine PER_THREAD_OUTPUT and PARTITIONED BY for COPY",
+        ),
+        (
+            "COPY p TO 'e' (PARTITION_BY (zz))",
+            "Binder Error: \"partition_by\" expected to find zz, but it was not found in the table",
+        ),
+        (
+            "COPY p TO 'e' (PARTITION_BY (k, K))",
+            "Binder Error: \"partition_by\" does now allow duplicate columns (found: K)",
+        ),
+        (
+            "COPY p TO 'e' (PARTITION_BY (k, id))",
+            "Not implemented Error: No column to write as all columns are specified as partition \
+             columns. WRITE_PARTITION_COLUMNS option can be used to write partition columns.",
+        ),
+    ] {
+        let error = db.execute(sql).expect_err(sql);
+        assert_eq!(error.to_string(), want, "{sql}");
+    }
+}
