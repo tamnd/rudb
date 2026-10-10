@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.7
+
+In the PostgreSQL dialect, #2973 lets a `SELECT` have no targets, so `SELECT FROM t` gives one row with no columns for each row of `t` and the set operations compare such rows as equal. #2975 adds the `SEARCH` and `CYCLE` clauses of a recursive `WITH` query, with the sequence and cycle columns that a star does not show and the errors of PostgreSQL for a query that is not recursive. #2976 lets a row of `VALUES` read a scalar query. #2977 does not run a scalar query in a subquery in `FROM` whose value nothing reads, as PostgreSQL does not, so such a query no longer fails when it gives more than one row. With these changes, the replay of `test_setup`, `with`, `subquery`, `select`, `union`, `window`, `aggregates`, `join` and `limit` gives 1825 of 2588 statements the same as PostgreSQL 19.
+
+#2974 names the pair of equal columns in `order.rs` so that clippy passes.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.6
 
 In the PostgreSQL dialect, #2968 makes `extract` the call `pg_catalog.extract(text, x)` and gives a `numeric` with the value and the scale of PostgreSQL, through new kernels that follow the part functions of `date.c` and `timestamp.c`, with their unit errors. #2971 moves `date_part` to the same code with `float8` answers computed in `double` as the C code computes them. It also binds a function whose forms are kernels or bodies in SQL through `pg_proc`, so `date_part(text, date)`, `round`, `log`, `log10`, `lpad`, `rpad`, `quote_literal` and `quote_nullable` bind as PostgreSQL binds them. #2962 computes the windows of one query in the order that `select_active_windows` puts them in, which decides the order of the rows when there is no `ORDER BY`. With these changes, the replay of `test_setup`, `with`, `subquery`, `select`, `union`, `window`, `aggregates`, `join` and `limit` gives 1773 of 2588 statements the same as PostgreSQL 19.
