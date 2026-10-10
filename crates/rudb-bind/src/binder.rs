@@ -512,6 +512,9 @@ pub(crate) struct Binder<'a> {
     /// The recursive definitions whose recursive side is being bound, as indexes into
     /// `Ast::ctes`, innermost last.
     recursing: Vec<u32>,
+    /// The block of the right side of a recursive definition with a `SEARCH` or `CYCLE` clause,
+    /// while that side is being bound.
+    pub(crate) passing: Option<crate::searchcycle::Passing>,
     /// How many materialisations have been numbered, which is where the next number comes from.
     next_cte: u32,
     /// When this statement started, read once and kept, which is what `now()` folds to.
@@ -606,6 +609,7 @@ impl<'a> Binder<'a> {
             expanding: Vec::new(),
             materialized: Vec::new(),
             recursing: Vec::new(),
+            passing: None,
             next_cte: 0,
             started: None,
             source: None,
@@ -933,13 +937,28 @@ impl<'a> Binder<'a> {
                 "a WITH clause inside a recursive definition is not supported yet",
             ));
         }
+        // PostgreSQL reads the mark of a `CYCLE` clause before the query of the definition.
+        let mark = match held.cycle {
+            Some(cycle) => Some(self.cycle_mark(ast, &cycle)?),
+            None => None,
+        };
         let (anchor, mut scope) = self.bind_query(ast, left)?;
         if !held.columns.is_empty() {
             let names: Vec<&str> = ast.name(held.columns).collect();
             scope.rename_prefix(&names);
         }
         let fields = scope.fields();
+        let width = fields.len();
         let (anchor, over) = self.project_onto(anchor, &scope, &fields, &name)?;
+        let added = self.search_cycle(ast, &held, &fields, mark)?;
+        let (anchor, over, fields) = match &added {
+            Some(added) => {
+                let (anchor, over) = self.with_added(anchor, &over, width, added, &name)?;
+                let fields = over.fields();
+                (anchor, over, fields)
+            }
+            None => (anchor, over, fields),
+        };
         let (key, folds) = self.recursive_key(ast, held.key, &over, &fields)?;
         let args: Vec<ExprRef> = folds.iter().flat_map(|fold| fold.args.iter().copied()).collect();
         let anchor = self.with_arguments(anchor, &over, &args);
@@ -965,11 +984,15 @@ impl<'a> Binder<'a> {
             finished: table.clone(),
             output,
         });
+        if let Some(added) = &added {
+            self.passing = Some(self.passing(ast, index, (left, right), width, added)?);
+        }
         self.recursing.push(index);
         let bound = self.bind_query(ast, right);
         self.recursing.pop();
+        let passed = self.passing.take().map_or(0, |passing| passing.len());
         let (recursive, other) = bound?;
-        if other.len() != scope.len() {
+        if other.len() != width + passed {
             return Err(Error::binder(
                 "Set operations can only apply to expressions with the same number of result columns",
             )
@@ -978,8 +1001,12 @@ impl<'a> Binder<'a> {
             .with_span(first_column(ast, right)));
         }
         let (recursive, over) = self.project_onto(recursive, &other, &fields, &name)?;
+        let (recursive, over) = match &added {
+            Some(added) => self.with_added(recursive, &over, width, added, &name)?,
+            None => (recursive, over),
+        };
         if !all {
-            for (at, field) in fields.iter().enumerate() {
+            for (at, field) in fields.iter().enumerate().take(width) {
                 let span = set_op_column(ast, left, at, fields.len());
                 self.sort_group_operators(&field.ty, false, span)?;
             }
@@ -2086,8 +2113,12 @@ impl<'a> Binder<'a> {
         self.unnest_here = true;
         self.alias_clause(AliasClause::Select);
         self.unknowns_kept = unknowns_kept;
-        let (mut exprs, mut names, origins) =
+        let (mut exprs, mut names, mut origins) =
             self.bind_targets(ast, &targets, &input, &mut above)?;
+        if self.passing.as_ref().is_some_and(|passing| passing.select == select) {
+            self.pass_added(&input, &mut exprs, &mut names)?;
+            origins.resize(exprs.len(), None);
+        }
         self.unnest_here = false;
         let visible = exprs.len();
         self.aliases = outer_aliases;
@@ -3568,6 +3599,14 @@ impl<'a> Binder<'a> {
         let index = self.fresh_index();
         if let Some(output) = output {
             self.collated.reads.insert(index, output);
+        }
+        // The right side of a definition with a `SEARCH` or `CYCLE` clause passes the added
+        // columns of this read through.
+        if let Some(passing) = &mut self.passing
+            && passing.written == written
+            && !recurring
+        {
+            passing.reads.push(index);
         }
         let mut scope = Scope::empty();
         for (at, field) in fields.iter().enumerate() {

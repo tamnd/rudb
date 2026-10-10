@@ -7230,3 +7230,90 @@ fn a_select_with_no_targets_gives_rows_with_no_columns() {
     );
     server.stop().unwrap();
 }
+
+#[test]
+fn a_recursive_query_takes_search_and_cycle_clauses() {
+    let dirs = Dirs::new("pgsearchcycle");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The values are the ones that PostgreSQL 19 gives.
+    let graph = "with recursive g(f, t) as (values (1, 2), (1, 3), (2, 3), (3, 1)), \
+        s(f, t) as (select * from g where f = 1 union all select g.* from g, s where g.f = s.t)";
+    assert_eq!(
+        scalar(
+            &mut client,
+            &format!(
+                "{graph} search breadth first by f, t set seq \
+                cycle f, t set c to 'Y' default 'N' using p \
+                select string_agg(f || '-' || t || ':' || c || ':' || seq::text, ' ' \
+                order by seq, c) from s"
+            )
+        ),
+        "1-2:N:(0,1,2) 1-3:N:(0,1,3) 2-3:N:(1,2,3) 3-1:N:(1,3,1) 1-2:N:(2,1,2) 1-3:Y:(2,1,3) \
+        3-1:N:(2,3,1) 1-2:Y:(3,1,2) 1-3:N:(3,1,3) 2-3:N:(3,2,3) 3-1:Y:(4,3,1) 3-1:Y:(4,3,1)"
+    );
+    assert_eq!(
+        scalar(
+            &mut client,
+            &format!(
+                "{graph} search depth first by f, t set seq cycle f, t set c using p \
+                select string_agg(f || '-' || t || ':' || c || ':' || array_length(p, 1), ' ' \
+                order by seq, c) from s"
+            )
+        ),
+        "1-2:false:1 2-3:false:2 3-1:false:3 1-2:true:4 1-3:false:4 3-1:true:5 1-3:false:1 \
+        3-1:false:2 1-2:false:3 2-3:false:4 3-1:true:5 1-3:true:3"
+    );
+    // The right side reads the added columns by name, and a star there does not reach them.
+    assert_eq!(
+        scalar(
+            &mut client,
+            "with recursive test as (select 0 as x union all select (x + 1) % 4 from test \
+            where not is_cycle) cycle x set is_cycle using path \
+            select string_agg(x || ':' || is_cycle, ' ') from test"
+        ),
+        "0:false 1:false 2:false 3:false 0:true"
+    );
+    assert_eq!(
+        scalar(
+            &mut client,
+            "with recursive a as (select 1 as b union all select * from a) cycle b set c using p \
+            select string_agg(b || ' ' || c || ' ' || p::text, '; ') from a"
+        ),
+        "1 false {(1)}; 1 true {(1),(1)}"
+    );
+    let counting = "with recursive s(f) as (select 1 union all select f + 1 from s)";
+    for (clause, code, message, place) in [
+        (
+            "search depth first by g set seq",
+            "42601",
+            "search column \"g\" not in WITH query column list",
+            "65",
+        ),
+        (
+            "cycle f set c to true default 55 using p",
+            "42804",
+            "CYCLE types boolean and integer cannot be matched",
+            "95",
+        ),
+        (
+            "cycle f set c to true default false using c",
+            "42601",
+            "cycle mark column name and cycle path column name are the same",
+            "65",
+        ),
+    ] {
+        let sql = format!("{counting} {clause} select * from s");
+        let messages = client.query(&sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(place), "{sql}");
+    }
+    let messages =
+        client.query("with s(f) as (select 1) search depth first by f set seq select * from s");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'M').as_deref(), Some("WITH query is not recursive"));
+    server.stop().unwrap();
+}

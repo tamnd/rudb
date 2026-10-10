@@ -42,6 +42,7 @@ mod pgcalls;
 mod pivot;
 mod query_text;
 mod scope;
+mod searchcycle;
 mod state;
 mod statement;
 mod structs;

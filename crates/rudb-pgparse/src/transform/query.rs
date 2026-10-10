@@ -3,12 +3,12 @@
 use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Cte, Distinct, Expr, JoinKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody, QueryRef,
-    Select, SetOp, Slice, Source, SourceRef, Target, WindowBound, WindowExclude, WindowRef,
-    WindowSpec, WindowUnit,
+    Cte, Cycle, Distinct, Expr, JoinKind, Nulls, Order, OrderItem, Quantifier, Query, QueryBody,
+    QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Target, WindowBound, WindowExclude,
+    WindowRef, WindowSpec, WindowUnit,
 };
 
-use super::{Definition, Made, Transform, clause, not_yet};
+use super::{Definition, Made, Refused, Transform, clause, not_yet};
 use crate::nodes::{
     Alias, CTEMaterialize, CommonTableExpr, FRAMEOPTION_BETWEEN, FRAMEOPTION_DEFAULTS,
     FRAMEOPTION_EXCLUDE_CURRENT_ROW, FRAMEOPTION_EXCLUDE_GROUP, FRAMEOPTION_EXCLUDE_TIES,
@@ -241,11 +241,8 @@ impl Transform<'_> {
                 .with_span(self.at(cte.location))
                 .into());
             }
-            if cte.search_clause.is_some() {
-                return clause("CTESearchClause");
-            }
-            if cte.cycle_clause.is_some() {
-                return clause("CTECycleClause");
+            if !with.recursive && (cte.search_clause.is_some() || cte.cycle_clause.is_some()) {
+                return Err(self.not_recursive(cte));
             }
             let select = match &cte.ctequery {
                 Some(Node::SelectStmt(select)) => select,
@@ -290,6 +287,8 @@ impl Transform<'_> {
             recursive: false,
             key: Slice::default(),
             dml: None,
+            search: None,
+            cycle: None,
         });
         self.scope.push(Definition {
             name: name.to_string(),
@@ -315,8 +314,15 @@ impl Transform<'_> {
             self.well_formed(query, name, self.at(cte.location), &found)?;
         }
         let recursive = found.iter().any(|read| !read.nested);
-        self.ast.ctes[slot as usize].query = query;
-        self.ast.ctes[slot as usize].recursive = recursive;
+        let (search, cycle) = self.search_and_cycle(cte)?;
+        if !recursive && (search.is_some() || cycle.is_some()) {
+            return Err(self.not_recursive(cte));
+        }
+        let held = &mut self.ast.ctes[slot as usize];
+        held.query = query;
+        held.recursive = recursive;
+        held.search = search;
+        held.cycle = cycle;
         Ok(Definition {
             name: name.to_string(),
             declared,
@@ -326,6 +332,40 @@ impl Transform<'_> {
             recursive,
             reads: Vec::new(),
         })
+    }
+
+    /// The `SEARCH` and `CYCLE` clauses of a definition. The binder checks them against the
+    /// columns of the definition, as `analyzeCTE` in `parse_cte.c` does.
+    fn search_and_cycle(&mut self, cte: &CommonTableExpr) -> Made<(Option<Search>, Option<Cycle>)> {
+        let search = match cte.search_clause.as_deref() {
+            Some(clause) => Some(Search {
+                breadth_first: clause.search_breadth_first,
+                columns: self.names(&clause.search_col_list)?,
+                sequence: self.intern(clause.search_seq_column.as_deref().unwrap_or_default()),
+                span: self.at(clause.location),
+            }),
+            None => None,
+        };
+        let cycle = match cte.cycle_clause.as_deref() {
+            Some(clause) => Some(Cycle {
+                columns: self.names(&clause.cycle_col_list)?,
+                mark: self.intern(clause.cycle_mark_column.as_deref().unwrap_or_default()),
+                value: self.optional(clause.cycle_mark_value.as_ref())?,
+                default: self.optional(clause.cycle_mark_default.as_ref())?,
+                path: self.intern(clause.cycle_path_column.as_deref().unwrap_or_default()),
+                span: self.at(clause.location),
+            }),
+            None => None,
+        };
+        Ok((search, cycle))
+    }
+
+    /// The error for a `SEARCH` or `CYCLE` clause on a definition that does not read itself.
+    fn not_recursive(&self, cte: &CommonTableExpr) -> Refused {
+        Error::parser("WITH query is not recursive")
+            .state(SqlState::SYNTAX_ERROR)
+            .with_span(self.at(cte.location))
+            .into()
     }
 
     /// The checks of `checkWellFormedRecursion` in `parse_cte.c`, in its order, on a definition
@@ -449,6 +489,8 @@ impl Transform<'_> {
                     recursive: false,
                     key: Slice::default(),
                     dml: None,
+                    search: None,
+                    cycle: None,
                 });
                 self.ast.ctes.len() as u32 - 1
             } else {
@@ -830,7 +872,7 @@ fn windowing(message: String) -> Error {
     Error::parser(message).state(SqlState::WINDOWING_ERROR)
 }
 
-fn missing_window(name: &str, span: Span) -> super::Refused {
+fn missing_window(name: &str, span: Span) -> Refused {
     Error::parser(format!("window \"{name}\" does not exist"))
         .state(SqlState::UNDEFINED_OBJECT)
         .with_span(span)
