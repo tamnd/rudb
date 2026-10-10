@@ -672,8 +672,9 @@ mod tests {
         let wide = LogicalType::decimal(34, 2).expect("a decimal");
         let large = |unscaled| Value::Decimal { unscaled, width: 34, scale: 2 };
         let far = 1_i128 << 70;
-        let second = Vector::from_values(wide, &[large(far), large(-1), large(-far - 1), large(far)])
-            .expect("arguments");
+        let second =
+            Vector::from_values(wide, &[large(far), large(-1), large(-far - 1), large(far)])
+                .expect("arguments");
         for _ in 0..2 {
             let mut local = Local::new(&memory);
             exchange
