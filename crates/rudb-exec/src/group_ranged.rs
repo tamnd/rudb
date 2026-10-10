@@ -256,8 +256,15 @@ impl Exchange {
             }
         }
         let shift = tallies.shift;
-        for &place in places.iter() {
-            tallies.cells[(place as usize) << shift] += 1;
+        // With no sum a place is one cell, and the shift each row would be for nothing.
+        if shift == 0 {
+            for &place in places.iter() {
+                tallies.cells[place as usize] += 1;
+            }
+        } else {
+            for &place in places.iter() {
+                tallies.cells[(place as usize) << shift] += 1;
+            }
         }
         for (lane, argument) in self.lanes.iter().zip(arguments) {
             let Some(nulls) = lane.nulls else { continue };
