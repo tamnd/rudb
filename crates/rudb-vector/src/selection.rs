@@ -183,7 +183,7 @@ impl Selection {
     #[must_use]
     pub fn indices(&self) -> &[u32] {
         self.list.get_or_init(|| {
-            self.mask.as_deref().map_or_else(Vec::new, |words| listed(words, self.kept))
+            self.mask.as_deref().map_or_else(Vec::new, listed)
         })
     }
 
@@ -296,22 +296,35 @@ impl Selection {
 /// How many dropped rows a word may have and still be walked by the rows it drops.
 const DENSE_WORD: u32 = 8;
 
-/// The positions whose bits are set in `words`, `kept` of them, in order.
+/// How many rows of a sparse word are written before asking whether it holds more.
+///
+/// A filter that keeps a few rows in a hundred leaves most words with none, one or two, so the
+/// first four are written whether the word has them or not and the answer only counts the ones it
+/// has. What that saves is the branch on whether a word is empty and the branch that ends the walk
+/// of its rows, and with words that are empty about as often as not, both were taken at random.
+const SPARSE_WORD: usize = 4;
+
+/// The positions whose bits are set in `words`, in order.
+///
+/// Every word is written into room the answer already has rather than pushed. A sparse word writes
+/// [`SPARSE_WORD`] rows whatever it holds, so an empty word costs a few stores past the end of the
+/// answer, which the next word writes over, and no branch. On TPC-H q14, whose filter keeps one
+/// row in eighty of `lineitem`, the branchy walk this replaces was 5 percent of the query.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "a mask is over a chunk, whose rows fit in a u32"
 )]
-fn listed(words: &[u64], kept: usize) -> Vec<u32> {
-    let mut out = Vec::with_capacity(kept + 64);
+#[allow(unsafe_code)]
+fn listed(words: &[u64]) -> Vec<u32> {
+    // Counted from the words rather than taken from the selection's count, because the room below
+    // is written into unchecked and a count that came out wrong somewhere else must not matter.
+    let total: usize = words.iter().map(|word| word.count_ones() as usize).sum();
+    // Room for every row, and for the 64 a word may write past the last of them.
+    let mut out = Vec::with_capacity(total + 2 * 64);
+    let room = out.spare_capacity_mut();
+    let mut len = 0;
     for (block, &word) in words.iter().enumerate() {
-        if word == 0 {
-            continue;
-        }
         let base = (block * 64) as u32;
-        if word == u64::MAX {
-            out.extend(base..base + 64);
-            continue;
-        }
         // A word that keeps most of its rows is walked by the rows it drops. Each run between two
         // of them is written as a whole 64 rows and cut back to its own, so it is a copy of fixed
         // width with no tail to finish a row at a time, and what it writes past its rows is
@@ -322,9 +335,10 @@ fn listed(words: &[u64], kept: usize) -> Vec<u32> {
             let mut from = 0;
             loop {
                 let at = if dropped == 0 { 64 } else { dropped.trailing_zeros() };
-                let listed = out.len() + (at - from) as usize;
-                out.extend(base + from..base + from + 64);
-                out.truncate(listed);
+                for (slot, row) in room[len..len + 64].iter_mut().zip(base + from..) {
+                    slot.write(row);
+                }
+                len += (at - from) as usize;
                 if dropped == 0 {
                     break;
                 }
@@ -333,12 +347,23 @@ fn listed(words: &[u64], kept: usize) -> Vec<u32> {
             }
             continue;
         }
-        let mut word = word;
-        while word != 0 {
-            out.push(base + word.trailing_zeros());
-            word &= word - 1;
+        let count = word.count_ones() as usize;
+        let mut rest = word;
+        for slot in &mut room[len..len + SPARSE_WORD] {
+            slot.write(base + rest.trailing_zeros());
+            rest &= rest.wrapping_sub(1);
         }
+        if count > SPARSE_WORD {
+            for slot in &mut room[len + SPARSE_WORD..len + count] {
+                slot.write(base + rest.trailing_zeros());
+                rest &= rest - 1;
+            }
+        }
+        len += count;
     }
+    // SAFETY: `len` is the rows listed, and every slot under it was written above, since each word
+    // writes the slots from the `len` it found up to the `len` it leaves.
+    unsafe { out.set_len(len) };
     out
 }
 
@@ -370,6 +395,30 @@ mod tests {
         assert_eq!(pushed.mask(), None);
         assert_eq!(pushed.len(), wanted.len() + 1);
         assert_eq!(selection.into_indices(), wanted);
+    }
+
+    /// The listing writes past its rows and counts only the ones it has, so every way a word can
+    /// hold rows is tried: empty, one to five rows, about half, and dense with a few dropped.
+    #[test]
+    fn a_mask_of_any_density_lists_its_positions() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for keep in [0, 1, 3, 9, 30, 64, 128, 192, 250, 255, 256] {
+            let words: Vec<u64> = (0..128)
+                .map(|_| (0..64).fold(0, |word, bit| word | u64::from(next() % 256 < keep) << bit))
+                .collect();
+            let kept = words.iter().map(|word| word.count_ones() as usize).sum();
+            let wanted: Vec<u32> = (0..words.len() * 64)
+                .filter(|&at| words[at / 64] >> (at % 64) & 1 == 1)
+                .map(|at| at as u32)
+                .collect();
+            assert_eq!(Selection::from_mask(words, kept).indices(), wanted.as_slice(), "{keep}");
+        }
     }
 
     #[test]
