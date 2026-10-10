@@ -5983,6 +5983,7 @@ impl Shared {
         context.relate(self.relationships(catalog));
         context.size(self.inner.settings.sizes());
         context.govern(self.inner.settings.rules());
+        context.unread_queries(self.session().semantics().unread_queries());
         Ok(context)
     }
 

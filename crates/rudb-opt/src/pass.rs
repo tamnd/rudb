@@ -77,6 +77,9 @@ pub struct Context {
     /// inside a pass, and `../stats/09-measurement.md` section 9.2 wants it off on its own so that
     /// the per rule table can say what that decision alone earned.
     rules: rudb_common::rules::Rules,
+    /// Whether a scalar query whose value nothing reads is run, which is a rule of the dialect
+    /// rather than a choice of the optimizer. See [`crate::columns`].
+    unread_queries: rudb_common::UnreadQueries,
 }
 
 impl Context {
@@ -223,6 +226,17 @@ impl Context {
     /// switch, and it is the same answer a fresh database gives.
     pub fn govern(&mut self, rules: rudb_common::rules::Rules) {
         self.rules = rules;
+    }
+
+    /// Sets whether a scalar query whose value nothing reads is run.
+    pub fn unread_queries(&mut self, unread: rudb_common::UnreadQueries) {
+        self.unread_queries = unread;
+    }
+
+    /// Whether a scalar query whose value nothing reads is skipped, as in PostgreSQL.
+    #[must_use]
+    pub fn skips_unread_queries(&self) -> bool {
+        self.unread_queries == rudb_common::UnreadQueries::Postgres
     }
 
     /// Whether one rule may fire, which is its own switch and its master's.

@@ -230,6 +230,7 @@ pub struct Semantics {
     tie_order: TieOrder,
     window_order: WindowOrder,
     empty_targets: EmptyTargets,
+    unread_queries: UnreadQueries,
     subscripts: Subscripts,
     collations: Collations,
     single_arrow_lambdas: bool,
@@ -289,6 +290,7 @@ impl Default for Semantics {
             tie_order: TieOrder::Pin,
             window_order: WindowOrder::Pin,
             empty_targets: EmptyTargets::Pin,
+            unread_queries: UnreadQueries::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
             collations: Collations::Pin,
@@ -497,6 +499,11 @@ impl Semantics {
     #[must_use]
     pub fn empty_targets(self) -> EmptyTargets {
         self.empty_targets
+    }
+    /// Whether a scalar query whose value nothing reads is run.
+    #[must_use]
+    pub fn unread_queries(self) -> UnreadQueries {
+        self.unread_queries
     }
     /// How a subscript and a slice of a list read the list.
     #[must_use]
@@ -1073,6 +1080,19 @@ pub enum EmptyTargets {
     Postgres,
 }
 
+/// Whether a scalar query whose value nothing reads is run, as in
+/// `SELECT a FROM (SELECT a, (SELECT b FROM t) AS c FROM u) s`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnreadQueries {
+    /// As in DuckDB: the query is run, so a query that gives more than one row is still an error.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the query is not run. PostgreSQL removes the outputs of a subquery in
+    /// `FROM` that nothing reads in `remove_unused_subquery_outputs`, and a scalar query there
+    /// goes with its output.
+    Postgres,
+}
+
 /// How a subscript and a slice of a list read the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Subscripts {
@@ -1499,6 +1519,7 @@ impl Session {
             self.semantics.tie_order = TieOrder::Postgres;
             self.semantics.window_order = WindowOrder::Postgres;
             self.semantics.empty_targets = EmptyTargets::Postgres;
+            self.semantics.unread_queries = UnreadQueries::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
