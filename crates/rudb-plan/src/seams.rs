@@ -54,6 +54,7 @@ pub fn seams_of(node: &Node) -> &'static [SeamId] {
         | Node::TableFetch { .. }
         | Node::Limit { .. }
         | Node::LimitPercent { .. }
+        | Node::LimitTies { .. }
         | Node::CrossProduct { .. }
         | Node::MaterializedCte { .. }
         | Node::RecursiveCte { .. }

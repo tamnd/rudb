@@ -611,6 +611,7 @@ fn ordered(plan: &Plan, node: NodeRef) -> bool {
         | Node::Filter { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::Fetch { input, .. } => ordered(plan, input),
         Node::Distinct { input, on } if !on.is_empty() => ordered(plan, input),
         _ => false,
@@ -3713,6 +3714,17 @@ impl<'a> Building<'a, '_> {
                 };
                 let schema = below.schema.clone();
                 let limit = Limit::new(edge(plan, count, &schema)?, edge(plan, offset, &schema)?)
+                    .in_session(self.session);
+                let counters = self.watch(reference, id, pipeline, "Limit", None);
+                below.then(Arc::new(Watched::new(limit, counters)), schema)
+            }
+            Node::LimitTies { input, keys, count, offset } => {
+                let below = self.node(input)?;
+                let schema = below.schema.clone();
+                let exprs: Vec<ExprRef> =
+                    plan.sort_key_list(keys).iter().map(|key| key.expr).collect();
+                let limit = Limit::new(edge(plan, count, &schema)?, edge(plan, offset, &schema)?)
+                    .with_ties(Prepared::new(plan, &exprs, &schema)?)
                     .in_session(self.session);
                 let counters = self.watch(reference, id, pipeline, "Limit", None);
                 below.then(Arc::new(Watched::new(limit, counters)), schema)

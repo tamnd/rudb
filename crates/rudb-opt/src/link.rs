@@ -748,6 +748,7 @@ pub(crate) fn absorbed(plan: &Plan, consumers: &[Option<NodeRef>], at: NodeRef) 
             | Node::Sort { .. }
             | Node::Limit { .. }
             | Node::LimitPercent { .. }
+            | Node::LimitTies { .. }
             | Node::TopN { .. }
             | Node::Window { .. }
             | Node::Join { .. }

@@ -397,6 +397,9 @@ impl Shape<'_> {
             query.limit_percent,
             self.expr(query.offset)
         );
+        if query.with_ties {
+            out.insert_str(out.len() - 1, ", with ties");
+        }
         out
     }
 

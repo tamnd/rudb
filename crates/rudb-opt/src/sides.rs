@@ -277,6 +277,7 @@ fn width(plan: &Plan, node: NodeRef) -> Option<u64> {
         | Node::Sort { input, .. }
         | Node::Limit { input, .. }
         | Node::LimitPercent { input, .. }
+        | Node::LimitTies { input, .. }
         | Node::TopN { input, .. }
         | Node::Distinct { input, .. } => width(plan, input),
         Node::Join { left, right, kind, .. }

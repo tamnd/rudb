@@ -202,6 +202,14 @@ fn write_arguments<W: Write>(plan: &Plan, out: &mut W, node: &Node) -> fmt::Resu
             out.write_str(" offset ")?;
             write_bound(plan, out, offset)
         }
+        Node::LimitTies { keys, count, offset, .. } => {
+            out.write_char(' ')?;
+            write_sort_keys(plan, out, keys)?;
+            out.write_str(" count ")?;
+            write_bound(plan, out, count)?;
+            out.write_str(" offset ")?;
+            write_bound(plan, out, offset)
+        }
         // The percentage prints through `Display` for a `f64`, which is the shortest text that
         // reads back as the same number, so the reader in `parse.rs` gets the bits it was given.
         Node::LimitPercent { percent, offset, .. } => {

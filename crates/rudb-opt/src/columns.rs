@@ -497,6 +497,15 @@ fn expressions(plan: &Plan, node: NodeRef, found: &mut Found) {
                 walk(plan, read, found);
             }
         }
+        // A limit with ties reads its keys as well, to tell the rows that tie.
+        Node::LimitTies { keys, count, offset, .. } => {
+            for key in plan.sort_key_list(keys) {
+                walk(plan, key.expr, found);
+            }
+            for read in [count.read(), offset.read()].into_iter().flatten() {
+                walk(plan, read, found);
+            }
+        }
         // And the same for a share of the input, where both the share and the offset can be
         // written that way.
         Node::LimitPercent { percent, offset, .. } => {
