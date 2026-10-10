@@ -91,7 +91,7 @@ impl Binder<'_> {
     }
 
     /// A struct of bound values with these field names, which can repeat.
-    fn pack_row(&mut self, names: &[String], values: &[ExprRef]) -> ExprRef {
+    pub(crate) fn pack_row(&mut self, names: &[String], values: &[ExprRef]) -> ExprRef {
         if values.is_empty() {
             return self.add_constant(Value::Struct(Vec::new()));
         }

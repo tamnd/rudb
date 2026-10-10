@@ -3797,7 +3797,16 @@ impl<'a> Transform<'a> {
             if materialized {
                 let index = self.ast.ctes.len() as u32;
                 let key = Slice::default();
-                self.ast.ctes.push(Cte { name, query, columns, recursive: false, key, dml: None });
+                self.ast.ctes.push(Cte {
+                    name,
+                    query,
+                    columns,
+                    recursive: false,
+                    key,
+                    dml: None,
+                    search: None,
+                    cycle: None,
+                });
                 once.push(index);
                 self.ctes.push((name, Held::Once(index), columns));
             } else {
@@ -3852,7 +3861,16 @@ impl<'a> Transform<'a> {
         let index = self.ast.ctes.len() as u32;
         let key = Slice::default();
         let dml = Some(statement);
-        self.ast.ctes.push(Cte { name, query, columns, recursive: false, key, dml });
+        self.ast.ctes.push(Cte {
+            name,
+            query,
+            columns,
+            recursive: false,
+            key,
+            dml,
+            search: None,
+            cycle: None,
+        });
         Ok(index)
     }
 
@@ -3876,7 +3894,16 @@ impl<'a> Transform<'a> {
     ) -> Result<u32> {
         let index = self.ast.ctes.len() as u32;
         let none = Slice::default();
-        self.ast.ctes.push(Cte { name, query: 0, columns, recursive: false, key: none, dml: None });
+        self.ast.ctes.push(Cte {
+            name,
+            query: 0,
+            columns,
+            recursive: false,
+            key: none,
+            dml: None,
+            search: None,
+            cycle: None,
+        });
         let scope = self.ctes.len();
         self.ctes.push((name, Held::Once(index), columns));
         let reads = self.self_reads.len();
@@ -3932,7 +3959,8 @@ impl<'a> Transform<'a> {
         // comes to take the last row per key over both sides of one that does not.
         let recursive = !found.is_empty() || (anchor.is_some() && key.len > 0);
         let key = if recursive { key } else { none };
-        self.ast.ctes[index as usize] = Cte { name, query, columns, recursive, key, dml: None };
+        self.ast.ctes[index as usize] =
+            Cte { name, query, columns, recursive, key, dml: None, search: None, cycle: None };
         Ok(index)
     }
 

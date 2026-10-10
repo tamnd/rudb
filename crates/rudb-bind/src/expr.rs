@@ -2617,11 +2617,25 @@ impl Binder<'_> {
             let connective = if all { ConjunctionOp::And } else { ConjunctionOp::Or };
             return Ok(self.conjunction(connective, tests));
         }
+        Ok(self.quantified_list(subject, list, common, comparison, all))
+    }
+
+    /// `subject op ANY (list)`, or `ALL` when `all` is set, for a list of `element` values that is
+    /// known only when the statement runs. The null rule is the one of PostgreSQL: no match and a
+    /// null among the comparisons is null.
+    pub(crate) fn quantified_list(
+        &mut self,
+        subject: ExprRef,
+        list: ExprRef,
+        element: LogicalType,
+        comparison: CompareOp,
+        all: bool,
+    ) -> ExprRef {
         let table = self.fresh_index();
         let name = self.plan_mut().intern("x");
         let params = self.plan_mut().add_name_list(&[name]);
         let candidate =
-            self.add_expr(Expr::LambdaParam(rudb_plan::ColumnBinding::new(table, 0)), common);
+            self.add_expr(Expr::LambdaParam(rudb_plan::ColumnBinding::new(table, 0)), element);
         let body = self.add_expr(
             Expr::Compare { op: comparison, left: subject, right: candidate },
             LogicalType::Boolean,
@@ -2636,7 +2650,7 @@ impl Binder<'_> {
         let fold = if all { "pg_quantified_all" } else { "pg_quantified_any" };
         let fold = self.plan_mut().intern(fold);
         let args = self.plan_mut().add_expr_list(&[answers]);
-        Ok(self.add_expr(Expr::Function { name: fold, args }, LogicalType::Boolean))
+        self.add_expr(Expr::Function { name: fold, args }, LogicalType::Boolean)
     }
 
     /// The values of a row written before `IN`, `ANY` or `ALL`, such as `(a, b)` or `row(a)`.

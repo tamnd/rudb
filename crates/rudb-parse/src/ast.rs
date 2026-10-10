@@ -846,6 +846,44 @@ pub struct Cte {
     /// each row it changed when it has none. `query` is then the statement's source, which is there
     /// only so a walk over every definition has a query to look at.
     pub dml: Option<Statement>,
+    /// The `SEARCH` clause of PostgreSQL, which only a definition that reads itself has.
+    pub search: Option<Search>,
+    /// The `CYCLE` clause of PostgreSQL, which only a definition that reads itself has.
+    pub cycle: Option<Cycle>,
+}
+
+/// `SEARCH { DEPTH | BREADTH } FIRST BY columns SET sequence` on a recursive definition: a column
+/// added after the columns of the definition that sorts its rows in the order of a walk of the
+/// graph it makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Search {
+    /// Whether the walk is breadth first rather than depth first.
+    pub breadth_first: bool,
+    /// The columns of the definition that name a row, as a run of [`StrRef`].
+    pub columns: Slice,
+    /// The name of the added column.
+    pub sequence: StrRef,
+    /// Where the clause was written.
+    pub span: Span,
+}
+
+/// `CYCLE columns SET mark [TO value DEFAULT other] USING path` on a recursive definition: two
+/// columns added after the columns of the definition, which find a row that a path already went
+/// through and stop the path there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cycle {
+    /// The columns of the definition that name a row, as a run of [`StrRef`].
+    pub columns: Slice,
+    /// The name of the column that marks a row as the end of a cycle.
+    pub mark: StrRef,
+    /// The value of the mark on such a row, `true` when the clause gave none.
+    pub value: ExprRef,
+    /// The value of the mark on every other row, `false` when the clause gave none.
+    pub default: ExprRef,
+    /// The name of the column that holds the rows of the path to a row.
+    pub path: StrRef,
+    /// Where the clause was written.
+    pub span: Span,
 }
 
 /// A query: a body, plus the modifiers that apply to whatever the body produced.

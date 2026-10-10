@@ -259,7 +259,8 @@ impl Binder<'_> {
         // `k` in the list takes it out wherever it is. PostgreSQL puts the merged columns first in
         // the scope and has no `EXCLUDE` or `RENAME`, so there a bare star is the scope in order.
         let walk = table.is_none() && self.semantics.join_columns() == JoinColumns::InPlace;
-        let walked = if walk { input.columns.iter().collect() } else { starred };
+        let walked: Vec<&Visible> = if walk { input.columns.iter().collect() } else { starred };
+        let walked = walked.into_iter().filter(|column| !self.unstarred(column));
         let mut placed = Vec::new();
         for copy in walked {
             let group = match copy.using {
