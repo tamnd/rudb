@@ -101,6 +101,17 @@ const FEW: u64 = 1 << 20;
 /// every join against `nation` or `region` is tens.
 const SPLIT: usize = 64 * 1024;
 
+fn exp_limits() -> (u64, u64, u64) {
+    static LIMITS: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let read = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|text| text.parse().ok()).unwrap_or(default)
+        };
+        let ranked = read("RUDB_RANKED", RANKED);
+        (ranked, read("RUDB_FEW", FEW), read("RUDB_ORD", ranked))
+    })
+}
+
 /// What a probe of a row whose key is not in the table leaves behind.
 ///
 /// Distinct from a slot rather than encoded as one, because slot zero is a real key and this has to
@@ -404,7 +415,9 @@ impl Lookup {
         let Ok(places) = u64::try_from(i128::from(high) - i128::from(low) + 1) else {
             return Ok(None);
         };
-        if places > (rows as u64).saturating_mul(RANKED).max(FEW) || places >= u64::from(NONE) {
+        let (ranked_at, few_at, ord_at) = exp_limits();
+        let limit = if ordered { ord_at } else { ranked_at };
+        if places > (rows as u64).saturating_mul(limit).max(few_at) || places >= u64::from(NONE) {
             return Ok(None);
         }
         cancel.check()?;
