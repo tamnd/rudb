@@ -335,6 +335,78 @@ impl Binder<'_> {
         })
     }
 
+    /// The arguments of an aggregate call in a PostgreSQL session that has a string literal among
+    /// them, each literal read as the type of the aggregate that `func_get_detail` finds over
+    /// `unknown` for it. `corr(g, 'NaN')` reads the literal as a `double precision`, and
+    /// `avg('4')` is not unique, since no form of `avg` takes text. A literal whose place has a
+    /// polymorphic type, a name that is not only an aggregate, a type that PostgreSQL does not
+    /// have, and a call that finds nothing keep the path of the pin.
+    pub(crate) fn pg_aggregate_unknowns(
+        &mut self,
+        ast: &Ast,
+        written: &str,
+        arguments: &[ast::ExprRef],
+        bound: &mut [ExprRef],
+    ) -> Result<()> {
+        use rudb_pgtypes::{Resolution, oid};
+        let untyped: Vec<bool> = arguments
+            .iter()
+            .map(|&argument| {
+                matches!(ast.expr(argument), ast::Expr::Literal { kind: LiteralKind::String, .. })
+            })
+            .collect();
+        let procs = rudb_pgtypes::procs(written);
+        if !untyped.contains(&true)
+            || procs.is_empty()
+            || procs.iter().any(|proc| proc.kind != b'a')
+            || arguments.len() != bound.len()
+        {
+            return Ok(());
+        }
+        let mut types = Vec::with_capacity(bound.len());
+        let mut oids = Vec::with_capacity(bound.len());
+        for (&argument, &untyped) in bound.iter().zip(&untyped) {
+            let ty = self.plan().expr_type(argument).clone();
+            let oid = match untyped || ty == LogicalType::Null {
+                true => oid::UNKNOWN,
+                false => match exact_oid(&ty) {
+                    Some(oid) => oid,
+                    None => return Ok(()),
+                },
+            };
+            types.push(ty);
+            oids.push(oid);
+        }
+        let call = rudb_pgtypes::Call { args: &oids, names: &[], variadic: false };
+        let candidate = match rudb_pgtypes::resolve_call(written, call) {
+            Resolution::Found(candidate) => candidate,
+            Resolution::NotFound(_) => return Ok(()),
+            Resolution::Ambiguous => {
+                let call = spelled_call(written, &types, &untyped, &[]);
+                let message = format!("function {call} is not unique");
+                return Err(Error::binder(message.clone())
+                    .state(SqlState::AMBIGUOUS_FUNCTION)
+                    .pg(message)
+                    .detail("Could not choose a best candidate function.")
+                    .hint("You might need to add explicit type casts.")
+                    .with_span(self.current_span));
+            }
+        };
+        for (index, &oid) in candidate.args.iter().enumerate() {
+            if !untyped.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            // A literal that already has the type stays the expression it is, so that a
+            // `DISTINCT` call still finds it among its sort keys.
+            if let Some(ty) = rudb_pgtypes::logical_type(oid)
+                && ty != types[index]
+            {
+                bound[index] = self.argument_as(ast, arguments[index], bound[index], &ty)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The call `written(arguments)` bound to the function of `pg_proc` that PostgreSQL finds for
     /// it, or `None` when the call takes another path here.
     ///

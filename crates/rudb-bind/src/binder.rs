@@ -6505,6 +6505,9 @@ impl<'a> Binder<'a> {
         {
             bound[0] = self.cast_to(only, &LogicalType::Varchar);
         }
+        if self.semantics.unknown_types() == UnknownTypes::Postgres {
+            self.pg_aggregate_unknowns(ast, name, &args, &mut bound)?;
+        }
         let types: Vec<LogicalType> =
             bound.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
         let mut resolved = resolve(name, &types)?;
@@ -6618,10 +6621,30 @@ impl<'a> Binder<'a> {
     /// exact `numeric` sums and answers a `numeric`, and of a `real` or a `double precision` in the
     /// state of `float8_accum` and answers a `double precision`, where the pin answers a DOUBLE
     /// from a Welford state for both. The calls take the names of PostgreSQL's final functions,
-    /// which are the states of [`rudb_kernels`] that keep them. Any other call is as resolved.
+    /// which are the states of [`rudb_kernels`] that keep them. `corr`, the covariances and the
+    /// `regr_*` family keep the state of `float8_regr_accum` under the names of their final
+    /// functions too, which answers null for a constant column where the pin answers NaN. Any
+    /// other call is as resolved.
     fn spread_as_postgres(&self, resolved: Resolved, types: &[LogicalType]) -> Resolved {
         if self.semantics.aggregate_types() != AggregateTypes::Postgres {
             return resolved;
+        }
+        let paired = match resolved.name {
+            "corr" => Some("float8_corr"),
+            "covar_pop" => Some("float8_covar_pop"),
+            "covar_samp" => Some("float8_covar_samp"),
+            "regr_avgx" => Some("float8_regr_avgx"),
+            "regr_avgy" => Some("float8_regr_avgy"),
+            "regr_intercept" => Some("float8_regr_intercept"),
+            "regr_r2" => Some("float8_regr_r2"),
+            "regr_slope" => Some("float8_regr_slope"),
+            "regr_sxx" => Some("float8_regr_sxx"),
+            "regr_sxy" => Some("float8_regr_sxy"),
+            "regr_syy" => Some("float8_regr_syy"),
+            _ => None,
+        };
+        if let Some(name) = paired {
+            return Resolved { name, ..resolved };
         }
         let ([argument], [_]) = (types, &resolved.arguments[..]) else { return resolved };
         let (argument, returns) = match argument {

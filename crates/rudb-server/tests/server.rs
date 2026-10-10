@@ -7623,6 +7623,38 @@ fn a_limit_in_a_correlated_subquery_reads_the_outer_row_as_postgres() {
 }
 
 #[test]
+fn a_pair_statistic_of_a_constant_column_is_null_as_postgres() {
+    let dirs = Dirs::new("pgpairs");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers are the ones that PostgreSQL 19 gives. A column that has one value has no
+    // spread, so its correlation and a slope against it are null, where the pin gives NaN.
+    for (sql, expected) in [
+        (
+            "select concat_ws('|', corr(0.09, g), regr_r2(0.09, g), regr_slope(g, 0.09), \
+             regr_intercept(g, 0.09), corr(g, g), regr_avgy(0.09, g)) \
+             from generate_series(1, 10) g",
+            "1|1|0.09",
+        ),
+        (
+            "select concat_ws('|', corr(g * g, g / 3.0), regr_slope(g * g, g / 3.0), \
+             regr_intercept(g * g, g / 3.0), regr_r2(g * g, g / 3.0), \
+             covar_samp(g * g, g / 3.0)) from generate_series(1, 9) g",
+            "0.9752810433442548|30.000000000000004|-18.33333333333334|0.9511731135066583|25",
+        ),
+        (
+            "select string_agg(coalesce(c::text, 'null'), ' ') from (select corr(y, x) \
+             over (order by x rows between 1 preceding and current row) c \
+             from (values (1, 1), (1, 2), (3, 3), (5, 4)) v(y, x)) q",
+            "null null 1 1",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+}
+
+#[test]
 fn a_volatile_target_is_computed_after_the_sort_as_postgres() {
     let dirs = Dirs::new("pgsorttgt");
     let server = Server::start(dirs.config()).unwrap();
