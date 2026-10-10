@@ -1,4 +1,5 @@
-//! `read_text(path)` and `read_blob(path)`, one row per file with the whole of it in a column.
+//! `read_text(path)` and `read_blob(path)`, one row per file with the whole of it in a column, and
+//! `glob(path)`, one row per file with only its name.
 //!
 //! The binder expanded the patterns, so the arguments are one constant per file in the order the
 //! rows go out. The files are read while the operator is built, like the other metadata tables
@@ -8,7 +9,7 @@
 
 use std::time::UNIX_EPOCH;
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_functions::{TableFunction, content_fields};
 use rudb_plan::{Expr, Plan, Slice};
 
@@ -27,19 +28,15 @@ pub(crate) fn contents(
     columns: Slice,
 ) -> Result<Metadata> {
     let name = function.name();
+    if function == TableFunction::Glob {
+        let rows = paths(plan, args)?.into_iter().map(|path| vec![text(&path)]).collect::<Vec<_>>();
+        let fields = [Field::new("file", LogicalType::Varchar)];
+        return Metadata::new(name, &fields, &rows, plan, index, columns);
+    }
     let blob = function == TableFunction::ReadBlob;
     let wanted = plan.field_list(columns).iter().any(|field| field.name == "content");
     let mut rows = Vec::new();
-    for argument in plan.expr_list(args) {
-        let path = match plan.expr(*argument) {
-            Expr::Constant(reference) => match plan.value(*reference) {
-                Value::Varchar(path) => path.clone(),
-                other => {
-                    return Err(Error::internal(format!("a file name arrived as {other}")));
-                }
-            },
-            _ => return Err(Error::internal("a file name that the binder did not fold")),
-        };
+    for path in paths(plan, args)? {
         let opened =
             |error: std::io::Error| Error::io(format!("Cannot open file \"{path}\": {error}"));
         let metadata = std::fs::metadata(&path).map_err(opened)?;
@@ -67,4 +64,18 @@ pub(crate) fn contents(
         rows.push(vec![text(&path), content, Value::BigInt(size), modified]);
     }
     Metadata::new(name, &content_fields(blob), &rows, plan, index, columns)
+}
+
+/// The file names the binder folded the arguments into, in the order the rows go out.
+fn paths(plan: &Plan, args: Slice) -> Result<Vec<String>> {
+    plan.expr_list(args)
+        .iter()
+        .map(|argument| match plan.expr(*argument) {
+            Expr::Constant(reference) => match plan.value(*reference) {
+                Value::Varchar(path) => Ok(path.clone()),
+                other => Err(Error::internal(format!("a file name arrived as {other}"))),
+            },
+            _ => Err(Error::internal("a file name that the binder did not fold")),
+        })
+        .collect()
 }

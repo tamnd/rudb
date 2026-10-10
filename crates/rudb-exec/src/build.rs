@@ -2572,7 +2572,10 @@ impl<'a> Building<'a, '_> {
                 );
                 Segment::new(Arc::new(Watched::new(table, counters)), schema)
             }
-            Some(function @ (TableFunction::ReadText | TableFunction::ReadBlob)) => {
+            Some(
+                function
+                @ (TableFunction::ReadText | TableFunction::ReadBlob | TableFunction::Glob),
+            ) => {
                 let table = contents(function, plan, args, index, columns)?;
                 let schema = table.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Metadata", Some(name));

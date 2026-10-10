@@ -113,6 +113,8 @@ pub enum TableFunction {
     ReadText,
     /// `read_blob(path)`, the same with the content as bytes.
     ReadBlob,
+    /// `glob(path)`, one row per file a pattern or a list of them names, with nothing read.
+    Glob,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
     /// `rudb_links()`, every relationship declared and what is stored for it.
@@ -214,6 +216,7 @@ impl TableFunction {
             Self::ReadSingleJsonFile => "read_single_json_file",
             Self::ReadText => "read_text",
             Self::ReadBlob => "read_blob",
+            Self::Glob => "glob",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
@@ -399,6 +402,13 @@ impl TableFunction {
         matches!(self, Self::ReadText | Self::ReadBlob)
     }
 
+    /// Whether the call takes its path the way `read_text` does, where a pattern that matches
+    /// nothing is no rows, which `glob` shares with the two whole file readers.
+    #[must_use]
+    pub const fn lists_files(self) -> bool {
+        matches!(self, Self::ReadText | Self::ReadBlob | Self::Glob)
+    }
+
     /// Which of the JSON readers this is, and `None` for a function that is not one.
     #[must_use]
     pub const fn json(self) -> Option<scan::Function> {
@@ -451,6 +461,7 @@ impl TableFunction {
             ("read_single_json_file", Self::ReadSingleJsonFile),
             ("read_text", Self::ReadText),
             ("read_blob", Self::ReadBlob),
+            ("glob", Self::Glob),
         ] {
             if name.eq_ignore_ascii_case(spelled) {
                 return Some(function);
@@ -638,7 +649,7 @@ pub fn resolve_table(name: &str, arguments: &[LogicalType]) -> Result<ResolvedTa
 /// Split out of [`resolve_table`] because a pragma only name has to get here without going past the
 /// check that turns it down in a `FROM` clause.
 fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<ResolvedTable> {
-    if function.reads_contents() {
+    if function.lists_files() {
         return contents(function, arguments);
     }
     if let Some(columns) = file_columns(function) {
@@ -897,6 +908,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::ReadSingleJsonFile => Some(Columns::Json),
         TableFunction::ReadText
         | TableFunction::ReadBlob
+        | TableFunction::Glob
         | TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::Unnest
@@ -991,6 +1003,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ReadSingleJsonFile
         | TableFunction::ReadText
         | TableFunction::ReadBlob
+        | TableFunction::Glob
         | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
@@ -998,7 +1011,8 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
     }
 }
 
-/// `read_text` and `read_blob`, which take a path or a list of them and answer four fixed columns.
+/// `read_text` and `read_blob`, which take a path or a list of them and answer four fixed columns,
+/// and `glob`, which takes the same and answers the one.
 ///
 /// Any list resolves, and what is in it is checked once it is folded, because the pin turns a list
 /// of numbers away as a parser error about the reader rather than as an overload that did not
@@ -1008,9 +1022,10 @@ fn contents(function: TableFunction, arguments: &[LogicalType]) -> Result<Resolv
         matches!(arguments, [LogicalType::Varchar | LogicalType::Null | LogicalType::List(_)]);
     if !path {
         let name = function.name();
+        let named = if function.reads_contents() { ", allow_empty : BOOLEAN" } else { "" };
         let mut candidates = String::new();
         for first in ["VARCHAR", "ANY[]", "VARIANT"] {
-            candidates.push_str(&format!("\t\"{name}\"({first}, allow_empty : BOOLEAN)\n"));
+            candidates.push_str(&format!("\t\"{name}\"({first}{named})\n"));
         }
         return Err(Error::binder(format!(
             "No function matches the given name and argument types '{name}({})'. You might need \
@@ -1021,7 +1036,11 @@ fn contents(function: TableFunction, arguments: &[LogicalType]) -> Result<Resolv
     Ok(ResolvedTable {
         function,
         arguments: arguments.to_vec(),
-        columns: Columns::Fixed(content_fields(function == TableFunction::ReadBlob)),
+        columns: Columns::Fixed(if function == TableFunction::Glob {
+            vec![Field::new("file", LogicalType::Varchar)]
+        } else {
+            content_fields(function == TableFunction::ReadBlob)
+        }),
     })
 }
 

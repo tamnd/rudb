@@ -167,3 +167,53 @@ fn each_reader_lists_three_overloads_in_the_catalog() {
          read_text|[VARCHAR, BOOLEAN]\nread_text|['ANY[]', BOOLEAN]\nread_text|[VARIANT, BOOLEAN]"
     );
 }
+
+#[test]
+fn glob_lists_the_files_a_pattern_names_and_reads_none_of_them() {
+    let files = Files::new();
+    files.check(&[
+        ("SELECT file FROM glob('D/*')", "D/a.txt\nD/b.bin\nD/e.txt"),
+        ("SELECT file FROM glob('D/**')", "D/a.txt\nD/b.bin\nD/e.txt\nD/sub/c.txt"),
+        ("SELECT file FROM glob('D/[ab].*')", "D/a.txt\nD/b.bin"),
+        ("SELECT file FROM glob(['D/e.txt', 'D/*.txt', 'D/missing'])", "D/e.txt\nD/a.txt\nD/e.txt"),
+        ("SELECT f FROM glob('D/a.txt') t(f)", "D/a.txt"),
+        ("SELECT count(*) FROM glob('D/missing/*')", "0"),
+        ("SELECT count(*) FROM glob('D/sub')", "0"),
+        ("SELECT count(*) FROM glob('')", "0"),
+        ("SELECT count(*) FROM glob([])", "0"),
+        (
+            "SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM glob('D/*'))",
+            "file|VARCHAR",
+        ),
+        (
+            "SELECT parameters, parameter_types FROM duckdb_functions() WHERE function_name = \
+             'glob' ORDER BY 2",
+            "[col0]|['ANY[]']\n[col0]|[VARCHAR]\n[col0]|[VARIANT]",
+        ),
+    ]);
+    for (sql, expected) in [
+        ("SELECT * FROM glob(NULL)", "Parser Error: \"glob\" cannot take NULL list as parameter"),
+        (
+            "SELECT * FROM glob(['D/a.txt', NULL])",
+            "Parser Error: \"glob\" reader cannot take NULL input as parameter",
+        ),
+        (
+            "SELECT * FROM glob([1])",
+            "Parser Error: \"glob\" reader can only take a list of strings, structs or variants as \
+             a parameter",
+        ),
+        (
+            "SELECT * FROM glob(42)",
+            "Binder Error: No function matches the given name and argument types 'glob(INTEGER)'. \
+             You might need to add explicit type casts.\n\tCandidate functions:\n\t\"glob\"\
+             (VARCHAR)\n\t\"glob\"(ANY[])\n\t\"glob\"(VARIANT)\n",
+        ),
+        (
+            "SELECT * FROM glob('D/*', x=1)",
+            "Binder Error: Invalid named parameter \"x\" for function glob\nFunction does not \
+             accept any named parameters.",
+        ),
+    ] {
+        assert_eq!(files.refused(sql), expected, "{sql}");
+    }
+}

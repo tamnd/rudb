@@ -224,8 +224,9 @@ fn tables() -> Vec<FunctionEntry> {
                 }
                 continue;
             }
-            // The two whole file readers take the same three kinds of path the JSON readers do.
-            if function.reads_contents() {
+            // The two whole file readers and `glob` take the same three kinds of path the JSON
+            // readers do.
+            if function.lists_files() {
                 for first in ["VARCHAR", "ANY[]", "VARIANT"] {
                     parameter_types[0] = first.to_string();
                     entries.push(table_entry(
@@ -298,6 +299,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ReadSingleJsonFile,
     TableFunction::ReadText,
     TableFunction::ReadBlob,
+    TableFunction::Glob,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
     TableFunction::RudbDeviceCard,
@@ -359,6 +361,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::ReadSingleJsonFile
         | TableFunction::ReadText
         | TableFunction::ReadBlob
+        | TableFunction::Glob
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => vec![1],
@@ -411,6 +414,7 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         | TableFunction::ReadSingleJsonFile
         | TableFunction::ReadText
         | TableFunction::ReadBlob
+        | TableFunction::Glob
         | TableFunction::JsonEach
         | TableFunction::JsonTree
         | TableFunction::PragmaTableInfo
