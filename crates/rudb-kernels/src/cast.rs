@@ -1995,7 +1995,7 @@ fn bignum_cast(value: &Value, target: &LogicalType) -> Result<Value> {
 }
 
 /// A cast to or from the `numeric` of PostgreSQL, which works as the casts of `numeric.c` do: a
-/// double goes through its text with 15 digits, and a number goes to an integer rounded half away
+/// double goes through its text with 15 digits and a float with 6, and a number goes to an integer rounded half away
 /// from zero.
 fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
     use rudb_pgtypes::Numeric;
@@ -2030,9 +2030,8 @@ fn numeric_cast(value: &Value, target: &LogicalType) -> Result<Value> {
         &Value::Decimal { unscaled, scale, .. } => {
             Numeric::from_decimal(unscaled, u32::from(scale))
         }
-        Value::Float(_) | Value::Double(_) => {
-            Numeric::from_f64(approximate(value).unwrap_or(f64::NAN))
-        }
+        &Value::Float(number) => Numeric::from_f32(number),
+        &Value::Double(number) => Numeric::from_f64(number),
         Value::BigNum(bytes) => rudb_pgtypes::numeric_in(&bignum::to_text(bytes), -1)?,
         Value::Boolean(_) => return Err(no_cast(value, target)),
         _ => match integral(value) {
