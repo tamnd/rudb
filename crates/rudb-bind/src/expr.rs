@@ -13,9 +13,9 @@
 use rudb_common::{
     CastInput, CastOutput, CharacterTypes, Collations, CommonTypes, ConditionTypes, CountTypes,
     DeclaredType, Error, ErrorTexts, Field, FloatRange, FunctionRules, LogicalType,
-    MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, RegexRules, Result, RowNulls,
-    Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames, UnknownTypes, Value,
-    is_clustering_setting, looks_like_rule, rule_names,
+    MAX_DECIMAL_WIDTH, NumberCasts, NumberLiterals, OperatorRules, RegexRules, Result,
+    RowComparisons, RowNulls, Semantics, Session, SetFunctions, SqlState, StateKey, TypeNames,
+    UnknownTypes, Value, is_clustering_setting, looks_like_rule, rule_names,
 };
 use rudb_functions::{FunctionKind, kind_of, part_type, resolve};
 use rudb_kernels::pgjson::JsonSet;
@@ -1163,6 +1163,45 @@ impl Binder<'_> {
             let last = self.bind_expr(ast, last, scope)?;
             return self.call("->>", vec![picked, last]);
         }
+        if self.semantics.row_comparisons() == RowComparisons::Postgres
+            && let ast::Expr::Row { items } = ast.expr(left)
+            && matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            )
+        {
+            match ast.expr(right) {
+                ast::Expr::Row { items: others } => {
+                    let left = self.bind_row_items(ast, items, scope)?;
+                    let right = self.bind_row_items(ast, others, scope)?;
+                    if left.len() != right.len() {
+                        return Err(Error::binder("unequal number of entries in row expressions")
+                            .state(SqlState::SYNTAX_ERROR));
+                    }
+                    return self.compare_rows(ast, op, &left, &right, scope);
+                }
+                ast::Expr::Subquery { query, array: false } => {
+                    let left = self.bind_row_items(ast, items, scope)?;
+                    let columns = self.bind_row_subquery(ast, query, scope)?;
+                    if left.len() < columns.len() {
+                        return Err(Error::binder("subquery has too many columns")
+                            .state(SqlState::SYNTAX_ERROR));
+                    }
+                    if left.len() > columns.len() {
+                        return Err(Error::binder("subquery has too few columns")
+                            .state(SqlState::SYNTAX_ERROR));
+                    }
+                    let right: Vec<_> = columns.into_iter().map(|column| (right, column)).collect();
+                    return self.compare_rows(ast, op, &left, &right, scope);
+                }
+                _ => {}
+            }
+        }
         let written = [left, right];
         let left = self.bind_expr(ast, left, scope)?;
         let right = self.bind_expr(ast, right, scope)?;
@@ -1170,6 +1209,163 @@ impl Binder<'_> {
         let texts = self.semantics.error_texts() == ErrorTexts::Postgres;
         self.bind_operator(ast, op, written, [left, right], scope).map_err(|error| match texts {
             true => undefined_operator(ast, error, symbol, &written, &types),
+            false => error,
+        })
+    }
+
+    /// The values of a row, each with the expression it was written as. `(r).*` gives a value for
+    /// each field of `r`, all written as the `(r).*`.
+    fn bind_row_items(
+        &mut self,
+        ast: &Ast,
+        items: ast::Slice,
+        scope: &Scope,
+    ) -> Result<Vec<(ast::ExprRef, ExprRef)>> {
+        let written = ast.expr_list(items).to_vec();
+        let mut bound = Vec::with_capacity(written.len());
+        for value in written {
+            match ast.expr(value) {
+                ast::Expr::Fields { record } => bound.extend(
+                    self.bind_fields(ast, record, scope)?
+                        .into_iter()
+                        .map(|(expr, _)| (value, expr)),
+                ),
+                _ => bound.push((value, self.bind_expr(ast, value, scope)?)),
+            }
+        }
+        Ok(bound)
+    }
+
+    /// The columns of the one row of a query that a row is compared with, as PostgreSQL reads
+    /// `ROW(a, b) = (SELECT x, y ...)`. The query is joined once into the outer rows as a scalar
+    /// query is, so it is null when the query has no row and an error when it has more than one.
+    /// A column that is a null with no type is a `text`, as PostgreSQL makes it in a query's
+    /// output.
+    fn bind_row_subquery(
+        &mut self,
+        ast: &Ast,
+        query: ast::QueryRef,
+        outer: &Scope,
+    ) -> Result<Vec<ExprRef>> {
+        let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
+        let projected = self.fresh_index();
+        let mut exprs = Vec::with_capacity(scope.len());
+        let mut names = Vec::with_capacity(scope.len());
+        for column in &scope.columns {
+            let mut expr = self.add_expr(Expr::Column(column.binding), column.ty.clone());
+            if column.ty == LogicalType::Null {
+                expr = self.cast_to(expr, &LogicalType::Varchar);
+            }
+            exprs.push(expr);
+            names.push(self.plan_mut().intern(&column.name));
+        }
+        let columns: Vec<ExprRef> = exprs
+            .iter()
+            .zip(0..)
+            .map(|(&expr, at)| {
+                let ty = self.plan().expr_type(expr).clone();
+                let binding = rudb_plan::ColumnBinding::new(projected, at);
+                self.add_expr(Expr::Column(binding), ty)
+            })
+            .collect();
+        let exprs = self.plan_mut().add_expr_list(&exprs);
+        let names = self.plan_mut().add_name_list(&names);
+        let node = self.add_node(Node::Project { input: node, index: projected, exprs, names });
+        self.scalar_subqueries.push(PendingSubquery {
+            node,
+            kind: rudb_plan::JoinKind::Single,
+            conditions: Vec::new(),
+            dependent: !correlations.is_empty(),
+            reads: correlations,
+            index: projected,
+            inside_aggregate: self.in_aggregate,
+        });
+        Ok(columns)
+    }
+
+    /// Two rows of as many values compared the way PostgreSQL's `make_row_comparison_op` does, a
+    /// pair of values at a time. `=` holds when every pair is equal and `<>` when any pair differs.
+    /// An ordered comparison is decided by the first pair that is not equal, so `(a, b) < (c, d)`
+    /// is `a < c OR (a = c AND b < d)`, and the last pair takes the operator as written, so that
+    /// `<=` holds for equal rows. A null in a pair that decides makes the answer null.
+    fn compare_rows(
+        &mut self,
+        ast: &Ast,
+        op: BinaryOp,
+        left: &[(ast::ExprRef, ExprRef)],
+        right: &[(ast::ExprRef, ExprRef)],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        if left.is_empty() {
+            return Err(Error::binder("cannot compare rows of zero length")
+                .state(SqlState::FEATURE_NOT_SUPPORTED));
+        }
+        let strict = match op {
+            BinaryOp::Lt | BinaryOp::LtEq => BinaryOp::Lt,
+            BinaryOp::Gt | BinaryOp::GtEq => BinaryOp::Gt,
+            _ => op,
+        };
+        let count = left.len();
+        let mut pairs = Vec::with_capacity(count);
+        for (at, (&(written_left, left), &(written_right, right))) in
+            left.iter().zip(right).enumerate()
+        {
+            let last = at + 1 == count;
+            let wanted: &[BinaryOp] = match op {
+                BinaryOp::Eq | BinaryOp::NotEq => &[op],
+                _ if last => &[op],
+                _ => &[strict, BinaryOp::Eq],
+            };
+            let mut tests = Vec::with_capacity(2);
+            for &each in wanted {
+                tests.push(self.compare_pair(
+                    ast,
+                    each,
+                    [written_left, written_right],
+                    [left, right],
+                    scope,
+                )?);
+            }
+            pairs.push(tests);
+        }
+        match op {
+            BinaryOp::Eq => {
+                let tests = pairs.into_iter().flatten().collect();
+                Ok(self.conjunction(ConjunctionOp::And, tests))
+            }
+            BinaryOp::NotEq => {
+                let tests = pairs.into_iter().flatten().collect();
+                Ok(self.conjunction(ConjunctionOp::Or, tests))
+            }
+            _ => {
+                let mut pairs = pairs.into_iter().rev();
+                let mut answer = pairs
+                    .next()
+                    .map(|tests| tests[0])
+                    .ok_or_else(|| Error::internal("a row comparison of no pairs"))?;
+                for tests in pairs {
+                    let tied = self.conjunction(ConjunctionOp::And, vec![tests[1], answer]);
+                    answer = self.conjunction(ConjunctionOp::Or, vec![tests[0], tied]);
+                }
+                Ok(answer)
+            }
+        }
+    }
+
+    /// One pair of a row comparison, with the error PostgreSQL gives when no operator takes the
+    /// two types.
+    fn compare_pair(
+        &mut self,
+        ast: &Ast,
+        op: BinaryOp,
+        written: [ast::ExprRef; 2],
+        [left, right]: [ExprRef; 2],
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let types = [left, right].map(|side| self.plan().expr_type(side).clone());
+        let texts = self.semantics.error_texts() == ErrorTexts::Postgres;
+        self.bind_operator(ast, op, written, [left, right], scope).map_err(|error| match texts {
+            true => undefined_operator(ast, error, op, &written, &types),
             false => error,
         })
     }

@@ -231,6 +231,7 @@ pub struct Semantics {
     window_order: WindowOrder,
     empty_targets: EmptyTargets,
     unread_queries: UnreadQueries,
+    row_comparisons: RowComparisons,
     subscripts: Subscripts,
     collations: Collations,
     single_arrow_lambdas: bool,
@@ -291,6 +292,7 @@ impl Default for Semantics {
             window_order: WindowOrder::Pin,
             empty_targets: EmptyTargets::Pin,
             unread_queries: UnreadQueries::Pin,
+            row_comparisons: RowComparisons::Pin,
             show_behavior: ShowBehavior::Auto,
             subscripts: Subscripts::Pin,
             collations: Collations::Pin,
@@ -504,6 +506,11 @@ impl Semantics {
     #[must_use]
     pub fn unread_queries(self) -> UnreadQueries {
         self.unread_queries
+    }
+    /// How a row written out is compared with another one, or with a query of several columns.
+    #[must_use]
+    pub fn row_comparisons(self) -> RowComparisons {
+        self.row_comparisons
     }
     /// How a subscript and a slice of a list read the list.
     #[must_use]
@@ -1093,6 +1100,21 @@ pub enum UnreadQueries {
     Postgres,
 }
 
+/// How a row written out is compared with another one, as in `ROW(a, b) < ROW(c, d)`, or with a
+/// query of several columns, as in `ROW(a, b) = (SELECT c, d FROM t)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RowComparisons {
+    /// As in DuckDB: the two rows are two struct values, compared as values, and a query has to
+    /// give one column.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the rows are compared a pair of columns at a time, as
+    /// `make_row_comparison_op` in `parse_expr.c` does. `=` is true when each pair is equal, `<>`
+    /// when one pair differs, and an ordered comparison is decided by the first pair that is not
+    /// equal, so a null there makes it null. The columns of the query are the second row.
+    Postgres,
+}
+
 /// How a subscript and a slice of a list read the list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Subscripts {
@@ -1520,6 +1542,7 @@ impl Session {
             self.semantics.window_order = WindowOrder::Postgres;
             self.semantics.empty_targets = EmptyTargets::Postgres;
             self.semantics.unread_queries = UnreadQueries::Postgres;
+            self.semantics.row_comparisons = RowComparisons::Postgres;
             self.semantics.subscripts = Subscripts::Postgres;
             self.semantics.collations = Collations::Postgres;
             self.semantics.regex_rules = RegexRules::Postgres;
