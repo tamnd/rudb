@@ -24,8 +24,8 @@ use rudb_common::{
 };
 use rudb_functions::{
     Columns, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, TYPES_SET, TableFunction,
-    content_files, csv_fields, csv_given, files, is_file, is_pattern, json_text, kind_of,
-    parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
+    content_files, csv_columns, csv_fields, csv_given, files, is_file, is_pattern, json_text,
+    kind_of, parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -4168,7 +4168,15 @@ impl<'a> Binder<'a> {
             }
         }
         self.clause = previous;
-        let options = Options::of(&written_options)?;
+        let options = Options::of(&written_options, called)?;
+        // A `COPY t FROM` with `AUTO_DETECT false` has the table's columns, which are put in later.
+        if options.given.fixed && options.given.types.is_none() && self.copy_into.is_none() {
+            return Err(Error::binder(
+                "read_csv requires columns to be specified through the 'columns' option. Use \
+                 read_csv_auto or set read_csv(..., AUTO_DETECT=TRUE) to automatically guess \
+                 columns.",
+            ));
+        }
 
         // The types are what resolve the call, not the count, because `read_parquet(3)` is a
         // different answer from `read_parquet('3')` and only the types tell them apart.
@@ -4274,7 +4282,9 @@ impl<'a> Binder<'a> {
                         footers.fields
                     }
                 };
-                if options.all_varchar {
+                // Types the call set stay what it set them to, which was measured: `INTEGER`
+                // columns read with `all_varchar=true` as well are still `INTEGER`.
+                if options.all_varchar && options.given.types.is_none() {
                     // The sniffer still ran, because the names come out of the same pass over the
                     // front of the file and only the types are being overruled. The executor reads
                     // the text as VARCHAR because this is the schema it is told to read into, which
@@ -4711,6 +4721,22 @@ impl<'a> Binder<'a> {
         // The JSON readers cast what they are given to the parameter's type themselves, and say
         // so in their own words when it does not cast.
         if function.json().is_some() {
+            return Ok((parameter, value, expr));
+        }
+        if *parameter == "columns" {
+            // The type names are read here, against the catalog, and the plan keeps them written
+            // out as what they came to. See `csv_columns`.
+            let catalog = self.catalog;
+            let mut read = |text: &str| crate::statement::read_type(catalog, text);
+            let (names, types) = csv_columns(&value, &mut read)?;
+            let fields =
+                names.iter().map(|name| Field::new(name.clone(), LogicalType::Varchar)).collect();
+            let written = names.into_iter().zip(types);
+            let value = Value::Struct(
+                written.map(|(name, ty)| (name, Value::Varchar(ty.to_string()))).collect(),
+            );
+            let at = self.plan.add_value(value.clone());
+            let expr = self.plan.add_expr(Expr::Constant(at), LogicalType::Struct(fields));
             return Ok((parameter, value, expr));
         }
         let given = self.plan.expr_type(expr).clone();
@@ -7176,7 +7202,7 @@ impl Options {
     /// function takes and the value is already the type it wants. What is left is reading them, and
     /// the last one written wins, which is DuckDB's answer to `delim='|', delim=','` and was
     /// measured rather than assumed.
-    fn of(written: &[(&'static str, Value, ExprRef)]) -> Result<Self> {
+    fn of(written: &[(&'static str, Value, ExprRef)], function: TableFunction) -> Result<Self> {
         let mut options = Self::default();
         for (parameter, value, _) in written {
             match (*parameter, value) {
@@ -7186,9 +7212,12 @@ impl Options {
                 _ => {}
             }
         }
-        let named: Vec<(&str, Value)> =
-            written.iter().map(|(parameter, value, _)| (*parameter, value.clone())).collect();
-        options.given = csv_given(&named)?;
+        // Only `read_csv`'s, since `read_json` has an `auto_detect` and a `columns` of its own.
+        if function == TableFunction::ReadCsv {
+            let named: Vec<(&str, Value)> =
+                written.iter().map(|(parameter, value, _)| (*parameter, value.clone())).collect();
+            options.given = csv_given(&named)?;
+        }
         Ok(options)
     }
 }
@@ -7485,7 +7514,10 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         return format!("Cannot use NULL as argument to key \"{parameter}\"");
     }
     match parameter {
-        "header" => format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)"),
+        "header" | "auto_detect" => {
+            format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
+        }
+        "columns" => format!("{} columns requires a struct as input", function.name()),
         "all_varchar" => format!("{} \"{parameter}\" cannot be NULL", function.name()),
         _ => format!("Cannot use NULL as argument to \"{parameter}\""),
     }

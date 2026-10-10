@@ -131,16 +131,28 @@ impl Reader {
         reader.fill(0)?;
         let sample = reader.buffer.clone();
         let given = &reader.given;
-        let quote = given.quote.or_else(|| dialect::quote(&sample));
-        let delimiter = match given.delimiter {
-            Some(byte) => byte,
-            None => dialect::delimiter(&sample, quote)?,
+        let (quote, delimiter, told) = if given.fixed {
+            (
+                given.quote.or(Some(b'"')),
+                given.delimiter.unwrap_or(b','),
+                given.header.or(Some(false)),
+            )
+        } else {
+            let quote = given.quote.or_else(|| dialect::quote(&sample));
+            let delimiter = match given.delimiter {
+                Some(byte) => byte,
+                None => dialect::delimiter(&sample, quote)?,
+            };
+            (quote, delimiter, given.header)
         };
         let escape = given.escape.or(quote);
-        let told = given.header;
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
         let rows = reader.sample_rows(&sample)?;
-        let (header, mut fields) = describe(&rows, told);
+        let (header, mut fields) = describe(&rows, told, reader.given.types.as_deref());
+        if let Some(types) = &reader.given.types {
+            let width = rows.iter().map(Vec::len).max().unwrap_or(types.len());
+            reader.set_widths(&rows, header, width, types.len())?;
+        }
         if let Some(names) = &reader.given.names {
             if names.len() > fields.len() {
                 return Err(Error::invalid_input(format!(
@@ -162,6 +174,73 @@ impl Reader {
             reader.skip_record()?;
         }
         Ok(reader)
+    }
+
+    /// Refuses a file that does not have as many columns as the call set types for.
+    ///
+    /// A file that was sniffed is turned away with the line of the pin's sniffer error that says
+    /// so, and the rest of that error is a list of fixes for a sniffer this one is not. A file that
+    /// was not sniffed has nothing to say about its width but its rows, so the first row in the
+    /// sample that is too short or too long is the error, worded as the pin words it.
+    ///
+    /// The pin converts a row as it splits it, so a value that does not fit its column ahead of
+    /// where the row ran out is the error rather than the width. That row is left for the read to
+    /// refuse, which it does with the conversion error the pin gives. Measured on
+    /// `v2.0.0-dev84237`: `1,2` read as two `INTEGER` columns with `delim=';'` and
+    /// `auto_detect=false` fails to convert `1,2`, and `1,x` read as `INTEGER, VARCHAR, INTEGER`
+    /// expects three columns and found two.
+    fn set_widths(
+        &self,
+        rows: &[Vec<Option<String>>],
+        header: bool,
+        found: usize,
+        set: usize,
+    ) -> Result<()> {
+        if !self.given.fixed {
+            if found == set {
+                return Ok(());
+            }
+            let names = self.given.names.as_deref().unwrap_or_default();
+            let types = self.given.types.as_deref().unwrap_or_default();
+            let columns: Vec<String> =
+                names.iter().zip(types).map(|(name, ty)| format!("'{name}' : '{ty}'")).collect();
+            return Err(Error::invalid_input(format!(
+                "Error when sniffing file \"{}\".\nIt was not possible to automatically detect the \
+                 CSV parsing dialect\n* Columns are set as: \"columns = {{ {}}}\", and they \
+                 contain: {set} columns. It does not match the number of columns found by the \
+                 sniffer: {found}. Verify the columns parameter is correctly set.",
+                self.path,
+                columns.join(", "),
+            )));
+        }
+        let types = self.given.types.as_deref().unwrap_or_default();
+        let fits = |row: &[Option<String>]| {
+            row.iter().zip(types).all(|(cell, ty)| match cell {
+                Some(text) => infer::fits(text, ty),
+                None => true,
+            })
+        };
+        let skipped = usize::from(header);
+        let Some((at, row)) =
+            rows.iter().enumerate().skip(skipped).find(|(_, row)| row.len() != set || !fits(row))
+        else {
+            return Ok(());
+        };
+        if !fits(row) {
+            return Ok(());
+        }
+        let written: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
+        Err(Error::invalid_input(format!(
+            "CSV Error on Line: {}\nOriginal Line: {}\nExpected Number of Columns: {set} Found: \
+             {}\nPossible fixes:\n* Disable the parser's strict mode (strict_mode=false) to allow \
+             reading rows that do not comply with the CSV standard.\n* Enable null padding \
+             (null_padding=true) to replace missing values with NULL\n* Enable ignore errors \
+             (ignore_errors=true) to skip this row\n\n  file = {}\n",
+            at + 1,
+            written.join(&char::from(self.dialect.delimiter).to_string()),
+            row.len(),
+            self.path,
+        )))
     }
 
     /// The columns this reader will produce, in order.
@@ -634,9 +713,20 @@ impl Reader {
 /// `told` is the caller answering the question instead, which is `header=true` or `header=false` on
 /// the call. It decides the names and the types as well as the row count, since a first row that is
 /// data is a row the types have to fit and a first row that is a header is not.
-fn describe(rows: &[Vec<Option<String>>], told: Option<bool>) -> (bool, Vec<Field>) {
+///
+/// `set` is the types the call gave its columns, which the question is then asked against rather
+/// than against what the rest of the sample looks like, and which are the types that come back.
+/// The question is asked of one row as well then, since the types no longer come from the rest.
+fn describe(
+    rows: &[Vec<Option<String>>],
+    told: Option<bool>,
+    set: Option<&[LogicalType]>,
+) -> (bool, Vec<Field>) {
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let body = types(&rows[1.min(rows.len())..], width);
+    let body = match set {
+        Some(set) => set.to_vec(),
+        None => types(&rows[1.min(rows.len())..], width),
+    };
     let all_text = body.iter().all(|ty| *ty == LogicalType::Varchar);
     let first_fits = rows.first().is_some_and(|first| {
         first.iter().zip(&body).all(|(text, ty)| match text {
@@ -645,9 +735,15 @@ fn describe(rows: &[Vec<Option<String>>], told: Option<bool>) -> (bool, Vec<Fiel
         })
     });
     // An empty file has no row to take names from, so it has no header whatever it was told.
-    let header = !rows.is_empty() && told.unwrap_or(rows.len() > 1 && (all_text || !first_fits));
+    // A single row is a header too once the call set the types, which was measured: `1,2` alone
+    // read as two `VARCHAR` columns comes back with no rows.
+    let enough = rows.len() > 1 || set.is_some();
+    let header = !rows.is_empty() && told.unwrap_or(enough && (all_text || !first_fits));
     if !header {
-        let types = types(rows, width);
+        let types = match set {
+            Some(set) => set.to_vec(),
+            None => types(rows, width),
+        };
         let fields = types
             .into_iter()
             .enumerate()
