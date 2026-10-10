@@ -90,11 +90,11 @@ pub(crate) struct Local {
 /// The counts, one array of cells for the rows and the sums and one per call that counts values,
 /// each over `width + 2` places.
 ///
-/// A place's row count and its sums sit together, `stride` cells to a place, the count first and
-/// then each sum as its low and its high half. A chunk's rows land at places all over the range, so
-/// every add is a miss, and with the rows in one array and each sum in another a row of q10 missed
-/// twice, once for its count and once for its sum. The stride is a power of two, so a place never
-/// straddles two lines and the second add finds the line the first one brought in.
+/// A place's row count and its sums sit together, `1 << shift` cells to a place, the count first
+/// and then each sum as its low and its high half. A chunk's rows land at places all over the
+/// range, so every add is a miss, and with the rows in one array and each sum in another a row of
+/// q10 missed twice, once for its count and once for its sum. A place is a power of two cells, so
+/// it never straddles two lines and the second add finds the line the first one brought in.
 ///
 /// A call that counts values keeps the nulls it saw rather than the values, and its array is empty
 /// until the first null comes, so a column with none costs no array and no pass at all.
@@ -105,7 +105,7 @@ pub(crate) struct Local {
 #[derive(Debug)]
 struct Tallies {
     cells: Vec<i64>,
-    stride: usize,
+    shift: u32,
     sums: usize,
     nulls: Vec<Vec<i64>>,
     outside: HashMap<i64, Vec<(i64, i128)>>,
@@ -118,7 +118,7 @@ impl Tallies {
         let stride = (1 + 2 * sums).next_power_of_two();
         Self {
             cells: vec![0; (width + 2) * stride],
-            stride,
+            shift: stride.trailing_zeros(),
             sums,
             nulls: vec![Vec::new(); valid],
             outside: HashMap::new(),
@@ -131,12 +131,12 @@ impl Tallies {
 
     /// The rows counted at `place`.
     fn rows(&self, place: usize) -> i64 {
-        self.cells[place * self.stride]
+        self.cells[place << self.shift]
     }
 
     /// The total of sum `sum` at `place`.
     fn sum(&self, sum: usize, place: usize) -> i128 {
-        let at = place * self.stride + 1 + 2 * sum;
+        let at = (place << self.shift) + 1 + 2 * sum;
         joined(self.cells[at], self.cells[at + 1])
     }
 
@@ -146,7 +146,7 @@ impl Tallies {
     }
 
     fn add(&mut self, other: Self) -> Result<()> {
-        let stride = self.stride;
+        let stride = 1 << self.shift;
         let places = self.cells.chunks_exact_mut(stride).zip(other.cells.chunks_exact(stride));
         for (into, from) in places {
             into[0] += from[0];
@@ -154,7 +154,7 @@ impl Tallies {
                 let total = joined(into[at], into[at + 1])
                     .checked_add(joined(from[at], from[at + 1]))
                     .ok_or_else(overflowed)?;
-                split(total, &mut into[at..at + 2]);
+                (into[at], into[at + 1]) = halves(total);
             }
         }
         for (into, from) in self.nulls.iter_mut().zip(other.nulls) {
@@ -255,9 +255,9 @@ impl Exchange {
                 }
             }
         }
-        let stride = tallies.stride;
+        let shift = tallies.shift;
         for &place in places.iter() {
-            tallies.cells[place as usize * stride] += 1;
+            tallies.cells[(place as usize) << shift] += 1;
         }
         for (lane, argument) in self.lanes.iter().zip(arguments) {
             let Some(nulls) = lane.nulls else { continue };
@@ -266,12 +266,15 @@ impl Exchange {
             if let Some(sum) = lane.sum {
                 let (cells, at) = (&mut tallies.cells, 1 + 2 * sum);
                 if argument.logical_type().physical() == PhysicalType::Int128 {
-                    wide_sum(argument, rows, places, cells, stride, at)?;
+                    wide_sum(argument, rows, places, cells, shift, at)?;
                 } else {
                     read.read(rows, argument)?;
                     for (&place, &value) in places.iter().zip(read.cut(rows)?) {
-                        let total = &mut cells[place as usize * stride + at..][..2];
-                        split(joined(total[0], total[1]) + i128::from(value), total);
+                        let cell = ((place as usize) << shift) + at;
+                        let Some([low, high]) = cells.get_mut(cell..cell + 2) else {
+                            return Err(past_cells());
+                        };
+                        (*low, *high) = halves(joined(*low, *high) + i128::from(value));
                     }
                 }
             }
@@ -290,7 +293,7 @@ impl Exchange {
         }
         // The rows the range did not cover, which should be none, counted again by their value.
         if tallies.rows(outside) != 0 {
-            tallies.cells[outside * stride] = 0;
+            tallies.cells[outside << shift] = 0;
             for (row, &place) in places.iter().enumerate() {
                 if place as usize != outside {
                     continue;
@@ -450,7 +453,7 @@ impl Out {
 }
 
 /// Adds a column of 128 bit values into the sums at their places, checking every add. Each place's
-/// total is the two cells `at` into its `stride`.
+/// total is the two cells `at` into its `1 << shift`.
 ///
 /// A flat column with no nulls is read as the slice it is. Any other form is asked a row at a time,
 /// where a null answers nothing and adds nothing.
@@ -459,12 +462,13 @@ fn wide_sum(
     rows: usize,
     places: &[u32],
     cells: &mut [i64],
-    stride: usize,
+    shift: u32,
     at: usize,
 ) -> Result<()> {
     let mut add = |place: u32, value: i128| {
-        let total = &mut cells[place as usize * stride + at..][..2];
-        split(joined(total[0], total[1]).checked_add(value).ok_or_else(overflowed)?, total);
+        let cell = ((place as usize) << shift) + at;
+        let Some([low, high]) = cells.get_mut(cell..cell + 2) else { return Err(past_cells()) };
+        (*low, *high) = halves(joined(*low, *high).checked_add(value).ok_or_else(overflowed)?);
         Ok::<_, Error>(())
     };
     if let (Some(Data::Int128(values)), true) = (argument.data(), argument.none_null()) {
@@ -494,11 +498,14 @@ fn joined(low: i64, high: i64) -> i128 {
     i128::from(high) << 64 | i128::from(low as u64)
 }
 
-/// `total` written into the two cells of `into`, the low half first.
+/// The two cells that hold `total`, the low half first.
 #[expect(clippy::cast_possible_truncation, reason = "each half is 64 of its bits")]
-fn split(total: i128, into: &mut [i64]) {
-    into[0] = total as i64;
-    into[1] = (total >> 64) as i64;
+fn halves(total: i128) -> (i64, i64) {
+    (total as i64, (total >> 64) as i64)
+}
+
+fn past_cells() -> Error {
+    Error::internal("a ranged place is past the cells")
 }
 
 fn overflowed() -> Error {
