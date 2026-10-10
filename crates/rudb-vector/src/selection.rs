@@ -182,9 +182,7 @@ impl Selection {
     /// The positions, in order.
     #[must_use]
     pub fn indices(&self) -> &[u32] {
-        self.list.get_or_init(|| {
-            self.mask.as_deref().map_or_else(Vec::new, listed)
-        })
+        self.list.get_or_init(|| self.mask.as_deref().map_or_else(Vec::new, listed))
     }
 
     /// The positions as `usize`, in order.
