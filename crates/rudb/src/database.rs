@@ -7149,14 +7149,7 @@ impl Shared {
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 let result = run(sql, &copy.plan, &catalog, cancel, under)?;
                 let zone = session.session_time_zone();
-                let rows = if copy.parquet {
-                    crate::export::write_parquet(&copy, &result)?
-                } else if copy.json {
-                    crate::export::write_json(&copy, &result, zone)?
-                } else {
-                    crate::export::write_csv(&copy, &result, zone)?
-                };
-                QueryResult::changed(rows)
+                QueryResult::changed(crate::export::write(&copy, &result, zone)?)
             }
             Bound::Setting(setting)
                 if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>
