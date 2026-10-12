@@ -8,10 +8,11 @@
 //! fault that maps them, and the kernel maps sixteen pages per fault around the one touched.
 //!
 //! The mapping covers the file as long as it was when it was opened. The caller promises that the
-//! bytes it asks for are never rewritten in place and that the file is never cut shorter than the
-//! mapping while it is held. The native format keeps both: a committed page is never written again,
-//! a rewrite goes to a new file that is renamed over the old one, and nothing truncates. The header
-//! slots are written in place, so those are read with a positional read and not through here.
+//! bytes it asks for are never rewritten in place while it is held and that the file is never cut
+//! shorter than the mapping. The native format keeps both: a page is written again only once it is
+//! on the free list and no open reader's generation can reach it, a rewrite goes to a new file that
+//! is renamed over the old one, and nothing truncates. The header slots are written in place, so
+//! those are read with a positional read and not through here.
 //!
 //! Where a mapping cannot be made, [`Mapped::open`] says so with `None` and the caller reads the way
 //! it did before. That is every platform that is not unix, and an empty file.

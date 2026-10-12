@@ -233,10 +233,11 @@ fn a_checkpoint_of_a_grown_table_writes_only_the_rows_since() {
         )
         .expect("appends");
     second.execute("CHECKPOINT").expect("extends");
-    // Everything past the header slots is where it was, and what the checkpoint wrote is on the
-    // end. A rewrite would have renamed a new file over this one.
+    // Everything past the header slots is where it was but for the runs the file had freed, which
+    // a commit writes into before the end. A rewrite would have written the stripes again.
     let after = std::fs::read(&path).expect("the file");
-    assert_eq!(after[80..size], before[80..], "the stripes the file had were written again");
+    let changed = after[80..size].iter().zip(&before[80..]).filter(|(a, b)| a != b).count();
+    assert!(changed * 20 < size, "the stripes the file had were written again: {changed} bytes");
     let grown = after.len() - size;
     assert!(grown * 20 < size, "a checkpoint of three rows wrote {grown} bytes of a {size} file");
     check(&second, 0);
