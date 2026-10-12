@@ -10,6 +10,16 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.10
+
+In the PostgreSQL dialect, #3033 chooses and applies the offset of a RANGE frame as PostgreSQL does, over numbers, dates, times and intervals. #3034 reads a `timetz` literal and a zone name in date and time input. #3036 reads the delimiter of `string_agg` on each row, leaves out the first one, and joins `bytea` values. #3037 lets a query call `float8_accum`, `float8_combine`, `float8_regr_accum` and `float8_regr_combine` directly, with the same arrays and the same errors as PostgreSQL. #3038 lets an ON CONFLICT DO UPDATE hold a subquery in a value or in its condition.
+
+For the pin, #3032 writes the column statistics, the encoding stats, the column orders and the key and value metadata of a parquet file the way the pin does.
+
+On the engine side, #3035 passes over a foreign key of a temporary table when a checkpoint builds the links.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.9
 
 For the pin, #2988 reads the `columns` and `auto_detect` parameters of `read_csv`, #2989 the `types`, `dtypes` and `column_types` parameters, and #2991 `skip`. #2990 refuses a CSV line longer than `max_line_size` or `buffer_size`, and #2992 takes `null_padding`. #2993 reads hive partitions and the `filename` option in `read_csv` and `read_parquet`, and #2994 adds the `glob` table function. #2995 writes `COPY TO` with `PARTITION_BY` as hive partitioned directories, #2996 rotates its files by `FILE_SIZE_BYTES` and `ROW_GROUPS_PER_FILE`, and #2998 and #2999 answer it with `RETURN_FILES` and `RETURN_STATS`. #3029 adds `parquet_metadata`, `parquet_schema`, `parquet_kv_metadata` and `parquet_file_metadata`.
