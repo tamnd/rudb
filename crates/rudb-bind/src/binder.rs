@@ -823,14 +823,14 @@ impl<'a> Binder<'a> {
 
     fn bind_query_inner(&mut self, ast: &Ast, query: ast::QueryRef) -> Result<(NodeRef, Scope)> {
         let written = ast.query(query);
-        if written.ctes.is_empty() {
+        if written.ctes.is_empty() && ast.defined_in(query).next().is_none() {
             return self.bind_body(ast, &written);
         }
         // The names a query introduces are gone again once it is bound, and they go whether the
         // binding worked or not, which is why the stack is cut back here rather than at the end of
         // the call that pushed onto it.
         let depth = self.materialized.len();
-        let result = self.bind_materialized(ast, &written);
+        let result = self.bind_materialized(ast, query, &written);
         self.materialized.truncate(depth);
         result
     }
@@ -840,15 +840,25 @@ impl<'a> Binder<'a> {
     /// The definitions are bound first and in the order they were written, so that a later one can
     /// read an earlier one, and then the body. The wrapping runs backwards so that the first
     /// definition ends up outermost, which is the order they have to be filled in.
-    fn bind_materialized(&mut self, ast: &Ast, written: &ast::Query) -> Result<(NodeRef, Scope)> {
+    ///
+    /// The PostgreSQL grammar also reads each definition that is not held where it is written,
+    /// in between the held ones, see [`Self::analyze_definitions`].
+    fn bind_materialized(
+        &mut self,
+        ast: &Ast,
+        query: ast::QueryRef,
+        written: &ast::Query,
+    ) -> Result<(NodeRef, Scope)> {
         let depth = self.materialized.len();
         // A parameter of no type in a definition is a `text`, whatever the body keeps.
         let unknowns_kept = std::mem::replace(&mut self.unknowns_kept, false);
         let held = ast.cte_list(written.ctes).to_vec();
         let mut definitions = Vec::with_capacity(held.len());
-        for &index in &held {
+        for (at, &index) in held.iter().enumerate() {
+            self.analyze_definitions(ast, query, at)?;
             definitions.push(self.bind_definition(ast, index)?);
         }
+        self.analyze_definitions(ast, query, held.len())?;
         self.unknowns_kept = unknowns_kept;
         let (mut node, scope) = self.bind_body(ast, written)?;
         for (at, definition) in definitions.into_iter().enumerate().rev() {
@@ -864,6 +874,64 @@ impl<'a> Binder<'a> {
         Ok((node, scope))
     }
 
+    /// Binds the definitions of the PostgreSQL grammar that the query `owner` does not hold and
+    /// that come after `after` of the ones it holds, as `analyzeCTE` in `parse_cte.c` reads each
+    /// definition where it is written. A definition that is put into the places that read it is
+    /// bound there again, and one that nothing reads is bound only here, so that an error in it is
+    /// still found. What is bound here is dropped.
+    fn analyze_definitions(&mut self, ast: &Ast, owner: ast::QueryRef, after: usize) -> Result<()> {
+        let analyzed: Vec<ast::Defined> = ast
+            .defined_in(owner)
+            .filter(|defined| !defined.held && defined.after as usize == after)
+            .copied()
+            .collect();
+        for defined in analyzed {
+            if defined.cte != NONE && ast.cte(defined.cte).recursive {
+                let depth = self.materialized.len();
+                let bound = self.bind_recursive(ast, defined.cte);
+                self.materialized.truncate(depth);
+                bound?;
+                continue;
+            }
+            let (_, mut scope) = self.bind_query(ast, defined.query)?;
+            let name = ast.string(defined.name);
+            self.declare_columns(ast, defined.columns, name, Some(defined.span), &mut scope)?;
+        }
+        Ok(())
+    }
+
+    /// Puts the column list of a `WITH` definition on the columns of its query.
+    ///
+    /// PostgreSQL refuses a list with more names than there are columns, at the name of the
+    /// definition, which is `written` when its grammar wrote the definition. The pin takes no
+    /// more names than there are columns and ignores the rest, see [`Scope::rename_prefix`].
+    fn declare_columns(
+        &self,
+        ast: &Ast,
+        columns: ast::Slice,
+        name: &str,
+        written: Option<Span>,
+        scope: &mut Scope,
+    ) -> Result<()> {
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = ast.name(columns).collect();
+        if let Some(span) = written
+            && names.len() > scope.len()
+        {
+            return Err(Error::binder(format!(
+                "WITH query \"{name}\" has {} columns available but {} columns specified",
+                scope.len(),
+                names.len()
+            ))
+            .state(SqlState::INVALID_COLUMN_REFERENCE)
+            .with_span(span));
+        }
+        scope.rename_prefix(&names);
+        Ok(())
+    }
+
     /// Binds one materialised `WITH` definition and makes its name readable from there on.
     ///
     /// The definition is projected onto exactly the columns a read of it sees, under the names the
@@ -871,8 +939,10 @@ impl<'a> Binder<'a> {
     /// what a read gets back, so the held rows have to be the rows of the definition's own select
     /// list and nothing it happened to carry along underneath.
     ///
-    /// A column list with more names in it than the definition has columns is not an error here,
-    /// which is the pinned build's rule and is written out on [`Scope::rename_prefix`].
+    /// A column list with more names in it than the definition has columns is not an error here
+    /// under the DuckDB grammar, which is the pinned build's rule and is written out on
+    /// [`Scope::rename_prefix`]. It is one under the PostgreSQL grammar, see
+    /// [`Self::declare_columns`].
     fn bind_definition(&mut self, ast: &Ast, index: u32) -> Result<NodeRef> {
         let held = ast.cte(index);
         if held.recursive {
@@ -884,10 +954,7 @@ impl<'a> Binder<'a> {
         } else {
             self.bind_query(ast, held.query)?
         };
-        if !held.columns.is_empty() {
-            let names: Vec<&str> = ast.name(held.columns).collect();
-            scope.rename_prefix(&names);
-        }
+        self.declare_columns(ast, held.columns, &name, ast.defined_at(index), &mut scope)?;
         let table = self.fresh_index();
         let mut exprs = Vec::with_capacity(scope.len());
         let mut names = Vec::with_capacity(scope.len());
@@ -1005,10 +1072,7 @@ impl<'a> Binder<'a> {
             None => None,
         };
         let (anchor, mut scope) = self.bind_query(ast, left)?;
-        if !held.columns.is_empty() {
-            let names: Vec<&str> = ast.name(held.columns).collect();
-            scope.rename_prefix(&names);
-        }
+        self.declare_columns(ast, held.columns, &name, ast.defined_at(index), &mut scope)?;
         let fields = scope.fields();
         let width = fields.len();
         let (anchor, over) = self.project_onto(anchor, &scope, &fields, &name)?;

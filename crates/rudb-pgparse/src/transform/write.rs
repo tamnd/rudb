@@ -70,6 +70,7 @@ impl Transform<'_> {
                 recursive: true,
                 reads: Vec::new(),
                 dml: None,
+                span: at,
             });
         }
         let reads = self.self_reads.len();
@@ -113,6 +114,7 @@ impl Transform<'_> {
             recursive: false,
             reads: Vec::new(),
             dml: Some(statement),
+            span: at,
         })
     }
 
@@ -132,9 +134,11 @@ impl Transform<'_> {
             self.with_clause(with)?;
         }
         let made = build(self);
-        let once = self.settle(mark);
+        let (once, defined) = self.settle(mark);
         let statement = made?;
         self.ast.carry_definitions(statement, &once);
+        let owner = self.ast.carrier(statement);
+        self.own(owner, defined);
         Ok(statement)
     }
 
