@@ -8451,3 +8451,33 @@ fn a_recursive_definition_keeps_the_types_of_its_non_recursive_term() {
     }
     server.stop().unwrap();
 }
+
+/// An array of rows takes a row with `||` on either side, as `array_append` and `array_prepend`
+/// of PostgreSQL over `record[]` and `record`. A recursive definition keeps the path of the rows it
+/// went through this way.
+#[test]
+fn an_array_of_rows_takes_a_row_with_the_concatenation_operator() {
+    let dirs = Dirs::new("pgrecordarrays");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, expected) in [
+        ("select array[row(1,2)] || row(3,4)", r#"{"(1,2)","(3,4)"}"#),
+        ("select row(3,4) || array[row(1,2)]", r#"{"(3,4)","(1,2)"}"#),
+        ("select array[row(1,'a')] || row(2,'b')", r#"{"(1,a)","(2,b)"}"#),
+        ("select array[row(1,2)] || null", r#"{"(1,2)"}"#),
+        ("select (array[row(1,2)] || row(3,4))[2]", "(3,4)"),
+        ("select pg_typeof(array[row(1,2)] || row(3,4))", "record[]"),
+        (
+            "with recursive walk(f, t, is_cycle, path) as (select 1, 2, false, \
+             array[row(1, 2)] union all select w.t, w.t % 2 + 1, row(w.t, w.t % 2 + 1) = \
+             any(path), path || row(w.t, w.t % 2 + 1) from walk w where not is_cycle) \
+             select string_agg(is_cycle || ' ' || path::text, ' ' order by cardinality(path)) \
+             from walk",
+            r#"false {"(1,2)"} false {"(1,2)","(2,1)"} true {"(1,2)","(2,1)","(1,2)"}"#,
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
