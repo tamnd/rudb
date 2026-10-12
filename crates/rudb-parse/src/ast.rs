@@ -1973,6 +1973,11 @@ pub struct Ast {
     /// The function sources written `WITH ORDINALITY`, which have one more column that numbers
     /// their rows from 1. Kept to one side because few sources have it.
     pub ordinal_sources: Vec<SourceRef>,
+    /// The tables of the PostgreSQL grammar whose name is the name of a `WITH` definition that the
+    /// place they are written at cannot read: one of a `WITH` without `RECURSIVE` that is being
+    /// read or comes after it. When there is no table of the name either, the error says why the
+    /// definition is not read. DuckDB has no such error, so its grammar has none of these.
+    pub future_sources: Vec<SourceRef>,
     /// The sources in `FROM` that the PostgreSQL grammar closed to the entries to their left, each
     /// with the reason. In DuckDB every entry can read them, so its grammar has none of these.
     pub closed_sources: Vec<(SourceRef, Closed)>,
@@ -2253,6 +2258,12 @@ impl Ast {
             }
             None => self.closed_sources.push((source, reason)),
         }
+    }
+
+    /// Whether a table has the name of a `WITH` definition that it cannot read, see
+    /// [`Ast::future_sources`].
+    pub fn names_future_definition(&self, source: SourceRef) -> bool {
+        self.future_sources.contains(&source)
     }
 
     /// Whether a function source was written `WITH ORDINALITY`.

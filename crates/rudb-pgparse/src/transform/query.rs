@@ -8,6 +8,7 @@ use rudb_parse::ast::{
     WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 
+use super::depend::ordered;
 use super::{Definition, Made, Refused, Transform, clause, not_yet};
 use crate::nodes::{
     Alias, CTEMaterialize, CommonTableExpr, FRAMEOPTION_BETWEEN, FRAMEOPTION_DEFAULTS,
@@ -237,54 +238,75 @@ impl Transform<'_> {
     // `WITH`.
 
     /// The definitions of a `WITH`, put in scope for the rest of the query.
+    ///
+    /// The definitions of a `WITH RECURSIVE` are read in the order of [`ordered`], so that each one
+    /// is read after the ones it reads, as `transformWithClause` does.
     pub(super) fn with_clause(&mut self, with: &WithClause) -> Made<()> {
-        let mark = self.scope.len();
+        let mut ctes = Vec::with_capacity(with.ctes.len());
         for node in with.ctes.iter().flatten() {
             let Node::CommonTableExpr(cte) = node else {
                 return Err(not_yet(node));
             };
-            let name = cte.ctename.as_deref().unwrap_or_default();
-            if self.scope[mark..].iter().any(|defined| defined.name == name) {
+            ctes.push(&**cte);
+        }
+        // A name defined twice is refused at the later one before any query is read, in the order
+        // that PostgreSQL compares them in.
+        for (at, cte) in ctes.iter().enumerate() {
+            if let Some(again) = ctes[at + 1..].iter().find(|later| later.ctename == cte.ctename) {
+                let name = again.ctename.as_deref().unwrap_or_default();
                 return Err(Error::parser(format!(
                     "WITH query name \"{name}\" specified more than once"
                 ))
                 .state(SqlState::DUPLICATE_ALIAS)
-                .with_span(self.at(cte.location))
+                .with_span(self.at(again.location))
                 .into());
             }
+        }
+        if with.recursive {
+            ctes = match ordered(ctes) {
+                Ok(ctes) => ctes,
+                Err(cte) => {
+                    return Err(Error::parser(
+                        "mutual recursion between WITH items is not implemented",
+                    )
+                    .state(SqlState::FEATURE_NOT_SUPPORTED)
+                    .with_span(self.at(cte.location))
+                    .into());
+                }
+            };
+        } else {
+            let names = ctes.iter().rev().map(|cte| cte.ctename.as_deref().unwrap_or_default());
+            self.future.extend(names.map(str::to_string));
+        }
+        for cte in ctes {
+            let name = cte.ctename.as_deref().unwrap_or_default();
             if !with.recursive && (cte.search_clause.is_some() || cte.cycle_clause.is_some()) {
                 return Err(self.not_recursive(cte));
             }
-            let select = match &cte.ctequery {
-                Some(Node::SelectStmt(select)) => select,
-                Some(
-                    written @ (Node::InsertStmt(_) | Node::UpdateStmt(_) | Node::DeleteStmt(_)),
-                ) => {
-                    let declared = self.names(&cte.aliascolnames)?;
-                    let definition =
-                        self.written_definition(cte, written, declared, with.recursive)?;
-                    self.scope.push(definition);
-                    continue;
-                }
-                Some(node) => return Err(not_yet(node)),
-                None => return clause("CommonTableExpr"),
-            };
             let declared = self.names(&cte.aliascolnames)?;
-            let definition = if with.recursive {
-                self.recursive_definition(cte, select, declared)?
-            } else {
-                let query = self.query(select)?;
-                Definition {
+            let definition = match &cte.ctequery {
+                Some(Node::SelectStmt(select)) if with.recursive => {
+                    self.recursive_definition(cte, select, declared)?
+                }
+                Some(Node::SelectStmt(select)) => Definition {
                     name: name.to_string(),
                     declared,
                     materialized: cte.ctematerialized,
-                    query,
+                    query: self.query(select)?,
                     slot: NONE,
                     recursive: false,
                     reads: Vec::new(),
                     dml: None,
-                }
+                },
+                Some(
+                    written @ (Node::InsertStmt(_) | Node::UpdateStmt(_) | Node::DeleteStmt(_)),
+                ) => self.written_definition(cte, written, declared, with.recursive)?,
+                Some(node) => return Err(not_yet(node)),
+                None => return clause("CommonTableExpr"),
             };
+            if !with.recursive {
+                self.future.pop();
+            }
             self.scope.push(definition);
         }
         Ok(())
@@ -622,9 +644,15 @@ impl Transform<'_> {
             self.scope[at].reads.push((source, alias, columns));
             return Ok(source);
         }
+        let future = table.schemaname.is_none()
+            && table.relname.as_deref().is_some_and(|name| self.future.iter().any(|n| n == name));
         let parts: Vec<u32> = parts.into_iter().map(|part| self.intern(part)).collect();
         let name = self.ast.part_slice(parts);
-        Ok(self.ast.push_source(Source::Table { name, alias, columns }, span))
+        let source = self.ast.push_source(Source::Table { name, alias, columns }, span);
+        if future {
+            self.ast.future_sources.push(source);
+        }
+        Ok(source)
     }
 
     fn join(&mut self, join: &JoinExpr) -> Made<SourceRef> {

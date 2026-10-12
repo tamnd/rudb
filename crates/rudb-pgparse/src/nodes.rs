@@ -10,6 +10,8 @@
 //! raw parse tree of each statement when `debug_print_raw_parse` is on, so a test can compare the
 //! tree of this parser with the tree of PostgreSQL for the same statement.
 
+use std::any::Any;
+
 pub use crate::generated::nodes::*;
 
 /// The text of a `char *` field.
@@ -74,6 +76,28 @@ pub trait NodeType: Out + Sized {
 
     /// The node as this type, or `None`.
     fn peek_mut(node: &mut Node) -> Option<&mut Self>;
+}
+
+/// A node type whose fields hold other nodes, which a walk goes through as
+/// `raw_expression_tree_walker` of `nodeFuncs.c` does.
+///
+/// The walk does not go down by itself. The function that `visit` calls goes on with the
+/// [`Walk::walk`] of the node it is given, or does not, as a walker of PostgreSQL calls
+/// `raw_expression_tree_walker` or returns.
+pub trait Walk: Any {
+    /// Calls `visit` on each node that a field holds, in the order of the fields: the node of a
+    /// `Node *` field, each node of a `List *` field and the node that a field of a node type
+    /// points to. A node of `value.h` holds no node and is not visited. A node type that is the
+    /// first field of another is not visited, but the nodes that its fields hold are.
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk));
+}
+
+impl dyn Walk {
+    /// The node as this type, or `None`, as `IsA` tells.
+    #[must_use]
+    pub fn peek<T: Walk>(&self) -> Option<&T> {
+        (self as &dyn Any).downcast_ref()
+    }
 }
 
 impl Node {
@@ -153,7 +177,7 @@ impl Out for BoolExpr {
 pub(crate) mod w {
     use std::fmt::Display;
 
-    use super::{List, Node, Out};
+    use super::{List, Node, Out, Walk};
 
     /// Writes ` :name `, with the prefix of an embedded node type.
     fn label(s: &mut String, prefix: &str, name: &str) {
@@ -204,6 +228,30 @@ pub(crate) mod w {
         match value {
             Some(node) => node.write(s),
             None => s.push_str("<>"),
+        }
+    }
+
+    /// Visits the node of a `Node *` field, see [`Walk::walk`].
+    pub(crate) fn visit_node<'a>(node: Option<&'a Node>, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        if let Some(node) = node {
+            node.visit(visit);
+        }
+    }
+
+    /// Visits each node of a `List *` field, see [`Walk::walk`].
+    pub(crate) fn visit_list<'a>(list: &'a List, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        for node in list.iter().flatten() {
+            node.visit(visit);
+        }
+    }
+
+    /// Visits the node that a field of a node type points to, see [`Walk::walk`].
+    pub(crate) fn visit_boxed<'a, T: Walk>(
+        node: Option<&'a T>,
+        visit: &mut dyn FnMut(&'a dyn Walk),
+    ) {
+        if let Some(node) = node {
+            visit(node);
         }
     }
 

@@ -15,7 +15,7 @@
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, missing_docs)]
 
-use crate::nodes::{Equal, List, NodeType, Out, Str, w};
+use crate::nodes::{Equal, List, NodeType, Out, Str, Walk, w};
 
 pub const PG_INT16_MAX: i32 = 32767;
 pub const NO_NULLTREATMENT: i32 = 0;
@@ -8040,6 +8040,1506 @@ impl Equal for XmlSerialize {
     }
 }
 
+impl Walk for ATAlterConstraint {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for A_ArrayExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.elements, visit);
+    }
+}
+
+impl Walk for A_Const {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.val.as_ref(), visit);
+    }
+}
+
+impl Walk for A_Expr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.name, visit);
+        w::visit_node(self.lexpr.as_ref(), visit);
+        w::visit_node(self.rexpr.as_ref(), visit);
+    }
+}
+
+impl Walk for A_Indices {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.lidx.as_ref(), visit);
+        w::visit_node(self.uidx.as_ref(), visit);
+    }
+}
+
+impl Walk for A_Indirection {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+        w::visit_list(&self.indirection, visit);
+    }
+}
+
+impl Walk for A_Star {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for AccessPriv {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.cols, visit);
+    }
+}
+
+impl Walk for Alias {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.colnames, visit);
+    }
+}
+
+impl Walk for AlterCollationStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.collname, visit);
+    }
+}
+
+impl Walk for AlterDatabaseRefreshCollStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for AlterDatabaseSetStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.setstmt.as_deref(), visit);
+    }
+}
+
+impl Walk for AlterDatabaseStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterDefaultPrivilegesStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+        w::visit_boxed(self.action.as_deref(), visit);
+    }
+}
+
+impl Walk for AlterDomainStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.typeName, visit);
+        w::visit_node(self.def.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterEnumStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.typeName, visit);
+    }
+}
+
+impl Walk for AlterEventTrigStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for AlterExtensionContentsStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.object.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterExtensionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterFdwStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.func_options, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterForeignServerStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterFunctionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.func.as_deref(), visit);
+        w::visit_list(&self.actions, visit);
+    }
+}
+
+impl Walk for AlterObjectDependsStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.object.as_ref(), visit);
+        w::visit_node(self.extname.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterObjectSchemaStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.object.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterOpFamilyStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.opfamilyname, visit);
+        w::visit_list(&self.items, visit);
+    }
+}
+
+impl Walk for AlterOperatorStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.opername.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterOwnerStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.object.as_ref(), visit);
+        w::visit_boxed(self.newowner.as_deref(), visit);
+    }
+}
+
+impl Walk for AlterPolicyStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.table.as_deref(), visit);
+        w::visit_list(&self.roles, visit);
+        w::visit_node(self.qual.as_ref(), visit);
+        w::visit_node(self.with_check.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterPublicationStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+        w::visit_list(&self.pubobjects, visit);
+    }
+}
+
+impl Walk for AlterRoleSetStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.role.as_deref(), visit);
+        w::visit_boxed(self.setstmt.as_deref(), visit);
+    }
+}
+
+impl Walk for AlterRoleStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.role.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterSeqStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.sequence.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterStatsStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.defnames, visit);
+        w::visit_node(self.stxstattarget.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterSubscriptionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.publication, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterSystemStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.setstmt.as_deref(), visit);
+    }
+}
+
+impl Walk for AlterTSConfigurationStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.cfgname, visit);
+        w::visit_list(&self.tokentype, visit);
+        w::visit_list(&self.dicts, visit);
+    }
+}
+
+impl Walk for AlterTSDictionaryStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.dictname, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterTableCmd {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.newowner.as_deref(), visit);
+        w::visit_node(self.def.as_ref(), visit);
+    }
+}
+
+impl Walk for AlterTableMoveAllStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.roles, visit);
+    }
+}
+
+impl Walk for AlterTableSpaceOptionsStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterTableStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.cmds, visit);
+    }
+}
+
+impl Walk for AlterTypeStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.typeName, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for AlterUserMappingStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.user.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for BoolExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+    }
+}
+
+impl Walk for BooleanTest {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+    }
+}
+
+impl Walk for CTECycleClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.cycle_col_list, visit);
+        w::visit_node(self.cycle_mark_value.as_ref(), visit);
+        w::visit_node(self.cycle_mark_default.as_ref(), visit);
+    }
+}
+
+impl Walk for CTESearchClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.search_col_list, visit);
+    }
+}
+
+impl Walk for CallStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.funccall.as_deref(), visit);
+        w::visit_node(self.funcexpr.as_ref(), visit);
+        w::visit_list(&self.outargs, visit);
+    }
+}
+
+impl Walk for CaseExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+        w::visit_list(&self.args, visit);
+        w::visit_node(self.defresult.as_ref(), visit);
+    }
+}
+
+impl Walk for CaseWhen {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+        w::visit_node(self.result.as_ref(), visit);
+    }
+}
+
+impl Walk for CheckPointStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for ClosePortalStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for CoalesceExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+    }
+}
+
+impl Walk for CollateClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+        w::visit_list(&self.collname, visit);
+    }
+}
+
+impl Walk for ColumnDef {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.typeName.as_deref(), visit);
+        w::visit_node(self.raw_default.as_ref(), visit);
+        w::visit_node(self.cooked_default.as_ref(), visit);
+        w::visit_boxed(self.identitySequence.as_deref(), visit);
+        w::visit_boxed(self.collClause.as_deref(), visit);
+        w::visit_list(&self.constraints, visit);
+        w::visit_list(&self.fdwoptions, visit);
+    }
+}
+
+impl Walk for ColumnRef {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.fields, visit);
+    }
+}
+
+impl Walk for CommentStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.object.as_ref(), visit);
+    }
+}
+
+impl Walk for CommonTableExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.aliascolnames, visit);
+        w::visit_node(self.ctequery.as_ref(), visit);
+        w::visit_boxed(self.search_clause.as_deref(), visit);
+        w::visit_boxed(self.cycle_clause.as_deref(), visit);
+        w::visit_list(&self.ctecolnames, visit);
+        w::visit_list(&self.ctecoltypes, visit);
+        w::visit_list(&self.ctecoltypmods, visit);
+        w::visit_list(&self.ctecolcollations, visit);
+    }
+}
+
+impl Walk for CompositeTypeStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.typevar.as_deref(), visit);
+        w::visit_list(&self.coldeflist, visit);
+    }
+}
+
+impl Walk for Constraint {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.raw_expr.as_ref(), visit);
+        w::visit_list(&self.keys, visit);
+        w::visit_list(&self.including, visit);
+        w::visit_list(&self.exclusions, visit);
+        w::visit_list(&self.options, visit);
+        w::visit_node(self.where_clause.as_ref(), visit);
+        w::visit_boxed(self.pktable.as_deref(), visit);
+        w::visit_list(&self.fk_attrs, visit);
+        w::visit_list(&self.pk_attrs, visit);
+        w::visit_list(&self.fk_del_set_cols, visit);
+        w::visit_list(&self.old_conpfeqop, visit);
+    }
+}
+
+impl Walk for ConstraintsSetStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.constraints, visit);
+    }
+}
+
+impl Walk for CopyStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.query.as_ref(), visit);
+        w::visit_list(&self.attlist, visit);
+        w::visit_list(&self.options, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+    }
+}
+
+impl Walk for CreateAmStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.handler_name, visit);
+    }
+}
+
+impl Walk for CreateCastStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.sourcetype.as_deref(), visit);
+        w::visit_boxed(self.targettype.as_deref(), visit);
+        w::visit_boxed(self.func.as_deref(), visit);
+    }
+}
+
+impl Walk for CreateConversionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.conversion_name, visit);
+        w::visit_list(&self.func_name, visit);
+    }
+}
+
+impl Walk for CreateDomainStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.domainname, visit);
+        w::visit_boxed(self.typeName.as_deref(), visit);
+        w::visit_boxed(self.collClause.as_deref(), visit);
+        w::visit_list(&self.constraints, visit);
+    }
+}
+
+impl Walk for CreateEnumStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.typeName, visit);
+        w::visit_list(&self.vals, visit);
+    }
+}
+
+impl Walk for CreateEventTrigStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.whenclause, visit);
+        w::visit_list(&self.funcname, visit);
+    }
+}
+
+impl Walk for CreateExtensionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateFdwStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.func_options, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateForeignServerStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateForeignTableStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        self.base.walk(visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateFunctionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.funcname, visit);
+        w::visit_list(&self.parameters, visit);
+        w::visit_boxed(self.returnType.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+        w::visit_node(self.sql_body.as_ref(), visit);
+    }
+}
+
+impl Walk for CreateOpClassItem {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.name.as_deref(), visit);
+        w::visit_list(&self.order_family, visit);
+        w::visit_list(&self.class_args, visit);
+        w::visit_boxed(self.storedtype.as_deref(), visit);
+    }
+}
+
+impl Walk for CreateOpClassStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.opclassname, visit);
+        w::visit_list(&self.opfamilyname, visit);
+        w::visit_boxed(self.datatype.as_deref(), visit);
+        w::visit_list(&self.items, visit);
+    }
+}
+
+impl Walk for CreateOpFamilyStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.opfamilyname, visit);
+    }
+}
+
+impl Walk for CreatePLangStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.plhandler, visit);
+        w::visit_list(&self.plinline, visit);
+        w::visit_list(&self.plvalidator, visit);
+    }
+}
+
+impl Walk for CreatePolicyStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.table.as_deref(), visit);
+        w::visit_list(&self.roles, visit);
+        w::visit_node(self.qual.as_ref(), visit);
+        w::visit_node(self.with_check.as_ref(), visit);
+    }
+}
+
+impl Walk for CreatePublicationStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+        w::visit_list(&self.pubobjects, visit);
+    }
+}
+
+impl Walk for CreateRangeStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.typeName, visit);
+        w::visit_list(&self.params, visit);
+    }
+}
+
+impl Walk for CreateRoleStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateSchemaStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.authrole.as_deref(), visit);
+        w::visit_list(&self.schemaElts, visit);
+    }
+}
+
+impl Walk for CreateSeqStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.sequence.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateStatsStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.defnames, visit);
+        w::visit_list(&self.stat_types, visit);
+        w::visit_list(&self.exprs, visit);
+        w::visit_list(&self.relations, visit);
+    }
+}
+
+impl Walk for CreateStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.tableElts, visit);
+        w::visit_list(&self.inhRelations, visit);
+        w::visit_boxed(self.partbound.as_deref(), visit);
+        w::visit_boxed(self.partspec.as_deref(), visit);
+        w::visit_boxed(self.ofTypename.as_deref(), visit);
+        w::visit_list(&self.constraints, visit);
+        w::visit_list(&self.nnconstraints, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateSubscriptionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.publication, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateTableAsStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.query.as_ref(), visit);
+        w::visit_boxed(self.into.as_deref(), visit);
+    }
+}
+
+impl Walk for CreateTableSpaceStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.owner.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreateTransformStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.type_name.as_deref(), visit);
+        w::visit_boxed(self.fromsql.as_deref(), visit);
+        w::visit_boxed(self.tosql.as_deref(), visit);
+    }
+}
+
+impl Walk for CreateTrigStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.funcname, visit);
+        w::visit_list(&self.args, visit);
+        w::visit_list(&self.columns, visit);
+        w::visit_node(self.whenClause.as_ref(), visit);
+        w::visit_list(&self.transitionRels, visit);
+        w::visit_boxed(self.constrrel.as_deref(), visit);
+    }
+}
+
+impl Walk for CreateUserMappingStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.user.as_deref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CreatedbStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for CurrentOfExpr {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for DeallocateStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for DeclareCursorStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.query.as_ref(), visit);
+    }
+}
+
+impl Walk for DefElem {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+    }
+}
+
+impl Walk for DefineStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.defnames, visit);
+        w::visit_list(&self.args, visit);
+        w::visit_list(&self.definition, visit);
+    }
+}
+
+impl Walk for DeleteStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.usingClause, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+        w::visit_boxed(self.returningClause.as_deref(), visit);
+        w::visit_boxed(self.withClause.as_deref(), visit);
+    }
+}
+
+impl Walk for DiscardStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for DoStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+    }
+}
+
+impl Walk for DropOwnedStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.roles, visit);
+    }
+}
+
+impl Walk for DropRoleStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.roles, visit);
+    }
+}
+
+impl Walk for DropStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.objects, visit);
+    }
+}
+
+impl Walk for DropSubscriptionStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for DropTableSpaceStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for DropUserMappingStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.user.as_deref(), visit);
+    }
+}
+
+impl Walk for DropdbStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for ExecuteStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.params, visit);
+    }
+}
+
+impl Walk for ExplainStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.query.as_ref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for FetchStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for FuncCall {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.funcname, visit);
+        w::visit_list(&self.args, visit);
+        w::visit_list(&self.agg_order, visit);
+        w::visit_node(self.agg_filter.as_ref(), visit);
+        w::visit_boxed(self.over.as_deref(), visit);
+    }
+}
+
+impl Walk for FunctionParameter {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.argType.as_deref(), visit);
+        w::visit_node(self.defexpr.as_ref(), visit);
+    }
+}
+
+impl Walk for GrantRoleStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.granted_roles, visit);
+        w::visit_list(&self.grantee_roles, visit);
+        w::visit_list(&self.opt, visit);
+        w::visit_boxed(self.grantor.as_deref(), visit);
+    }
+}
+
+impl Walk for GrantStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.objects, visit);
+        w::visit_list(&self.privileges, visit);
+        w::visit_list(&self.grantees, visit);
+        w::visit_boxed(self.grantor.as_deref(), visit);
+    }
+}
+
+impl Walk for GroupingFunc {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+        w::visit_list(&self.refs, visit);
+        w::visit_list(&self.cols, visit);
+    }
+}
+
+impl Walk for GroupingSet {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.content, visit);
+    }
+}
+
+impl Walk for ImportForeignSchemaStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.table_list, visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for IndexElem {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+        w::visit_list(&self.collation, visit);
+        w::visit_list(&self.opclass, visit);
+        w::visit_list(&self.opclassopts, visit);
+    }
+}
+
+impl Walk for IndexStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.indexParams, visit);
+        w::visit_list(&self.indexIncludingParams, visit);
+        w::visit_list(&self.options, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+        w::visit_list(&self.excludeOpNames, visit);
+    }
+}
+
+impl Walk for InferClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.indexElems, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+    }
+}
+
+impl Walk for InsertStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.cols, visit);
+        w::visit_node(self.selectStmt.as_ref(), visit);
+        w::visit_boxed(self.onConflictClause.as_deref(), visit);
+        w::visit_boxed(self.returningClause.as_deref(), visit);
+        w::visit_boxed(self.withClause.as_deref(), visit);
+    }
+}
+
+impl Walk for IntoClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.rel.as_deref(), visit);
+        w::visit_list(&self.colNames, visit);
+        w::visit_list(&self.options, visit);
+        w::visit_node(self.viewQuery.as_ref(), visit);
+    }
+}
+
+impl Walk for JoinExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.larg.as_ref(), visit);
+        w::visit_node(self.rarg.as_ref(), visit);
+        w::visit_list(&self.usingClause, visit);
+        w::visit_boxed(self.join_using_alias.as_deref(), visit);
+        w::visit_node(self.quals.as_ref(), visit);
+        w::visit_boxed(self.alias.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonAggConstructor {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.output.as_deref(), visit);
+        w::visit_node(self.agg_filter.as_ref(), visit);
+        w::visit_list(&self.agg_order, visit);
+        w::visit_boxed(self.over.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonArgument {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.val.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonArrayAgg {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.constructor.as_deref(), visit);
+        w::visit_boxed(self.arg.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonArrayConstructor {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.exprs, visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonArrayQueryConstructor {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.query.as_ref(), visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+        w::visit_boxed(self.format.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonBehavior {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+    }
+}
+
+impl Walk for JsonFormat {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for JsonFuncExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.context_item.as_deref(), visit);
+        w::visit_node(self.pathspec.as_ref(), visit);
+        w::visit_list(&self.passing, visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+        w::visit_boxed(self.on_empty.as_deref(), visit);
+        w::visit_boxed(self.on_error.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonIsPredicate {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+        w::visit_boxed(self.format.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonKeyValue {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.key.as_ref(), visit);
+        w::visit_boxed(self.value.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonObjectAgg {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.constructor.as_deref(), visit);
+        w::visit_boxed(self.arg.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonObjectConstructor {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.exprs, visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonOutput {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.typeName.as_deref(), visit);
+        w::visit_boxed(self.returning.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonParseExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.expr.as_deref(), visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonReturning {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.format.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonScalarExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonSerializeExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.expr.as_deref(), visit);
+        w::visit_boxed(self.output.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonTable {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.context_item.as_deref(), visit);
+        w::visit_boxed(self.pathspec.as_deref(), visit);
+        w::visit_list(&self.passing, visit);
+        w::visit_list(&self.columns, visit);
+        w::visit_boxed(self.on_error.as_deref(), visit);
+        w::visit_boxed(self.alias.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonTableColumn {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.typeName.as_deref(), visit);
+        w::visit_boxed(self.pathspec.as_deref(), visit);
+        w::visit_boxed(self.format.as_deref(), visit);
+        w::visit_list(&self.columns, visit);
+        w::visit_boxed(self.on_empty.as_deref(), visit);
+        w::visit_boxed(self.on_error.as_deref(), visit);
+    }
+}
+
+impl Walk for JsonTablePathSpec {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.string.as_ref(), visit);
+    }
+}
+
+impl Walk for JsonValueExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.raw_expr.as_ref(), visit);
+        w::visit_node(self.formatted_expr.as_ref(), visit);
+        w::visit_boxed(self.format.as_deref(), visit);
+    }
+}
+
+impl Walk for ListenStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for LoadStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for LockStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.relations, visit);
+    }
+}
+
+impl Walk for LockingClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.lockedRels, visit);
+    }
+}
+
+impl Walk for MergeStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.sourceRelation.as_ref(), visit);
+        w::visit_node(self.joinCondition.as_ref(), visit);
+        w::visit_list(&self.mergeWhenClauses, visit);
+        w::visit_boxed(self.returningClause.as_deref(), visit);
+        w::visit_boxed(self.withClause.as_deref(), visit);
+    }
+}
+
+impl Walk for MergeSupportFunc {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for MergeWhenClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.condition.as_ref(), visit);
+        w::visit_list(&self.targetList, visit);
+        w::visit_list(&self.values, visit);
+    }
+}
+
+impl Walk for MinMaxExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+    }
+}
+
+impl Walk for MultiAssignRef {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.source.as_ref(), visit);
+    }
+}
+
+impl Walk for NamedArgExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+    }
+}
+
+impl Walk for NotifyStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for NullTest {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+    }
+}
+
+impl Walk for ObjectWithArgs {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.objname, visit);
+        w::visit_list(&self.objargs, visit);
+        w::visit_list(&self.objfuncargs, visit);
+    }
+}
+
+impl Walk for OnConflictClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.infer.as_deref(), visit);
+        w::visit_list(&self.targetList, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+    }
+}
+
+impl Walk for PLAssignStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.indirection, visit);
+        w::visit_boxed(self.val.as_deref(), visit);
+    }
+}
+
+impl Walk for ParamRef {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for PartitionBoundSpec {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.listdatums, visit);
+        w::visit_list(&self.lowerdatums, visit);
+        w::visit_list(&self.upperdatums, visit);
+    }
+}
+
+impl Walk for PartitionCmd {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.name.as_deref(), visit);
+        w::visit_boxed(self.bound.as_deref(), visit);
+    }
+}
+
+impl Walk for PartitionElem {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+        w::visit_list(&self.collation, visit);
+        w::visit_list(&self.opclass, visit);
+    }
+}
+
+impl Walk for PartitionSpec {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.partParams, visit);
+    }
+}
+
+impl Walk for PrepareStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.argtypes, visit);
+        w::visit_node(self.query.as_ref(), visit);
+    }
+}
+
+impl Walk for PublicationAllObjSpec {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.except_tables, visit);
+    }
+}
+
+impl Walk for PublicationObjSpec {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.pubtable.as_deref(), visit);
+    }
+}
+
+impl Walk for PublicationTable {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+        w::visit_list(&self.columns, visit);
+    }
+}
+
+impl Walk for RangeFunction {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.functions, visit);
+        w::visit_boxed(self.alias.as_deref(), visit);
+        w::visit_list(&self.coldeflist, visit);
+    }
+}
+
+impl Walk for RangeSubselect {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.subquery.as_ref(), visit);
+        w::visit_boxed(self.alias.as_deref(), visit);
+    }
+}
+
+impl Walk for RangeTableFunc {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.docexpr.as_ref(), visit);
+        w::visit_node(self.rowexpr.as_ref(), visit);
+        w::visit_list(&self.namespaces, visit);
+        w::visit_list(&self.columns, visit);
+        w::visit_boxed(self.alias.as_deref(), visit);
+    }
+}
+
+impl Walk for RangeTableFuncCol {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.typeName.as_deref(), visit);
+        w::visit_node(self.colexpr.as_ref(), visit);
+        w::visit_node(self.coldefexpr.as_ref(), visit);
+    }
+}
+
+impl Walk for RangeTableSample {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.relation.as_ref(), visit);
+        w::visit_list(&self.method, visit);
+        w::visit_list(&self.args, visit);
+        w::visit_node(self.repeatable.as_ref(), visit);
+    }
+}
+
+impl Walk for RangeVar {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.alias.as_deref(), visit);
+    }
+}
+
+impl Walk for RawStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.stmt.as_ref(), visit);
+    }
+}
+
+impl Walk for ReassignOwnedStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.roles, visit);
+        w::visit_boxed(self.newrole.as_deref(), visit);
+    }
+}
+
+impl Walk for RefreshMatViewStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+    }
+}
+
+impl Walk for ReindexStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.params, visit);
+    }
+}
+
+impl Walk for RenameStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.object.as_ref(), visit);
+    }
+}
+
+impl Walk for RepackStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.params, visit);
+    }
+}
+
+impl Walk for ReplicaIdentityStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for ResTarget {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.indirection, visit);
+        w::visit_node(self.val.as_ref(), visit);
+    }
+}
+
+impl Walk for ReturnStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.returnval.as_ref(), visit);
+    }
+}
+
+impl Walk for ReturningClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+        w::visit_list(&self.exprs, visit);
+    }
+}
+
+impl Walk for ReturningOption {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for RoleSpec {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for RowExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+        w::visit_list(&self.colnames, visit);
+    }
+}
+
+impl Walk for RuleStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+        w::visit_list(&self.actions, visit);
+    }
+}
+
+impl Walk for SQLValueFunction {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for SecLabelStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.object.as_ref(), visit);
+    }
+}
+
+impl Walk for SelectStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.distinctClause, visit);
+        w::visit_boxed(self.intoClause.as_deref(), visit);
+        w::visit_list(&self.targetList, visit);
+        w::visit_list(&self.fromClause, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+        w::visit_list(&self.groupClause, visit);
+        w::visit_node(self.havingClause.as_ref(), visit);
+        w::visit_list(&self.windowClause, visit);
+        w::visit_list(&self.valuesLists, visit);
+        w::visit_list(&self.sortClause, visit);
+        w::visit_node(self.limitOffset.as_ref(), visit);
+        w::visit_node(self.limitCount.as_ref(), visit);
+        w::visit_list(&self.lockingClause, visit);
+        w::visit_boxed(self.withClause.as_deref(), visit);
+        w::visit_boxed(self.larg.as_deref(), visit);
+        w::visit_boxed(self.rarg.as_deref(), visit);
+    }
+}
+
+impl Walk for SetToDefault {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for SortBy {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.node.as_ref(), visit);
+        w::visit_list(&self.useOp, visit);
+    }
+}
+
+impl Walk for StatsElem {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+    }
+}
+
+impl Walk for SubLink {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.testexpr.as_ref(), visit);
+        w::visit_list(&self.operName, visit);
+        w::visit_node(self.subselect.as_ref(), visit);
+    }
+}
+
+impl Walk for TableLikeClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+    }
+}
+
+impl Walk for TransactionStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for TriggerTransition {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for TruncateStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.relations, visit);
+    }
+}
+
+impl Walk for TypeCast {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.arg.as_ref(), visit);
+        w::visit_boxed(self.typeName.as_deref(), visit);
+    }
+}
+
+impl Walk for TypeName {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.names, visit);
+        w::visit_list(&self.typmods, visit);
+        w::visit_list(&self.arrayBounds, visit);
+    }
+}
+
+impl Walk for UnlistenStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for UpdateStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.targetList, visit);
+        w::visit_node(self.whereClause.as_ref(), visit);
+        w::visit_list(&self.fromClause, visit);
+        w::visit_boxed(self.returningClause.as_deref(), visit);
+        w::visit_boxed(self.withClause.as_deref(), visit);
+    }
+}
+
+impl Walk for VacuumRelation {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.relation.as_deref(), visit);
+        w::visit_list(&self.va_cols, visit);
+    }
+}
+
+impl Walk for VacuumStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+        w::visit_list(&self.rels, visit);
+    }
+}
+
+impl Walk for VariableSetStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.args, visit);
+    }
+}
+
+impl Walk for VariableShowStmt {
+    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {}
+}
+
+impl Walk for ViewStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_boxed(self.view.as_deref(), visit);
+        w::visit_list(&self.aliases, visit);
+        w::visit_node(self.query.as_ref(), visit);
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for WaitStmt {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.options, visit);
+    }
+}
+
+impl Walk for WindowDef {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.partitionClause, visit);
+        w::visit_list(&self.orderClause, visit);
+        w::visit_node(self.startOffset.as_ref(), visit);
+        w::visit_node(self.endOffset.as_ref(), visit);
+    }
+}
+
+impl Walk for WithClause {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.ctes, visit);
+    }
+}
+
+impl Walk for XmlExpr {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_list(&self.named_args, visit);
+        w::visit_list(&self.arg_names, visit);
+        w::visit_list(&self.args, visit);
+    }
+}
+
+impl Walk for XmlSerialize {
+    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        w::visit_node(self.expr.as_ref(), visit);
+        w::visit_boxed(self.typeName.as_deref(), visit);
+    }
+}
+
 /// A node of the raw parse tree. The nodes of `value.h` hold their value, and the other
 /// node types are boxed.
 #[derive(Clone, Debug, PartialEq)]
@@ -8723,6 +10223,234 @@ impl Equal for Node {
             (Node::XmlExpr(a), Node::XmlExpr(b)) => a.equal(b),
             (Node::XmlSerialize(a), Node::XmlSerialize(b)) => a.equal(b),
             _ => false,
+        }
+    }
+}
+
+impl Node {
+    /// Calls `visit` on the node, or on each node of a list, see [`Walk::walk`]. A node of
+    /// `value.h` holds no node and is not visited.
+    pub fn visit<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {
+        match self {
+            Node::List(list) => w::visit_list(list, visit),
+            Node::Integer(_)
+            | Node::Float(_)
+            | Node::Boolean(_)
+            | Node::String(_)
+            | Node::BitString(_) => {}
+            Node::ATAlterConstraint(node) => visit(&**node),
+            Node::A_ArrayExpr(node) => visit(&**node),
+            Node::A_Const(node) => visit(&**node),
+            Node::A_Expr(node) => visit(&**node),
+            Node::A_Indices(node) => visit(&**node),
+            Node::A_Indirection(node) => visit(&**node),
+            Node::A_Star(node) => visit(&**node),
+            Node::AccessPriv(node) => visit(&**node),
+            Node::Alias(node) => visit(&**node),
+            Node::AlterCollationStmt(node) => visit(&**node),
+            Node::AlterDatabaseRefreshCollStmt(node) => visit(&**node),
+            Node::AlterDatabaseSetStmt(node) => visit(&**node),
+            Node::AlterDatabaseStmt(node) => visit(&**node),
+            Node::AlterDefaultPrivilegesStmt(node) => visit(&**node),
+            Node::AlterDomainStmt(node) => visit(&**node),
+            Node::AlterEnumStmt(node) => visit(&**node),
+            Node::AlterEventTrigStmt(node) => visit(&**node),
+            Node::AlterExtensionContentsStmt(node) => visit(&**node),
+            Node::AlterExtensionStmt(node) => visit(&**node),
+            Node::AlterFdwStmt(node) => visit(&**node),
+            Node::AlterForeignServerStmt(node) => visit(&**node),
+            Node::AlterFunctionStmt(node) => visit(&**node),
+            Node::AlterObjectDependsStmt(node) => visit(&**node),
+            Node::AlterObjectSchemaStmt(node) => visit(&**node),
+            Node::AlterOpFamilyStmt(node) => visit(&**node),
+            Node::AlterOperatorStmt(node) => visit(&**node),
+            Node::AlterOwnerStmt(node) => visit(&**node),
+            Node::AlterPolicyStmt(node) => visit(&**node),
+            Node::AlterPublicationStmt(node) => visit(&**node),
+            Node::AlterRoleSetStmt(node) => visit(&**node),
+            Node::AlterRoleStmt(node) => visit(&**node),
+            Node::AlterSeqStmt(node) => visit(&**node),
+            Node::AlterStatsStmt(node) => visit(&**node),
+            Node::AlterSubscriptionStmt(node) => visit(&**node),
+            Node::AlterSystemStmt(node) => visit(&**node),
+            Node::AlterTSConfigurationStmt(node) => visit(&**node),
+            Node::AlterTSDictionaryStmt(node) => visit(&**node),
+            Node::AlterTableCmd(node) => visit(&**node),
+            Node::AlterTableMoveAllStmt(node) => visit(&**node),
+            Node::AlterTableSpaceOptionsStmt(node) => visit(&**node),
+            Node::AlterTableStmt(node) => visit(&**node),
+            Node::AlterTypeStmt(node) => visit(&**node),
+            Node::AlterUserMappingStmt(node) => visit(&**node),
+            Node::BoolExpr(node) => visit(&**node),
+            Node::BooleanTest(node) => visit(&**node),
+            Node::CTECycleClause(node) => visit(&**node),
+            Node::CTESearchClause(node) => visit(&**node),
+            Node::CallStmt(node) => visit(&**node),
+            Node::CaseExpr(node) => visit(&**node),
+            Node::CaseWhen(node) => visit(&**node),
+            Node::CheckPointStmt(node) => visit(&**node),
+            Node::ClosePortalStmt(node) => visit(&**node),
+            Node::CoalesceExpr(node) => visit(&**node),
+            Node::CollateClause(node) => visit(&**node),
+            Node::ColumnDef(node) => visit(&**node),
+            Node::ColumnRef(node) => visit(&**node),
+            Node::CommentStmt(node) => visit(&**node),
+            Node::CommonTableExpr(node) => visit(&**node),
+            Node::CompositeTypeStmt(node) => visit(&**node),
+            Node::Constraint(node) => visit(&**node),
+            Node::ConstraintsSetStmt(node) => visit(&**node),
+            Node::CopyStmt(node) => visit(&**node),
+            Node::CreateAmStmt(node) => visit(&**node),
+            Node::CreateCastStmt(node) => visit(&**node),
+            Node::CreateConversionStmt(node) => visit(&**node),
+            Node::CreateDomainStmt(node) => visit(&**node),
+            Node::CreateEnumStmt(node) => visit(&**node),
+            Node::CreateEventTrigStmt(node) => visit(&**node),
+            Node::CreateExtensionStmt(node) => visit(&**node),
+            Node::CreateFdwStmt(node) => visit(&**node),
+            Node::CreateForeignServerStmt(node) => visit(&**node),
+            Node::CreateForeignTableStmt(node) => visit(&**node),
+            Node::CreateFunctionStmt(node) => visit(&**node),
+            Node::CreateOpClassItem(node) => visit(&**node),
+            Node::CreateOpClassStmt(node) => visit(&**node),
+            Node::CreateOpFamilyStmt(node) => visit(&**node),
+            Node::CreatePLangStmt(node) => visit(&**node),
+            Node::CreatePolicyStmt(node) => visit(&**node),
+            Node::CreatePublicationStmt(node) => visit(&**node),
+            Node::CreateRangeStmt(node) => visit(&**node),
+            Node::CreateRoleStmt(node) => visit(&**node),
+            Node::CreateSchemaStmt(node) => visit(&**node),
+            Node::CreateSeqStmt(node) => visit(&**node),
+            Node::CreateStatsStmt(node) => visit(&**node),
+            Node::CreateStmt(node) => visit(&**node),
+            Node::CreateSubscriptionStmt(node) => visit(&**node),
+            Node::CreateTableAsStmt(node) => visit(&**node),
+            Node::CreateTableSpaceStmt(node) => visit(&**node),
+            Node::CreateTransformStmt(node) => visit(&**node),
+            Node::CreateTrigStmt(node) => visit(&**node),
+            Node::CreateUserMappingStmt(node) => visit(&**node),
+            Node::CreatedbStmt(node) => visit(&**node),
+            Node::CurrentOfExpr(node) => visit(&**node),
+            Node::DeallocateStmt(node) => visit(&**node),
+            Node::DeclareCursorStmt(node) => visit(&**node),
+            Node::DefElem(node) => visit(&**node),
+            Node::DefineStmt(node) => visit(&**node),
+            Node::DeleteStmt(node) => visit(&**node),
+            Node::DiscardStmt(node) => visit(&**node),
+            Node::DoStmt(node) => visit(&**node),
+            Node::DropOwnedStmt(node) => visit(&**node),
+            Node::DropRoleStmt(node) => visit(&**node),
+            Node::DropStmt(node) => visit(&**node),
+            Node::DropSubscriptionStmt(node) => visit(&**node),
+            Node::DropTableSpaceStmt(node) => visit(&**node),
+            Node::DropUserMappingStmt(node) => visit(&**node),
+            Node::DropdbStmt(node) => visit(&**node),
+            Node::ExecuteStmt(node) => visit(&**node),
+            Node::ExplainStmt(node) => visit(&**node),
+            Node::FetchStmt(node) => visit(&**node),
+            Node::FuncCall(node) => visit(&**node),
+            Node::FunctionParameter(node) => visit(&**node),
+            Node::GrantRoleStmt(node) => visit(&**node),
+            Node::GrantStmt(node) => visit(&**node),
+            Node::GroupingFunc(node) => visit(&**node),
+            Node::GroupingSet(node) => visit(&**node),
+            Node::ImportForeignSchemaStmt(node) => visit(&**node),
+            Node::IndexElem(node) => visit(&**node),
+            Node::IndexStmt(node) => visit(&**node),
+            Node::InferClause(node) => visit(&**node),
+            Node::InsertStmt(node) => visit(&**node),
+            Node::IntoClause(node) => visit(&**node),
+            Node::JoinExpr(node) => visit(&**node),
+            Node::JsonAggConstructor(node) => visit(&**node),
+            Node::JsonArgument(node) => visit(&**node),
+            Node::JsonArrayAgg(node) => visit(&**node),
+            Node::JsonArrayConstructor(node) => visit(&**node),
+            Node::JsonArrayQueryConstructor(node) => visit(&**node),
+            Node::JsonBehavior(node) => visit(&**node),
+            Node::JsonFormat(node) => visit(&**node),
+            Node::JsonFuncExpr(node) => visit(&**node),
+            Node::JsonIsPredicate(node) => visit(&**node),
+            Node::JsonKeyValue(node) => visit(&**node),
+            Node::JsonObjectAgg(node) => visit(&**node),
+            Node::JsonObjectConstructor(node) => visit(&**node),
+            Node::JsonOutput(node) => visit(&**node),
+            Node::JsonParseExpr(node) => visit(&**node),
+            Node::JsonReturning(node) => visit(&**node),
+            Node::JsonScalarExpr(node) => visit(&**node),
+            Node::JsonSerializeExpr(node) => visit(&**node),
+            Node::JsonTable(node) => visit(&**node),
+            Node::JsonTableColumn(node) => visit(&**node),
+            Node::JsonTablePathSpec(node) => visit(&**node),
+            Node::JsonValueExpr(node) => visit(&**node),
+            Node::ListenStmt(node) => visit(&**node),
+            Node::LoadStmt(node) => visit(&**node),
+            Node::LockStmt(node) => visit(&**node),
+            Node::LockingClause(node) => visit(&**node),
+            Node::MergeStmt(node) => visit(&**node),
+            Node::MergeSupportFunc(node) => visit(&**node),
+            Node::MergeWhenClause(node) => visit(&**node),
+            Node::MinMaxExpr(node) => visit(&**node),
+            Node::MultiAssignRef(node) => visit(&**node),
+            Node::NamedArgExpr(node) => visit(&**node),
+            Node::NotifyStmt(node) => visit(&**node),
+            Node::NullTest(node) => visit(&**node),
+            Node::ObjectWithArgs(node) => visit(&**node),
+            Node::OnConflictClause(node) => visit(&**node),
+            Node::PLAssignStmt(node) => visit(&**node),
+            Node::ParamRef(node) => visit(&**node),
+            Node::PartitionBoundSpec(node) => visit(&**node),
+            Node::PartitionCmd(node) => visit(&**node),
+            Node::PartitionElem(node) => visit(&**node),
+            Node::PartitionSpec(node) => visit(&**node),
+            Node::PrepareStmt(node) => visit(&**node),
+            Node::PublicationAllObjSpec(node) => visit(&**node),
+            Node::PublicationObjSpec(node) => visit(&**node),
+            Node::PublicationTable(node) => visit(&**node),
+            Node::RangeFunction(node) => visit(&**node),
+            Node::RangeSubselect(node) => visit(&**node),
+            Node::RangeTableFunc(node) => visit(&**node),
+            Node::RangeTableFuncCol(node) => visit(&**node),
+            Node::RangeTableSample(node) => visit(&**node),
+            Node::RangeVar(node) => visit(&**node),
+            Node::RawStmt(node) => visit(&**node),
+            Node::ReassignOwnedStmt(node) => visit(&**node),
+            Node::RefreshMatViewStmt(node) => visit(&**node),
+            Node::ReindexStmt(node) => visit(&**node),
+            Node::RenameStmt(node) => visit(&**node),
+            Node::RepackStmt(node) => visit(&**node),
+            Node::ReplicaIdentityStmt(node) => visit(&**node),
+            Node::ResTarget(node) => visit(&**node),
+            Node::ReturnStmt(node) => visit(&**node),
+            Node::ReturningClause(node) => visit(&**node),
+            Node::ReturningOption(node) => visit(&**node),
+            Node::RoleSpec(node) => visit(&**node),
+            Node::RowExpr(node) => visit(&**node),
+            Node::RuleStmt(node) => visit(&**node),
+            Node::SQLValueFunction(node) => visit(&**node),
+            Node::SecLabelStmt(node) => visit(&**node),
+            Node::SelectStmt(node) => visit(&**node),
+            Node::SetToDefault(node) => visit(&**node),
+            Node::SortBy(node) => visit(&**node),
+            Node::StatsElem(node) => visit(&**node),
+            Node::SubLink(node) => visit(&**node),
+            Node::TableLikeClause(node) => visit(&**node),
+            Node::TransactionStmt(node) => visit(&**node),
+            Node::TriggerTransition(node) => visit(&**node),
+            Node::TruncateStmt(node) => visit(&**node),
+            Node::TypeCast(node) => visit(&**node),
+            Node::TypeName(node) => visit(&**node),
+            Node::UnlistenStmt(node) => visit(&**node),
+            Node::UpdateStmt(node) => visit(&**node),
+            Node::VacuumRelation(node) => visit(&**node),
+            Node::VacuumStmt(node) => visit(&**node),
+            Node::VariableSetStmt(node) => visit(&**node),
+            Node::VariableShowStmt(node) => visit(&**node),
+            Node::ViewStmt(node) => visit(&**node),
+            Node::WaitStmt(node) => visit(&**node),
+            Node::WindowDef(node) => visit(&**node),
+            Node::WithClause(node) => visit(&**node),
+            Node::XmlExpr(node) => visit(&**node),
+            Node::XmlSerialize(node) => visit(&**node),
         }
     }
 }

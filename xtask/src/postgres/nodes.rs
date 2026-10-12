@@ -710,7 +710,7 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
          \n\
          #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, missing_docs)]\n\
          \n\
-         use crate::nodes::{Equal, List, NodeType, Out, Str, w};\n",
+         use crate::nodes::{Equal, List, NodeType, Out, Str, Walk, w};\n",
     );
 
     if !used_defines.is_empty() {
@@ -833,6 +833,37 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
         out.push_str("    }\n}\n");
     }
 
+    // The walk of `raw_expression_tree_walker`, through every field that holds a node.
+    for (name, fields) in &layouts {
+        let mut lines = Vec::new();
+        for (field, kind) in fields {
+            let f = field_name(&field.name);
+            let line = match kind {
+                Kind::List => format!("w::visit_list(&self.{f}, visit);"),
+                Kind::Node | Kind::Value => format!("w::visit_node(self.{f}.as_ref(), visit);"),
+                Kind::Boxed(_) => format!("w::visit_boxed(self.{f}.as_deref(), visit);"),
+                Kind::Embedded(_) => format!("self.{f}.walk(visit);"),
+                _ => continue,
+            };
+            lines.push(line);
+        }
+        if lines.is_empty() {
+            let _ = write!(
+                out,
+                "\nimpl Walk for {name} {{\n    fn walk<'a>(&'a self, _: &mut dyn FnMut(&'a dyn Walk)) {{}}\n}}\n"
+            );
+            continue;
+        }
+        let _ = write!(
+            out,
+            "\nimpl Walk for {name} {{\n    fn walk<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {{\n"
+        );
+        for line in lines {
+            let _ = writeln!(out, "        {line}");
+        }
+        out.push_str("    }\n}\n");
+    }
+
     // The node enum, its writer and the conversions.
     out.push_str(
         "\n/// A node of the raw parse tree. The nodes of `value.h` hold their value, and the other\n\
@@ -870,6 +901,17 @@ pub(super) fn nodes(texts: &[String]) -> Result<String, String> {
         }
     }
     out.push_str("            _ => false,\n        }\n    }\n}\n");
+    out.push_str(
+        "\nimpl Node {\n    /// Calls `visit` on the node, or on each node of a list, see [`Walk::walk`]. A node of\n    \
+         /// `value.h` holds no node and is not visited.\n    \
+         pub fn visit<'a>(&'a self, visit: &mut dyn FnMut(&'a dyn Walk)) {\n        match self {\n            \
+         Node::List(list) => w::visit_list(list, visit),\n            Node::Integer(_)\n            | Node::Float(_)\n            \
+         | Node::Boolean(_)\n            | Node::String(_)\n            | Node::BitString(_) => {}\n",
+    );
+    for name in layouts.keys() {
+        let _ = writeln!(out, "            Node::{name}(node) => visit(&**node),");
+    }
+    out.push_str("        }\n    }\n}\n");
     for name in layouts.keys() {
         let _ = write!(
             out,
