@@ -4090,9 +4090,7 @@ impl<'a> Binder<'a> {
         let resolved = match catalog.resolve(&parts) {
             Ok(resolved) => resolved,
             Err(missing) => {
-                let missing = missing
-                    .state(SqlState::UNDEFINED_TABLE)
-                    .pg(format!("relation \"{}\" does not exist", parts.join(".")));
+                let missing = missing_relation(missing, &parts);
                 return self.bind_replacement_scan(ast, &parts, alias, columns, missing);
             }
         };
@@ -7721,6 +7719,15 @@ impl Options {
 
 /// The one file a read names, canonical, with what the file system says about it now, or `None`
 /// for a read of several files or of something that is not a regular file with a UTF-8 name.
+/// The error for a name that the catalog does not hold, as `parserOpenTable` gives it in
+/// PostgreSQL: `relation "s.t" does not exist` whether the schema or the table is missing. The
+/// pin's message says which of the two it is.
+pub fn missing_relation(missing: Error, parts: &[&str]) -> Error {
+    missing
+        .state(SqlState::UNDEFINED_TABLE)
+        .pg(format!("relation \"{}\" does not exist", parts.join(".")))
+}
+
 fn mirror_target(paths: &[String]) -> Option<(String, FileStamp)> {
     let [path] = paths else { return None };
     let canonical = std::fs::canonicalize(path).ok()?;
