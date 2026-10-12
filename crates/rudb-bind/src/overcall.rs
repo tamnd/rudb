@@ -10,7 +10,8 @@
 //! Of the window functions, only `lag`, `lead`, `first_value`, `last_value` and `nth_value` read
 //! values and so have nulls to skip. The others refuse a null treatment. PostgreSQL does that
 //! when the function computes its first row, so the error has no position, and a query over no
-//! rows does not get it there. It is said here when the call is bound.
+//! rows does not get it. The binder keeps such a call and puts its value through a kernel that
+//! refuses each row, so the error comes at the same point.
 //!
 //! `count()` is the pin's other spelling of `count(*)`, and PostgreSQL refuses it with or without
 //! an `OVER`, since it wants the star for an aggregate that takes no arguments.
@@ -52,20 +53,17 @@ pub(crate) fn not_windowed(
     }
 }
 
-/// PostgreSQL's error for a null treatment on a call with an `OVER`, or `None` for one of the
-/// window functions that take it.
+/// PostgreSQL's error for a null treatment on an aggregate with an `OVER`, which it gives when
+/// it finds the function.
 pub(crate) fn treated_window(written: &str) -> Option<Error> {
-    match kind_of(written) {
-        Some(FunctionKind::Aggregate) => Some(refused_aggregate()),
-        _ if TREATS_NULLS.iter().any(|name| rudb_catalog::same_name(name, written)) => None,
-        _ => Some(
-            Error::not_implemented(format!(
-                "function {written} does not allow RESPECT/IGNORE NULLS"
-            ))
-            .state(SqlState::FEATURE_NOT_SUPPORTED)
-            .unplaced(),
-        ),
-    }
+    (kind_of(written) == Some(FunctionKind::Aggregate)).then(refused_aggregate)
+}
+
+/// Whether a window function refuses a null treatment on its first row, which is every one that
+/// reads no values. See the module documentation.
+pub(crate) fn refuses_treatment(written: &str) -> bool {
+    kind_of(written) == Some(FunctionKind::Window)
+        && !TREATS_NULLS.iter().any(|name| rudb_catalog::same_name(name, written))
 }
 
 /// PostgreSQL's error for a null treatment on a call with no `OVER` that is found. A window

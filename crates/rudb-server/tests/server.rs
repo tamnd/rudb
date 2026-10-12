@@ -1570,12 +1570,6 @@ fn a_window_or_a_null_treatment_on_the_wrong_function_is_refused_as_postgres_ref
             Some("8"),
         ),
         (
-            "select row_number() respect nulls over () from generate_series(1, 3) x",
-            "0A000",
-            "function row_number does not allow RESPECT/IGNORE NULLS",
-            None,
-        ),
-        (
             "select first_value(x) ignore nulls from generate_series(1, 3) x",
             "42809",
             "window function first_value requires an OVER clause",
@@ -1611,6 +1605,31 @@ fn a_window_or_a_null_treatment_on_the_wrong_function_is_refused_as_postgres_ref
             "argument of nth_value must be greater than zero",
             None,
         ),
+        (
+            "select sum(x) over (groups between unbounded preceding and current row) \
+             from generate_series(1, 3) x",
+            "42P20",
+            "GROUPS mode requires an ORDER BY clause",
+            Some("20"),
+        ),
+        (
+            "select rank() over (order by rank() over ())",
+            "42P20",
+            "window functions are not allowed in window definitions",
+            Some("30"),
+        ),
+        (
+            "select sum(rank() over ()) over ()",
+            "42P20",
+            "window function calls cannot be nested",
+            Some("12"),
+        ),
+        (
+            "select sum(1) filter (where rank() over () > 0) over ()",
+            "42P20",
+            "window functions are not allowed in FILTER",
+            Some("29"),
+        ),
     ] {
         let messages = client.query(sql);
         assert!(tags(&messages).ends_with("EZ"), "{sql}");
@@ -1619,6 +1638,19 @@ fn a_window_or_a_null_treatment_on_the_wrong_function_is_refused_as_postgres_ref
         assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
         assert_eq!(error.field(b'P').as_deref(), place, "{sql}");
     }
+    // A window function that reads no values refuses a null treatment on its first row, after
+    // the row description, and a query over no rows is answered.
+    let messages =
+        client.query("select row_number() respect nulls over () from generate_series(1, 3) x");
+    assert_eq!(tags(&messages), "TEZ");
+    let error = &messages[1];
+    assert_eq!(error.field(b'C').as_deref(), Some("0A000"));
+    let message = "function row_number does not allow RESPECT/IGNORE NULLS";
+    assert_eq!(error.field(b'M').as_deref(), Some(message));
+    assert_eq!(error.field(b'P'), None);
+    let messages =
+        client.query("select ntile(1) ignore nulls over () from generate_series(1, 0) x");
+    assert_eq!(tags(&messages), "TCZ");
     server.stop().unwrap();
 }
 

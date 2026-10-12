@@ -155,6 +155,17 @@ pub(crate) struct Aggregation {
     pub(crate) aggregates: Vec<ExprRef>,
 }
 
+/// The part of a window call being bound, which decides how PostgreSQL words a window inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowPart {
+    /// The arguments, and the `ORDER BY` inside the brackets.
+    Arguments,
+    /// The partition, the order and the frame of the `OVER`.
+    Definition,
+    /// The `FILTER`.
+    Filter,
+}
+
 /// The clause a select block's aliases are being read from, which decides how they are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AliasClause {
@@ -488,6 +499,8 @@ pub(crate) struct Binder<'a> {
     pub(crate) sequences: Vec<QualifiedName>,
     /// Set while a window call's own arguments and keys are being bound, so nesting is caught.
     pub(crate) in_window: bool,
+    /// The part of a window call being bound, while [`Self::in_window`] is set.
+    pub(crate) window_part: WindowPart,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
     pub(crate) scalar_subqueries: Vec<PendingSubquery>,
     /// Table indices of the queries this block will join in above its grouping, not below it.
@@ -634,6 +647,7 @@ impl<'a> Binder<'a> {
             grouped_unnests: Vec::new(),
             sequences: Vec::new(),
             in_window: false,
+            window_part: WindowPart::Arguments,
             scalar_subqueries: Vec::new(),
             joined_above: Vec::new(),
             outer_scopes: Vec::new(),
@@ -7080,7 +7094,15 @@ impl<'a> Binder<'a> {
             ));
         }
         if self.in_window {
-            return Err(Error::binder("window function calls cannot be nested"));
+            let error = Error::binder("window function calls cannot be nested")
+                .state(SqlState::WINDOWING_ERROR);
+            return Err(match self.window_part {
+                WindowPart::Arguments => error,
+                WindowPart::Definition => {
+                    error.pg("window functions are not allowed in window definitions")
+                }
+                WindowPart::Filter => error.pg("window functions are not allowed in FILTER"),
+            });
         }
         if postgres && let Some(error) = self.within_group_required(name, args.len()) {
             return Err(error);
@@ -7125,7 +7147,9 @@ impl<'a> Binder<'a> {
         // is again the order the messages come out in upstream. It is still inside the window, so a
         // window in it is a nested window, while an aggregate in it is an ordinary aggregate over
         // the same rows and is answered.
+        self.window_part = WindowPart::Filter;
         let filter = if parts.is_ok() { self.bind_filter(ast, filter, scope) } else { Ok(None) };
+        self.window_part = WindowPart::Arguments;
         self.in_window = false;
         let mut parts = parts?;
         let filter = filter?;
@@ -7145,6 +7169,14 @@ impl<'a> Binder<'a> {
             .iter()
             .any(|end| matches!(end, WindowBound::Preceding(_) | WindowBound::Following(_)));
         let pg_offsets = self.semantics.frame_offsets() == FrameOffsets::Postgres;
+        // PostgreSQL wants an order to count the groups by, as the standard does, where the pin
+        // counts the whole partition as one group.
+        if pg_offsets && parts.frame.unit == WindowUnit::Groups && parts.order.is_empty() {
+            let message = "GROUPS mode requires an ORDER BY clause";
+            return Err(Error::binder(message)
+                .state(SqlState::WINDOWING_ERROR)
+                .placed_at(ast.window_span(spec)));
+        }
         if parts.frame.unit == WindowUnit::Range && offsets && parts.order.len() != 1 {
             if pg_offsets {
                 let message =
@@ -7189,6 +7221,9 @@ impl<'a> Binder<'a> {
         {
             return Err(error);
         }
+        // The call is kept, and its value goes through a kernel that refuses each row.
+        let refused =
+            (postgres && treated && overcall::refuses_treatment(name)).then(|| name.to_string());
         // `fill` reads the sort key rather than the frame, so what it needs from the query is not
         // what any other window needs and it is refused on its own terms. An `ORDER BY` inside
         // its brackets is the key it reads in place of the one in the `OVER`.
@@ -7285,8 +7320,12 @@ impl<'a> Binder<'a> {
 
         let at = self.window_run(ast, spec, (parts.partition, parts.order, parts.frame), call);
         let index = self.windows.last().expect("the run was just filed").index;
-        let column = self.column(index, at, ty);
+        let column = self.column(index, at, ty.clone());
         self.carry_collation(call, column)?;
+        if let Some(written) = refused {
+            let written = self.add_constant(Value::Varchar(written));
+            return Ok(self.pgproc_kernel("window_null_treatment", &[column, written], ty));
+        }
         Ok(self.typed_as_postgres(resolved.name, &types, column))
     }
 
@@ -7366,6 +7405,20 @@ impl<'a> Binder<'a> {
             let expr = self.collate_key(expr, expr)?;
             inner.push(self.sort_key(expr, item));
         }
+        self.window_part = WindowPart::Definition;
+        let defined = self.window_definition(ast, held, scope);
+        self.window_part = WindowPart::Arguments;
+        let (partition, order, frame) = defined?;
+        Ok(WindowParts { args: bound, partition, order, inner, frame })
+    }
+
+    /// The partition, the order and the frame of a window call.
+    fn window_definition(
+        &mut self,
+        ast: &Ast,
+        held: ast::WindowSpec,
+        scope: &Scope,
+    ) -> Result<(Vec<ExprRef>, Vec<SortKey>, WindowFrame)> {
         let mut partition = Vec::new();
         for &key in ast.expr_list(held.partition) {
             let expr = self.bind_expr(ast, key, scope)?;
@@ -7398,7 +7451,7 @@ impl<'a> Binder<'a> {
                 ast::WindowExclude::Ties => WindowExclude::Ties,
             },
         };
-        Ok(WindowParts { args: bound, partition, order, inner, frame })
+        Ok((partition, order, frame))
     }
 
     /// One end of a frame, with its offset bound where it has one.
