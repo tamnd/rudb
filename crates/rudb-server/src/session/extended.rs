@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rudb::{Chunk, Description, Prepared, QueryResult, Transaction};
 use rudb_common::{Fields, LogicalType, Origin, Value};
 use rudb_pgtypes::{
-    DateTimeInput, InputSettings, NoZones, Oid, RowEncoder, TypeError, UNIX_TO_POSTGRES_USECS,
+    DateTimeInput, InputSettings, Oid, RowEncoder, SessionZones, TypeError, UNIX_TO_POSTGRES_USECS,
     ZoneAbbrevs, logical_type, param_value, pg_type,
 };
 use rudb_pgwire::{Bind, CommandTag, Level, OutBuf, Portals, ProtocolError, Statements, Target};
@@ -407,7 +407,7 @@ impl Extended {
             datetime: DateTimeInput {
                 order: runner.format.date_format.order,
                 zone: &runner.zone,
-                zones: &NoZones,
+                zones: &SessionZones,
                 abbrevs: ZoneAbbrevs::postgres_default(),
                 now: now + UNIX_TO_POSTGRES_USECS,
             },

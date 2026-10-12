@@ -2074,6 +2074,35 @@ fn the_windows_of_a_query_are_computed_in_the_order_postgres_computes_them_in() 
     server.stop().unwrap();
 }
 
+/// A string literal of `timetz` is read by the input function of PostgreSQL, so a zone abbreviation
+/// such as `BST` is its offset. A zone name such as `America/New_York` is read from the tz database
+/// in a literal, a parameter and `COPY`, and a `timetz` with a zone name and no date is an error, as
+/// in PostgreSQL.
+#[test]
+fn a_zone_abbreviation_or_a_zone_name_in_a_literal_is_read_as_postgres_reads_it() {
+    let dirs = Dirs::new("pgzonenames");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("set timezone = 'UTC'");
+    client.query("create temp table zt (t timetz)");
+    let messages = client.query("insert into zt values ('10:00 BST'), ('11:00 PDT')");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, value) in [
+        ("select '10:00 PST'::timetz::text", "10:00:00-08"),
+        ("select '2003-04-12 04:05:06 America/New_York'::timetz::text", "04:05:06-04"),
+        ("select '2003-07-12 04:05:06 Europe/Paris'::timestamptz::text", "2003-07-12 02:05:06+00"),
+        ("select string_agg(t::text, ',' order by t) from zt", "10:00:00+01,11:00:00-07"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    let messages = client.query("select '04:05:06 America/New_York'::timetz");
+    assert_eq!(tags(&messages), "EZ");
+    assert_eq!(messages[0].field(b'C').as_deref(), Some("22007"));
+    server.stop().unwrap();
+}
+
 /// `extract` gives a numeric with the value and the scale that PostgreSQL gives and `date_part` a
 /// double, both read a time stamp with a time zone in the zone of the session, and both refuse a
 /// unit as PostgreSQL does. A function with a body in SQL, such as `date_part(text, date)` or

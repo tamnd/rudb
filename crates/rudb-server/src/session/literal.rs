@@ -8,7 +8,7 @@ use rudb_common::session::LiteralInput;
 use rudb_common::value::Value;
 use rudb_common::{Error, Result};
 use rudb_pgtypes::{
-    DateOrder, DateTimeInput, InputSettings, IntervalStyle, NoZones, RegKind, TypeInfo,
+    DateOrder, DateTimeInput, InputSettings, IntervalStyle, RegKind, SessionZones, TypeInfo,
     UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, json_in, jsonb_in, numeric_in, oid, param_value,
 };
 
@@ -53,6 +53,7 @@ impl Literals {
             oid::UUID,
             oid::DATE,
             oid::TIME,
+            oid::TIMETZ,
             oid::TIMESTAMP,
             oid::TIMESTAMPTZ,
             oid::INTERVAL,
@@ -76,7 +77,7 @@ impl Literals {
             datetime: DateTimeInput {
                 order: self.order,
                 zone: &zone,
-                zones: &NoZones,
+                zones: &SessionZones,
                 abbrevs: ZoneAbbrevs::postgres_default(),
                 now: now + UNIX_TO_POSTGRES_USECS,
             },
