@@ -107,6 +107,57 @@ fn record_types(oids: &[rudb_pgtypes::Oid], types: &[LogicalType]) -> Option<Log
     rows.all(|other| other == row).then(|| row.clone())
 }
 
+/// The error of PostgreSQL when it has no operator `symbol` for the operands, which `oper`
+/// gives before the operator is used. A comparison here meets the two types where it can, so
+/// `1::int8 = 'a'::text` would read `'a'` as a number, and `1 in (select '1')` would be true.
+///
+/// `written` has the expression of each operand, or `None` for a column of a subquery, and
+/// `types` has its type. A string literal, a null and a parameter are of no type yet, as
+/// PostgreSQL sees them, and so is an operand of a type that PostgreSQL does not have. Then the
+/// operator is not looked for. A column of a subquery that is a null is a `text`, which is the type
+/// PostgreSQL gives a column of no type when the subquery is done. More than one operator is not an error here, because the
+/// comparison picks its own type.
+pub(crate) fn pg_operator_exists(
+    ast: &Ast,
+    symbol: &str,
+    written: &[Option<ast::ExprRef>],
+    types: &[&LogicalType],
+) -> Result<()> {
+    let untyped = |written: Option<ast::ExprRef>| {
+        written.is_some_and(|written| {
+            matches!(
+                ast.expr(written),
+                ast::Expr::Literal { kind: LiteralKind::String, .. } | ast::Expr::Parameter { .. }
+            )
+        })
+    };
+    let mut oids = Vec::with_capacity(types.len());
+    for (&written, &ty) in written.iter().zip(types) {
+        if written.is_none() && *ty == LogicalType::Null {
+            oids.push(rudb_pgtypes::oid::TEXT);
+            continue;
+        }
+        if untyped(written) || *ty == LogicalType::Null {
+            return Ok(());
+        }
+        let Some(oid) = exact_oid(ty).or_else(|| record_oid(ty)) else { return Ok(()) };
+        oids.push(oid);
+    }
+    if !matches!(
+        rudb_pgtypes::resolve_operator(symbol, &oids),
+        rudb_pgtypes::OperatorResolution::NotFound
+    ) {
+        return Ok(());
+    }
+    let names: Vec<_> = oids.iter().map(|&oid| rudb_pgtypes::format_type(oid)).collect();
+    let message = format!("operator does not exist: {}", names.join(&format!(" {symbol} ")));
+    Err(Error::binder(message.clone())
+        .state(SqlState::UNDEFINED_FUNCTION)
+        .pg(message)
+        .detail("No operator of that name accepts the given argument types.")
+        .hint("You might need to add explicit type casts."))
+}
+
 /// A function of `pg_proc` named `written` whose every form returns a set that a kernel here
 /// gives as an array, such as `string_to_table`, which a select list and `FROM` unnest.
 pub(crate) fn rows_function(written: &str) -> bool {

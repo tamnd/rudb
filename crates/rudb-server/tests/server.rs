@@ -8452,6 +8452,46 @@ fn a_recursive_definition_keeps_the_types_of_its_non_recursive_term() {
     server.stop().unwrap();
 }
 
+/// A comparison of two types that no operator of PostgreSQL compares is refused at the operator,
+/// also under `IN`, `ANY` and `ALL` against a list, an array and a subquery. A comparison that an
+/// operator takes after an implicit cast, or that has a string or a null on one side, is made.
+#[test]
+fn a_comparison_of_two_types_needs_an_operator_for_them() {
+    let dirs = Dirs::new("pgcompare");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, message, place) in [
+        ("select 1::int8 = 'a'::text", "bigint = text", "16"),
+        ("select 1::int8 in ('1'::text, 2)", "bigint = text", "16"),
+        ("select 1::int8 not in (select '1'::text)", "bigint = text", "16"),
+        ("select 1 < all (select 'a'::text)", "integer < text", "10"),
+        ("select 1 = any (array[true])", "integer = boolean", "10"),
+        ("select (1, 2) in (select 1, 'a'::text)", "integer = text", "15"),
+        ("select 1 in (select null)", "integer = text", "10"),
+        ("select array[1] = array[1::int8]", "integer[] = bigint[]", "17"),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42883"), "{sql}");
+        let message = format!("operator does not exist: {message}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message.as_str()), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), Some(place), "{sql}");
+    }
+    for (sql, expected) in [
+        ("select 1 in (select 1.5)", "f"),
+        ("select '1' in (select 1)", "t"),
+        ("select 1 = any ('{1,2}')", "t"),
+        ("select 1::oid = 1", "t"),
+        ("select 1 in (1, 2.5)", "t"),
+        ("select 'a'::char(2) = 'a'::text", "t"),
+        ("select 1::int2 = 1::int8", "t"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// An array of rows takes a row with `||` on either side, as `array_append` and `array_prepend`
 /// of PostgreSQL over `record[]` and `record`. A recursive definition keeps the path of the rows it
 /// went through this way.
