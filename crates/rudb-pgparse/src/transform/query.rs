@@ -4,7 +4,7 @@ use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
     Closed, Cte, Cycle, Distinct, Expr, JoinKind, JoinNames, Nulls, Order, OrderItem, Quantifier,
-    Query, QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Target,
+    Query, QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Statement, Target,
     WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 
@@ -257,6 +257,15 @@ impl Transform<'_> {
             }
             let select = match &cte.ctequery {
                 Some(Node::SelectStmt(select)) => select,
+                Some(
+                    written @ (Node::InsertStmt(_) | Node::UpdateStmt(_) | Node::DeleteStmt(_)),
+                ) => {
+                    let declared = self.names(&cte.aliascolnames)?;
+                    let definition =
+                        self.written_definition(cte, written, declared, with.recursive)?;
+                    self.scope.push(definition);
+                    continue;
+                }
                 Some(node) => return Err(not_yet(node)),
                 None => return clause("CommonTableExpr"),
             };
@@ -273,6 +282,7 @@ impl Transform<'_> {
                     slot: NONE,
                     recursive: false,
                     reads: Vec::new(),
+                    dml: None,
                 }
             };
             self.scope.push(definition);
@@ -309,6 +319,7 @@ impl Transform<'_> {
             slot,
             recursive: true,
             reads: Vec::new(),
+            dml: None,
         });
         let reads = self.self_reads.len();
         self.recursing.push((slot, self.depth + 1, self.places.len()));
@@ -342,6 +353,7 @@ impl Transform<'_> {
             slot,
             recursive,
             reads: Vec::new(),
+            dml: None,
         })
     }
 
@@ -487,7 +499,10 @@ impl Transform<'_> {
             let reads = definition.reads.len();
             let asked = definition.materialized == CTEMaterialize::CTEMaterializeAlways;
             let refused = definition.materialized == CTEMaterialize::CTEMaterializeNever;
-            let held = (definition.recursive && reads > 0) || asked || (!refused && reads > 1);
+            let held = definition.dml.is_some()
+                || (definition.recursive && reads > 0)
+                || asked
+                || (!refused && reads > 1);
             if !held {
                 continue;
             }
@@ -510,6 +525,11 @@ impl Transform<'_> {
             for (source, alias, columns) in definition.reads {
                 self.ast.sources[source as usize] =
                     Source::Cte { cte, alias, columns, recurring: false };
+            }
+            // The binder binds each query of a written statement on its own, so the statement
+            // carries the definitions held before it.
+            if let Some(statement) = definition.dml {
+                self.ast.carry_definitions(statement, &once);
             }
             once.push(cte);
         }
@@ -564,6 +584,27 @@ impl Transform<'_> {
             && let Some(at) = self.scope.iter().rposition(|definition| definition.name == name)
         {
             let definition = &self.scope[at];
+            if let Some(statement) = definition.dml {
+                let (Statement::Insert(index)
+                | Statement::Update(index)
+                | Statement::Delete(index)) = statement
+                else {
+                    return clause("CommonTableExpr");
+                };
+                if self.ast.inserts[index as usize].returning.is_none() {
+                    return Err(Error::parser(format!(
+                        "WITH query \"{name}\" does not have a RETURNING clause"
+                    ))
+                    .state(SqlState::FEATURE_NOT_SUPPORTED)
+                    .with_span(span)
+                    .into());
+                }
+                let cte = definition.slot;
+                let recurring = false;
+                return Ok(self
+                    .ast
+                    .push_source(Source::Cte { cte, alias, columns, recurring }, span));
+            }
             if definition.query == NONE {
                 let cte = definition.slot;
                 self.read_itself(cte, span);

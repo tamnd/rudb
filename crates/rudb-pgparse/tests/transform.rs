@@ -86,6 +86,11 @@ const SAME: &[&str] = &[
     "with q as materialized (select 1 as a) update t set a = q.a from q",
     "with q as materialized (select 1 as a) delete from t where a in (select a from q) returning a",
     "with q as materialized (select 1 as a) insert into t select * from q returning (select a from q)",
+    "with w as (insert into t values (1) returning a) select * from w",
+    "with w as (delete from t returning *) select 1",
+    "with w as (update t set a = 1 returning a) insert into t select a from w",
+    "with q as (select 1 as v), w as (insert into t select v from q returning a) select * from w, q",
+    "with w as (insert into t values (1) returning a), x as (insert into t select a from w returning a) select * from x",
 ];
 
 /// The shape of the tree of each transform, or the error of each.
