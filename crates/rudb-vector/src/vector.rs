@@ -1160,6 +1160,8 @@ impl Vector {
     /// caller that built one in a different order from the type's would otherwise get the values
     /// silently transposed into the wrong columns, which is the kind of wrong answer that reads as
     /// right. A row missing a field the type names is an error rather than a null for the same reason.
+    /// Two fields can have the same name, as the two `?column?` fields of the whole row of
+    /// `(SELECT 'a', 1)` in PostgreSQL, so the second field of a name takes the second value of it.
     ///
     /// A null row is a null in every child as well as a false bit in the mask here. [`Body::Fields`]
     /// says a null struct is allowed to have readable children and that is about a struct built out of
@@ -1170,6 +1172,7 @@ impl Vector {
         // An unnamed struct has no names to match on, so its fields are taken by place.
         let unnamed = Field::unnamed(fields);
         for (at, field) in fields.iter().enumerate() {
+            let earlier = fields[..at].iter().filter(|other| other.name == field.name).count();
             let mut column = Vec::with_capacity(values.len());
             for value in values {
                 column.push(match value {
@@ -1180,7 +1183,8 @@ impl Vector {
                         .ok_or_else(|| Error::internal("a tuple row shorter than its type"))?,
                     Value::Struct(held) => held
                         .iter()
-                        .find(|(name, _)| *name == field.name)
+                        .filter(|(name, _)| *name == field.name)
+                        .nth(earlier)
                         .map(|(_, held)| held.clone())
                         .ok_or_else(|| {
                             Error::internal(format!(
@@ -7612,6 +7616,22 @@ mod tests {
         assert_eq!(column.signed_at(0), None);
         assert_eq!(column.bytes_at(0), None);
         assert_eq!(column.data(), None);
+    }
+
+    /// Two fields of one name each take their own value, in the order the row holds them.
+    #[test]
+    fn two_fields_of_one_name_take_their_values_in_order() {
+        let name = "?column?";
+        let ty = LogicalType::Struct(vec![
+            Field::new(name, LogicalType::Varchar),
+            Field::new(name, LogicalType::Integer),
+        ]);
+        let row = Value::Struct(vec![
+            (name.to_string(), Value::Varchar("xyzzy".into())),
+            (name.to_string(), Value::Integer(1)),
+        ]);
+        let column = Vector::from_values(ty, std::slice::from_ref(&row)).unwrap();
+        assert_eq!(column.value_at(0), row);
     }
 
     #[test]
