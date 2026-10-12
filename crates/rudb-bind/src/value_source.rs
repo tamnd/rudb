@@ -215,13 +215,12 @@ impl Binder<'_> {
         }
         let mut exprs = Vec::new();
         for ((&read, ty), name) in reads.iter().zip(&types).zip(&written) {
-            match ty {
-                LogicalType::Struct(fields) => exprs.extend(self.struct_fields(read, fields)),
+            // A JSON set function names its column, and the alias does not rename it.
+            let json = JsonSet::of(name).and_then(JsonSet::column);
+            match (ty, json) {
+                (LogicalType::Struct(fields), _) => exprs.extend(self.struct_fields(read, fields)),
+                (_, Some(column)) => exprs.push((read, column.to_owned())),
                 // One call that gives a value names its column for the alias of the source.
-                // A JSON set function names its column, and the alias does not rename it.
-                _ if let Some(column) = JsonSet::of(name).and_then(JsonSet::column) => {
-                    exprs.push((read, column.to_owned()));
-                }
                 _ if values.len() == 1 && alias != NONE => exprs.push((read, label.clone())),
                 _ => exprs.push((read, name.clone())),
             }

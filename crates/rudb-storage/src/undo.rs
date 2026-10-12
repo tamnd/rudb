@@ -183,7 +183,7 @@ struct Spill {
 /// A record read back from the spill file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spilled {
-    /// Its timestamp, a commit's or [`ABORTED`].
+    /// Its timestamp, a commit's or `ABORTED`.
     pub ts: u64,
     /// What it undoes.
     pub kind: UndoKind,

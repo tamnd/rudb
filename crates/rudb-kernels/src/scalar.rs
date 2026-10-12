@@ -438,10 +438,10 @@ fn one_of<A: Fn(usize) -> usize>(
         }
         name if datetime::is_interval(name) => made_interval(name, data, at, base, rows, returns),
         "~" | "bit_count" => bits_of(name == "~", data, at, &base, rows, returns),
-        name if let Some(body) = crate::pgproc::float_unary(name) => {
-            math::over_float(body, data, at, base, rows, returns)
-        }
-        _ => math::vectorized(name, data, at, base, rows, returns),
+        _ => match crate::pgproc::float_unary(name) {
+            Some(body) => math::over_float(body, data, at, base, rows, returns),
+            None => math::vectorized(name, data, at, base, rows, returns),
+        },
     }
 }
 

@@ -144,7 +144,7 @@ impl Graveyard {
         self.ghosts.len()
     }
 
-    /// Whether it holds no slot, which [`Self::dig`] never makes.
+    /// Whether it holds no slot, which `dig` never makes.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ghosts.is_empty()

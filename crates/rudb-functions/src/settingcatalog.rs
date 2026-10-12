@@ -1803,7 +1803,6 @@ const PER_CONNECTION: &[&str] = &[
     "debug_force_update_to_del_and_insert",
     "debug_transformer_trampoline_style",
     "delim_join_as_cte",
-    "dialect_compatibility_mode",
     "disable_parquet_prefetching",
     "disable_timestamptz_casts",
     "dynamic_or_filter_threshold",

@@ -6596,7 +6596,15 @@ impl Shared {
         let context = self.optimizer(&catalog)?;
         let session = self.session();
         let outlined = mirror && self.inner.settings.config().parquet_mirror();
-        let (bound, bind_ns) = timed(|| {
+        // A prepared statement keeps its plan under the names it resolved and the settings it was
+        // bound with, and sets the values of the next execution into it, as `execute_mirrored`
+        // does for the statements that write.
+        let kept = parameters.kept();
+        let at = (catalog.naming(), self.inner.settings_revision.load(Ordering::Relaxed));
+        let (mut bound, bind_ns) = timed(|| {
+            if let Some(plan) = kept.and_then(|kept| kept.take(at, parameters, &catalog)) {
+                return Ok(Bound::Query(plan));
+            }
             if outlined {
                 rudb_bind::bind_statement_outlined(ast, &catalog, parameters, &session)
             } else {
@@ -6616,6 +6624,9 @@ impl Shared {
                 self.mirror(&wanted);
                 return self.read_mirrored(ast, sql, parameters, cancel, parse_ns, false, noted);
             }
+        }
+        if let (Some(kept), Bound::Query(plan)) = (kept, &mut bound) {
+            kept.keep(at, parameters, plan);
         }
         match bound {
             Bound::Query(mut plan) => {
