@@ -706,7 +706,8 @@ pub enum JoinColumns {
     MergedFirst,
 }
 
-/// The result types of `sum` and `avg`.
+/// The result types of `sum` and `avg`, and the states of the aggregates that the dialects
+/// compute in different steps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AggregateTypes {
     /// As in DuckDB: `sum` of an integer is a `HUGEINT`, `sum` of a `FLOAT` is a `DOUBLE`, and
@@ -714,7 +715,9 @@ pub enum AggregateTypes {
     #[default]
     Pin,
     /// As in PostgreSQL: `sum` of an `int2` or an `int4` is an `int8`, `sum` of a `float4` is a
-    /// `float4`, and `avg` of an integer or a `numeric` is a `numeric`.
+    /// `float4`, and `avg` of an integer or a `numeric` is a `numeric`. The variance and
+    /// regression families keep the states of PostgreSQL, and `string_agg` reads a delimiter on
+    /// each row and joins a `bytea` into a `bytea`.
     Postgres,
 }
 

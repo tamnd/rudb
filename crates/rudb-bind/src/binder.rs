@@ -6672,6 +6672,15 @@ impl<'a> Binder<'a> {
         if let Some(name) = paired {
             return Resolved { name, ..resolved };
         }
+        // PostgreSQL reads the delimiter on each row, and it joins a `bytea` into a `bytea`.
+        if let ("string_agg", [value, _]) = (resolved.name, types) {
+            let (name, ty) = match value {
+                LogicalType::Blob => ("bytea_string_agg_finalfn", LogicalType::Blob),
+                _ => ("string_agg_finalfn", LogicalType::Varchar),
+            };
+            let arguments = vec![ty.clone(), ty.clone()];
+            return Resolved { name, arguments, returns: ty, ..resolved };
+        }
         let ([argument], [_]) = (types, &resolved.arguments[..]) else { return resolved };
         let (argument, returns) = match argument {
             // An exact state reads the integers that fit an `i128` as they are.
@@ -6941,6 +6950,8 @@ impl<'a> Binder<'a> {
             "last",
             "any_value",
             "string_agg",
+            "string_agg_finalfn",
+            "bytea_string_agg_finalfn",
             "lttb",
             "arg_min",
             "arg_max",
