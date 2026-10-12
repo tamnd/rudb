@@ -992,16 +992,20 @@ pub enum ExplainOutput {
     Postgres,
 }
 
-/// Which key an `ON CONFLICT` can name, and when a target that matches no key is refused.
+/// Which key an `ON CONFLICT` can name, when a target that matches no key is refused, and what
+/// a `DO UPDATE` can hold.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConflictArbiter {
     /// As in DuckDB: a target that matches no key is refused before the `DO UPDATE` is read, and
-    /// an `ON CONFLICT` with no target is refused when the table has no key.
+    /// an `ON CONFLICT` with no target is refused when the table has no key. A subquery in a
+    /// `DO UPDATE` is refused.
     #[default]
     Pin,
     /// As in PostgreSQL: the `DO UPDATE` is read first, so an error in it comes first. A target
     /// that matches no key is then `42P10`. An `ON CONFLICT DO NOTHING` with no target is allowed
-    /// when the table has no key, and it skips no row.
+    /// when the table has no key, and it skips no row. A value or the condition of a `DO UPDATE`
+    /// can hold a subquery, which can read the target row, the `excluded` row and the `WITH`
+    /// queries of the statement.
     Postgres,
 }
 
