@@ -2955,6 +2955,7 @@ fn trigger(
         names: fields.iter().map(|field| field.name.clone()).collect(),
         types: fields.iter().map(|field| field.ty.clone()).collect(),
         rows: Vec::new(),
+        origins: Vec::new(),
     };
     let mut given = parameters.uncaught();
     if written.row {

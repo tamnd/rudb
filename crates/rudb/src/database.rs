@@ -7668,6 +7668,7 @@ impl Shared {
             names: fields.iter().map(|field| field.name.clone()).collect(),
             types: fields.iter().map(|field| field.ty.clone()).collect(),
             rows: values.to_vec(),
+            origins: Vec::new(),
         };
         let mut given = Parameters::new();
         if trigger.row {
@@ -7719,6 +7720,7 @@ impl Shared {
                     names: answer.names().to_vec(),
                     types: answer.types().to_vec(),
                     rows: answer.rows().collect(),
+                    origins: (0..answer.names().len()).map(|at| answer.origin(at)).collect(),
                 }
             } else {
                 let changed = answer.changes().unwrap_or(0);

@@ -479,6 +479,14 @@ impl Binder<'_> {
         };
         let mut binding = column.binding;
         let mut ty = column.ty.clone();
+        // An `ARRAY(SELECT ...)` is of the array type of the column, with the column's modifier.
+        let declared = crate::binder::declared_type(column).and_then(|declared| {
+            if !array {
+                return Some(declared);
+            }
+            let info = rudb_pgtypes::TypeInfo::get(declared.oid)?;
+            (info.array != 0).then_some(DeclaredType { oid: info.array, ..declared })
+        });
         if array {
             let mut element = self.add_expr(Expr::Column(binding), ty.clone());
             let resolved = resolve("array_agg", std::slice::from_ref(&ty))?;
@@ -530,7 +538,14 @@ impl Binder<'_> {
             };
             let empty = Value::List { element: (**element).clone(), values: Vec::new() };
             let empty = self.add_constant(empty);
-            return self.call("coalesce", vec![expr, empty]);
+            let gathered = self.call("coalesce", vec![expr, empty])?;
+            if let Some(declared) = declared {
+                self.subquery_types.push((gathered, declared));
+            }
+            return Ok(gathered);
+        }
+        if let Some(declared) = declared {
+            self.subquery_types.push((expr, declared));
         }
         Ok(expr)
     }

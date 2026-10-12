@@ -2259,6 +2259,70 @@ fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
     shape.collect()
 }
 
+/// A column read from a data changing `WITH` definition, or from a query around a `LATERAL` one,
+/// is the table column that it reads, and a scalar query or an `ARRAY(SELECT ...)` keeps the
+/// declared type of its column, all as `markTargetListOrigins` and `exprTypmod` of PostgreSQL
+/// find them.
+#[test]
+fn ctes_lateral_queries_and_subqueries_keep_the_origins_of_their_columns() {
+    let dirs = Dirs::new("pgorigins");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client
+        .query("create temp table kept (a int, b varchar(7)); insert into kept values (1, 'x')");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    // The name, whether a table gives the column, its attribute number, its type and modifier.
+    let origins = |client: &mut Client, sql: &str| {
+        let messages = client.query(sql);
+        let Some(description) = messages.iter().find(|message| message.tag == b'T') else {
+            panic!("{sql}: {messages:?}");
+        };
+        let bytes = description.decoded();
+        let Backend::RowDescription(fields) = Backend::decode(&bytes).unwrap().unwrap().0 else {
+            panic!("{description:?}");
+        };
+        let shape = fields.iter().map(|f| {
+            let name = String::from_utf8_lossy(f.name).into_owned();
+            (name, f.table != 0, f.column, f.type_oid, f.type_modifier)
+        });
+        shape.collect::<Vec<_>>()
+    };
+    let column = |name: &str, table: bool, at: i16, oid: u32, typmod: i32| {
+        (name.to_owned(), table, at, oid, typmod)
+    };
+    assert_eq!(
+        origins(
+            &mut client,
+            "with t as (insert into kept values (2, 'y') returning *) select * from t"
+        ),
+        [column("a", true, 1, 23, -1), column("b", true, 2, 1043, 11)]
+    );
+    assert_eq!(
+        origins(
+            &mut client,
+            "with t as (update kept set a = a returning b, a + 1) select * from t"
+        ),
+        [column("b", true, 2, 1043, 11), column("?column?", false, 0, 23, -1)]
+    );
+    assert_eq!(
+        origins(&mut client, "select x.* from kept, lateral (select kept.b, kept.a + 1 as c) x"),
+        [column("b", true, 2, 1043, 11), column("c", false, 0, 23, -1)]
+    );
+    assert_eq!(
+        origins(
+            &mut client,
+            "select (select b from kept limit 1), (select b::varchar(3) from kept limit 1) c, array(select b from kept) d"
+        ),
+        [
+            column("b", false, 0, 1043, 11),
+            column("c", false, 0, 1043, 7),
+            column("d", false, 0, 1015, 11)
+        ]
+    );
+    server.stop().unwrap();
+}
+
 /// A `sum` over a window has the type it has over a group, a column of a set operation has the
 /// declared type and modifier of its two sides, a subscripted subquery is named for its column, and
 /// a scalar subquery of two rows is error 21000, all as in PostgreSQL.

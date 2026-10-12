@@ -186,6 +186,9 @@ pub struct Written {
     pub types: Vec<LogicalType>,
     /// Its rows, each as wide as `names`, so with no `RETURNING` each row is empty.
     pub rows: Vec<Vec<Value>>,
+    /// The table columns that its `RETURNING` columns read, as wide as `names` when it knows
+    /// them and empty when it does not.
+    pub origins: Vec<Option<Origin>>,
 }
 
 impl Parameters {
