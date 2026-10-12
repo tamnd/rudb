@@ -1135,6 +1135,9 @@ struct End {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use rudb_common::{LogicalType, Value};
     use rudb_vector::{Bitmap, Chunk, Validity, Vector};
 
@@ -1421,6 +1424,53 @@ mod tests {
         assert_eq!(range.high, Some(Bound::Bytes(b"grace".to_vec())), "not turing");
         let probes = vec![Probe { column: 0, op: Op::Equal, value: Bound::Bytes(b"ada".to_vec()) }];
         assert!(zone.skips(&probes));
+    }
+
+    /// Strings that stay in the file, the way a table sorted on its way in hands them to the writer,
+    /// with a count of how many were read.
+    #[derive(Debug)]
+    struct Filed {
+        values: Vec<Vec<u8>>,
+        reads: AtomicUsize,
+    }
+
+    impl rudb_vector::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> rudb_common::Result<Option<&[u8]>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+    }
+
+    /// A chunk of codes into a dictionary that is still in the file reads the strings its codes
+    /// name, each once, and none of the rest. It used to read all of them for every chunk.
+    #[test]
+    fn a_dictionary_left_in_the_file_is_read_only_where_the_codes_point() {
+        let values: Vec<String> =
+            (0..1000).map(|at| format!("value-{:04}", (at * 7919) % 1000)).collect();
+        let source = Arc::new(Filed {
+            values: values.iter().map(|text| text.as_bytes().to_vec()).collect(),
+            reads: AtomicUsize::new(0),
+        });
+        let filed = Vector::external_text(LogicalType::Varchar, Arc::clone(&source) as Arc<_>)
+            .expect("a filed vector");
+        let codes = vec![5, 900, 5, 17, 900];
+        let vector = Vector::dictionary(codes.clone(), filed).expect("five rows of a thousand");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        let mut held: Vec<&String> = codes.iter().map(|&code| &values[code as usize]).collect();
+        held.sort();
+        assert_eq!(range.low, Some(Bound::Bytes(held[0].as_bytes().to_vec())));
+        assert_eq!(range.high, Some(Bound::Bytes(held[4].as_bytes().to_vec())));
+        let reads = source.reads.load(Ordering::Relaxed);
+        assert!(reads <= 3, "three codes in use and {reads} strings read");
     }
 
     /// A dictionary holds values no row points at, so its own two ends are wider than the column.
