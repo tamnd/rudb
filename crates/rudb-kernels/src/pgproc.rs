@@ -10,14 +10,14 @@ use rudb_common::{LogicalType, Result, Value};
 
 use crate::{
     pgarray, pgdatetime, pgformattype, pgmath, pgnormalize, pgregression, pgseries, pgstring,
-    pgunicode, pgvariance,
+    pgunicode, pgvariance, pgwindow,
 };
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// The C functions of each module of kernels, sorted.
-const SOURCES: [&[&str]; 10] = [
+const SOURCES: [&[&str]; 11] = [
     pgmath::SOURCES,
     pgvariance::SOURCES,
     pgregression::SOURCES,
@@ -28,10 +28,11 @@ const SOURCES: [&[&str]; 10] = [
     pgarray::SOURCES,
     pgformattype::SOURCES,
     pgseries::SOURCES,
+    pgwindow::SOURCES,
 ];
 
 /// The C functions of each module that are not strict, as `proisstrict` has them.
-const NULLS: [&[&str]; 3] = [pgstring::NULLS, pgarray::NULLS, pgformattype::NULLS];
+const NULLS: [&[&str]; 4] = [pgstring::NULLS, pgarray::NULLS, pgformattype::NULLS, pgwindow::NULLS];
 
 /// Whether the kernel of the C function `src` writes the elements of its first argument, an
 /// array, which it then takes with each element as text by the output function of its type.
@@ -111,6 +112,9 @@ pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         return Ok(Some(value));
     }
     if let Some(value) = pgseries::call(src, args)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = pgwindow::call(src, args)? {
         return Ok(Some(value));
     }
     pgarray::proc_call(src, args, returns)

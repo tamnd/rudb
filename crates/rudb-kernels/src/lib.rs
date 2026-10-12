@@ -110,6 +110,7 @@ mod pgstring;
 mod pgstringagg;
 mod pgunicode;
 mod pgvariance;
+mod pgwindow;
 pub mod prepare;
 mod printf;
 mod quantile;
