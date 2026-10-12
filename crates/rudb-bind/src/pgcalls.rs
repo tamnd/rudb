@@ -26,6 +26,14 @@ use crate::advisory::{no_such_function, spelled_call};
 use crate::binder::Binder;
 use crate::scope::Scope;
 
+/// The function of `pg_proc` that a call resolves to, with the type of each argument as
+/// PostgreSQL sees it and as it is bound.
+struct Resolved {
+    candidate: rudb_pgtypes::Candidate,
+    oids: Vec<rudb_pgtypes::Oid>,
+    types: Vec<LogicalType>,
+}
+
 /// How a call was written apart from its arguments, for the rules of `func_get_detail`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Written<'a> {
@@ -133,6 +141,18 @@ fn innermost_list(ty: &LogicalType) -> &LogicalType {
     }
 }
 
+/// The C functions of `generate_series` whose rows the series of the engine gives: the ones over
+/// `int4` and `int8` in `FROM`, where a stream is faster than an array, and the ones over the
+/// timestamps everywhere.
+pub(crate) const ENGINE_SERIES: &[&str] = &[
+    "generate_series_int4",
+    "generate_series_int8",
+    "generate_series_step_int4",
+    "generate_series_step_int8",
+    "generate_series_timestamp",
+    "generate_series_timestamptz",
+];
+
 /// The functions whose result is an `int4` in PostgreSQL and a BIGINT here.
 const INTEGER_RESULTS: &[&str] = &[
     "array_length",
@@ -224,11 +244,6 @@ fn serial_sequence_of(catalog: &Catalog, table: &str, column: &str) -> Result<Va
         quote_identifier(&sequence.schema),
         quote_identifier(&sequence.table)
     )))
-}
-
-/// Whether `ty` fits in an `int4`.
-fn narrow(ty: &LogicalType) -> bool {
-    matches!(ty, LogicalType::TinyInt | LogicalType::SmallInt | LogicalType::Integer)
 }
 
 /// Whether `field` is a string literal that names the seconds field of `date_part`.
@@ -514,59 +529,16 @@ impl Binder<'_> {
         how: Written<'_>,
         scope: &Scope,
     ) -> Result<Option<ExprRef>> {
-        use rudb_pgtypes::{Resolution, oid};
+        use rudb_pgtypes::oid;
         let special = !how.names.is_empty() || how.variadic;
         let procs = rudb_pgtypes::procs(written);
         if (procs.is_empty() && !special) || procs.iter().any(|proc| proc.kind != b'f') {
             return Ok(None);
         }
-        let mut types = Vec::with_capacity(bound.len());
-        let mut oids = Vec::with_capacity(bound.len());
-        for (at, (&argument, &untyped)) in bound.iter().zip(untyped).enumerate() {
-            let ty = self.plan().expr_type(argument).clone();
-            // An array of any number of dimensions has the type of its elements' array.
-            let typed = match how.variadic && at + 1 == bound.len() {
-                true => innermost_list(&ty),
-                false => &ty,
-            };
-            let oid = match untyped || ty == LogicalType::Null {
-                true => oid::UNKNOWN,
-                false => match exact_oid(typed) {
-                    Some(oid) => oid,
-                    None => return Ok(None),
-                },
-            };
-            types.push(ty);
-            oids.push(oid);
-        }
-        let call = rudb_pgtypes::Call { args: &oids, names: how.names, variadic: how.variadic };
-        let candidate = match rudb_pgtypes::resolve_call(written, call) {
-            Resolution::Found(candidate) => candidate,
-            Resolution::NotFound(failure) => {
-                let call =
-                    spelled_call(how.qualified.unwrap_or(written), &types, untyped, how.names);
-                let message = format!("function {call} does not exist");
-                let mut error =
-                    Error::binder(message.clone()).state(SqlState::UNDEFINED_FUNCTION).pg(message);
-                if let Some(detail) = failure.detail() {
-                    error = error.detail(detail);
-                }
-                if let Some(hint) = failure.hint() {
-                    error = error.hint(hint);
-                }
-                return Err(error.with_span(self.current_span));
-            }
-            Resolution::Ambiguous => {
-                let call =
-                    spelled_call(how.qualified.unwrap_or(written), &types, untyped, how.names);
-                let message = format!("function {call} is not unique");
-                return Err(Error::binder(message.clone())
-                    .state(SqlState::AMBIGUOUS_FUNCTION)
-                    .pg(message)
-                    .detail("Could not choose a best candidate function.")
-                    .hint("You might need to add explicit type casts.")
-                    .with_span(self.current_span));
-            }
+        let Some(Resolved { candidate, oids, types }) =
+            self.pg_candidate(written, bound, untyped, how)?
+        else {
+            return Ok(None);
         };
         let proc = candidate.proc;
         if candidate.variadic != 0 {
@@ -618,16 +590,18 @@ impl Binder<'_> {
                 .map_err(|error| Error::from(error).unplaced())?
         };
         let Some(returns) = rudb_pgtypes::logical_type(generic.result) else { return Ok(None) };
-        // A function that returns a set is the unnest of the array of its kernel, so it binds
-        // only as the argument of the unnest of a select list or of `FROM`.
-        let rows = match proc.retset {
-            false => None,
-            true => match rudb_kernels::pgproc::rows_of(proc.src) {
-                Some(_) if !self.in_unnest => return Err(self.misplaced_set_function()),
-                Some(array) => Some(array),
-                None => return Ok(None),
-            },
-        };
+        // A function that returns a set is the unnest of the array of its kernel, or of the list
+        // of the series of the engine, so it binds only as the argument of the unnest of a select
+        // list or of `FROM`.
+        let array = proc.retset.then(|| rudb_kernels::pgproc::rows_of(proc.src)).flatten();
+        let engine = proc.retset && array.is_none() && ENGINE_SERIES.contains(&proc.src);
+        if (array.is_some() || engine) && !self.in_unnest {
+            return Err(self.misplaced_set_function());
+        }
+        if proc.retset && array.is_none() && !engine {
+            return Ok(None);
+        }
+        let rows = array;
         let kernel = matches!(proc.lang, b'i' | b'c')
             && (rudb_kernels::pgproc::has(proc.src) || rows.is_some());
         let body = match proc.lang {
@@ -646,7 +620,7 @@ impl Binder<'_> {
             true => operator_of(proc),
             false => None,
         };
-        if !kernel && body.is_none() && !special && operator.is_none() {
+        if !kernel && body.is_none() && !special && operator.is_none() && !engine {
             return Ok(None);
         }
         // A polymorphic argument of a body whose actual type has no type here is the argument as
@@ -712,6 +686,71 @@ impl Binder<'_> {
             cast.push(self.add_constant(Value::BigInt(i64::from(oid))));
         }
         Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
+    }
+
+    /// The function of `pg_proc` named `written` that PostgreSQL finds for the bound arguments,
+    /// by the rules of `func_get_detail`, with the type of each argument as PostgreSQL sees it and
+    /// as it is bound. An argument of type `unknown` is a string literal, a null or a parameter
+    /// with no type. `None` is an argument of a type that PostgreSQL does not have. No function,
+    /// or more than one, is the error of PostgreSQL.
+    fn pg_candidate(
+        &mut self,
+        written: &str,
+        bound: &[ExprRef],
+        untyped: &[bool],
+        how: Written<'_>,
+    ) -> Result<Option<Resolved>> {
+        use rudb_pgtypes::{Resolution, oid};
+
+        let mut types = Vec::with_capacity(bound.len());
+        let mut oids = Vec::with_capacity(bound.len());
+        for (at, (&argument, &untyped)) in bound.iter().zip(untyped).enumerate() {
+            let ty = self.plan().expr_type(argument).clone();
+            // An array of any number of dimensions has the type of its elements' array.
+            let typed = match how.variadic && at + 1 == bound.len() {
+                true => innermost_list(&ty),
+                false => &ty,
+            };
+            let oid = match untyped || ty == LogicalType::Null {
+                true => oid::UNKNOWN,
+                false => match exact_oid(typed) {
+                    Some(oid) => oid,
+                    None => return Ok(None),
+                },
+            };
+            types.push(ty);
+            oids.push(oid);
+        }
+        let call = rudb_pgtypes::Call { args: &oids, names: how.names, variadic: how.variadic };
+        let candidate = match rudb_pgtypes::resolve_call(written, call) {
+            Resolution::Found(candidate) => candidate,
+            Resolution::NotFound(failure) => {
+                let call =
+                    spelled_call(how.qualified.unwrap_or(written), &types, untyped, how.names);
+                let message = format!("function {call} does not exist");
+                let mut error =
+                    Error::binder(message.clone()).state(SqlState::UNDEFINED_FUNCTION).pg(message);
+                if let Some(detail) = failure.detail() {
+                    error = error.detail(detail);
+                }
+                if let Some(hint) = failure.hint() {
+                    error = error.hint(hint);
+                }
+                return Err(error.with_span(self.current_span));
+            }
+            Resolution::Ambiguous => {
+                let call =
+                    spelled_call(how.qualified.unwrap_or(written), &types, untyped, how.names);
+                let message = format!("function {call} is not unique");
+                return Err(Error::binder(message.clone())
+                    .state(SqlState::AMBIGUOUS_FUNCTION)
+                    .pg(message)
+                    .detail("Could not choose a best candidate function.")
+                    .hint("You might need to add explicit type casts.")
+                    .with_span(self.current_span));
+            }
+        };
+        Ok(Some(Resolved { candidate, oids, types }))
     }
 
     /// The call of the kernel of the C function `src` of `pg_proc`.
@@ -1739,27 +1778,37 @@ impl Binder<'_> {
         call
     }
 
-    /// Whether `function(arguments)` is the series over `int4` of PostgreSQL, which gives an
-    /// `int4` column where the series here gives a BIGINT. A parameter of no type is typed as an
-    /// `int4` here, as PostgreSQL types it.
-    pub(crate) fn postgres_series(&mut self, function: &str, arguments: &mut [ExprRef]) -> bool {
+    /// The function of `pg_proc` that `function(arguments)` calls in `FROM` in a PostgreSQL
+    /// session, when it is `generate_series`, with each argument cast to the type that it
+    /// declares. A string literal and a parameter with no type are of type `unknown`, as for any
+    /// other call, so `generate_series(now(), now() + '1 day', '1 hour')` steps by an `interval`.
+    pub(crate) fn pg_series(
+        &mut self,
+        ast: &Ast,
+        function: &str,
+        written: &[ast::ExprRef],
+        bound: &mut [ExprRef],
+    ) -> Result<Option<&'static rudb_pgtypes::Proc>> {
         if self.semantics.function_rules() == FunctionRules::Pin
             || !same_name(function, "generate_series")
-            || arguments.is_empty()
+            || written.len() != bound.len()
         {
-            return false;
+            return Ok(None);
         }
-        let integers = arguments.iter().all(|&argument| {
-            narrow(self.plan().expr_type(argument)) || self.is_placeholder(argument)
-        });
-        if integers {
-            for argument in arguments.iter_mut() {
-                if self.is_placeholder(*argument) {
-                    *argument = self.cast_to(*argument, &LogicalType::Integer);
-                }
-            }
+        let untyped: Vec<bool> =
+            written.iter().map(|&argument| string_literal(ast, argument).is_some()).collect();
+        let how = Written::default();
+        let Some(Resolved { candidate, .. }) = self.pg_candidate(function, bound, &untyped, how)?
+        else {
+            return Ok(None);
+        };
+        let mut cast = Vec::with_capacity(bound.len());
+        for ((&argument, &input), &oid) in written.iter().zip(bound.iter()).zip(&candidate.args) {
+            let Some(ty) = rudb_pgtypes::logical_type(oid) else { return Ok(None) };
+            cast.push(self.argument_as(ast, argument, input, &ty)?);
         }
-        integers
+        bound.copy_from_slice(&cast);
+        Ok(Some(candidate.proc))
     }
 
     /// A projection over the series `node` that casts its BIGINT column to an `int4`. The value is

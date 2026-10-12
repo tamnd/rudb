@@ -42,6 +42,7 @@ use crate::fold;
 use crate::ordinality::unnumbered;
 use crate::overcall;
 use crate::parameters::{Parameters, Written};
+use crate::pgcalls::ENGINE_SERIES;
 use crate::scope::{Joined, Scope, Visible};
 
 /// The PostgreSQL type `name`, which `current_user` and the other session names have.
@@ -3751,7 +3752,16 @@ impl<'a> Binder<'a> {
                 if let Some(call) = self.value_call(ast, source, name) {
                     return self.bind_value_source(ast, &[call], alias, columns, ordinality);
                 }
-                self.bind_table_function(ast, name, args, alias, columns, pragma, ordinality)
+                // A call that PostgreSQL parsed is at the place of its name, where an error of the
+                // call points.
+                let span = ast.source_call(source).map(|call| ast.expr_span(call));
+                let outer = span.map(|span| std::mem::replace(&mut self.current_span, span));
+                let bound =
+                    self.bind_table_function(ast, name, args, alias, columns, pragma, ordinality);
+                if let Some(outer) = outer {
+                    self.current_span = outer;
+                }
+                bound
             }
             ast::Source::Subquery { query, alias, columns } => {
                 let (node, mut scope) = self.bind_query(ast, query)?;
@@ -4367,6 +4377,7 @@ impl<'a> Binder<'a> {
         let waiting = self.scalar_subqueries.len();
         let previous = std::mem::replace(&mut self.clause, "table function arguments");
         let mut bound = Vec::new();
+        let mut positional = Vec::new();
         let mut written_options = Vec::new();
         for argument in written {
             let identifiers =
@@ -4376,6 +4387,7 @@ impl<'a> Binder<'a> {
             let expr = expr?;
             if argument.alias == NONE {
                 bound.push(expr);
+                positional.push(argument.expr);
             } else {
                 let name = ast.string(argument.alias).to_string();
                 written_options.push(self.named_argument(called, function_name, &name, expr)?);
@@ -4394,7 +4406,30 @@ impl<'a> Binder<'a> {
 
         // The types are what resolve the call, not the count, because `read_parquet(3)` is a
         // different answer from `read_parquet('3')` and only the types tell them apart.
-        let integers = !pragma && self.postgres_series(function_name, &mut bound);
+        // The series of PostgreSQL is the function of `pg_proc` that the arguments resolve to.
+        // The engine streams the ones that it has, and the others are the unnest of the array of
+        // their kernel.
+        let series = match pragma {
+            true => None,
+            false => self.pg_series(ast, function_name, &positional, &mut bound)?,
+        };
+        if let Some(proc) = series
+            && !ENGINE_SERIES.contains(&proc.src)
+            && let Some(array) = rudb_kernels::pgproc::rows_of(proc.src)
+            && let Some(returns) = rudb_pgtypes::logical_type(proc.result)
+        {
+            let list = self.pgproc_kernel(array, &bound, LogicalType::List(Box::new(returns)));
+            return self.bind_list_source(
+                ast,
+                list,
+                function_name,
+                waiting,
+                alias,
+                renamed,
+                ordinality,
+            );
+        }
+        let integers = series.is_some_and(|proc| proc.src.ends_with("_int4"));
         let given: Vec<LogicalType> =
             bound.iter().map(|&expr| self.plan.expr_type(expr).clone()).collect();
         let resolved = if pragma {
