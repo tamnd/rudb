@@ -14,9 +14,16 @@
 //! cuts records out of their chains: a chunk cut at epoch `e` can be made again once every
 //! statement that took `e` or earlier and reads a table of the chunk has ended, see
 //! [`Horizons::passed`].
+//!
+//! A snapshot that holds more undo than the temp directory may take is killed, `15-resources.md`
+//! section 15.3: the collector marks the oldest one and from then on leaves it out of every
+//! horizon. Its statement goes on reading what is left until it ends and finds out, see
+//! [`Horizons::too_old`], and the epochs keep what it reads in memory until then.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
+
+use rudb_common::Error;
 
 /// What a slot holds when its worker is idle.
 const IDLE: u64 = u64::MAX;
@@ -51,8 +58,48 @@ struct Slot {
     snapshot: AtomicU64,
     /// The epoch its statement began at, or [`IDLE`].
     epoch: AtomicU64,
-    /// The tables it reads, set before the snapshot is published.
-    reads: Mutex<Reads>,
+    /// The tables it reads, set before the snapshot is published, and whether the snapshot was
+    /// killed.
+    held: Mutex<Held>,
+}
+
+/// What a slot's lock guards.
+#[derive(Debug)]
+struct Held {
+    reads: Reads,
+    /// Set by [`Horizons::kill_oldest`] for the snapshot it found in the slot. A statement that
+    /// begins with another snapshot clears it before publishing that one.
+    killed: Option<Killed>,
+}
+
+impl Held {
+    /// Whether the statement at `snapshot` holds back `table`.
+    fn holds(&self, table: u32, snapshot: u64) -> bool {
+        self.reads.holds(table) && !self.killed.is_some_and(|killed| killed.snapshot == snapshot)
+    }
+}
+
+/// A snapshot the collector killed, with what the error says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Killed {
+    /// The snapshot.
+    pub snapshot: u64,
+    /// How many commits it was behind the clock.
+    pub behind: u64,
+    /// The undo in memory and in the temp directory when it was killed, in bytes.
+    pub held: u64,
+}
+
+impl Killed {
+    /// The error the transaction gets, `15-resources.md` section 15.3.
+    #[must_use]
+    pub fn error(&self) -> Error {
+        Error::transaction(format!(
+            "snapshot too old: it was {} commits behind and held {} of undo",
+            self.behind,
+            rudb_common::memory::human(self.held)
+        ))
+    }
 }
 
 /// The slots of every worker.
@@ -71,7 +118,7 @@ impl Horizons {
                 .map(|_| Slot {
                     snapshot: AtomicU64::new(IDLE),
                     epoch: AtomicU64::new(IDLE),
-                    reads: Mutex::new(Reads::All),
+                    held: Mutex::new(Held { reads: Reads::All, killed: None }),
                 })
                 .collect(),
             epoch: AtomicU64::new(0),
@@ -93,7 +140,7 @@ impl Horizons {
     /// If `worker` has no slot.
     pub fn begin(&self, worker: usize, clock: &AtomicU64, reads: Reads) -> u64 {
         let slot = &self.slots[worker];
-        *slot.reads.lock().unwrap_or_else(PoisonError::into_inner) = reads;
+        *slot.held.lock().unwrap_or_else(PoisonError::into_inner) = Held { reads, killed: None };
         slot.epoch.store(self.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
         loop {
             let snapshot = clock.load(Ordering::SeqCst);
@@ -106,19 +153,24 @@ impl Horizons {
 
     /// Begins a statement of a transaction that already has its snapshot, which keeps holding
     /// back every table. Between statements the transaction holds no undo record, so the epoch
-    /// moves on and the chunks it was keeping can be freed.
+    /// moves on and the chunks it was keeping can be freed. A snapshot that was killed stays
+    /// killed.
     ///
     /// # Panics
     ///
     /// If `worker` has no slot.
     pub fn resume(&self, worker: usize, snapshot: u64) {
         let slot = &self.slots[worker];
-        *slot.reads.lock().unwrap_or_else(PoisonError::into_inner) = Reads::All;
+        let mut held = slot.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.reads = Reads::All;
+        held.killed = held.killed.filter(|killed| killed.snapshot == snapshot);
+        drop(held);
         slot.epoch.store(self.epoch.load(Ordering::SeqCst), Ordering::SeqCst);
         slot.snapshot.store(snapshot, Ordering::SeqCst);
     }
 
-    /// Ends the statement on `worker`.
+    /// Ends the statement on `worker`. Whether its snapshot was killed is [`Self::too_old`]'s
+    /// question, asked before this.
     ///
     /// # Panics
     ///
@@ -138,7 +190,7 @@ impl Horizons {
         for slot in &self.slots {
             let snapshot = slot.snapshot.load(Ordering::SeqCst);
             if snapshot < oldest
-                && slot.reads.lock().unwrap_or_else(PoisonError::into_inner).holds(table)
+                && slot.held.lock().unwrap_or_else(PoisonError::into_inner).holds(table, snapshot)
             {
                 oldest = snapshot;
             }
@@ -157,12 +209,62 @@ impl Horizons {
             .filter_map(|slot| {
                 let snapshot = slot.snapshot.load(Ordering::SeqCst);
                 (snapshot != IDLE
-                    && slot.reads.lock().unwrap_or_else(PoisonError::into_inner).holds(table))
+                    && slot
+                        .held
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .holds(table, snapshot))
                 .then_some(snapshot)
             })
             .collect::<Vec<_>>();
         snapshots.sort_unstable();
         snapshots
+    }
+
+    /// Kills the oldest snapshot a statement holds that is not killed already, and returns it, or
+    /// `None` when nobody holds one. `held` is the undo it holds back, for the error.
+    ///
+    /// The slot's snapshot is read under its lock, which a statement beginning with another one
+    /// takes to clear the mark before it publishes. So the mark is for the snapshot the slot holds
+    /// now, or for one that has already gone and that a later statement does not inherit.
+    pub fn kill_oldest(&self, clock: &AtomicU64, held: u64) -> Option<Killed> {
+        let now = clock.load(Ordering::SeqCst);
+        let mut oldest: Option<(usize, u64)> = None;
+        for (at, slot) in self.slots.iter().enumerate() {
+            let snapshot = slot.snapshot.load(Ordering::SeqCst);
+            let killed = slot.held.lock().unwrap_or_else(PoisonError::into_inner).killed;
+            if snapshot != IDLE
+                && !killed.is_some_and(|killed| killed.snapshot == snapshot)
+                && oldest.is_none_or(|(_, oldest)| snapshot < oldest)
+            {
+                oldest = Some((at, snapshot));
+            }
+        }
+        let (at, _) = oldest?;
+        let slot = &self.slots[at];
+        let mut lock = slot.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let snapshot = slot.snapshot.load(Ordering::SeqCst);
+        if snapshot == IDLE {
+            return None;
+        }
+        let killed = Killed { snapshot, behind: now.saturating_sub(snapshot), held };
+        lock.killed = Some(killed);
+        Some(killed)
+    }
+
+    /// Whether the snapshot of the statement on `worker` was killed, and why. The statement asks
+    /// before it ends, and fails with [`Killed::error`] when it was, since it may have read rows
+    /// the collector no longer kept for it.
+    ///
+    /// # Panics
+    ///
+    /// If `worker` has no slot.
+    #[must_use]
+    pub fn too_old(&self, worker: usize) -> Option<Killed> {
+        let slot = &self.slots[worker];
+        let killed = slot.held.lock().unwrap_or_else(PoisonError::into_inner).killed;
+        let snapshot = slot.snapshot.load(Ordering::SeqCst);
+        killed.filter(|killed| killed.snapshot == snapshot)
     }
 
     /// Moves the epoch on and returns the one it was, which the caller tags what it just did
@@ -183,7 +285,7 @@ impl Horizons {
             let began = slot.epoch.load(Ordering::SeqCst);
             began == IDLE
                 || began > epoch
-                || !slot.reads.lock().unwrap_or_else(PoisonError::into_inner).meets(tables)
+                || !slot.held.lock().unwrap_or_else(PoisonError::into_inner).reads.meets(tables)
         })
     }
 }
@@ -232,5 +334,40 @@ mod tests {
         assert!(!horizons.passed(second, &[3]), "worker 1 began at the second, on every table");
         horizons.resume(1, 1);
         assert!(horizons.passed(second, &[3]), "its next statement began after");
+    }
+
+    #[test]
+    fn a_killed_snapshot_holds_nothing_back_and_its_statement_finds_out() {
+        let horizons = Horizons::new(3);
+        let clock = AtomicU64::new(10);
+        horizons.begin(0, &clock, Reads::Tables(vec![1]));
+        clock.store(20, std::sync::atomic::Ordering::SeqCst);
+        horizons.begin(1, &clock, Reads::Tables(vec![1]));
+        clock.store(50, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(horizons.too_old(0), None);
+        let killed = horizons.kill_oldest(&clock, 3 << 30).expect("one to kill");
+        assert_eq!((killed.snapshot, killed.behind), (10, 40));
+        assert_eq!(
+            killed.error().to_string(),
+            "TransactionContext Error: snapshot too old: it was 40 commits behind and held \
+             3.0 GiB of undo"
+        );
+        assert_eq!(horizons.oldest(&clock, 1), 20, "the killed one is left out");
+        assert_eq!(horizons.snapshots(1), vec![20]);
+        assert_eq!(horizons.too_old(0), Some(killed));
+        assert_eq!(horizons.too_old(1), None);
+        // The next kill is the next oldest, not the same one again.
+        assert_eq!(horizons.kill_oldest(&clock, 0).map(|killed| killed.snapshot), Some(20));
+        assert_eq!(horizons.kill_oldest(&clock, 0), None, "nobody left");
+
+        // The transaction's next statement at the same snapshot is still killed, and a new
+        // statement is not.
+        horizons.end(0);
+        horizons.resume(0, 10);
+        assert_eq!(horizons.too_old(0), Some(killed));
+        horizons.end(0);
+        horizons.begin(0, &clock, Reads::All);
+        assert_eq!(horizons.too_old(0), None);
+        assert_eq!(horizons.oldest(&clock, 1), 50);
     }
 }
