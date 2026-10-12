@@ -1064,9 +1064,10 @@ impl HotStripe {
         self.undo.get(part).map_or(0, |undo| undo[at].load(Ordering::Acquire))
     }
 
-    /// Puts the stub `with` in the chain of `slot` where `record` is, with the records from
-    /// `record` down gone to the spill file, if it is still in the chain. Says whether it was.
-    /// Only the collector calls this, one call at a time.
+    /// Puts `with` in the chain of `slot` where `record` is, if it is still in the chain, and says
+    /// whether it was: a stub for the records from `record` down, gone to the spill file, or a
+    /// copy of `record` that points where it does. Only the collector calls this, one call at a
+    /// time.
     pub(crate) fn replace(&self, slot: u32, record: UndoRef, with: UndoRef) -> bool {
         self.relink(slot, record, with)
     }

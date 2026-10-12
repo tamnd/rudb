@@ -45,6 +45,18 @@
 //! stub is gone the file starts again from nothing. A record that would take the file past
 //! [`SpillLimits::most`] is not written, and the oldest snapshot is killed instead, see
 //! [`Horizons::kill_oldest`].
+//!
+//! Pruning leaves holes. A chunk whose records are all out of their chains but a few still waits
+//! for those few, and one old snapshot that reads a record in each of a hundred chunks keeps 6.4
+//! MiB for a few KiB. So once the records left in a chunk take an eighth of it or less, the
+//! collector copies them into a chunk of its own and puts each copy in its chain where the record
+//! was, and the chunk counts as pruned from then on. A reader on its way down the chain from the
+//! old record reads the same records as one from the copy. Over the spill limit, spilling comes
+//! first: a spilled record leaves a stub of a few words where a copy is the whole record.
+//!
+//! The collector runs every millisecond on whichever worker ends a statement first after the
+//! deadline, section 8.9, through [`UndoSpace::collect_due`], so nobody waits for a thread of its
+//! own to wake up.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -141,6 +153,8 @@ pub struct UndoSpace {
     collector: Mutex<Rounds>,
     /// The spill file, which the collector writes and old snapshots read.
     spill: Mutex<Spill>,
+    /// When the next [`UndoSpace::collect_due`] runs, in milliseconds.
+    due: AtomicU64,
 }
 
 /// When and where undo goes to disk, `15-resources.md` section 15.3.
@@ -188,8 +202,8 @@ struct Rounds {
     cut: Vec<Held>,
     /// Records of waiting chunks taken out of their chains above the horizon, pruned or spilled.
     pruned: HashSet<UndoRef>,
-    /// Where the stubs of spilled records are written.
-    stubs: UndoBuffer,
+    /// Where the collector writes: the stubs of spilled records and the records it moves.
+    own: UndoBuffer,
 }
 
 /// A chunk on its way to the free list: the units used, the epoch of the step it took last, and
@@ -215,6 +229,8 @@ pub struct Collected {
     pub pruned: usize,
     /// Records written to the spill file.
     pub spilled: usize,
+    /// Records moved out of a chunk that held little else anyone needs.
+    pub moved: usize,
     /// The snapshot killed because the spill file was full.
     pub killed: Option<Killed>,
 }
@@ -233,9 +249,9 @@ pub trait Heads {
     /// is not asked, and stays.
     fn prune(&self, table: u32, rid: u64, spare: &mut dyn FnMut(UndoRef) -> bool) -> Vec<UndoRef>;
 
-    /// Puts `with` in the chain of `rid` in `table` where `record` is, with nothing after it, if
-    /// the row's stripe is still hot and the record is still in its chain, and says whether it
-    /// did.
+    /// Puts `with` in the chain of `rid` in `table` where `record` is, with what `with` points at
+    /// after it, if the row's stripe is still hot and the record is still in its chain, and says
+    /// whether it did.
     fn replace(&self, table: u32, rid: u64, record: UndoRef, with: UndoRef) -> bool;
 
     /// The newest record in the chain of `rid` in `table`, or 0 when the row's stripe is not hot
@@ -260,6 +276,7 @@ impl UndoSpace {
             sealed: Mutex::new(Vec::new()),
             collector: Mutex::new(Rounds::default()),
             spill: Mutex::new(Spill::default()),
+            due: AtomicU64::new(0),
         }
     }
 
@@ -296,6 +313,29 @@ impl UndoSpace {
     #[must_use]
     pub fn live_chunks(&self) -> usize {
         self.chunks() as usize - self.free_chunks()
+    }
+
+    /// [`Self::collect`] once its deadline has passed, as a worker calls it when a statement ends:
+    /// the first call at or after the deadline collects and sets the next a millisecond on, and
+    /// every other call returns `None` at once. `now` is in milliseconds of a clock that does not
+    /// go back.
+    pub fn collect_due(
+        &self,
+        now: u64,
+        horizons: &Horizons,
+        clock: &AtomicU64,
+        heads: &dyn Heads,
+    ) -> Option<Collected> {
+        let due = self.due.load(Ordering::Relaxed);
+        if now < due
+            || self
+                .due
+                .compare_exchange(due, now + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        Some(self.collect(horizons, clock, heads))
     }
 
     /// One round of garbage collection, `08-concurrency.md` section 8.9: moves each sealed chunk
@@ -419,6 +459,12 @@ impl UndoSpace {
         }
 
         self.spill_oldest(rounds, horizons, clock, heads, &mut done);
+        self.compact(rounds, horizons, clock, heads, &mut done);
+        // A copy in a chunk the collector has not sealed is held until it is, so once nothing is
+        // waiting the chunk goes with the rest. Otherwise it fills first.
+        if rounds.waiting.is_empty() {
+            rounds.own.seal(self);
+        }
 
         // After the cuts and the reads of every stamp above, so a statement that begins at this
         // epoch or later cannot reach a record cut here, and one that saw a value an abort took
@@ -427,6 +473,67 @@ impl UndoSpace {
         rounds.cut.extend(cut.into_iter().map(|held| Held { epoch, ..held }));
         rounds.found.extend(found.into_iter().map(|held| Held { epoch, ..held }));
         done
+    }
+
+    /// Moves the records left in each chunk still waiting, when they take an eighth of it or less,
+    /// into the collector's own chunk, see the module documentation. A chunk with a record a
+    /// writer has not committed yet stays, since the writer stamps the record where it is.
+    fn compact(
+        &self,
+        rounds: &mut Rounds,
+        horizons: &Horizons,
+        clock: &AtomicU64,
+        heads: &dyn Heads,
+        done: &mut Collected,
+    ) {
+        let mut horizon = HashMap::new();
+        let mut moving = Vec::new();
+        for &(chunk, units) in &rounds.waiting {
+            let mut left = Vec::new();
+            let mut used = 0;
+            let mut open = false;
+            for (at, record) in self.records(chunk, units) {
+                let ts = record.ts();
+                if ts & UNCOMMITTED != 0 && ts != ABORTED {
+                    open = true;
+                    break;
+                }
+                let table = record.table();
+                let below =
+                    ts <= *horizon.entry(table).or_insert_with(|| horizons.oldest(clock, table));
+                if ts == ABORTED || below || rounds.pruned.contains(&at) {
+                    continue;
+                }
+                used += record.words.len().div_ceil(2) as u32;
+                if used * 8 > units {
+                    break;
+                }
+                left.push(at);
+            }
+            if !open && !left.is_empty() && used * 8 <= units {
+                moving.extend(left);
+            }
+        }
+        let mut stubs = 0;
+        for at in moving {
+            let Some(record) = self.record(at) else { continue };
+            let row = Row { table: record.table(), rid: record.rid() };
+            let images = record.images().collect::<Vec<_>>();
+            let Some(copy) =
+                rounds.own.one(self, record.kind(), record.ts(), row, record.prev(), &images)
+            else {
+                break;
+            };
+            stubs += u64::from(record.kind() == UndoKind::Spilled);
+            if heads.replace(row.table, row.rid, at, copy) {
+                rounds.pruned.insert(at);
+                done.moved += 1;
+            }
+        }
+        // Every stub is counted off when its chunk is freed, a copy too, put in its chain or not.
+        if stubs > 0 {
+            self.spill.lock().unwrap_or_else(PoisonError::into_inner).stubs += stubs;
+        }
     }
 
     /// Writes the oldest undo still in chains to the spill file while there is more in memory than
@@ -513,8 +620,7 @@ impl UndoSpace {
             bytes.clear();
             let stub = Image { column: 0, value: Some(u128::from(offset) | u128::from(len) << 64) };
             let row = Row { table, rid };
-            let Some(stub) = rounds.stubs.write(self, UndoKind::Spilled, ts, row, 0, &[stub])
-            else {
+            let Some(stub) = rounds.own.write(self, UndoKind::Spilled, ts, row, 0, &[stub]) else {
                 break;
             };
             spill.stubs += 1;
@@ -523,7 +629,7 @@ impl UndoSpace {
                 rounds.pruned.extend(tail);
             }
         }
-        rounds.stubs.seal(self);
+        rounds.own.seal(self);
     }
 
     /// Notes that `stubs` stubs were freed, and starts the file again when none is left.
@@ -1138,9 +1244,8 @@ mod tests {
             assert_eq!(as_of(&orders, order, later), Some(u128::from(later)));
 
             // Each transaction goes on with statements at the snapshot it has. Those begin after
-            // the records were taken out, so of `orders` only the first chunk, which has the
-            // records the two snapshots read, and the last, which has the row's newest record,
-            // are left.
+            // the records were taken out, so of `orders` only the records the two snapshots read
+            // and the row's newest are left, which the collector moved into a chunk of its own.
             for _ in 0..3 {
                 horizons.end(0);
                 horizons.end(1);
@@ -1148,7 +1253,7 @@ mod tests {
                 horizons.resume(1, later);
                 space.collect(&horizons, &clock, &heads);
             }
-            assert_eq!(space.live_chunks(), 2, "{made} made");
+            assert_eq!(space.live_chunks(), 1, "{made} made");
             assert_eq!(as_of(&orders, order, old), Some(0), "the old snapshot still reads");
             assert_eq!(as_of(&orders, order, later), Some(u128::from(later)));
 
@@ -1211,8 +1316,9 @@ mod tests {
             buffer.seal(&space);
             // Kept are the first update, which nothing older is under, the one over the update
             // the later snapshot reads, and the newest.
+            // The three are all that is left of the chunk, and move out of it.
             let round = space.collect(&horizons, &clock, &heads);
-            assert_eq!((round.found, round.pruned), (0, 197));
+            assert_eq!((round.found, round.pruned, round.moved), (0, 197, 3));
             assert_eq!(space.collect(&horizons, &clock, &heads).pruned, 0, "pruned once");
             let now = clock.load(Ordering::SeqCst);
             assert_eq!(as_of(&items, rid, old), Some(0));
@@ -1271,6 +1377,71 @@ mod tests {
             assert_eq!(read(old), [Some(0), Some(0)]);
             assert_eq!(read(6), [Some(4), Some(6)]);
             horizons.end(0);
+        }
+
+        #[test]
+        fn the_few_records_an_old_snapshot_reads_move_out_and_let_their_chunks_go() {
+            let space = Arc::new(UndoSpace::new());
+            let items = table(&space, 1);
+            let rids = rows(&items, 8);
+            let clock = AtomicU64::new(1);
+            let horizons = Horizons::new(1);
+            let heads = Tables(vec![Arc::clone(&items)]);
+            let mut buffer = UndoBuffer::default();
+            let old = horizons.begin(0, &clock, Reads::Tables(vec![1]));
+            for &rid in &rids {
+                updates(&items, rid, &clock, 1_000, &mut buffer);
+            }
+            buffer.seal(&space);
+            assert_eq!(space.chunks(), 8);
+
+            // Of each row's thousand records the old snapshot reads the first, and the newest is
+            // at the head. The rest are pruned, and the two left in each chunk or so move out.
+            let round = space.collect(&horizons, &clock, &heads);
+            assert_eq!((round.pruned, round.moved), (8 * 998, 16));
+            for _ in 0..3 {
+                horizons.end(0);
+                horizons.resume(0, old);
+                space.collect(&horizons, &clock, &heads);
+            }
+            assert_eq!(space.live_chunks(), 1, "the collector's own, with the sixteen");
+            let now = clock.load(Ordering::SeqCst);
+            for (row, &rid) in rids.iter().enumerate() {
+                let last = old + 1_000 * (row as u64 + 1);
+                assert_eq!(
+                    as_of(&items, rid, old),
+                    Some(0),
+                    "row {row} as the old snapshot reads it"
+                );
+                assert_eq!(as_of(&items, rid, now), Some(u128::from(last)), "row {row} now");
+            }
+
+            horizons.end(0);
+            for _ in 0..3 {
+                space.collect(&horizons, &clock, &heads);
+            }
+            assert_eq!(space.live_chunks(), 0);
+            for (row, &rid) in rids.iter().enumerate() {
+                assert_eq!(
+                    as_of(&items, rid, now),
+                    Some(u128::from(old + 1_000 * (row as u64 + 1)))
+                );
+            }
+        }
+
+        #[test]
+        fn a_collection_is_due_once_a_millisecond() {
+            let space = UndoSpace::new();
+            let clock = AtomicU64::new(1);
+            let horizons = Horizons::new(1);
+            let heads = Tables(Vec::new());
+            let due = |now| space.collect_due(now, &horizons, &clock, &heads).is_some();
+            assert!(due(5));
+            assert!(!due(5), "the next is at 6");
+            assert!(!due(4));
+            assert!(due(6));
+            assert!(due(9));
+            assert!(!due(9));
         }
 
         fn spill_directory(tag: &str) -> PathBuf {
@@ -1569,7 +1740,8 @@ mod tests {
             assert_eq!(spills, spilled > 0, "{spilled} records spilled");
             let seen: Vec<_> =
                 readers.into_iter().map(|reader| reader.join().expect("reads")).collect();
-            for _ in 0..3 {
+            // The collector's own chunk, sealed once nothing else waits, goes a round after.
+            for _ in 0..4 {
                 space.collect(&horizons, &clock, &*heads);
             }
             assert_eq!(space.live_chunks(), 0, "every chunk was sealed and nobody is reading");
