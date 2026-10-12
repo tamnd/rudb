@@ -7680,6 +7680,50 @@ fn fetch_first_with_ties_keeps_the_rows_that_tie_as_postgres() {
 }
 
 #[test]
+fn the_float8_transition_functions_can_be_called_as_in_postgres() {
+    let dirs = Dirs::new("pgf8accum");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers and the errors are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        ("select float8_accum('{4,140,2900}'::float8[], 100)", "{5,240,6280}"),
+        ("select float8_combine('{3,60,200}'::float8[], '{2,180,200}'::float8[])", "{5,240,6280}"),
+        (
+            "select float8_regr_accum('{4,140,2900,1290,83075,15050,100,0}'::float8[], 200, 100)",
+            "{5,240,2900,1490,95080,15050,100,NaN}",
+        ),
+        (
+            "select float8_regr_combine('{3,60,200,750,20000,2000,7,8}'::float8[], \
+             '{2,180,200,740,57800,-3400,7,9}'::float8[])",
+            "{5,240,6280,1490,95080,8680,7,NaN}",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    for (sql, code, message) in [
+        (
+            "select float8_accum('{4,140}'::float8[], 100)",
+            "XX000",
+            "float8_accum: expected 3-element float8 array",
+        ),
+        (
+            "select float8_accum('{1,1e308,0}'::float8[], 1e308)",
+            "22003",
+            "value out of range: overflow",
+        ),
+    ] {
+        let messages = client.query(sql);
+        let tags = tags(&messages);
+        assert!(tags.ends_with("EZ"), "{sql}");
+        let error = &messages[tags.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn string_agg_reads_a_delimiter_on_each_row_and_joins_bytea_as_postgres() {
     let dirs = Dirs::new("pgstragg");
     let server = Server::start(dirs.config()).unwrap();

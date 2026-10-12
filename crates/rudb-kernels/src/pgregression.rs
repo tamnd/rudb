@@ -7,10 +7,49 @@
 //! constant column is null rather than a quotient of rounding errors. The pin keeps the states of
 //! [`crate::statistics`] and answers NaN there. The binder gives a PostgreSQL session the names of
 //! these states, which are the names of PostgreSQL's final functions.
+//!
+//! A query can call `float8_regr_accum` and `float8_regr_combine` on a state written as a
+//! `float8[]` too, and those calls go through the same steps.
 
 use rudb_common::{Error, Result, Value};
 
 use crate::pgmath::overflow;
+use crate::pgvariance::{transition, transition_of};
+
+/// The C functions of this module that a call reaches, sorted.
+pub(crate) const SOURCES: &[&str] = &["float8_regr_accum", "float8_regr_combine"];
+
+/// The value of a call of `float8_regr_accum` or `float8_regr_combine` outside an aggregate, or
+/// `None` for another C function. A finite sum that overflows is an error here and not at an
+/// answer.
+pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
+    let state = match (src, args) {
+        ("float8_regr_accum", [state, Value::Double(y), Value::Double(x)]) => {
+            let mut state = FloatPairs::read(state, src)?;
+            state.add(*y, *x);
+            state
+        }
+        ("float8_regr_combine", [left, right]) => {
+            let mut state = FloatPairs::read(left, src)?;
+            state.combine(&FloatPairs::read(right, src)?)?;
+            state
+        }
+        _ => return Ok(None),
+    };
+    if state.overflowed {
+        return Err(overflow());
+    }
+    Ok(Some(transition(&[
+        state.count,
+        state.sum_x,
+        state.squared_x,
+        state.sum_y,
+        state.squared_y,
+        state.product,
+        state.common_x,
+        state.common_y,
+    ])))
+}
 
 /// Which answer a [`FloatPairs`] gives, one for each final function of PostgreSQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +119,24 @@ impl FloatPairs {
             common_y: 0.0,
             overflowed: false,
             answer: Final::named(name)?,
+        })
+    }
+
+    /// The state that a `float8[]` of eight elements writes.
+    fn read(state: &Value, caller: &str) -> Result<Self> {
+        let [count, sum_x, squared_x, sum_y, squared_y, product, common_x, common_y] =
+            transition_of(state, caller)?;
+        Ok(Self {
+            count,
+            sum_x,
+            squared_x,
+            sum_y,
+            squared_y,
+            product,
+            common_x,
+            common_y,
+            overflowed: false,
+            answer: Final::Corr,
         })
     }
 
@@ -176,16 +233,17 @@ impl FloatPairs {
         }
         let apart_x = self.sum_x / here - other.sum_x / there;
         let apart_y = self.sum_y / here - other.sum_y / there;
-        let joined = |mine: f64, theirs: f64, step: f64| {
-            let joined = mine + theirs + here * there * step / count;
+        // PostgreSQL multiplies from the left, `N1 * N2 * tmp1 * tmp2 / N`, and so does this.
+        let joined = |mine: f64, theirs: f64, first: f64, second: f64| {
+            let joined = mine + theirs + here * there * first * second / count;
             match joined.is_infinite() && !mine.is_infinite() && !theirs.is_infinite() {
                 true => Err(overflow()),
                 false => Ok(joined),
             }
         };
-        self.squared_x = joined(self.squared_x, other.squared_x, apart_x * apart_x)?;
-        self.squared_y = joined(self.squared_y, other.squared_y, apart_y * apart_y)?;
-        self.product = joined(self.product, other.product, apart_x * apart_y)?;
+        self.squared_x = joined(self.squared_x, other.squared_x, apart_x, apart_x)?;
+        self.squared_y = joined(self.squared_y, other.squared_y, apart_y, apart_y)?;
+        self.product = joined(self.product, other.product, apart_x, apart_y)?;
         // `float8_eq` holds two NaNs equal, and a NaN here already means the values differ.
         if self.common_x != other.common_x {
             self.common_x = f64::NAN;
