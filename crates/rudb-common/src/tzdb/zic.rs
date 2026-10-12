@@ -217,7 +217,6 @@ fn made_rule(
     abbrvar: &'static str,
 ) -> Rule {
     Rule {
-        name: "",
         loyear: 0,
         hiyear: 0,
         lowasnum: false,
