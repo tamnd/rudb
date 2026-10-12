@@ -4735,22 +4735,9 @@ impl Shared {
         given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
-        use crate::prepared::Limit;
         let [(_, bound)] = range.lookup.equal.as_slice() else { return None };
         let bound = given.value(bound)?;
-        let limit = match &range.limit {
-            Limit::Rows(rows) => *rows,
-            Limit::Given(item) => match given.value(item)? {
-                Value::Integer(rows) => usize::try_from(rows).ok()?,
-                Value::BigInt(rows) => usize::try_from(rows).ok()?,
-                // A driver that binds every parameter as text, which the plan casts. Only plain
-                // digits here, so a text the cast reads some other way still goes to the plan.
-                Value::Varchar(text) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
-                    text.parse().ok()?
-                }
-                _ => return None,
-            },
-        };
+        let limit = rows_given(&range.limit, given)?;
         if limit > crate::prepared::RANGE_ROWS {
             return None;
         }
@@ -4788,6 +4775,69 @@ impl Shared {
         (!unanswered).then_some(result)
     }
 
+    /// Runs a prepared read of the rows over the front of a key or an index without binding it, or
+    /// says it cannot and leaves it to [`Shared::execute_ast`], see
+    /// [`crate::prepared::FrontRead`]. Inside a transaction too, as for [`Shared::lookup`].
+    pub(crate) fn front_read(
+        &self,
+        front: &crate::prepared::FrontRead,
+        given: crate::prepared::Given<'_>,
+        sql: &str,
+    ) -> Option<Result<QueryResult>> {
+        use crate::prepared::RANGE_ROWS;
+        let values = front
+            .lookup
+            .equal
+            .iter()
+            .map(|(_, item)| given.value(item))
+            .collect::<Option<Vec<_>>>()?;
+        // With no `LIMIT` one row past the most read this way says there are too many.
+        let (limit, most) = match &front.limit {
+            Some(limit) => (rows_given(limit, given)?, RANGE_ROWS),
+            None => (RANGE_ROWS + 1, RANGE_ROWS),
+        };
+        if front.limit.is_some() && limit > RANGE_ROWS {
+            return None;
+        }
+        let descending = front
+            .order
+            .map(|order| order.unwrap_or_else(|| self.inner.settings.default_descending()));
+        let catalog = self.read();
+        let target = match front.lookup.found.get(catalog.naming()) {
+            Some(target) => target,
+            None => {
+                let target = Arc::new(lookup_target(&catalog, &front.lookup)?);
+                front.lookup.found.keep(catalog.naming(), Arc::clone(&target));
+                target
+            }
+        };
+        let table = catalog.table(&target.name).ok()?;
+        let equal = front.equal;
+        let next = target.key.get(equal).copied();
+        let bound = front.reach.and_then(|reach| Some((next?, reach, values.get(equal)?)));
+        let order = descending.and_then(|descending| Some((next?, descending)));
+        let mut unanswered = false;
+        let result = kept(sql, 0, |_| {
+            let fronted = (&target.key[..equal], &values[..equal]);
+            let read = table.prefix(fronted, bound, order, (limit, most), &target.columns)?;
+            let Some(chunks) =
+                read.filter(|chunks| chunks.iter().map(Chunk::len).sum::<usize>() <= RANGE_ROWS)
+            else {
+                unanswered = true;
+                return Err(Error::internal("a range read the table cannot answer by an index"));
+            };
+            let reservation = Memory::unlimited().reservation();
+            let result = QueryResult::new(
+                Arc::clone(&target.names),
+                Arc::clone(&target.types),
+                chunks,
+                reservation,
+            );
+            Ok(if target.zoned { result.in_session(self.session()) } else { result })
+        });
+        (!unanswered).then_some(result)
+    }
+
     /// The point plan a prepared statement of one of the shapes [`crate::prepared`] takes the short
     /// way with runs as against the catalog as it is now, for [`crate::Prepared::explain`], or
     /// `None` when it would go through the plan.
@@ -4800,7 +4850,7 @@ impl Shared {
         // only. Nothing does in one that is aborted.
         let refused = match self.open().as_ref() {
             Some(open) => match shape {
-                Shape::Lookup(_) | Shape::Range(_) => open.aborted,
+                Shape::Lookup(_) | Shape::Range(_) | Shape::Front(_) => open.aborted,
                 Shape::Insert(_) | Shape::Write(_) | Shape::Upsert(_) => {
                     open.aborted || open.read_only
                 }
@@ -4866,6 +4916,14 @@ impl Shared {
                 let target = lookup_target(&catalog, &range.lookup)?;
                 let [key] = target.key.as_slice() else { return None };
                 if !catalog.table(&target.name).ok()?.ranges_by(*key) {
+                    return None;
+                }
+                Some(format!("Range {}", named(&target.name, &target.key)?))
+            }
+            Shape::Front(front) => {
+                let target = lookup_target(&catalog, &front.lookup)?;
+                let (front, next) = target.key.split_at(front.equal);
+                if !catalog.table(&target.name).ok()?.reads_front(front, next.first().copied()) {
                     return None;
                 }
                 Some(format!("Range {}", named(&target.name, &target.key)?))
@@ -8952,19 +9010,37 @@ fn point_write_target(
 }
 
 /// Whether a write by key to `target` can be made where the row is: the `SET` names no column of
-/// a key or a unique index, and the table has no checks, no declared order and no foreign key
+/// a key or an index, and the table has no checks, no declared order and no foreign key
 /// either way, each of which the plan has something to say about.
 fn writes_in_place(catalog: &Catalog, target: &crate::prepared::Target) -> bool {
     let name = &target.name;
     let Ok(table) = catalog.table(name) else { return false };
     let touches = |columns: &[usize]| columns.iter().any(|column| target.sets.contains(column));
     !(table.guards().iter().any(|key| touches(&key.columns))
-        || table.indexes().iter().any(|index| index.unique && touches(&index.columns))
+        || table.indexes().iter().any(|index| touches(&index.columns))
         || !table.checks().is_empty()
         || !table.foreign().is_empty()
         || table.clustering().is_some()
         || table.has_generated()
         || catalog.tables().any(|held| held.foreign().iter().any(|key| &key.table == name)))
+}
+
+/// The rows a `LIMIT` says, as a number written or a parameter given as an integer.
+fn rows_given(limit: &crate::prepared::Limit, given: crate::prepared::Given<'_>) -> Option<usize> {
+    use crate::prepared::Limit;
+    match limit {
+        Limit::Rows(rows) => Some(*rows),
+        Limit::Given(item) => match given.value(item)? {
+            Value::Integer(rows) => usize::try_from(rows).ok(),
+            Value::BigInt(rows) => usize::try_from(rows).ok(),
+            // A driver that binds every parameter as text, which the plan casts. Only plain digits
+            // here, so a text the cast reads some other way still goes to the plan.
+            Value::Varchar(text) if text.bytes().all(|byte| byte.is_ascii_digit()) => {
+                text.parse().ok()
+            }
+            _ => None,
+        },
+    }
 }
 
 /// The integer `was` of a column of type `ty` plus `by`, or minus it, for an `UPDATE` that sets a
