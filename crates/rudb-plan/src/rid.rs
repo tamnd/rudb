@@ -350,6 +350,21 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_with_ties_keeps_them() {
+        let mut plan = Plan::new();
+        let input = scan(&mut plan, 0);
+        let keys = plan.add_sort_keys(&[]);
+        let ties = plan.add_node(Node::LimitTies {
+            input,
+            keys,
+            count: Bound::Rows(10),
+            offset: Bound::All,
+        });
+        plan.set_root(ties);
+        assert_eq!(carried(&plan), vec![0], "the rows that tie are still rows of the input");
+    }
+
+    #[test]
     fn a_sort_and_a_top_n_drop_it_until_something_carries_it_through() {
         // Conservative and marked as such in the module: a sort could preserve this by carrying the
         // row id as a column, and nothing materialises one yet.
