@@ -953,7 +953,8 @@ impl Drop for Inner {
         let catalog = self.catalog.get_mut();
         if let Some(path) = self.path.as_ref().filter(|_| self.writable) {
             let journal = self.journal.get_mut().unwrap_or_else(PoisonError::into_inner);
-            let _ = persist_main(path, catalog, &self.pages, journal, true);
+            let depth = self.settings.recluster_depth();
+            let _ = persist_main(path, catalog, &self.pages, journal, true, depth);
         }
         // Every attached file gets the same write, which is what the pin does for one that was
         // never detached.
@@ -1748,7 +1749,8 @@ impl Database {
         let _writing = self.shared.writing();
         let mut catalog = self.shared.committed();
         let mut journal = self.shared.committed_journal();
-        persist_main(&path, &mut catalog, &self.shared.inner.pages, &mut journal, true)?;
+        let depth = self.shared.inner.settings.recluster_depth();
+        persist_main(&path, &mut catalog, &self.shared.inner.pages, &mut journal, true, depth)?;
         drop(journal);
         for (name, path) in attached_files(&catalog) {
             persist(&path, &mut catalog, &self.shared.inner.pages, &name)?;
@@ -2404,9 +2406,12 @@ fn persist_main(
     pages: &rudb_native::PagePool,
     journal: &mut Option<Journal>,
     closing: bool,
+    depth: f64,
 ) -> Result<()> {
     let Some(journal) = journal.as_mut() else {
-        return persist(path, catalog, pages, DEFAULT_CATALOG);
+        return reclustered(catalog, depth, |catalog| {
+            persist(path, catalog, pages, DEFAULT_CATALOG)
+        });
     };
     // A checkpoint in flight lands first, since this one writes the file from where it left it.
     land(catalog, journal, true)?;
@@ -2418,7 +2423,9 @@ fn persist_main(
         .filter(|held| same_name(&held.name().catalog, DEFAULT_CATALOG))
         .map(|held| (Arc::clone(held.counter()), held.counter().snapshot().1))
         .collect();
-    persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor), false)?;
+    reclustered(catalog, depth, |catalog| {
+        persist_anchored(path, catalog, pages, DEFAULT_CATALOG, Some(&anchor), false)
+    })?;
     for (counter, uses) in counters {
         counter.covered(uses);
     }
@@ -2428,6 +2435,22 @@ fn persist_main(
     let tables =
         catalog.stored_tables_in(DEFAULT_CATALOG).map(rudb_catalog::Table::oid).collect::<Vec<_>>();
     journal.checkpointed(&tables, catalog.generation())
+}
+
+/// `write` with every clustered table of the default database that decayed past `depth` put back
+/// in order first, see [`crate::recluster`]. A write that fails gets the tables back as they were,
+/// since the file and the log still number their rows the old way.
+fn reclustered(
+    catalog: &mut Catalog,
+    depth: f64,
+    write: impl FnOnce(&mut Catalog) -> Result<()>,
+) -> Result<()> {
+    let before = crate::recluster::reorder(catalog, DEFAULT_CATALOG, depth)?;
+    let written = write(catalog);
+    if written.is_err() {
+        crate::recluster::restore(catalog, before);
+    }
+    written
 }
 
 /// A checkpoint of the default database on a thread of its own, which a commit that takes the log
@@ -2612,8 +2635,9 @@ fn vacuum_main(
     catalog: &mut Catalog,
     pages: &rudb_native::PagePool,
     journal: &mut Option<Journal>,
+    depth: f64,
 ) -> Result<()> {
-    persist_main(path, catalog, pages, journal, false)?;
+    persist_main(path, catalog, pages, journal, false, depth)?;
     let names = catalog
         .stored_tables_in(DEFAULT_CATALOG)
         .map(|table| table.name().clone())
@@ -5745,6 +5769,7 @@ impl Shared {
                             &self.inner.pages,
                             &mut journal,
                             false,
+                            self.inner.settings.recluster_depth(),
                         );
                     }
                     if pending.wait().is_ok() {
@@ -5757,7 +5782,8 @@ impl Shared {
                 Err(_) => {}
             }
         }
-        persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false)
+        let depth = self.inner.settings.recluster_depth();
+        persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false, depth)
     }
 
     /// The checkpoint a commit makes once the log it wrote passed `checkpoint_threshold`: started
@@ -5772,6 +5798,7 @@ impl Shared {
         catalog: &mut Catalog,
         journal: &mut Option<Journal>,
     ) -> Result<()> {
+        let depth = self.inner.settings.recluster_depth();
         if self.inner.settings.background_checkpoint()
             && let Some(held) = journal.as_mut()
         {
@@ -5781,11 +5808,15 @@ impl Shared {
                     return Ok(());
                 }
             }
-            if launch(path, catalog, &self.inner.pages, held) {
+            // A table to put back in order is written before the commit returns, see
+            // `crate::recluster`.
+            if !crate::recluster::any_decayed(catalog, DEFAULT_CATALOG, depth)
+                && launch(path, catalog, &self.inner.pages, held)
+            {
                 return Ok(());
             }
         }
-        persist_main(path, catalog, &self.inner.pages, journal, false)
+        persist_main(path, catalog, &self.inner.pages, journal, false, depth)
     }
 
     /// Lands the checkpoint in flight, if there is one, for a write of the file that does not go
@@ -7683,6 +7714,7 @@ impl Shared {
                         &mut catalog,
                         &self.inner.pages,
                         &mut self.committed_journal(),
+                        self.inner.settings.recluster_depth(),
                     )?;
                     let links = self.inner.settings.links();
                     sketch(path, &mut catalog, &self.inner.pages, |catalog| {
@@ -7810,6 +7842,7 @@ impl Shared {
                         &self.inner.pages,
                         &mut self.committed_journal(),
                         false,
+                        self.inner.settings.recluster_depth(),
                     )?;
                     let links = self.inner.settings.links();
                     sketch(path, &mut catalog, &self.inner.pages, |catalog| {

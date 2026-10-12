@@ -8681,6 +8681,27 @@ impl Reader {
         });
     }
 
+    /// The rows of every part and the two ends of `column` in it, in the order a scan reads the
+    /// parts, which is what the reclusterer measures how far the parts of a clustered table overlap
+    /// by. The ends are `None` for a part that wrote none down, which is a part of nulls, and for
+    /// one whose page of ends could not be read.
+    ///
+    /// The ends come off the same pages [`Self::skips`] reads and are kept with them, so asking
+    /// again at the next checkpoint reads nothing.
+    #[must_use]
+    pub fn part_ends(&self, column: usize) -> Vec<(usize, Option<(Bound, Bound)>)> {
+        let mut ends = Vec::with_capacity(self.places.len());
+        for (at, stripe) in self.table.stripes.iter().enumerate() {
+            let ranges = self.stripe_part_ranges(at, column);
+            for (part, &rows) in stripe.parts.iter().enumerate() {
+                let range = ranges.and_then(|held| held.get(part));
+                let pair = range.and_then(|range| Some((range.low.clone()?, range.high.clone()?)));
+                ends.push((rows as usize, pair));
+            }
+        }
+        ends
+    }
+
     /// The share of a sample of a string column's rows that `function` keeps, one of the `LIKE`
     /// family, `=` or one of the four orderings, called with the column and `pattern`.
     ///

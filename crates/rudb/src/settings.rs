@@ -350,6 +350,12 @@ pub(crate) struct Settings {
     ///
     /// Not a DuckDB setting either.
     background_checkpoint: RwLock<bool>,
+    /// How far the parts of a clustered table may drift out of order before a checkpoint puts the
+    /// table back in order, as `SET recluster_depth` has left it, see `crate::recluster`. Zero
+    /// turns it off.
+    ///
+    /// Not a DuckDB setting either.
+    recluster_depth: RwLock<f64>,
     /// When a commit's rows are seen by other connections, as `SET visibility` has left it.
     visibility: RwLock<Visibility>,
     /// What `SET VARIABLE` has left, in the order the names were first set.
@@ -473,6 +479,7 @@ impl Settings {
             lock_timeout: RwLock::new(LOCK_TIMEOUT),
             log_lanes: RwLock::new(None),
             background_checkpoint: RwLock::new(true),
+            recluster_depth: RwLock::new(RECLUSTER_DEPTH),
             visibility: RwLock::new(Visibility::Durable),
             variables: RwLock::new(Vec::new()),
             changes: AtomicU64::new(0),
@@ -556,6 +563,11 @@ impl Settings {
     /// What `SET background_checkpoint` left.
     pub(crate) fn background_checkpoint(&self) -> bool {
         *self.background_checkpoint.read().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// What `SET recluster_depth` left.
+    pub(crate) fn recluster_depth(&self) -> f64 {
+        *self.recluster_depth.read().unwrap_or_else(|held| held.into_inner())
     }
 
     /// The log size after which a commit checkpoints, `SET checkpoint_threshold`.
@@ -848,6 +860,27 @@ impl Settings {
         if is_background_checkpoint(name) {
             let on = value.map_or(Ok(true), boolean_of)?;
             *self.background_checkpoint.write().unwrap_or_else(|held| held.into_inner()) = on;
+            return Ok(());
+        }
+        if is_recluster_depth(name) {
+            let depth = match value {
+                None => RECLUSTER_DEPTH,
+                Some(value) => {
+                    let written = text_of(value);
+                    written
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|depth| depth.is_finite() && (*depth == 0.0 || *depth >= 1.0))
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "recluster_depth is 0, for never, or a depth of 1 or more, not \
+                                 {written}"
+                            ))
+                        })?
+                }
+            };
+            *self.recluster_depth.write().unwrap_or_else(|held| held.into_inner()) = depth;
             return Ok(());
         }
         if is_lock_timeout(name) {
@@ -1418,6 +1451,9 @@ impl Settings {
         if is_background_checkpoint(name) {
             return Ok(self.background_checkpoint().to_string());
         }
+        if is_recluster_depth(name) {
+            return Ok(self.recluster_depth().to_string());
+        }
         if is_visibility(name) {
             let word = match self.visibility() {
                 Visibility::Durable => "durable",
@@ -1851,6 +1887,15 @@ fn is_background_checkpoint(name: &str) -> bool {
     rudb_functions::setting_named(name).is_none()
         && name.eq_ignore_ascii_case("background_checkpoint")
 }
+
+/// Whether this name is the reclusterer's depth, the same shape as [`is_engine`].
+fn is_recluster_depth(name: &str) -> bool {
+    rudb_functions::setting_named(name).is_none() && name.eq_ignore_ascii_case("recluster_depth")
+}
+
+/// The depth a clustered table is put back in order past until a statement says otherwise,
+/// `engine-v4/14-reads-stay-fast.md` section 14.6.
+const RECLUSTER_DEPTH: f64 = 2.0;
 
 /// How long a write waits for a held row until a statement says otherwise, the second section
 /// 8.4 of the concurrency spec gives it.
