@@ -34,6 +34,7 @@ use crate::connection::{Connection, single};
 use crate::journal::{Change, Journal, Replayed};
 use crate::prepared::Prepared;
 use crate::result::{Notice, QueryResult};
+use crate::serial::Reads;
 use crate::settings::{COMPILED_ENGINE, Local, Settings, Visibility};
 use crate::txn::{self, Board, Open, Registry};
 use crate::{foreign, upsert};
@@ -722,6 +723,8 @@ struct Conn {
     /// The settings this connection set for itself, which it reads in front of the database's.
     /// See [`crate::settings::Local`].
     local: Mutex<Option<Box<Local>>>,
+    /// What the open transaction read, when it is a serializable one.
+    reads: Reads,
 }
 
 /// How many plans a connection keeps by the text of their query.
@@ -780,6 +783,7 @@ impl Conn {
             making: Mutex::default(),
             temporary: Mutex::default(),
             database: Arc::downgrade(inner),
+            reads: Reads::default(),
         }
     }
 
@@ -4701,7 +4705,7 @@ impl Shared {
 
     /// The memory and the threads this database will lend a query.
     fn budget(&self) -> Budget<'_> {
-        Budget { memory: &self.inner.memory, pool: &self.inner.pool }
+        Budget { memory: &self.inner.memory, pool: &self.inner.pool, reads: Some(&self.conn.reads) }
     }
 
     /// What the settings are now, read once and handed to both the binder and the executor.
@@ -4880,11 +4884,15 @@ impl Shared {
     /// Rolls back what the open transaction did and lets go of its snapshot, leaving it open as
     /// `BEGIN` left it, for its first statement to run again.
     fn give_up_snapshot(&self) -> Result<()> {
-        let taken = self.open().as_mut().and_then(|open| open.snapshot.take());
+        let taken =
+            self.open().as_mut().and_then(|open| Some((open.snapshot.take()?, open.serializable)));
         match taken {
-            Some(snapshot) => {
+            Some((snapshot, serializable)) => {
                 let closed = Open { snapshot: Some(snapshot), ..Open::new(false, false) };
-                self.close_transaction(closed, false)
+                let closed = self.close_transaction(closed, false);
+                // Closing let go of what it read, and the statement reads it all again.
+                self.conn.reads.begin(serializable);
+                closed
             }
             None => Ok(()),
         }
@@ -5183,6 +5191,10 @@ impl Shared {
         given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
+        // A serializable transaction notes what it reads from the plan.
+        if self.conn.reads.noting() {
+            return None;
+        }
         let values =
             lookup.equal.iter().map(|(_, item)| given.value(item)).collect::<Option<Vec<_>>>()?;
         let catalog = self.read();
@@ -5232,6 +5244,9 @@ impl Shared {
         given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
+        if self.conn.reads.noting() {
+            return None;
+        }
         let [(_, bound)] = range.lookup.equal.as_slice() else { return None };
         let bound = given.value(bound)?;
         let limit = rows_given(&range.limit, given)?;
@@ -5347,9 +5362,12 @@ impl Shared {
         // only. Nothing does in one that is aborted.
         let refused = match self.open().as_ref() {
             Some(open) => match shape {
-                Shape::Lookup(_) | Shape::Range(_) | Shape::Front(_) => open.aborted,
-                Shape::Insert(_) | Shape::Write(_) | Shape::Upsert(_) => {
-                    open.aborted || open.read_only
+                Shape::Lookup(_) | Shape::Range(_) | Shape::Front(_) => {
+                    open.aborted || open.serializable
+                }
+                Shape::Insert(_) => open.aborted || open.read_only,
+                Shape::Write(_) | Shape::Upsert(_) => {
+                    open.aborted || open.read_only || open.serializable
                 }
             },
             None => false,
@@ -5464,7 +5482,7 @@ impl Shared {
         }
         // An aborted or read only transaction is refused by the plan, in its words.
         let transacting = match self.open().as_ref() {
-            Some(open) if open.aborted || open.read_only => return None,
+            Some(open) if open.aborted || open.read_only || open.serializable => return None,
             open => open.is_some(),
         };
         let writing = (!transacting).then(|| self.writing());
@@ -5651,7 +5669,7 @@ impl Shared {
             .collect::<Option<Vec<_>>>()?;
         // An aborted or read only transaction is refused by the plan, in its words.
         let transacting = match self.open().as_ref() {
-            Some(open) if open.aborted || open.read_only => return None,
+            Some(open) if open.aborted || open.read_only || open.serializable => return None,
             open => open.is_some(),
         };
         let writing = (!transacting).then(|| self.writing());
@@ -5785,7 +5803,7 @@ impl Shared {
             .map(|(_, item)| given.value(item))
             .collect::<Option<Vec<_>>>()?;
         let transacting = match self.open().as_ref() {
-            Some(open) if open.aborted || open.read_only => return None,
+            Some(open) if open.aborted || open.read_only || open.serializable => return None,
             open => open.is_some(),
         };
         let writing = (!transacting).then(|| self.writing());
@@ -6004,6 +6022,7 @@ impl Shared {
                 let received = self.conn.received.load(Ordering::Acquire);
                 let begun = if received == 0 { rudb_bind::micros_now() } else { received };
                 self.conn.begun.store(begun, Ordering::Release);
+                self.conn.reads.begin(serializable);
             }
             ast::Transaction::Commit => {
                 let Some(closed) = open.take() else {
@@ -6034,6 +6053,7 @@ impl Shared {
     ///
     /// A commit that conflicts with one made since the snapshot, which then rolls back.
     fn close_transaction(&self, closed: Open, commit: bool) -> Result<()> {
+        let reads = self.conn.reads.take();
         let Some(mut snapshot) = closed.snapshot else { return Ok(()) };
         let mine = std::mem::replace(&mut *self.conn.catalog.write(), Catalog::bare());
         let staged = self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner).take();
@@ -6043,7 +6063,8 @@ impl Shared {
         let merged = if commit {
             let workers = self.inner.pool.threads();
             let blend = self.registry().blends(snapshot.id);
-            txn::merge(&mut committed, mine, &mut snapshot, workers, &blend)
+            self.serialized(reads.as_deref(), &snapshot, &committed)
+                .and_then(|()| txn::merge(&mut committed, mine, &mut snapshot, workers, &blend))
         } else {
             Ok(Vec::new())
         };
@@ -6085,6 +6106,25 @@ impl Shared {
             }
         }
         merged.map(|_| ())
+    }
+
+    /// Fails the commit of a serializable transaction that read a row committed since its snapshot,
+    /// see [`crate::serial`]. `reads` is what it read, and nothing for a transaction that is not
+    /// serializable. Called with the committed catalog held, so nothing commits in between.
+    fn serialized(
+        &self,
+        reads: Option<&[crate::serial::Read]>,
+        snapshot: &txn::Snapshot,
+        committed: &Catalog,
+    ) -> Result<()> {
+        let Some(reads) = reads else { return Ok(()) };
+        if committed.generation() == snapshot.base.generation() {
+            return Ok(());
+        }
+        let registry = self.registry();
+        crate::serial::check(reads, &snapshot.base, committed, |oid| {
+            registry.changed_since(oid, snapshot.at)
+        })
     }
 
     /// Refuses rows the open transaction is adding to `name` when a key of theirs was committed
@@ -8097,6 +8137,7 @@ impl Shared {
                         if let Some(told) = self.inner.loading.lock().unwrap().take() {
                             let _ = told.send(());
                         }
+                        self.conn.reads.note(plan, &reading);
                         let query = rudb_exec::build_measured_into(
                             plan,
                             &reading,
@@ -8400,6 +8441,7 @@ impl Shared {
                                 keys,
                             )?
                         });
+                        self.conn.reads.note(&insert.source, &catalog);
                         let query = rudb_exec::build_measured_into(
                             &insert.source,
                             &catalog,
@@ -8437,7 +8479,14 @@ impl Shared {
                     }
                 }
                 let facts = context.facts();
-                let under = Under::new(self.budget(), facts, &seams, &session, Rows::ForATable)
+                // The rows an update or a delete reads are the ones its flag picks, which the
+                // source's plan alone does not say.
+                let mut budget = self.budget();
+                if matches!(insert.write, Write::Update | Write::Delete) {
+                    self.conn.reads.note_change(&insert.source, &catalog);
+                    budget.reads = None;
+                }
+                let under = Under::new(budget, facts, &seams, &session, Rows::ForATable)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
                 let result = run(sql, &insert.source, &catalog, cancel, under)?;
                 let workers = self.inner.pool.threads();
@@ -8458,6 +8507,9 @@ impl Shared {
                         // Rows it may have changed as well as added, which the commit cannot do
                         // again on a table somebody else changed since.
                         let oid = catalog.table(&name)?.oid();
+                        // It looked its keys up in the table, which a serializable transaction
+                        // takes as a read of all of it.
+                        self.conn.reads.note_table(oid);
                         self.wrote(oid, |written, _| written.opaque());
                         done
                     }
@@ -9140,6 +9192,9 @@ fn table_named<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a rudb_catalog:
 struct Budget<'a> {
     memory: &'a Memory,
     pool: &'a Pool,
+    /// Where a serializable transaction notes what the query read, see [`crate::serial`]. Here
+    /// because every query that runs a plan is handed a budget, so none of them can forget to.
+    reads: Option<&'a Reads>,
 }
 
 /// Who the rows a query produced are for, which is what decides whether they are flattened.
@@ -10093,7 +10148,10 @@ fn built<'a>(
     cancel: &Cancel,
     under: Under<'_>,
 ) -> Result<Built<'a>> {
-    let Under { budget: Budget { memory, .. }, seams, session, .. } = under;
+    let Under { budget: Budget { memory, reads, .. }, seams, session, .. } = under;
+    if let Some(reads) = reads {
+        reads.note(plan, catalog);
+    }
     // The budget is shared by the database and its high-water mark survives a query. Reset it to
     // what is live now before measuring this execution, otherwise a metrics document either says
     // zero forever (when nobody copies the mark) or inherits the largest earlier query. A caller
@@ -10215,7 +10273,7 @@ fn finish(
     under: Under<'_>,
     built: Built<'_>,
 ) -> Result<QueryResult> {
-    let Under { budget: Budget { memory, pool }, facts, seams: _, session, going, planning } =
+    let Under { budget: Budget { memory, pool, .. }, facts, seams: _, session, going, planning } =
         under;
     let Built { query, report, wall: built_wall, cpu: built_cpu } = built;
     if going == Rows::ForACaller {
@@ -10340,7 +10398,10 @@ fn run_compiled(
     under: Under<'_>,
 ) -> Result<QueryResult> {
     let Codegen { compiled, codegen_ns, switches } = compiled;
-    let Under { budget: Budget { memory, pool }, seams, session, planning, .. } = under;
+    let Under { budget: Budget { memory, pool, reads }, seams, session, planning, .. } = under;
+    if let Some(reads) = reads {
+        reads.note(plan, catalog);
+    }
     memory.forget_peak();
     let driving = Span::start();
     let qc = rudb_qc::Under { catalog, cancel, memory, seams, session, pool };

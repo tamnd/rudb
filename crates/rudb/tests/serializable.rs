@@ -2,7 +2,8 @@
 //! isolation under every level it parses (`engine-v4/18-compat.md` section 18.7).
 //!
 //! The test of it is the on-call one: two doctors are on call, each sees the other is, and each
-//! goes off. Snapshot isolation lets both commit and leaves nobody on call.
+//! goes off. Snapshot isolation lets both commit and leaves nobody on call. Serializable fails the
+//! second commit, because the second doctor read a row the first one changed.
 
 use rudb::{Connection, Database};
 use rudb_common::Value;
@@ -34,8 +35,62 @@ fn go_off(begin: &str) -> (bool, bool, Value) {
     alice.execute("UPDATE doctors SET on_call = false WHERE name = 'alice'").expect("updates");
     bob.execute("UPDATE doctors SET on_call = false WHERE name = 'bob'").expect("updates");
     let first = alice.execute("COMMIT").is_ok();
-    let second = bob.execute("COMMIT").is_ok();
+    let second = match bob.execute("COMMIT") {
+        Ok(_) => true,
+        Err(error) => {
+            assert!(error.to_string().contains("could not serialize access"), "{error}");
+            false
+        }
+    };
     (first, second, count(&alice, on_call))
+}
+
+#[test]
+fn at_serializable_the_second_doctor_cannot_go_off() {
+    for begin in [
+        "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "START TRANSACTION READ WRITE, ISOLATION LEVEL SERIALIZABLE",
+    ] {
+        assert_eq!(go_off(begin), (true, false, Value::BigInt(1)), "{begin}");
+    }
+}
+
+#[test]
+fn serializable_transactions_on_rows_apart_both_commit() {
+    let database = Database::new();
+    let one = database.connect();
+    let two = database.connect();
+    one.execute("CREATE TABLE accounts (id INTEGER, balance INTEGER)").expect("creates");
+    one.execute("INSERT INTO accounts VALUES (1, 10), (2, 20)").expect("inserts");
+    for connection in [&one, &two] {
+        connection.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").expect("begins");
+    }
+    assert_eq!(count(&one, "SELECT balance FROM accounts WHERE id = 1"), Value::Integer(10));
+    assert_eq!(count(&two, "SELECT balance FROM accounts WHERE id = 2"), Value::Integer(20));
+    one.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1").expect("updates");
+    two.execute("UPDATE accounts SET balance = balance + 2 WHERE id = 2").expect("updates");
+    one.execute("COMMIT").expect("the first commits");
+    two.execute("COMMIT").expect("the second read nothing the first changed");
+    assert_eq!(count(&one, "SELECT sum(balance)::BIGINT FROM accounts"), Value::BigInt(33));
+}
+
+#[test]
+fn a_row_added_that_a_read_picks_fails_the_commit_and_one_it_does_not_pick_does_not() {
+    let (_database, alice, bob) = doctors();
+    let on_call = "SELECT count(*) FROM doctors WHERE on_call";
+    alice.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").expect("begins");
+    assert_eq!(count(&alice, on_call), Value::BigInt(2));
+    bob.execute("INSERT INTO doctors VALUES ('dave', false)").expect("inserts");
+    alice.execute("UPDATE doctors SET on_call = false WHERE name = 'alice'").expect("updates");
+    alice.execute("COMMIT").expect("dave is not on call, so the count still holds");
+
+    alice.execute("BEGIN ISOLATION LEVEL SERIALIZABLE").expect("begins");
+    assert_eq!(count(&alice, on_call), Value::BigInt(1));
+    bob.execute("INSERT INTO doctors VALUES ('carol', true)").expect("inserts");
+    alice.execute("INSERT INTO doctors VALUES ('erin', false)").expect("inserts");
+    let error = alice.execute("COMMIT").expect_err("carol is a phantom the count missed");
+    assert!(error.to_string().contains("could not serialize access"), "{error}");
+    assert_eq!(count(&alice, "SELECT count(*) FROM doctors"), Value::BigInt(4));
 }
 
 #[test]
