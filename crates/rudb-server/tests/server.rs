@@ -7139,6 +7139,47 @@ fn a_written_column_is_placed_at_its_name() {
 }
 
 #[test]
+fn a_do_update_can_hold_a_subquery_as_in_postgres() {
+    let dirs = Dirs::new("pgupsub");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in [
+        "create temp table u (k int primary key, v text)",
+        "insert into u values (1, 'one'), (4, 'four')",
+    ] {
+        assert!(!tags(&client.query(sql)).contains('E'), "{sql}");
+    }
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (
+            "with aa as (select 1 a, 2 b) insert into u values (1, 'insert') on conflict (k) \
+             do update set v = (select b || ' update' from aa where a = 1 limit 1) returning v",
+            "2 update",
+        ),
+        (
+            "insert into u values (4, 'x') on conflict (k) do update \
+             set v = (select excluded.v || u.k) returning v",
+            "x4",
+        ),
+        (
+            "with aa as (select 1 a) insert into u values (1, 'y') on conflict (k) \
+             do update set v = 'kept' where u.k = (select a from aa) returning v",
+            "kept",
+        ),
+        (
+            "insert into u values (4, 'z') on conflict (k) do update set v = 'seen' \
+             where exists (select 1 where excluded.v = 'z') returning v",
+            "seen",
+        ),
+        ("select string_agg(k || ':' || v, ' ' order by k) from u", "1:kept 4:seen"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn on_conflict_reads_its_action_before_it_matches_a_key() {
     let dirs = Dirs::new("conflict-arbiter");
     let server = Server::start(dirs.config()).unwrap();

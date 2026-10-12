@@ -3882,7 +3882,7 @@ fn bind_conflict(
                 }
                 columns.push(at);
             }
-            let defaulted = conflict_defaults(ast, query)?;
+            let defaulted = conflict_defaults(ast, query, arbiter)?;
             let mut binder = Binder::with(catalog, parameters, session);
             binder.upsert = true;
             binder.default_as_null = defaulted.contains(&true);
@@ -3926,9 +3926,14 @@ fn bind_conflict(
 }
 
 /// Refuses what the pin refuses in a `DO UPDATE`, and says which of its values are a bare
-/// `DEFAULT`. A subquery is refused anywhere in it, a `DEFAULT` in its `WHERE` or inside a value,
-/// and a name qualified with `excluded` when the table is written with that alias as well.
-fn conflict_defaults(ast: &Ast, query: ast::QueryRef) -> Result<Vec<bool>> {
+/// `DEFAULT`. A subquery is refused anywhere in it, unless the session reads an `ON CONFLICT` as
+/// PostgreSQL does, a `DEFAULT` in its `WHERE` or inside a value, and a name qualified with
+/// `excluded` when the table is written with that alias as well.
+fn conflict_defaults(
+    ast: &Ast,
+    query: ast::QueryRef,
+    arbiter: ConflictArbiter,
+) -> Result<Vec<bool>> {
     let ast::QueryBody::Select(select) = ast.query(query).body else { return Ok(Vec::new()) };
     let select = ast.select(select);
     let aliased = ast.source_list(select.from).iter().any(|&source| {
@@ -3949,7 +3954,9 @@ fn conflict_defaults(ast: &Ast, query: ast::QueryRef) -> Result<Vec<bool>> {
                 ast::Expr::Subquery { .. }
                 | ast::Expr::Exists { .. }
                 | ast::Expr::InSubquery { .. }
-                | ast::Expr::QuantifiedSubquery { .. } => {
+                | ast::Expr::QuantifiedSubquery { .. }
+                    if arbiter == ConflictArbiter::Pin =>
+                {
                     return Err(Error::binder("DO UPDATE SET clause cannot contain a subquery"));
                 }
                 ast::Expr::Default if condition => {
