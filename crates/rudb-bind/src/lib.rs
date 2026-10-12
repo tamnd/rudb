@@ -55,7 +55,7 @@ mod value_source;
 mod vector_types;
 mod windoworder;
 
-pub use binder::{bind, bind_sql, bind_sql_with, bind_with};
+pub use binder::{bind, bind_sql, bind_sql_with, bind_with, missing_relation};
 pub use collation::check_collation;
 pub use context::{is_session_word, micros_now};
 pub use kept::Kept;

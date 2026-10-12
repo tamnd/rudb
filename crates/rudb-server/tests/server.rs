@@ -8271,3 +8271,29 @@ fn a_written_definition_runs_once_and_is_refused_where_postgres_refuses_it() {
     }
     server.stop().unwrap();
 }
+
+/// A write into a table that is not there is the error PostgreSQL gives for a read of one,
+/// `relation "nosuch" does not exist` at the name, even when a `WITH` of that name is in scope.
+/// `TRUNCATE` gives the same error with no position.
+#[test]
+fn a_write_into_a_missing_table_is_a_missing_relation_at_its_name() {
+    let dirs = Dirs::new("pgmissingtarget");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, relation, place) in [
+        ("insert into nosuch values (1)", "nosuch", Some("13")),
+        ("update s.t set a = 1", "s.t", Some("8")),
+        ("with nosuch as (select 1) delete from nosuch", "nosuch", Some("39")),
+        ("truncate nosuch", "nosuch", None),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some("42P01"), "{sql}");
+        let message = format!("relation \"{relation}\" does not exist");
+        assert_eq!(error.field(b'M'), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), place, "{sql}");
+    }
+    server.stop().unwrap();
+}

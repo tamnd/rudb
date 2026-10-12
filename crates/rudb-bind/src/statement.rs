@@ -25,7 +25,7 @@ use rudb_parse::ast::{self, Ast};
 use rudb_parse::{NONE, deparse, parse_ast};
 use rudb_plan::{Arm, Expr, ExprRef, Node, Plan, SortKey};
 
-use crate::binder::Binder;
+use crate::binder::{Binder, missing_relation};
 use crate::parameters::{Parameters, Placeholders};
 
 /// One statement, bound.
@@ -3378,6 +3378,23 @@ fn bucketed(
     binder.plan_mut().add_expr(Expr::Function { name, args }, ty)
 }
 
+/// The table that an `INSERT`, an `UPDATE`, a `DELETE` or a `TRUNCATE` writes. A missing one is
+/// an error at the name, except for `TRUNCATE`, whose error PostgreSQL gives with no position.
+fn written_target(
+    ast: &Ast,
+    catalog: &Catalog,
+    written: &ast::Insert,
+    parts: &[&str],
+) -> Result<QualifiedName> {
+    catalog.resolve(parts).map_err(|missing| {
+        let missing = missing_relation(missing, parts);
+        match written.truncate {
+            Some(_) => missing.unplaced(),
+            None => missing.placed_at(ast.part_span(written.name, 0)),
+        }
+    })
+}
+
 fn insert(
     ast: &Ast,
     catalog: &Catalog,
@@ -3387,7 +3404,7 @@ fn insert(
 ) -> Result<Bound> {
     let written = ast.insert(index);
     let parts: Vec<&str> = ast.name(written.name).collect();
-    let name = catalog.resolve(&parts)?;
+    let name = written_target(ast, catalog, &written, &parts)?;
     if catalog.entry(&name)? == Entry::View {
         // The binary's sentence, article and all. A view has no rows of its own to append to, and
         // an updatable view is a rule about rewriting the insert that neither database has.
@@ -4065,7 +4082,7 @@ fn change(
 ) -> Result<Bound> {
     let written = ast.insert(index);
     let parts: Vec<&str> = ast.name(written.name).collect();
-    let name = catalog.resolve(&parts)?;
+    let name = written_target(ast, catalog, &written, &parts)?;
     if catalog.entry(&name)? == Entry::View {
         return Err(Error::binder(if delete {
             "Can only delete from base table"

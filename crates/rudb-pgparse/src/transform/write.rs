@@ -4,7 +4,7 @@
 //! table that they write. `rudb_parse::build` makes those queries for both transforms, so this file
 //! only reads the parts of each statement out of the raw tree.
 
-use rudb_common::{Error, SqlState};
+use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
     Conflict, ConflictAction, Cte, ExprRef, Insert, Overriding, QueryRef, Slice, Statement, StrRef,
@@ -258,17 +258,20 @@ impl Transform<'_> {
     }
 
     /// The name and the alias of the table that a statement writes. `ONLY` is the same as no
-    /// `ONLY`, because no table inherits from another.
+    /// `ONLY`, because no table inherits from another. The first part of the name has the place
+    /// the name was written at, which is where an error about a missing table points.
     pub(super) fn written_table(&mut self, table: Option<&RangeVar>) -> Made<(Slice, StrRef)> {
         let Some(table) = table else {
             return clause("RangeVar");
         };
-        let parts: Vec<StrRef> = [&table.catalogname, &table.schemaname, &table.relname]
-            .into_iter()
-            .filter_map(|part| part.as_deref())
-            .map(|part| self.intern(part))
-            .collect();
-        let name = self.ast.part_slice(parts);
+        let mut at = Some(self.at(table.location));
+        let parts: Vec<(StrRef, Option<Span>)> =
+            [&table.catalogname, &table.schemaname, &table.relname]
+                .into_iter()
+                .filter_map(|part| part.as_deref())
+                .map(|part| (self.intern(part), at.take()))
+                .collect();
+        let name = self.ast.placed_part_slice(parts);
         let alias = match table.alias.as_deref().and_then(|alias| alias.aliasname.as_deref()) {
             Some(alias) => self.intern(alias),
             None => NONE,

@@ -14,6 +14,7 @@ use rudb_common::{Error, Maintenance, Result, Session, SqlState};
 use rudb_parse::Ast;
 use rudb_parse::ast::{self, OptionArg, UtilityOption};
 
+use crate::binder::missing_relation;
 use crate::explain::{boolean, string};
 
 /// A `VACUUM` or an `ANALYZE` that was checked.
@@ -67,12 +68,9 @@ pub(crate) fn vacuum(
     let mut tables = Vec::with_capacity(written.targets.len());
     for target in &written.targets {
         let parts: Vec<&str> = ast.name(target.name).collect();
-        let name = catalog.resolve(&parts).map_err(|missing| {
-            missing
-                .state(SqlState::UNDEFINED_TABLE)
-                .pg(format!("relation \"{}\" does not exist", parts.join(".")))
-                .unplaced()
-        })?;
+        let name = catalog
+            .resolve(&parts)
+            .map_err(|missing| missing_relation(missing, &parts).unplaced())?;
         tables.push(name);
     }
     let mut warnings = Vec::new();

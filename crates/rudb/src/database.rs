@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use rudb_bind::{Bound, Described, Parameters, Placeholders, Returns, Write};
+use rudb_bind::{Bound, Described, Parameters, Placeholders, Returns, Write, missing_relation};
 use rudb_catalog::{
     Alteration, Catalog, DEFAULT_CATALOG, DETACHED, Entry, Key, KeyLog, QualifiedName,
     TEMP_CATALOG, View, same_name,
@@ -7392,7 +7392,9 @@ impl Shared {
             for statement in &ast.statements {
                 let ast::Statement::Delete(at) = *statement else { continue };
                 let parts: Vec<&str> = ast.name(ast.inserts[at as usize].name).collect();
-                let name = catalog.resolve(&parts)?;
+                let name = catalog
+                    .resolve(&parts)
+                    .map_err(|missing| missing_relation(missing, &parts).unplaced())?;
                 if !tables.contains(&name) {
                     tables.push(name);
                 }
