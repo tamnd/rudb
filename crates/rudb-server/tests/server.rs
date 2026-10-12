@@ -8350,3 +8350,50 @@ fn a_recursive_with_reads_its_definitions_in_the_order_of_what_they_read() {
     }
     server.stop().unwrap();
 }
+
+/// PostgreSQL reads each `WITH` definition where it is written, also one that nothing reads, and
+/// refuses a column list longer than the columns at the name of the definition.
+#[test]
+fn a_with_definition_is_read_where_it_is_written() {
+    let dirs = Dirs::new("pgwithcolumns");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let sql = "with x(a, b) as (select 1, 2, 3) select x.a + y.b from x, x y";
+    assert_eq!(scalar(&mut client, sql), "3");
+    for (sql, code, message, place) in [
+        (
+            "with x(a, b) as (select 1) select 1",
+            "42P10",
+            "WITH query \"x\" has 1 columns available but 2 columns specified",
+            "6",
+        ),
+        ("with x as (select nosuch) select 1", "42703", "column \"nosuch\" does not exist", "19"),
+        (
+            "with x(a, b) as materialized (select 1) select * from x, x y",
+            "42P10",
+            "WITH query \"x\" has 1 columns available but 2 columns specified",
+            "6",
+        ),
+        (
+            "with recursive x(n, b) as (select 1 union all select n + 1 from x) select 1",
+            "42P10",
+            "WITH query \"x\" has 1 columns available but 2 columns specified",
+            "16",
+        ),
+        (
+            "with a as (select 1 as v), b(x, y) as (select v from a) select 1",
+            "42P10",
+            "WITH query \"b\" has 1 columns available but 2 columns specified",
+            "28",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), Some(place), "{sql}");
+    }
+    server.stop().unwrap();
+}

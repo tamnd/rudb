@@ -852,6 +852,34 @@ pub struct Cte {
     pub cycle: Option<Cycle>,
 }
 
+/// A `WITH` definition of the PostgreSQL grammar, where it was written.
+///
+/// PostgreSQL reads each definition where it is written, in `analyzeCTE` of `parse_cte.c`, and
+/// checks its column list there. It does so whether the definition is held, put into the places
+/// that read it, or not read at all. DuckDB binds a definition only where it is read, and a column
+/// list longer than the columns is no error there, so its grammar writes none of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Defined {
+    /// The query whose `WITH` the definition is in. For a statement that writes rows it is the
+    /// first query of the statement that carries the held definitions, see
+    /// [`Ast::carrier`].
+    pub owner: QueryRef,
+    /// How many of the held definitions of `owner` come before it.
+    pub after: u32,
+    /// Its index in [`Ast::ctes`] when it is held or reads itself, or [`NONE`].
+    pub cte: u32,
+    /// Whether it is held, which is when it is in the definitions of `owner` and is bound there.
+    pub held: bool,
+    /// What produces its rows.
+    pub query: QueryRef,
+    /// The column names from `AS name(a, b)`, as a run of [`StrRef`].
+    pub columns: Slice,
+    /// The name it was written with.
+    pub name: StrRef,
+    /// Where its name was written.
+    pub span: Span,
+}
+
 /// `SEARCH { DEPTH | BREADTH } FIRST BY columns SET sequence` on a recursive definition: a column
 /// added after the columns of the definition that sorts its rows in the order of a walk of the
 /// graph it makes.
@@ -1978,6 +2006,9 @@ pub struct Ast {
     /// read or comes after it. When there is no table of the name either, the error says why the
     /// definition is not read. DuckDB has no such error, so its grammar has none of these.
     pub future_sources: Vec<SourceRef>,
+    /// The `WITH` definitions of the PostgreSQL grammar, in the order PostgreSQL reads them, see
+    /// [`Defined`].
+    pub defined: Vec<Defined>,
     /// The sources in `FROM` that the PostgreSQL grammar closed to the entries to their left, each
     /// with the reason. In DuckDB every entry can read them, so its grammar has none of these.
     pub closed_sources: Vec<(SourceRef, Closed)>,
@@ -2264,6 +2295,17 @@ impl Ast {
     /// [`Ast::future_sources`].
     pub fn names_future_definition(&self, source: SourceRef) -> bool {
         self.future_sources.contains(&source)
+    }
+
+    /// The `WITH` definitions that the query `owner` has, in the order PostgreSQL reads them.
+    pub fn defined_in(&self, owner: QueryRef) -> impl Iterator<Item = &Defined> {
+        self.defined.iter().filter(move |defined| defined.owner == owner)
+    }
+
+    /// Where the held or recursive definition `cte` was written, when the PostgreSQL grammar
+    /// wrote it.
+    pub fn defined_at(&self, cte: u32) -> Option<Span> {
+        self.defined.iter().find(|defined| defined.cte == cte).map(|defined| defined.span)
     }
 
     /// Whether a function source was written `WITH ORDINALITY`.

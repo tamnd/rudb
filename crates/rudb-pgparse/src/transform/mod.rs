@@ -173,6 +173,8 @@ struct Definition {
     /// The `INSERT`, the `UPDATE` or the `DELETE` of a definition that writes rows, which is held
     /// in its slot whether it is read or not.
     dml: Option<Statement>,
+    /// Where the name was written.
+    span: Span,
 }
 
 struct Transform<'a> {

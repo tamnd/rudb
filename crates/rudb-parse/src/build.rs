@@ -403,23 +403,10 @@ impl Ast {
     /// of its queries carries already: the source, the `RETURNING` and the values of an `ON
     /// CONFLICT DO UPDATE`. Each of these queries is bound on its own, so each carries them.
     pub fn carry_definitions(&mut self, statement: Statement, once: &[u32]) {
-        let (Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index)) =
-            statement
-        else {
-            return;
-        };
         if once.is_empty() {
             return;
         }
-        let insert = self.inserts[index as usize];
-        let update = match insert.conflict.map(|conflict| conflict.action) {
-            Some(ConflictAction::Update { query, .. }) => Some(query),
-            _ => None,
-        };
-        for query in std::iter::once(insert.source).chain(insert.returning).chain(update) {
-            if query == NONE {
-                continue;
-            }
+        for query in self.carriers(statement) {
             // Outermost first, so the statement's own come ahead of any the query wrote.
             let own = self.queries[query as usize].ctes;
             let mut all = once.to_vec();
@@ -427,6 +414,29 @@ impl Ast {
             let slice = self.cte_slice(all);
             self.queries[query as usize].ctes = slice;
         }
+    }
+
+    /// The first query of a writing statement that carries its held `WITH` definitions, or
+    /// [`NONE`] when it has none, as an `INSERT ... DEFAULT VALUES` has none.
+    pub fn carrier(&self, statement: Statement) -> QueryRef {
+        self.carriers(statement).next().unwrap_or(NONE)
+    }
+
+    /// The queries of a writing statement that carry its held `WITH` definitions, which are the
+    /// ones the binder binds on their own.
+    fn carriers(&self, statement: Statement) -> impl Iterator<Item = QueryRef> + use<> {
+        let queries = match statement {
+            Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index) => {
+                let insert = self.inserts[index as usize];
+                let update = match insert.conflict.map(|conflict| conflict.action) {
+                    Some(ConflictAction::Update { query, .. }) => query,
+                    _ => NONE,
+                };
+                [insert.source, insert.returning.unwrap_or(NONE), update]
+            }
+            _ => [NONE; 3],
+        };
+        queries.into_iter().filter(|&query| query != NONE)
     }
 
     fn true_literal(&mut self, span: Span) -> ExprRef {

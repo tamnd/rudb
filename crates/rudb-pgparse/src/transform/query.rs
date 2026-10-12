@@ -3,9 +3,9 @@
 use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Closed, Cte, Cycle, Distinct, Expr, JoinKind, JoinNames, Nulls, Order, OrderItem, Quantifier,
-    Query, QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Statement, Target,
-    WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    Closed, Cte, Cycle, Defined, Distinct, Expr, JoinKind, JoinNames, Nulls, Order, OrderItem,
+    Quantifier, Query, QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef,
+    Statement, Target, WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 
 use super::depend::ordered;
@@ -43,10 +43,12 @@ impl Transform<'_> {
         let made = self.query_rest(select);
         self.windows = outer;
         let mut query = made?;
-        let once = self.settle(mark);
+        let (once, defined) = self.settle(mark);
         query.ctes = self.ast.cte_slice(once);
         let span = self.span;
-        Ok(self.ast.push_query(query, span))
+        let query = self.ast.push_query(query, span);
+        self.own(query, defined);
+        Ok(query)
     }
 
     /// The body of a query, its `ORDER BY` and its limits.
@@ -297,6 +299,7 @@ impl Transform<'_> {
                     recursive: false,
                     reads: Vec::new(),
                     dml: None,
+                    span: self.at(cte.location),
                 },
                 Some(
                     written @ (Node::InsertStmt(_) | Node::UpdateStmt(_) | Node::DeleteStmt(_)),
@@ -342,6 +345,7 @@ impl Transform<'_> {
             recursive: true,
             reads: Vec::new(),
             dml: None,
+            span: self.at(cte.location),
         });
         let reads = self.self_reads.len();
         self.recursing.push((slot, self.depth + 1, self.places.len()));
@@ -376,6 +380,7 @@ impl Transform<'_> {
             recursive,
             reads: Vec::new(),
             dml: None,
+            span: self.at(cte.location),
         })
     }
 
@@ -506,7 +511,7 @@ impl Transform<'_> {
     }
 
     /// Takes the definitions of the query out of scope, and gives the ones that are held, which
-    /// the query carries.
+    /// the query carries, and all of them as [`Defined`] in the order they were read.
     ///
     /// A held definition runs once and each read of it reads its rows. Any other definition is put
     /// into each place that reads it. The rule is the one of `inline_cte` in `subselect.c`: a
@@ -514,9 +519,10 @@ impl Transform<'_> {
     /// read more than once, at any depth. A definition written in a subquery can read a column of
     /// the query around it, and the held rows are then made again for each row of that query.
     /// `NOT MATERIALIZED` puts a definition in place even when it is read more than once.
-    pub(super) fn settle(&mut self, mark: usize) -> Vec<u32> {
+    pub(super) fn settle(&mut self, mark: usize) -> (Vec<u32>, Vec<Defined>) {
         let definitions = self.scope.split_off(mark);
         let mut once = Vec::new();
+        let mut defined = Vec::with_capacity(definitions.len());
         for definition in definitions {
             let reads = definition.reads.len();
             let asked = definition.materialized == CTEMaterialize::CTEMaterializeAlways;
@@ -525,11 +531,21 @@ impl Transform<'_> {
                 || (definition.recursive && reads > 0)
                 || asked
                 || (!refused && reads > 1);
+            let name = self.intern(&definition.name);
+            defined.push(Defined {
+                owner: NONE,
+                after: once.len() as u32,
+                cte: definition.slot,
+                held,
+                query: definition.query,
+                columns: definition.declared,
+                name,
+                span: definition.span,
+            });
             if !held {
                 continue;
             }
             let cte = if definition.slot == NONE {
-                let name = self.intern(&definition.name);
                 self.ast.ctes.push(Cte {
                     name,
                     query: definition.query,
@@ -553,9 +569,21 @@ impl Transform<'_> {
             if let Some(statement) = definition.dml {
                 self.ast.carry_definitions(statement, &once);
             }
+            if let Some(last) = defined.last_mut() {
+                last.cte = cte;
+            }
             once.push(cte);
         }
-        once
+        (once, defined)
+    }
+
+    /// Gives the definitions that [`Self::settle`] gave to the query `owner`. A statement with no
+    /// query to carry them has no place where they are read, and they are dropped.
+    pub(super) fn own(&mut self, owner: QueryRef, defined: Vec<Defined>) {
+        if owner == NONE {
+            return;
+        }
+        self.ast.defined.extend(defined.into_iter().map(|defined| Defined { owner, ..defined }));
     }
 
     // `FROM`.
