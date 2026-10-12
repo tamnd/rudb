@@ -704,9 +704,7 @@ impl Binder<'_> {
             return Ok(self.cast_to(constant, &ty));
         }
         // A null handed to an `EXECUTE` as `NULL::INT` is a null of that type, as it is on the pin.
-        if null
-            && let Some(ty) = self.parameters.null_type(name)
-        {
+        if null && let Some(ty) = self.parameters.null_type(name) {
             let ty = ty.clone();
             return Ok(self.cast_to(constant, &ty));
         }

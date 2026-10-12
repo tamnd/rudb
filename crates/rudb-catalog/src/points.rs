@@ -697,6 +697,7 @@ impl Located {
                         noted += 1;
                     }
                     values.clear();
+                    // row at a time: the values of one row, for its key.
                     for column in 0..self.columns.len() {
                         values.push(chunk.column(column)?.value_at(row));
                     }
