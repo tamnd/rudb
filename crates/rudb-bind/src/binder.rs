@@ -7062,6 +7062,9 @@ impl<'a> Binder<'a> {
         if parts.frame.unit == WindowUnit::Range && offsets && parts.order.len() != 1 {
             return Err(Error::binder("RANGE frames must have only one ORDER BY expression"));
         }
+        if self.semantics.unknown_types() == UnknownTypes::Postgres {
+            self.pg_aggregate_unknowns(ast, name, args, &mut parts.args)?;
+        }
 
         let types: Vec<LogicalType> =
             parts.args.iter().map(|&arg| self.plan.expr_type(arg).clone()).collect();
