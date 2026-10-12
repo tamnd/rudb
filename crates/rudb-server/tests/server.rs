@@ -3102,6 +3102,57 @@ fn generate_series_resolves_and_gives_its_rows_as_in_postgres() {
 }
 
 #[test]
+fn the_whole_row_of_a_relation_is_null_where_an_outer_join_padded_it() {
+    let dirs = Dirs::new("pgpadded");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or("null".to_string(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    client.query("create temp table a (x int, y int);");
+    client.query("create temp table b (x int, y int);");
+    client.query("insert into a values (1, 1), (2, 2);");
+    client.query("insert into b values (1, null), (null, null);");
+    // The rows are the ones that PostgreSQL 19 gives. A row of `b` with a null in each column is
+    // still a row, and the row that the join made up for `a.x = 2` is null.
+    let cases: [(&str, &[&str]); 6] = [
+        (
+            "select a.x, count(b.*), count(b) from a left join b on a.x = b.x group by a.x order by 1;",
+            &["1|1|1", "2|0|0"],
+        ),
+        ("select count(b.*) from b;", &["2"]),
+        (
+            "select a.x, b, b is null from a left join b on a.x = b.x order by 1;",
+            &["1|(1,)|f", "2|null|t"],
+        ),
+        (
+            "select a.x, count(s.*) from a left join (select * from b offset 0) s on a.x = s.x group by a.x order by 1;",
+            &["1|1", "2|0"],
+        ),
+        (
+            "with w as (select * from b) select a.x, count(w) from a left join w on a.x = w.x group by a.x order by 1;",
+            &["1|1", "2|0"],
+        ),
+        (
+            "select a.x, v from a left join (values (1, 'p')) v(k, t) on a.x = v.k order by 1;",
+            &["1|(1,p)", "2|null"],
+        ),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_array_functions_resolve_their_types_and_give_the_values_of_postgres() {
     let dirs = Dirs::new("pgarrays");
     let server = Server::start(dirs.config()).unwrap();

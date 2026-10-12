@@ -4813,7 +4813,7 @@ impl Binder<'_> {
         }
     }
 
-    fn against_null(&mut self, op: CompareOp, expr: ExprRef) -> Result<ExprRef> {
+    pub(crate) fn against_null(&mut self, op: CompareOp, expr: ExprRef) -> Result<ExprRef> {
         let null = self.add_constant(Value::Null);
         self.compare(op, expr, null)
     }
