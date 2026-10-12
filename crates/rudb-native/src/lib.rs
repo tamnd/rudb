@@ -8801,7 +8801,7 @@ impl Reader {
     }
 
     /// How many rows of the table hold a value of `column` any of `branches` keeps, run over every
-    /// row when the table has no more than [`PICKED_PARTS`] parts, the tables [`Self::picked`] runs
+    /// row when the table has no more than `PICKED_PARTS` parts, the tables [`Self::picked`] runs
     /// a condition over whole. `None` for a larger table and for a column that is not a string.
     /// Kept for as long as the reader is, as [`Self::matched`] keeps its shares.
     #[must_use]
