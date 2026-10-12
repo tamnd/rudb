@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use rudb_bind::Parameters;
+use rudb_bind::{Kept, Parameters};
 use rudb_catalog::QualifiedName;
 use rudb_common::{
     Cancel, DeclaredType, Error, Field, IdentifierCompare, LogicalType, Origin, Result, Value,
@@ -33,11 +33,13 @@ pub struct Description {
 
 /// A prepared statement.
 ///
-/// The statement is parsed here and bound at each execution, with the values in hand. That is the
-/// opposite of the usual arrangement, where a prepared statement is planned once and the values are
-/// pushed into the plan, and it is on purpose for now: an analytical query is planned against the
-/// data it reads, so a plan built without knowing that `$1` is `1` or `1000000` is a plan built
-/// blind. Parsing is the part that is pure overhead, and that happens once.
+/// The statement is parsed here, and bound with the values of its first execution in hand. The
+/// bound plan is kept, and a later execution with values of the same types sets them into it and
+/// skips the binder, as long as the catalog's names and the settings are as they were (see
+/// [`Kept`]). It is optimized at each execution, with the values in hand: an analytical query is
+/// planned against the data it reads, so a plan built without knowing that `$1` is `1` or
+/// `1000000` is a plan built blind. A read, write or insert by key skips all of that and runs on a
+/// short way of its own.
 ///
 /// What a parameter can be written as is DuckDB's list: `?` numbered by where it is, `?1` and `$1`
 /// numbered by hand, and `$name`. A parameter used twice is one parameter, because it is one value
@@ -74,6 +76,9 @@ pub struct Prepared {
     described: Arc<Mutex<Option<Described>>>,
     /// The PostgreSQL type that the client declared for each parameter, in the order of `names`.
     types: Vec<Option<DeclaredType>>,
+    /// The plans bound for the statement that it runs again with other values, for an execution
+    /// none of the short ways takes.
+    kept: Kept,
 }
 
 /// A description that [`Prepared::describe`] keeps.
@@ -988,7 +993,9 @@ impl Prepared {
         let numbered = numbered_one_to_n(&names);
         let sql = sql.to_string();
         let described = Arc::default();
-        Ok(Self { shared, cancel, sql, ast, names, short, numbered, described, types: Vec::new() })
+        let kept = Kept::default();
+        let types = Vec::new();
+        Ok(Self { shared, cancel, sql, ast, names, short, numbered, described, types, kept })
     }
 
     /// Gives the parameters the PostgreSQL types that the client declared, in the order of
@@ -997,6 +1004,8 @@ impl Prepared {
     pub fn declare(&mut self, types: Vec<Option<DeclaredType>>) {
         self.types = types;
         *self.described.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        // A plan bound under the types declared before is not the plan these bind.
+        self.kept = Kept::default();
     }
 
     /// `parameters` with the declared types.
@@ -1134,7 +1143,9 @@ impl Prepared {
             {
                 return done;
             }
-            self.run(&self.typed(Parameters::positional(values.to_vec())))
+            let mut parameters = self.typed(Parameters::positional(values.to_vec()));
+            parameters.keep_in(self.kept.clone());
+            self.run(&parameters)
         });
         result.map_err(|error| self.shared.process_error(error))
     }
@@ -1154,7 +1165,8 @@ impl Prepared {
         for (name, value) in values {
             parameters.set(*name, value.clone());
         }
-        let parameters = self.typed(parameters);
+        let mut parameters = self.typed(parameters);
+        parameters.keep_in(self.kept.clone());
         let result = self.shared.in_transaction(&self.sql, || self.run(&parameters));
         result.map_err(|error| self.shared.process_error(error))
     }
@@ -1368,5 +1380,56 @@ mod tests {
         }
         let delete = db.prepare("DELETE FROM t WHERE id = ?").expect("prepares");
         assert!(delete.short.write.as_ref().is_some_and(|write| write.delete));
+    }
+
+    /// A plan bound once runs again with the values of each execution and the facts the tables
+    /// have by then, so it answers what binding again would have.
+    #[test]
+    fn a_plan_bound_once_runs_again_with_other_values() {
+        let db = Database::new();
+        db.execute("CREATE TABLE o (w INTEGER, d INTEGER, i INTEGER)").expect("creates");
+        db.execute("CREATE TABLE s (w INTEGER, i INTEGER, q INTEGER)").expect("creates");
+        db.execute("INSERT INTO o SELECT r % 3, r % 10, r FROM range(100) t(r)").expect("inserts");
+        db.execute("INSERT INTO s SELECT r % 3, r, r % 20 FROM range(100) t(r)").expect("inserts");
+        let level = "SELECT count(DISTINCT s.i) FROM o, s WHERE o.w = ? AND o.d = ? AND s.w = o.w \
+                     AND s.i = o.i AND s.q < ?";
+        let grouped = "SELECT max(c) FROM (SELECT i, count(*) AS c FROM o WHERE w = ? GROUP BY i)";
+        let kept = [db.prepare(level).expect("prepares"), db.prepare(grouped).expect("prepares")];
+        let same = |at: usize, values: &[Value]| {
+            let sql = [level, grouped][at];
+            let fresh = db.prepare(sql).expect("prepares").value(values).expect("runs");
+            assert_eq!(kept[at].value(values).expect("runs"), fresh, "{sql} with {values:?}");
+        };
+        let ints = |values: &[i32]| values.iter().map(|&v| Value::Integer(v)).collect::<Vec<_>>();
+
+        same(0, &ints(&[1, 1, 10]));
+        assert_eq!(kept[0].kept.len(), 1, "the plan is kept");
+        same(0, &ints(&[2, 5, 15]));
+        same(1, &ints(&[1]));
+        assert_eq!(kept[1].kept.len(), 1, "the plan is kept");
+        // Rows that put `i` out of order and land beside a group already seen.
+        db.execute("INSERT INTO o VALUES (1, 1, 1), (1, 1, 1), (0, 0, NULL)").expect("inserts");
+        db.execute("DELETE FROM s WHERE i = 1").expect("deletes");
+        same(0, &ints(&[1, 1, 10]));
+        same(1, &ints(&[1]));
+        assert_eq!(kept[1].value(&ints(&[1])).expect("runs"), Value::BigInt(3));
+        same(0, &[Value::BigInt(0), Value::Integer(0), Value::Integer(19)]);
+        assert_eq!(kept[0].kept.len(), 2, "one plan for each set of types");
+
+        // A change of what the names resolve to binds again.
+        db.execute("ALTER TABLE s ADD COLUMN extra INTEGER").expect("alters");
+        same(0, &ints(&[0, 3, 4]));
+        assert_eq!(kept[0].kept.len(), 1, "the plans of the names before are let go");
+
+        // A value read while binding, or the clock, leaves nothing to keep.
+        for sql in [
+            "SELECT count(*) FROM (SELECT * FROM o LIMIT ?)",
+            "SELECT count(*) FROM o WHERE w = ? AND now() IS NOT NULL",
+            "SELECT count(*) FROM range(?)",
+        ] {
+            let prepared = db.prepare(sql).expect("prepares");
+            prepared.value(&ints(&[2])).expect("runs");
+            assert!(prepared.kept.is_empty(), "{sql}");
+        }
     }
 }

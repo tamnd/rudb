@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use rudb_common::{DeclaredType, Error, Field, LogicalType, Origin, Value};
 
+use crate::kept::Kept;
+
 /// What a prepared statement was handed, by identifier.
 ///
 /// A parameter is written `?`, `?1`, `$1` or `$name`, and the parser gives every one of them an
@@ -27,6 +29,7 @@ pub struct Parameters {
     /// The type of a null that a parameter was given, such as the `INTEGER` of `NULL::INT` in an
     /// `EXECUTE`, which the null itself does not carry.
     nulls: Vec<(String, LogicalType)>,
+    kept: Option<Kept>,
 }
 
 /// What a statement takes and gives, found by binding it with no values, which is what a client
@@ -197,6 +200,7 @@ impl Parameters {
             placeholders: None,
             types: Vec::new(),
             nulls: Vec::new(),
+            kept: None,
         }
     }
 
@@ -308,6 +312,33 @@ impl Parameters {
     #[must_use]
     pub fn uncaught(&self) -> Self {
         Self { capture: None, ..self.clone() }
+    }
+
+    /// Binds the statement so that `kept` can keep the plan and run it again with other values.
+    pub fn keep_in(&mut self, kept: Kept) {
+        self.kept = Some(kept);
+    }
+
+    /// Where the plan is kept, when the statement is bound to keep it.
+    #[must_use]
+    pub fn kept(&self) -> Option<&Kept> {
+        self.kept.as_ref()
+    }
+
+    /// Whether these are values and nothing else: no rows handed in, nothing caught, nothing
+    /// described, no null typed apart from its value. Only a plan bound with plain values can be
+    /// run again with others.
+    pub(crate) fn plain(&self) -> bool {
+        self.written.is_empty()
+            && self.relations.is_empty()
+            && self.capture.is_none()
+            && self.placeholders.is_none()
+            && self.nulls.is_empty()
+    }
+
+    /// The values, in the order they were given.
+    pub(crate) fn values(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.values.iter().map(|(name, value)| (name.as_str(), value))
     }
 
     /// Whether nothing was provided.
