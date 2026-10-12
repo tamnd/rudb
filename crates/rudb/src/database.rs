@@ -5266,6 +5266,9 @@ impl Shared {
         };
         let table = catalog.table(&target.name).ok()?;
         let [key] = target.key.as_slice() else { return None };
+        if !keys_fit(table, &target.key, std::slice::from_ref(&bound)) {
+            return None;
+        }
         let mut unanswered = false;
         let result = kept(sql, 0, |_| {
             let reach = (range.reach, &bound);
@@ -5328,6 +5331,11 @@ impl Shared {
         };
         let table = catalog.table(&target.name).ok()?;
         let equal = front.equal;
+        // A value that the normalized form of its column does not hold as the column does, such
+        // as a `char(n)` with trailing spaces, is left to the plan, as for a point read.
+        if !keys_fit(table, &target.key, &values) {
+            return None;
+        }
         let next = target.key.get(equal).copied();
         let bound = front.reach.and_then(|reach| Some((next?, reach, values.get(equal)?)));
         let order = descending.and_then(|descending| Some((next?, descending)));
@@ -5347,7 +5355,8 @@ impl Shared {
                 Arc::clone(&target.types),
                 chunks,
                 reservation,
-            );
+            )
+            .with_origins(&target.origins);
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
         // A serializable transaction takes a read over the front of a key for a read of the whole
