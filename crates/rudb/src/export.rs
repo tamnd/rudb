@@ -138,12 +138,10 @@ pub(crate) fn statistics(files: Vec<Wrote>) -> Result<QueryResult> {
                 entries.push(("nan_count", nans.to_string()));
             }
             if let (Some(min), Some(max)) = (&column.min, &column.max) {
-                let (min, min_exact) = bound_text(min, false)?;
-                let (max, max_exact) = bound_text(max, true)?;
-                entries.push(("min", min));
-                entries.push(("min_is_exact", min_exact.to_string()));
-                entries.push(("max", max));
-                entries.push(("max_is_exact", max_exact.to_string()));
+                entries.push(("min", bound_text(min)?));
+                entries.push(("min_is_exact", column.min_exact.to_string()));
+                entries.push(("max", bound_text(max)?));
+                entries.push(("max_is_exact", column.max_exact.to_string()));
             }
             entries.sort_unstable_by_key(|&(key, _)| key);
             let entries = entries
@@ -195,43 +193,15 @@ pub(crate) fn statistics(files: Vec<Wrote>) -> Result<QueryResult> {
     ))
 }
 
-/// How many bytes of a string or a blob a bound keeps, which is the pin's limit.
-const BOUND_BYTES: usize = 256;
-
-/// A bound of a column as the pin reports it, and whether it is exact. A bool is 1 or 0 and a blob
-/// is its bytes in hex. A string or a blob longer than [`BOUND_BYTES`] is cut short, a string on a
-/// character, and an upper bound then has its last character or byte raised by one so that it is
-/// still above every value, and neither is exact any more.
-fn bound_text(value: &Value, upper: bool) -> Result<(String, bool)> {
+/// A bound of a column as the pin reports it: a bool is 1 or 0 and a blob is its bytes in hex. A
+/// long string or blob comes already cut by the writer, the way the file's bounds are.
+fn bound_text(value: &Value) -> Result<String> {
     Ok(match value {
-        Value::Boolean(on) => (u8::from(*on).to_string(), true),
-        Value::Blob(bytes) if bytes.len() > BOUND_BYTES => {
-            let mut kept = bytes[..BOUND_BYTES].to_vec();
-            if upper {
-                while kept.last() == Some(&u8::MAX) {
-                    kept.pop();
-                }
-                if let Some(last) = kept.last_mut() {
-                    *last += 1;
-                }
-            }
-            (hex(&kept), false)
-        }
-        Value::Blob(bytes) => (hex(bytes), true),
-        Value::Varchar(text) if text.len() > BOUND_BYTES => {
-            let mut end = BOUND_BYTES;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            let mut kept = text[..end].to_string();
-            if upper && let Some(last) = kept.pop() {
-                kept.extend(char::from_u32(u32::from(last) + 1));
-            }
-            (kept, false)
-        }
+        Value::Boolean(on) => u8::from(*on).to_string(),
+        Value::Blob(bytes) => hex(bytes),
         other => match cast_value(other, &LogicalType::Varchar, false)? {
-            Value::Varchar(text) => (text, true),
-            cast => (cast.to_string(), true),
+            Value::Varchar(text) => text,
+            cast => cast.to_string(),
         },
     })
 }
@@ -611,13 +581,13 @@ impl<'a> Sink<'a> {
             let mut stored = Vec::with_capacity(types.len());
             let mut fields = Vec::with_capacity(types.len());
             for (name, ty) in names.iter().zip(types) {
-                let ty = rudb_parquet::storage(ty)?;
                 fields.push(Field::new(name.clone(), ty.clone()));
-                stored.push(ty);
+                stored.push(rudb_parquet::storage(ty)?);
             }
             let codec =
                 if copy.compression == "snappy" { Codec::Snappy } else { Codec::Uncompressed };
-            let writer = rudb_parquet::Writer::new(out, &fields, codec, CREATED_BY)?;
+            let mut writer = rudb_parquet::Writer::new(out, &fields, codec, CREATED_BY)?;
+            writer.set_key_values(copy.kv_metadata.clone());
             Body::Parquet { writer, stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
             let moments = Moments {

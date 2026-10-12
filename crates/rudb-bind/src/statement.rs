@@ -164,6 +164,8 @@ pub struct CopyTo {
     pub compression: String,
     /// For Parquet, how many rows go in a row group.
     pub row_group_size: u64,
+    /// For Parquet, the key value pairs `KV_METADATA` puts in the footer, in the order written.
+    pub kv_metadata: Vec<(String, Vec<u8>)>,
     /// For JSON, the `strftime` format a date is written with, where `None` writes its cast to
     /// VARCHAR.
     pub date_format: Option<String>,
@@ -955,7 +957,10 @@ fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -
         let Some(written) = written else { continue };
         // A bare NULL for `HEADER` is refused here for every format, before JSON says it does
         // not know the option.
-        if written.null() && (!json || !bare(written) || name == "header") && name != "partition_by"
+        // `KV_METADATA` takes any type and refuses a NULL for not being a struct.
+        if written.null()
+            && (!json || !bare(written) || name == "header")
+            && !matches!(name, "partition_by" | "kv_metadata")
         {
             return Err(Error::binder(format!(
                 "NULL is not supported as a valid option for COPY option \"{name}\""
@@ -1032,8 +1037,47 @@ fn copy_to(
         "parquet" => parquet_to(&rest, plan)?,
         _ => csv_to(&rest, plan)?,
     };
+    if out.parquet {
+        out.kv_metadata = kv_metadata(copy, typed)?;
+    }
     out.partitioned = partitioned;
     Ok(out)
+}
+
+/// The key value pairs of a Parquet `KV_METADATA`: a field of the struct each, with a blob as its
+/// bytes and any other value as its text, which is how the pin writes them.
+fn kv_metadata(copy: &ast::CopyTo, typed: &[Option<Written>]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut pairs = Vec::new();
+    for ((name, _), written) in copy.options.iter().zip(typed) {
+        if name != "kv_metadata" {
+            continue;
+        }
+        let Some(written) =
+            written.as_ref().filter(|written| matches!(written.ty, LogicalType::Struct(_)))
+        else {
+            return Err(Error::binder("Expected kv_metadata argument to be a STRUCT"));
+        };
+        let Some(Value::Struct(fields)) = &written.value else {
+            return Err(Error::not_implemented(
+                "COPY TO with a KV_METADATA struct that is not a constant is not supported yet",
+            ));
+        };
+        pairs.clear();
+        for (key, value) in fields {
+            let bytes = match value {
+                Value::Blob(bytes) => bytes.clone(),
+                Value::Null => b"NULL".to_vec(),
+                other => {
+                    match rudb_kernels::cast::cast_value(other, &LogicalType::Varchar, false)? {
+                        Value::Varchar(text) => text.into_bytes(),
+                        cast => cast.to_string().into_bytes(),
+                    }
+                }
+            };
+            pairs.push((key.clone(), bytes));
+        }
+    }
+    Ok(pairs)
 }
 
 /// Reads the options of a `COPY ... TO` a CSV file.
@@ -1055,6 +1099,7 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         row_group_size: 0,
         date_format: None,
         timestamp_format: None,
+        kv_metadata: Vec::new(),
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1139,6 +1184,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         row_group_size: 0,
         date_format: None,
         timestamp_format: None,
+        kv_metadata: Vec::new(),
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1204,7 +1250,8 @@ fn json_format(name: &str, value: &Option<String>) -> Result<String> {
     Ok(format.clone())
 }
 
-/// Reads the options of a `COPY ... TO` a Parquet file, which are the codec and the row group size.
+/// Reads the options of a `COPY ... TO` a Parquet file, which are the codec, the row group size and
+/// the key value pairs.
 fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     let mut out = CopyTo {
         plan,
@@ -1223,12 +1270,14 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         row_group_size: 122_880,
         date_format: None,
         timestamp_format: None,
+        kv_metadata: Vec::new(),
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
         let written = value.as_deref().unwrap_or_default().trim_matches('\'');
         match name.as_str() {
-            "format" => {}
+            // `KV_METADATA` is read from its bound value in `copy_to`.
+            "format" | "kv_metadata" => {}
             "compression" | "codec" => {
                 let codec = written.to_ascii_lowercase();
                 match codec.as_str() {
@@ -1258,7 +1307,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             "row_group_size_bytes"
             | "compression_level"
             | "field_ids"
-            | "kv_metadata"
             | "dictionary_size_limit"
             | "string_dictionary_page_size_limit"
             | "write_bloom_filter"
