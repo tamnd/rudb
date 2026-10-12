@@ -81,8 +81,8 @@ impl Entry {
         self.state
             .get_or_init(|| match self.source {
                 Source::File(release, index) => {
-                    let data = &release.registry().data;
-                    State::load(zic::compile(&data.zones[index].eras, &data.rules))
+                    let (eras, rules) = release.registry().data.zone(index);
+                    State::load(zic::compile(&eras, &rules))
                 }
                 Source::Posix { lastditch } => State::parse(self.name, lastditch),
             })
@@ -96,42 +96,52 @@ struct Registry {
     /// The zone files as the pin of PostgreSQL installs them: a file for each zone and each link,
     /// in the order of their names.
     files: Vec<Entry>,
-    /// The index in `files` of each name in upper case.
-    by_upper: HashMap<String, usize>,
+    /// The indexes of `files` in the order of the names in upper case, where the last of a name
+    /// is the one it finds.
+    by_upper: Vec<u32>,
 }
 
 impl Registry {
     fn new(release: Release) -> Registry {
         let data = zi::read(release.text());
-        let mut files: Vec<Entry> = data
-            .zones
-            .iter()
-            .enumerate()
-            .map(|(index, zone)| Entry {
-                name: zone.name,
+        // A link to a zone the file names twice is to the later one.
+        let mut zone_of: Vec<(&str, usize)> =
+            data.zones.iter().enumerate().map(|(index, &(name, _))| (name, index)).collect();
+        zone_of.sort_by_key(|&(name, _)| name);
+        let mut named = zone_of.clone();
+        named.extend(data.links.iter().filter_map(|&(target, name)| {
+            let after = zone_of.partition_point(|&(zone, _)| zone <= target);
+            let (zone, index) = *zone_of.get(after.checked_sub(1)?)?;
+            (zone == target).then_some((name, index))
+        }));
+        // Sorted as the pairs they are rather than as entries, which are a lot bigger to move.
+        named.sort_by_key(|&(name, _)| name);
+        let files: Vec<Entry> = named
+            .into_iter()
+            .map(|(name, index)| Entry {
+                name,
                 source: Source::File(release, index),
                 state: OnceLock::new(),
             })
             .collect();
-        let zone_of: HashMap<&str, usize> =
-            data.zones.iter().enumerate().map(|(index, zone)| (zone.name, index)).collect();
-        for &(target, name) in &data.links {
-            if let Some(&index) = zone_of.get(target) {
-                files.push(Entry {
-                    name,
-                    source: Source::File(release, index),
-                    state: OnceLock::new(),
-                });
-            }
-        }
-        files.sort_by_key(|entry| entry.name);
-        let by_upper = files
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.name.to_ascii_uppercase(), index))
-            .collect();
+        let mut by_upper: Vec<u32> = (0..files.len() as u32).collect();
+        by_upper
+            .sort_by(|&one, &other| upper(files[one as usize].name, files[other as usize].name));
         Registry { data, files, by_upper }
     }
+
+    /// The file a name finds without regard to case.
+    fn find(&self, name: &str) -> Option<&Entry> {
+        let after =
+            self.by_upper.partition_point(|&at| upper(self.files[at as usize].name, name).is_le());
+        let entry = &self.files[*self.by_upper.get(after.checked_sub(1)?)? as usize];
+        entry.name.eq_ignore_ascii_case(name).then_some(entry)
+    }
+}
+
+/// Two names compared in upper case.
+fn upper(one: &str, other: &str) -> std::cmp::Ordering {
+    one.bytes().map(|b| b.to_ascii_uppercase()).cmp(other.bytes().map(|b| b.to_ascii_uppercase()))
 }
 
 /// A time zone.
@@ -143,8 +153,7 @@ impl Zone {
     /// finds it.
     #[must_use]
     pub fn file(release: Release, name: &str) -> Option<Zone> {
-        let registry = release.registry();
-        let entry = &registry.files[*registry.by_upper.get(&name.to_ascii_uppercase())?];
+        let entry = release.registry().find(name)?;
         entry.state().is_some().then_some(Zone(entry))
     }
 
@@ -189,13 +198,16 @@ impl Zone {
     }
 
     /// The zone `UTC` of a release, the default zone of a session.
+    ///
+    /// # Panics
+    ///
+    /// Never: the data of both releases has the zone `UTC`.
     #[must_use]
     pub fn utc(release: Release) -> Zone {
-        static UTC: LazyLock<[Zone; 2]> = LazyLock::new(|| {
-            [Release::Postgres, Release::Icu]
-                .map(|release| Zone::file(release, "UTC").expect("the data has the zone UTC"))
-        });
-        UTC[usize::from(release == Release::Icu)]
+        // One release apiece, since a session of one dialect reads no data of the other.
+        static UTC: [OnceLock<Zone>; 2] = [OnceLock::new(), OnceLock::new()];
+        *UTC[usize::from(release == Release::Icu)]
+            .get_or_init(|| Zone::file(release, "UTC").expect("the data has the zone UTC"))
     }
 
     /// The zone files of a release in the order of their names, as `pg_timezone_names` walks

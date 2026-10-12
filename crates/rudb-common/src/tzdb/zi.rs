@@ -3,6 +3,14 @@
 //! The file is the source that the pin compiles into its zone files. A line is a rule, a zone, a
 //! continuation of the zone above it, or a link. The pin's data has no leap second lines, so they
 //! are not read.
+//!
+//! The file is read in two steps. [`read`] tells the lines apart and keeps where each zone starts
+//! and which lines hold the rules of each name, and [`Data::zone`] reads the eras of a zone and the
+//! rules they follow when the zone is compiled. A session compiles one or two of the six hundred
+//! zones of a release, and reading them all took 20 million instructions a release, more than
+//! answering `SELECT COUNT(*)` over ten million rows.
+
+use std::ops::Range;
 
 /// `ZIC_MIN` and `ZIC_MAX`: the years `minimum` and `maximum`, and the times before and after all
 /// others.
@@ -32,7 +40,6 @@ pub(super) enum DayCode {
 /// ends.
 #[derive(Clone, Debug)]
 pub(super) struct Rule {
-    pub name: &'static str,
     pub loyear: i64,
     pub hiyear: i64,
     pub lowasnum: bool,
@@ -63,28 +70,22 @@ pub(super) struct Era {
     pub specifier: Option<u8>,
     /// The time the era ends and how it is written, for an era that is not the last.
     pub until: Option<(Rule, i64)>,
-    /// The rules the era follows, a range of [`Data::rules`].
-    pub rules: std::ops::Range<usize>,
+    /// The rules the era follows, a range of the rules [`Data::zone`] reads with the eras.
+    pub rules: Range<usize>,
     /// The saved time and the daylight saving flag of an era that names no rules.
     pub save: i64,
     pub isdst: bool,
 }
 
-/// A zone and the eras of its history.
-#[derive(Debug)]
-pub(super) struct Zone {
-    pub name: &'static str,
-    pub eras: Vec<Era>,
-}
-
-/// What `tzdata.zi` holds.
+/// What `tzdata.zi` holds, with the zones and the rules still as their lines.
 #[derive(Debug)]
 pub(super) struct Data {
-    /// The rules, sorted by name as `associate` sorts them.
-    pub rules: Vec<Rule>,
-    pub zones: Vec<Zone>,
+    /// The name of each zone and the text of the file from the zone's line on.
+    pub zones: Vec<(&'static str, &'static str)>,
     /// The links: the target and the name of the link.
     pub links: Vec<(&'static str, &'static str)>,
+    /// The name of each rule and its line, in the order of the file.
+    rules: Vec<(&'static str, &'static str)>,
 }
 
 const MONTHS: [&str; 12] = [
@@ -197,9 +198,7 @@ fn getsave(field: &str) -> Option<(i64, bool)> {
 }
 
 /// `rulesub`: the years, the day and the time of day of a rule.
-#[allow(clippy::too_many_arguments)]
 fn rulesub(
-    name: &'static str,
     loyear: &str,
     hiyear: &str,
     month: &str,
@@ -256,7 +255,6 @@ fn rulesub(
         (dycode, wday, number)
     };
     Some(Rule {
-        name,
         loyear: lo,
         hiyear: hi,
         lowasnum,
@@ -350,68 +348,128 @@ pub(super) fn rpytime(rule: &Rule, wanted: i64) -> i64 {
 /// `getfields`: the fields of a line, split at white space and ended by a `#`, where a field can
 /// quote white space in double quotes. A `-` field is empty.
 fn getfields(line: &'static str) -> Vec<&'static str> {
-    let mut fields = Vec::new();
-    for field in line.split('#').next().unwrap_or_default().split_ascii_whitespace() {
-        fields.push(if field == "-" { "" } else { field.trim_matches('"') });
-    }
-    fields
+    Fields(line).collect()
 }
 
-/// `infile` and `associate`: the rules, the zones and the links of the file.
+/// The fields of a line as `getfields` splits it, found one at a time, so that a scan reads no
+/// further into a line than the fields it needs.
+struct Fields(&'static str);
+
+impl Iterator for Fields {
+    type Item = &'static str;
+
+    fn next(&mut self) -> Option<&'static str> {
+        let bytes = self.0.as_bytes();
+        let start = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+        if bytes[start] == b'#' {
+            self.0 = "";
+            return None;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b.is_ascii_whitespace() || b == b'#')
+            .map_or(bytes.len(), |length| start + length);
+        let field = &self.0[start..end];
+        self.0 = &self.0[end..];
+        Some(if field == "-" { "" } else { field.trim_matches('"') })
+    }
+}
+
+/// `infile`, as far as telling the lines apart: the zones, the links and the rules of the file.
+///
+/// A line is told by its first word alone. `infile` reads the line after an era with an end as
+/// the era's continuation whatever its first word is, but `zic` refuses one that is a rule, a zone
+/// or a link, so in data that compiles the word says the same. The fields of a rule are counted
+/// when a zone reads the rule.
 pub(super) fn read(text: &'static str) -> Data {
-    let mut rules = Vec::new();
-    let mut zones: Vec<Zone> = Vec::new();
+    let mut zones = Vec::new();
     let mut links = Vec::new();
-    let mut wantcont = false;
+    let mut rules = Vec::new();
     for line in text.lines() {
-        let fields = getfields(line);
-        if fields.is_empty() {
-            continue;
-        }
-        if wantcont {
-            if let Some(zone) = zones.last_mut() {
-                wantcont = era(&fields, zone);
-            }
-            continue;
-        }
-        match byword(fields[0], &["Rule", "Zone", "Link"]) {
-            Some(0) if fields.len() == 10 => {
-                let Some(save) = getsave(fields[8]) else { continue };
-                if let Some(rule) = rulesub(
-                    fields[1], fields[2], fields[3], fields[5], fields[6], fields[7], save,
-                    fields[9],
-                ) {
-                    rules.push(rule);
+        let mut fields = Fields(line);
+        // The file writes the words as their first letters, which `byword` takes as well.
+        let word = match fields.next() {
+            None => continue,
+            Some("R") => Some(0),
+            Some("Z") => Some(1),
+            Some("L") => Some(2),
+            Some(word) => byword(word, &["Rule", "Zone", "Link"]),
+        };
+        match word {
+            Some(0) => rules.push((fields.next().unwrap_or_default(), line)),
+            Some(1) => {
+                let name = fields.next().unwrap_or_default();
+                if fields.count() >= 3 {
+                    let at = line.as_ptr() as usize - text.as_ptr() as usize;
+                    zones.push((name, &text[at..]));
                 }
             }
-            Some(1) if fields.len() >= 5 => {
-                let mut zone = Zone { name: fields[1], eras: Vec::new() };
-                wantcont = era(&fields[2..], &mut zone);
-                zones.push(zone);
+            Some(2) => {
+                if let (Some(target), Some(name), None) =
+                    (fields.next(), fields.next(), fields.next())
+                {
+                    links.push((target, name));
+                }
             }
-            Some(2) if fields.len() == 3 => links.push((fields[1], fields[2])),
             _ => {}
         }
     }
-    // `qsort` with `rcomp` keeps no order among the rules of one name, and the order of the
-    // file is the one the pin's build gets from the sort of glibc, which is stable.
-    rules.sort_by_key(|rule: &Rule| rule.name);
-    for zone in &mut zones {
-        for era in &mut zone.eras {
-            let start = rules.partition_point(|rule| rule.name < era.rule);
-            let end = rules.partition_point(|rule| rule.name <= era.rule);
-            era.rules = start..end;
-            if start == end {
-                (era.save, era.isdst) = getsave(era.rule).unwrap_or((0, false));
+    Data { zones, links, rules }
+}
+
+impl Data {
+    /// `inzone`, `inzcont` and `associate` for the zone at `index` of [`Data::zones`]: its eras,
+    /// and the rules they follow, sorted by name as `associate` sorts them.
+    pub(super) fn zone(&self, index: usize) -> (Vec<Era>, Vec<Rule>) {
+        let mut lines = self.zones[index].1.lines();
+        let mut eras = Vec::new();
+        let first = getfields(lines.next().unwrap_or_default());
+        let mut wantcont = era(&first[2..], &mut eras);
+        for line in lines {
+            if !wantcont {
+                break;
+            }
+            let fields = getfields(line);
+            if !fields.is_empty() {
+                wantcont = era(&fields, &mut eras);
             }
         }
+        let mut rules = Vec::new();
+        let mut read: Vec<(&str, Range<usize>)> = Vec::new();
+        for era in &mut eras {
+            let range = match read.iter().find(|(name, _)| *name == era.rule) {
+                Some((_, range)) => range.clone(),
+                None => {
+                    let start = rules.len();
+                    // `qsort` with `rcomp` keeps no order among the rules of one name, and the
+                    // order of the file is the one the pin's build gets from the sort of glibc,
+                    // which is stable.
+                    for &(_, line) in self.rules.iter().filter(|(name, _)| *name == era.rule) {
+                        let fields = getfields(line);
+                        if fields.len() != 10 {
+                            continue;
+                        }
+                        let Some(save) = getsave(fields[8]) else { continue };
+                        rules.extend(rulesub(
+                            fields[2], fields[3], fields[5], fields[6], fields[7], save, fields[9],
+                        ));
+                    }
+                    read.push((era.rule, start..rules.len()));
+                    start..rules.len()
+                }
+            };
+            if range.is_empty() {
+                (era.save, era.isdst) = getsave(era.rule).unwrap_or((0, false));
+            }
+            era.rules = range;
+        }
+        (eras, rules)
     }
-    Data { rules, zones, links }
 }
 
 /// `inzsub`: an era of a zone, from the fields after the name. Whether a continuation line
 /// follows, which is when the era has an end.
-fn era(fields: &[&'static str], zone: &mut Zone) -> bool {
+fn era(fields: &[&'static str], eras: &mut Vec<Era>) -> bool {
     if fields.len() < 3 || fields.len() > 7 {
         return false;
     }
@@ -427,7 +485,7 @@ fn era(fields: &[&'static str], zone: &mut Zone) -> bool {
             let month = fields.get(4).copied().unwrap_or("Jan");
             let day = fields.get(5).copied().unwrap_or("1");
             let time = fields.get(6).copied().unwrap_or("0");
-            rulesub("", fields[3], "only", month, day, time, (0, false), "")
+            rulesub(fields[3], "only", month, day, time, (0, false), "")
         })
         .flatten()
         .map(|rule| {
@@ -435,7 +493,7 @@ fn era(fields: &[&'static str], zone: &mut Zone) -> bool {
             (rule, time)
         });
     let more = until.is_some();
-    zone.eras.push(Era {
+    eras.push(Era {
         stdoff,
         rule: fields[1],
         format,
@@ -478,10 +536,10 @@ mod tests {
 
     #[test]
     fn a_rule_names_its_day_in_each_year() {
-        let rule = rulesub("US", "2007", "ma", "Mar", "Sun>=8", "2", (3600, true), "D").unwrap();
+        let rule = rulesub("2007", "ma", "Mar", "Sun>=8", "2", (3600, true), "D").unwrap();
         // 2026-03-08 02:00.
         assert_eq!(rpytime(&rule, 2026), 1_772_935_200);
-        let last = rulesub("EU", "1996", "ma", "O", "lastSu", "1u", (0, false), "").unwrap();
+        let last = rulesub("1996", "ma", "O", "lastSu", "1u", (0, false), "").unwrap();
         assert!(last.todisut && last.todisstd);
         // 2026-10-25 01:00.
         assert_eq!(rpytime(&last, 2026), 1_792_890_000);
