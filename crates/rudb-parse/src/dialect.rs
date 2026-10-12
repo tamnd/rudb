@@ -18,7 +18,7 @@ impl Dialect {
     }
 }
 
-use crate::token::{Kind, Token};
+use crate::token::{Flags, Kind, Token};
 
 /// Every SQL parser dialect installed in this build.
 pub const DIALECTS: &[Dialect] = &[Dialect { name: "duckdb" }];
@@ -200,9 +200,78 @@ fn truncate_list(
         .then_some((start..at, only))
 }
 
+/// Takes the `ISOLATION LEVEL` clauses out of `BEGIN` and `START TRANSACTION`, which the vendored
+/// grammar does not have and the pin's parser does, and marks the `BEGIN` of a transaction that
+/// asked for `SERIALIZABLE` with [`Flags::SERIALIZABLE`].
+///
+/// The pin parses every level and runs snapshot isolation under all of them. rudb does the same for
+/// the others and runs `SERIALIZABLE` serializable, which is the one place it goes past the pin
+/// (`engine-v4/18-compat.md` section 18.7). As with [`postgres_tokens`], the tokens leave the list
+/// and the text stays, so an error still points at the right place.
+pub fn isolation_levels(query: &str, tokens: &mut Vec<Token>) {
+    let word = |token: &Token, text: &str| {
+        matches!(token.kind, Kind::Identifier | Kind::Keyword)
+            && token.text(query).eq_ignore_ascii_case(text)
+    };
+    let comma = |token: &Token| token.kind == Kind::Operator && token.text(query) == ",";
+    let mut at = 0;
+    while at < tokens.len() {
+        let starts = at == 0 || tokens[at - 1].kind == Kind::Terminator;
+        if !(starts && (word(&tokens[at], "begin") || word(&tokens[at], "start"))) {
+            at += 1;
+            continue;
+        }
+        let begin = at;
+        at += 1;
+        if at < tokens.len() && (word(&tokens[at], "transaction") || word(&tokens[at], "work")) {
+            at += 1;
+        }
+        // The modes, each a level or a READ ONLY or READ WRITE, with commas between them.
+        loop {
+            let clause = if at + 1 < tokens.len() && comma(&tokens[at]) { at + 1 } else { at };
+            if !(clause + 2 < tokens.len()
+                && word(&tokens[clause], "isolation")
+                && word(&tokens[clause + 1], "level"))
+            {
+                if clause + 1 < tokens.len()
+                    && word(&tokens[clause], "read")
+                    && (word(&tokens[clause + 1], "only") || word(&tokens[clause + 1], "write"))
+                {
+                    at = clause + 2;
+                    continue;
+                }
+                break;
+            }
+            let level = clause + 2;
+            let words = match () {
+                () if word(&tokens[level], "serializable") || word(&tokens[level], "snapshot") => 1,
+                () if level + 1 < tokens.len()
+                    && ((word(&tokens[level], "repeatable")
+                        && word(&tokens[level + 1], "read"))
+                        || (word(&tokens[level], "read")
+                            && (word(&tokens[level + 1], "committed")
+                                || word(&tokens[level + 1], "uncommitted")))) =>
+                {
+                    2
+                }
+                () => break,
+            };
+            if word(&tokens[level], "serializable") {
+                tokens[begin].flags = tokens[begin].flags.with(Flags::SERIALIZABLE);
+            }
+            // The comma before the clause goes with it, or, for the first mode, the one after it.
+            let mut end = level + words;
+            if clause == at && end < tokens.len() && comma(&tokens[end]) {
+                end += 1;
+            }
+            tokens.drain(at..end);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DIALECTS, dialect_named, postgres_tokens};
+    use super::{DIALECTS, dialect_named, isolation_levels, postgres_tokens};
 
     #[test]
     fn the_vendored_grammar_is_the_one_registered_dialect() {
@@ -264,5 +333,40 @@ mod tests {
         );
         let generated = "create table t (a int generated always as (1))";
         assert_eq!(texts(generated).len(), crate::tokenize(generated).expect("tokens").len());
+    }
+
+    /// The words left of `query` once the levels are out, and whether each `BEGIN` asked for
+    /// `SERIALIZABLE`.
+    fn levels(query: &str) -> (String, Vec<bool>) {
+        let mut tokens = crate::tokenize(query).expect("tokens");
+        isolation_levels(query, &mut tokens);
+        let words = tokens.iter().map(|token| token.text(query)).collect::<Vec<_>>();
+        let serializable = tokens
+            .iter()
+            .filter(|token| token.text(query).eq_ignore_ascii_case("begin"))
+            .map(|token| token.flags.has(super::Flags::SERIALIZABLE))
+            .collect();
+        (words.join(" ").trim().to_string(), serializable)
+    }
+
+    #[test]
+    fn a_begin_keeps_its_read_mode_and_says_whether_it_asked_for_serializable() {
+        let cases = [
+            ("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE", "BEGIN TRANSACTION", true),
+            ("begin isolation level serializable, read only", "begin read only", true),
+            ("BEGIN READ WRITE, ISOLATION LEVEL SERIALIZABLE", "BEGIN READ WRITE", true),
+            ("BEGIN ISOLATION LEVEL REPEATABLE READ", "BEGIN", false),
+            ("BEGIN WORK ISOLATION LEVEL READ COMMITTED READ ONLY", "BEGIN WORK READ ONLY", false),
+            ("BEGIN ISOLATION LEVEL READ UNCOMMITTED", "BEGIN", false),
+            ("BEGIN", "BEGIN", false),
+        ];
+        for (query, left, serializable) in cases {
+            assert_eq!(levels(query), (left.to_string(), vec![serializable]), "{query}");
+        }
+        let (left, _) = levels("START TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1");
+        assert_eq!(left, "START TRANSACTION ; SELECT 1");
+        // Only at the start of a statement, and a level it does not know is left to fail.
+        let query = "SELECT begin, isolation FROM t; BEGIN ISOLATION LEVEL CHAOS";
+        assert_eq!(levels(query).0, query.replace(';', " ;").replace(',', " ,"));
     }
 }

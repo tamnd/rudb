@@ -32,7 +32,7 @@ use crate::build::{Change, Interner};
 use crate::generated::rules::PROGRAM;
 use crate::matcher::{NONE, Tree, parse_tokens};
 use crate::parameters::{self, Arranged, Refilled, Slot};
-use crate::token::{Kind, Token};
+use crate::token::{Flags, Kind, Token};
 use crate::tokenize::{quoted, tokenize};
 
 /// Parse a script and transform it into the AST.
@@ -46,7 +46,8 @@ pub fn parse_ast(query: &str) -> Result<Ast> {
 
 /// Parse a script while folding its unquoted identifiers for this session.
 pub fn parse_ast_with_case(query: &str, identifier_case: IdentifierCase) -> Result<Ast> {
-    let tokens = tokenize(query)?;
+    let mut tokens = tokenize(query)?;
+    crate::dialect::isolation_levels(query, &mut tokens);
     let tree = parse_tokens(query, &tokens, PROGRAM, true)?;
     transform_with_case(query, &tokens, &tree, identifier_case)
 }
@@ -55,6 +56,7 @@ pub fn parse_ast_with_case(query: &str, identifier_case: IdentifierCase) -> Resu
 pub fn parse_ast_postgres(query: &str, identifier_case: IdentifierCase) -> Result<Ast> {
     let mut tokens = tokenize(query)?;
     crate::dialect::postgres_tokens(query, &mut tokens);
+    crate::dialect::isolation_levels(query, &mut tokens);
     let tree = parse_tokens(query, &tokens, PROGRAM, true)?;
     transform_dialect(query, &tokens, &tree, identifier_case, true)
 }
@@ -779,7 +781,9 @@ impl<'a> Transform<'a> {
                     "BeginTransaction" => {
                         let mode = self.find(kind, "ReadOrWrite");
                         let read_only = mode != NONE && self.descendant(mode, "ReadOnly") != NONE;
-                        Transaction::Begin { read_only }
+                        let first = self.tree.node(kind).start as usize;
+                        let serializable = self.tokens[first].flags.has(Flags::SERIALIZABLE);
+                        Transaction::Begin { read_only, serializable }
                     }
                     "CommitTransaction" => Transaction::Commit,
                     _ => Transaction::Rollback,
@@ -8336,9 +8340,10 @@ mod tests {
                 let exists = if if_exists { "IF EXISTS " } else { "" };
                 format!("DETACH {exists}{}", ast.string(name))
             }
-            Statement::Transaction(Transaction::Begin { read_only: false }) => "BEGIN".to_string(),
-            Statement::Transaction(Transaction::Begin { read_only: true }) => {
-                "BEGIN READ ONLY".to_string()
+            Statement::Transaction(Transaction::Begin { read_only, serializable }) => {
+                let level = if serializable { " ISOLATION LEVEL SERIALIZABLE" } else { "" };
+                let mode = if read_only { " READ ONLY" } else { "" };
+                format!("BEGIN{level}{mode}")
             }
             Statement::Transaction(Transaction::Commit) => "COMMIT".to_string(),
             Statement::Transaction(Transaction::Rollback) => "ROLLBACK".to_string(),

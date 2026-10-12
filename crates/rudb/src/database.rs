@@ -4883,7 +4883,7 @@ impl Shared {
         let taken = self.open().as_mut().and_then(|open| open.snapshot.take());
         match taken {
             Some(snapshot) => {
-                let closed = Open { aborted: false, read_only: false, snapshot: Some(snapshot) };
+                let closed = Open { snapshot: Some(snapshot), ..Open::new(false, false) };
                 self.close_transaction(closed, false)
             }
             None => Ok(()),
@@ -5993,13 +5993,13 @@ impl Shared {
     fn transaction(&self, kind: ast::Transaction) -> Result<QueryResult> {
         let mut open = self.open();
         match kind {
-            ast::Transaction::Begin { read_only } => {
+            ast::Transaction::Begin { read_only, serializable } => {
                 if open.is_some() {
                     return Err(Error::transaction(
                         "cannot start a transaction within a transaction",
                     ));
                 }
-                *open = Some(Open::new(read_only));
+                *open = Some(Open::new(read_only, serializable));
                 // The transaction begins when the client sent the statement, as in PostgreSQL.
                 let received = self.conn.received.load(Ordering::Acquire);
                 let begun = if received == 0 { rudb_bind::micros_now() } else { received };
@@ -7470,7 +7470,7 @@ impl Shared {
     fn atomically(&self, run: impl FnOnce() -> Result<QueryResult>) -> Result<QueryResult> {
         let own = !self.transacting();
         if own {
-            *self.open() = Some(Open::new(false));
+            *self.open() = Some(Open::new(false, false));
         }
         let result = run();
         if !own {
@@ -7671,7 +7671,7 @@ impl Shared {
         if self.implicit_statement(ast) {
             // A transaction of its own, so the rows are found and changed on a copy of the
             // catalog without the writer lock, and only the commit waits for it.
-            *self.open() = Some(Open::new(false));
+            *self.open() = Some(Open::new(false, false));
             let result = kept(sql, parse_ns, |noted| {
                 self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
             });

@@ -1643,6 +1643,9 @@ pub enum Transaction {
     Begin {
         /// Whether the transaction may not write.
         read_only: bool,
+        /// Whether it asked for `ISOLATION LEVEL SERIALIZABLE`. Every other level runs snapshot
+        /// isolation, as the pin runs all of them.
+        serializable: bool,
     },
     /// `COMMIT` or `END`.
     Commit,
