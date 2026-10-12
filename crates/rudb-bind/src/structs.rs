@@ -9,9 +9,9 @@
 //! since which field it names decides the type of the answer, so the binder checks it against the
 //! struct's fields and the kernel finds the same field again by name.
 
-use rudb_common::{Error, Field, LogicalType, Result, RowFields, SqlState, Value};
+use rudb_common::{Error, Field, LogicalType, PaddedRows, Result, RowFields, SqlState, Value};
 use rudb_parse::ast::{self, Ast};
-use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef};
+use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef};
 
 use crate::binder::Binder;
 use crate::fold;
@@ -113,6 +113,9 @@ impl Binder<'_> {
     /// else. The name is the one the table is reachable through, so after `FROM t AS x` only `x`
     /// is the row. The scope of this block comes first and then the scopes around it from the
     /// nearest out, the same order a column name is looked for in.
+    ///
+    /// Under [`PaddedRows::Postgres`] the row is null where an outer join made the row up, which
+    /// the row number or the marker of the relation says, as for `count(t.*)` in `counted.rs`.
     pub(crate) fn whole_row(&mut self, word: &str, scope: &Scope) -> Result<Option<ExprRef>> {
         let compare = self.semantics.identifier_compare();
         let columns = |scope: &Scope| -> Vec<(String, rudb_plan::ColumnBinding, LogicalType)> {
@@ -133,6 +136,16 @@ impl Binder<'_> {
         if found.is_empty() {
             return Ok(None);
         }
+        let marker = match self.semantics.padded_rows() {
+            PaddedRows::Pin => None,
+            PaddedRows::Postgres => {
+                let held = outer.map_or(scope, |at| &self.outer_scopes[at]);
+                match held.markers_of(compare, word)[..] {
+                    [marker] => Some(marker),
+                    _ => None,
+                }
+            }
+        };
         let mut names = Vec::with_capacity(found.len());
         let mut values = Vec::with_capacity(found.len());
         for (name, binding, ty) in found {
@@ -142,7 +155,19 @@ impl Binder<'_> {
             });
             names.push(name);
         }
-        Ok(Some(self.pack_row(&names, &values)))
+        let row = self.pack_row(&names, &values);
+        let Some((binding, scan)) = marker else {
+            return Ok(Some(row));
+        };
+        self.number_scan(scan);
+        let marker = match outer {
+            Some(at) => self.outer_column(at, binding, LogicalType::BigInt)?,
+            None => self.add_expr(Expr::Column(binding), LogicalType::BigInt),
+        };
+        let when = self.against_null(CompareOp::DistinctFrom, marker)?;
+        let ty = self.plan().expr_type(row).clone();
+        let arms = self.plan_mut().add_arms(&[Arm { when, then: row }]);
+        Ok(Some(self.add_expr(Expr::Case { arms, otherwise: None }, ty)))
     }
 
     /// `(r).*`: each field of a composite value as a value of its own, with the name of its

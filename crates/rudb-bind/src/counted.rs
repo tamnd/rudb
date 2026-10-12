@@ -5,9 +5,15 @@
 //! row number of a table, or for any other relation a constant put over it in a projection. The
 //! constant is only put there when the statement says `count(t.*)` somewhere, since every relation
 //! of every other query would otherwise carry a column nothing reads.
+//!
+//! PostgreSQL reads `count(t.*)` as `count(t)`, the count of the rows where the whole row of `t` is
+//! not null, and the whole row is null on a row an outer join made up. So under
+//! [`PaddedRows::Postgres`] the whole row reads the same marker, and the marker is put over every
+//! relation that the statement names where a value goes.
 
 use rudb_catalog::same_name;
-use rudb_common::{Error, LogicalType, Result, SqlState, Value};
+use rudb_common::{Error, LogicalType, PaddedRows, Result, SqlState, Value};
+use rudb_parse::NONE;
 use rudb_parse::ast::{self, Ast};
 use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
 
@@ -15,7 +21,8 @@ use crate::binder::{Binder, ROWID};
 use crate::scope::{Scope, Visible};
 
 impl Binder<'_> {
-    /// Whether the statement `ast` holds says `count(t.*)` anywhere.
+    /// Whether the statement `ast` holds says `count(t.*)` anywhere, or under
+    /// [`PaddedRows::Postgres`] names the whole row of a relation anywhere.
     pub(crate) fn counts_relations(&mut self, ast: &Ast) -> bool {
         let key = (std::ptr::from_ref(ast) as usize, ast.exprs.len());
         if let Some((held, counts)) = self.counted
@@ -31,7 +38,8 @@ impl Binder<'_> {
                     && counted_star(ast, args[0]).is_some()
             }
             _ => false,
-        });
+        }) || (self.semantics.padded_rows() == PaddedRows::Postgres
+            && names_a_row(ast));
         self.counted = Some((key, counts));
         counts
     }
@@ -152,6 +160,41 @@ pub(crate) fn refuse_star(
         }
     }
     Ok(())
+}
+
+/// Whether a column name of one part in `ast` is also the name of a relation in its `FROM`, which
+/// is how the whole row of a relation is written. A column with the name of a relation is read as
+/// the column, so this can say yes where no whole row is read, which costs a marker and no more.
+fn names_a_row(ast: &Ast) -> bool {
+    let relations: Vec<&str> = ast
+        .sources
+        .iter()
+        .filter_map(|source| match *source {
+            ast::Source::Table { name, alias, .. } if alias == NONE => ast.name(name).last(),
+            ast::Source::Cte { cte, alias, .. } if alias == NONE => {
+                Some(ast.string(ast.cte(cte).name))
+            }
+            ast::Source::Table { alias, .. }
+            | ast::Source::Cte { alias, .. }
+            | ast::Source::Subquery { alias, .. }
+            | ast::Source::Function { alias, .. }
+            | ast::Source::Calls { alias, .. }
+            | ast::Source::Values { alias, .. }
+                if alias != NONE =>
+            {
+                Some(ast.string(alias))
+            }
+            _ => None,
+        })
+        .collect();
+    !relations.is_empty()
+        && ast.exprs.iter().any(|expr| match *expr {
+            ast::Expr::Column { name } if name.len == 1 => ast
+                .name(name)
+                .next()
+                .is_some_and(|word| relations.iter().any(|relation| same_name(relation, word))),
+            _ => false,
+        })
 }
 
 /// The qualifier of `expr` when it is `t.*` with nothing replaced.

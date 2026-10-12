@@ -222,6 +222,7 @@ pub struct Semantics {
     regex_rules: RegexRules,
     row_fields: RowFields,
     row_nulls: RowNulls,
+    padded_rows: PaddedRows,
     scalar_subquery_error_on_multiple_rows: bool,
     sequence_owners: SequenceOwners,
     set_functions: SetFunctions,
@@ -264,6 +265,7 @@ impl Default for Semantics {
             float_range: FloatRange::Pin,
             row_fields: RowFields::Pin,
             row_nulls: RowNulls::Pin,
+            padded_rows: PaddedRows::Pin,
             character_types: CharacterTypes::Pin,
             column_names: ColumnNames::Pin,
             default_descending: false,
@@ -477,6 +479,11 @@ impl Semantics {
     #[must_use]
     pub fn row_nulls(self) -> RowNulls {
         self.row_nulls
+    }
+    /// What the whole row of a relation is on a row that an outer join padded.
+    #[must_use]
+    pub fn padded_rows(self) -> PaddedRows {
+        self.padded_rows
     }
     /// What the name after `OWNED BY` of a sequence names.
     #[must_use]
@@ -977,6 +984,17 @@ pub enum RowNulls {
     /// As in PostgreSQL and the SQL standard: a row `IS NULL` when each of its fields is null and
     /// `IS NOT NULL` when none of them is, so `row(1, null)` is neither. The test does not look
     /// inside a field that is a row itself.
+    Postgres,
+}
+
+/// What the whole row of a relation is, as `t` or `t.*` in a value, on a row that an outer join
+/// padded with nulls because the relation had no row to join.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PaddedRows {
+    /// As in DuckDB: a struct with a null in each field, which `count(t)` counts.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: null, since the relation gave no row. `count(t.*)` does not count it.
     Postgres,
 }
 
@@ -1603,6 +1621,7 @@ impl Session {
             self.semantics.float_range = FloatRange::Postgres;
             self.semantics.row_fields = RowFields::Postgres;
             self.semantics.row_nulls = RowNulls::Postgres;
+            self.semantics.padded_rows = PaddedRows::Postgres;
             self.semantics.sequence_owners = SequenceOwners::Column;
             self.semantics.set_functions = SetFunctions::Postgres;
             self.semantics.sort_operators = SortOperators::Postgres;
