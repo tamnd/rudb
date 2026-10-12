@@ -1961,6 +1961,9 @@ pub struct Ast {
     /// The function sources written `WITH ORDINALITY`, which have one more column that numbers
     /// their rows from 1. Kept to one side because few sources have it.
     pub ordinal_sources: Vec<SourceRef>,
+    /// The subqueries in `FROM` that the PostgreSQL grammar read without `LATERAL`, which cannot
+    /// read the entries to their left. In DuckDB every entry can, so its grammar has none of these.
+    pub closed_sources: Vec<SourceRef>,
     /// The joins of the PostgreSQL grammar that are given a name, each with its names. Kept to one
     /// side because few joins have one.
     pub join_names: Vec<(SourceRef, JoinNames)>,
@@ -2221,6 +2224,12 @@ impl Ast {
     /// The names a join is given, when it is given any.
     pub fn join_names(&self, source: SourceRef) -> Option<JoinNames> {
         self.join_names.iter().find(|(held, _)| *held == source).map(|&(_, names)| names)
+    }
+
+    /// Whether a source cannot read the entries to its left, as a subquery PostgreSQL read without
+    /// `LATERAL` cannot.
+    pub fn closed(&self, source: SourceRef) -> bool {
+        self.closed_sources.contains(&source)
     }
 
     /// Whether a function source was written `WITH ORDINALITY`.

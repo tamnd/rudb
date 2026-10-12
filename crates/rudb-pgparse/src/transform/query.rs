@@ -528,7 +528,12 @@ impl Transform<'_> {
                 };
                 let query = self.query(select)?;
                 let (alias, columns) = self.alias(subselect.alias.as_deref())?;
-                Ok(self.ast.push_source(Source::Subquery { query, alias, columns }, self.span))
+                let source =
+                    self.ast.push_source(Source::Subquery { query, alias, columns }, self.span);
+                if !subselect.lateral {
+                    self.ast.closed_sources.push(source);
+                }
+                Ok(source)
             }
             Node::RangeFunction(function) => self.function_source(function),
             node => Err(not_yet(node)),

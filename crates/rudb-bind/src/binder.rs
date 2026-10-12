@@ -507,6 +507,9 @@ pub(crate) struct Binder<'a> {
     /// check needs to know which scope the name came out of. Each entry is a position in
     /// `outer_scopes`.
     pub(crate) lateral_scopes: Vec<usize>,
+    /// The left neighbours of each closed FROM entry being bound, which a name in the entry does
+    /// not reach. They are kept to say why a name that one of them has is not found.
+    pub(crate) closed_scopes: Vec<Scope>,
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
     /// The column a `COLUMNS` stands for while the expression it is in is bound for that column.
     pub(crate) star_entry: Option<crate::columns::Picked>,
@@ -636,6 +639,7 @@ impl<'a> Binder<'a> {
             outer_scopes: Vec::new(),
             placeholders: Vec::new(),
             lateral_scopes: Vec::new(),
+            closed_scopes: Vec::new(),
             correlations: Vec::new(),
             star_entry: None,
             columns_scope: None,
@@ -3680,7 +3684,9 @@ impl<'a> Binder<'a> {
     ///
     /// That is what LATERAL means, and it is what a comma separated FROM does here whether the word
     /// was written or not, because the pinned build resolves `FROM o, (SELECT o.k + 1)` without it.
-    /// The keyword therefore changes nothing and is accepted rather than acted on.
+    /// PostgreSQL does not: a subquery written without the word is closed, and a name in it skips
+    /// the left and resolves in the query around, so `(select q2) y` reads the `q2` of an
+    /// enclosing query and not the one of its neighbour. A function is open in both.
     ///
     /// The columns of the left that the entry read come back with it, and an entry that read none
     /// is an ordinary product. The rest are somebody else's: a name that resolved past the left
@@ -3693,6 +3699,13 @@ impl<'a> Binder<'a> {
         source: ast::SourceRef,
         left: &Scope,
     ) -> Result<(NodeRef, Scope, Vec<ColumnBinding>)> {
+        if ast.closed(source) {
+            self.closed_scopes.push(left.clone());
+            let bound = self.bind_source(ast, source);
+            self.closed_scopes.pop();
+            let (node, scope) = bound?;
+            return Ok((node, scope, Vec::new()));
+        }
         self.lateral_scopes.push(self.outer_scopes.len());
         self.outer_scopes.push(left.clone());
         self.correlations.push(Vec::new());
