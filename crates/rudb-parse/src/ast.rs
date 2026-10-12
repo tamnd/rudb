@@ -1365,6 +1365,18 @@ pub struct PivotColumn {
     pub names: Slice,
 }
 
+/// Why a source in `FROM` cannot read the entries to its left.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Closed {
+    /// A subquery that the PostgreSQL grammar read without `LATERAL`, which does not see the
+    /// entries to its left at all.
+    pub not_lateral: bool,
+    /// The right side of a `RIGHT` or a `FULL` join, which PostgreSQL closes to the left side
+    /// because a row of the right side can have no row of the left side to read. `LATERAL` does
+    /// not open it.
+    pub combining: bool,
+}
+
 /// Which join.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinKind {
@@ -1961,9 +1973,9 @@ pub struct Ast {
     /// The function sources written `WITH ORDINALITY`, which have one more column that numbers
     /// their rows from 1. Kept to one side because few sources have it.
     pub ordinal_sources: Vec<SourceRef>,
-    /// The subqueries in `FROM` that the PostgreSQL grammar read without `LATERAL`, which cannot
-    /// read the entries to their left. In DuckDB every entry can, so its grammar has none of these.
-    pub closed_sources: Vec<SourceRef>,
+    /// The sources in `FROM` that the PostgreSQL grammar closed to the entries to their left, each
+    /// with the reason. In DuckDB every entry can read them, so its grammar has none of these.
+    pub closed_sources: Vec<(SourceRef, Closed)>,
     /// The joins of the PostgreSQL grammar that are given a name, each with its names. Kept to one
     /// side because few joins have one.
     pub join_names: Vec<(SourceRef, JoinNames)>,
@@ -2226,10 +2238,21 @@ impl Ast {
         self.join_names.iter().find(|(held, _)| *held == source).map(|&(_, names)| names)
     }
 
-    /// Whether a source cannot read the entries to its left, as a subquery PostgreSQL read without
-    /// `LATERAL` cannot.
-    pub fn closed(&self, source: SourceRef) -> bool {
-        self.closed_sources.contains(&source)
+    /// Why a source cannot read the entries to its left, as a subquery PostgreSQL read without
+    /// `LATERAL` cannot, or `None` when it can.
+    pub fn closed(&self, source: SourceRef) -> Option<Closed> {
+        self.closed_sources.iter().find(|(held, _)| *held == source).map(|&(_, closed)| closed)
+    }
+
+    /// Records one more reason why `source` cannot read the entries to its left.
+    pub fn close(&mut self, source: SourceRef, reason: Closed) {
+        match self.closed_sources.iter_mut().find(|(held, _)| *held == source) {
+            Some((_, closed)) => {
+                closed.not_lateral |= reason.not_lateral;
+                closed.combining |= reason.combining;
+            }
+            None => self.closed_sources.push((source, reason)),
+        }
     }
 
     /// Whether a function source was written `WITH ORDINALITY`.

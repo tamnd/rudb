@@ -852,7 +852,7 @@ impl Binder<'_> {
                 .closed_scopes
                 .iter()
                 .rev()
-                .find_map(|left| left.closed_to(compare, table, column))
+                .find_map(|(left, closed)| left.closed_to(*closed, compare, table, column))
             {
                 return Err(error);
             }

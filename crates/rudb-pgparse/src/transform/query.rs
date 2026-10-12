@@ -3,9 +3,9 @@
 use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Cte, Cycle, Distinct, Expr, JoinKind, JoinNames, Nulls, Order, OrderItem, Quantifier, Query,
-    QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Target, WindowBound,
-    WindowExclude, WindowRef, WindowSpec, WindowUnit,
+    Closed, Cte, Cycle, Distinct, Expr, JoinKind, JoinNames, Nulls, Order, OrderItem, Quantifier,
+    Query, QueryBody, QueryRef, Search, Select, SetOp, Slice, Source, SourceRef, Target,
+    WindowBound, WindowExclude, WindowRef, WindowSpec, WindowUnit,
 };
 
 use super::{Definition, Made, Refused, Transform, clause, not_yet};
@@ -531,7 +531,7 @@ impl Transform<'_> {
                 let source =
                     self.ast.push_source(Source::Subquery { query, alias, columns }, self.span);
                 if !subselect.lateral {
-                    self.ast.closed_sources.push(source);
+                    self.ast.close(source, Closed { not_lateral: true, combining: false });
                 }
                 Ok(source)
             }
@@ -601,6 +601,9 @@ impl Transform<'_> {
         };
         let left = self.within(outer(left_outer), |this| this.source(left))?;
         let right = self.within(outer(right_outer), |this| this.source(right))?;
+        if left_outer {
+            self.ast.close(right, Closed { not_lateral: false, combining: true });
+        }
         let using = self.names(&join.usingClause)?;
         let on = self.optional(join.quals.as_ref())?;
         let kind = match join.jointype {

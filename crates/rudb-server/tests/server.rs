@@ -3218,7 +3218,7 @@ fn a_subquery_without_lateral_does_not_see_the_entries_to_its_left() {
             "42703",
             "column \"q2\" does not exist",
             "There is a column named \"q2\" in table \"x\", but it cannot be referenced from this part of the query.",
-            column,
+            Some(column),
             "29",
         ),
         (
@@ -3226,7 +3226,7 @@ fn a_subquery_without_lateral_does_not_see_the_entries_to_its_left() {
             "42703",
             "column \"q2\" does not exist",
             "There is a column named \"q2\" in table \"x\", but it cannot be referenced from this part of the query.",
-            column,
+            Some(column),
             "38",
         ),
         (
@@ -3234,8 +3234,32 @@ fn a_subquery_without_lateral_does_not_see_the_entries_to_its_left() {
             "42P01",
             "invalid reference to FROM-clause entry for table \"x\"",
             "There is an entry for table \"x\", but it cannot be referenced from this part of the query.",
-            table,
+            Some(table),
             "29",
+        ),
+        (
+            "select * from i8 x full join (select q2 as r) y on true;",
+            "42703",
+            "column \"q2\" does not exist",
+            "There is a column named \"q2\" in table \"x\", but it cannot be referenced from this part of the query.",
+            None,
+            "38",
+        ),
+        (
+            "select * from i8 x right join lateral (select x.q2 as r) y on true;",
+            "42P10",
+            "invalid reference to FROM-clause entry for table \"x\"",
+            "The combining JOIN type must be INNER or LEFT for a LATERAL reference.",
+            None,
+            "47",
+        ),
+        (
+            "select * from i8 x full join lateral generate_series(1, q1) g on true;",
+            "42P10",
+            "invalid reference to FROM-clause entry for table \"x\"",
+            "The combining JOIN type must be INNER or LEFT for a LATERAL reference.",
+            None,
+            "57",
         ),
     ] {
         let messages = client.query(sql);
@@ -3243,7 +3267,7 @@ fn a_subquery_without_lateral_does_not_see_the_entries_to_its_left() {
         assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
         assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
         assert_eq!(error.field(b'D').as_deref(), Some(detail), "{sql}");
-        assert_eq!(error.field(b'H').as_deref(), Some(hint), "{sql}");
+        assert_eq!(error.field(b'H').as_deref(), hint, "{sql}");
         assert_eq!(error.field(b'P').as_deref(), Some(position), "{sql}");
     }
     server.stop().unwrap();

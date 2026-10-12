@@ -10,6 +10,7 @@
 //! no `hits` to refer to, which is SQL's rule and not ours.
 
 use rudb_common::{Error, Field, IdentifierCompare, LogicalType, Origin, Result, SqlState};
+use rudb_parse::ast::Closed;
 use rudb_plan::{ColumnBinding, NodeRef};
 use std::ops::Range;
 
@@ -498,34 +499,55 @@ impl Scope {
     }
 
     /// The complaint about a name that this scope has and does not lend, because the name is in a
-    /// subquery to its right that PostgreSQL read without `LATERAL`, or `None` when the scope does
-    /// not have it. The words are those of `errorMissingColumn` and `errorMissingRTE` in
+    /// source to its right that is `closed`, or `None` when the scope does not have it. The words
+    /// are those of `errorMissingColumn`, `errorMissingRTE` and `refnameNamespaceItem` in
     /// `parse_relation.c`.
     pub(crate) fn closed_to(
         &self,
+        closed: Closed,
         compare: IdentifierCompare,
         table: Option<&str>,
         column: &str,
     ) -> Option<Error> {
+        if !closed.not_lateral {
+            // PostgreSQL finds the entry and then refuses it, so the name of the entry is told.
+            let held = self.columns.iter().find(|held| match table {
+                Some(table) => compare.same(&held.table, table),
+                None => !(held.qualified || held.hidden) && compare.same(&held.name, column),
+            })?;
+            let reason = "The combining JOIN type must be INNER or LEFT for a LATERAL reference";
+            return Some(
+                Error::binder(reason)
+                    .state(SqlState::INVALID_COLUMN_REFERENCE)
+                    .pg(format!(
+                        "invalid reference to FROM-clause entry for table \"{}\"",
+                        held.table
+                    ))
+                    .detail(format!("{reason}.")),
+            );
+        }
+        // `LATERAL` would not open the right side of a `RIGHT` or a `FULL` join, so PostgreSQL
+        // does not say to write it there.
+        let hint = !closed.combining;
         if let Some(table) = table {
             let held = self.columns.iter().find(|held| compare.same(&held.table, table))?;
             let table = &held.table;
-            return Some(
+            let error =
                 Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
                     .state(SqlState::UNDEFINED_TABLE)
                     .pg(format!("invalid reference to FROM-clause entry for table \"{table}\""))
                     .detail(format!(
                         "There is an entry for table \"{table}\", but it cannot be referenced \
                          from this part of the query."
-                    ))
-                    .hint("To reference that table, you must mark this subquery with LATERAL."),
-            );
+                    ));
+            let lateral = "To reference that table, you must mark this subquery with LATERAL.";
+            return Some(if hint { error.hint(lateral) } else { error });
         }
         let held = self
             .columns
             .iter()
             .find(|held| !(held.qualified || held.hidden) && compare.same(&held.name, column))?;
-        Some(
+        let error =
             Error::binder(format!("Referenced column \"{column}\" not found in FROM clause!"))
                 .state(SqlState::UNDEFINED_COLUMN)
                 .pg(format!("column \"{column}\" does not exist"))
@@ -533,9 +555,9 @@ impl Scope {
                     "There is a column named \"{column}\" in table \"{}\", but it cannot be \
                      referenced from this part of the query.",
                     held.table
-                ))
-                .hint("To reference that column, you must mark this subquery with LATERAL."),
-        )
+                ));
+        let lateral = "To reference that column, you must mark this subquery with LATERAL.";
+        Some(if hint { error.hint(lateral) } else { error })
     }
 
     /// The `Candidate bindings:` part of a complaint about a name that is not here, empty when
