@@ -58,6 +58,11 @@ impl Pass for UnusedColumns {
         // side's columns to prune again.
         if context.skips_unread_queries() && unread_queries(plan) {
             prune(plan);
+            // A query taken out may have been the only read of a materialisation, which that pass
+            // has already run past, and a second run of the passes would drop it.
+            if !context.is_disabled(crate::cte::UnusedMaterialization.name()) {
+                crate::cte::drop_unread(plan);
+            }
         }
         forward(plan);
         Ok(())
