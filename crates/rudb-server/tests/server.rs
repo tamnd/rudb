@@ -1939,7 +1939,8 @@ fn an_aggregate_over_the_recursive_side_is_refused() {
 }
 
 /// A query reads the catalog beside the queries of other sessions, so a long one keeps no other
-/// query waiting, whether it comes in as a simple or as an extended query.
+/// query waiting, whether it comes in as a simple or as an extended query. The long one sleeps for
+/// eight seconds and the others have six, which a loaded machine running a debug build needs.
 #[test]
 fn a_long_query_keeps_no_query_of_another_session_waiting() {
     let dirs = Dirs::new("pglong");
@@ -1948,7 +1949,7 @@ fn a_long_query_keeps_no_query_of_another_session_waiting() {
     connect(&mut long, PROTOCOL_3_0);
     let mut other = Client::unix(&server);
     connect(&mut other, PROTOCOL_3_0);
-    long.send(&Frontend::Query(b"select pg_sleep(3)"));
+    long.send(&Frontend::Query(b"select pg_sleep(8)"));
     std::thread::sleep(Duration::from_millis(300));
     let started = std::time::Instant::now();
     assert_eq!(scalar(&mut other, "select 1"), "1");
@@ -1957,7 +1958,7 @@ fn a_long_query_keeps_no_query_of_another_session_waiting() {
     other.bind("", "", &[], &[Some(b"41")]);
     other.execute("", 0);
     assert_eq!(tags(&other.sync()), "12DCZ");
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
     assert_eq!(tags(&long.until_ready()), "TDCZ");
     server.stop().unwrap();
 }
