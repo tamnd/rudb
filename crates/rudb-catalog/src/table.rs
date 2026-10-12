@@ -1112,6 +1112,16 @@ impl Rows {
         }
     }
 
+    /// The file these rows were read from, whose parts come first, and its rows gone since, when
+    /// the rows are of a file.
+    pub(crate) fn file(&self) -> Option<(&NativeReader, Option<&Gone>)> {
+        match self {
+            Self::Native(reader) | Self::Grown(reader, _) => Some((reader, None)),
+            Self::Masked(reader, gone, _) => Some((reader, Some(gone))),
+            Self::Memory(_) => None,
+        }
+    }
+
     /// Number of independently readable chunks or parts.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
@@ -2192,6 +2202,18 @@ impl Table {
             .chain(unique.map(|index| index.columns.as_slice()))
             .enumerate()
             .find(|(_, held)| same(held))
+    }
+
+    /// The columns of each key and plain unique index, each in its own order, which are the keys a
+    /// lookup finds rows by and a checkpoint seals into runs, see [`crate::sealed`].
+    #[must_use]
+    pub fn point_keys(&self) -> Vec<&[usize]> {
+        let unique = self.indexes.iter().filter(|index| index.unique && index.plain);
+        self.keys
+            .iter()
+            .map(|held| held.columns.as_slice())
+            .chain(unique.map(|index| index.columns.as_slice()))
+            .collect()
     }
 
     /// Whether [`Self::point`] can find a row by the columns `key`, given values of their types.

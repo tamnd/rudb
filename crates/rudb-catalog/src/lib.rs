@@ -25,6 +25,7 @@ pub mod mirror;
 pub mod name;
 pub mod parent;
 pub mod points;
+pub mod sealed;
 pub mod search;
 pub mod system;
 pub mod table;

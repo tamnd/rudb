@@ -17,6 +17,7 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::Chunk;
 
 use crate::keys::{Encoded, Key, encode, push};
+use crate::sealed::Sealed;
 use crate::table::Rows;
 
 /// A hasher for keys that are already spread: an integer key or the bytes of an encoded one,
@@ -86,6 +87,10 @@ pub(crate) struct Located {
     columns: Vec<usize>,
     /// The keys, oldest first. Never empty.
     levels: Vec<Arc<Level>>,
+    /// The keys of the first rows of the file, out of the run a checkpoint sealed them into, older
+    /// than every level. A key here is numbered by the place of its row in the file, which is the
+    /// number it has when no row was taken out, and the rows gone from the file are in `taken`.
+    sealed: Option<Arc<Sealed>>,
     /// The number of the first row of each part, and after them the number of rows.
     starts: Vec<u64>,
     /// The numbers the keys have for the rows taken out since this was built, in order. A key
@@ -314,10 +319,82 @@ impl Located {
             placed,
             columns: columns.to_vec(),
             levels: vec![Arc::new(level)],
+            sealed: None,
             starts,
             taken: Vec::new(),
             sorted: OnceLock::new(),
         })
+    }
+
+    /// The keys of `rows` out of the run a checkpoint sealed them into, when the rows are a file
+    /// that has one for the key, and the keys of the rows the run does not cover read the way
+    /// [`Self::build`] reads them. `None` when there is no run, or when the rows gone from the
+    /// file are a quarter of it or a key column was written over, and then the caller builds.
+    fn opened(rows: &Rows, columns: &[usize], placed: u64) -> Result<Option<Self>> {
+        let Some((reader, gone)) = rows.file() else { return Ok(None) };
+        if gone.is_some_and(|gone| columns.iter().any(|&column| gone.touched(column))) {
+            return Ok(None);
+        }
+        let Some(sealed) = Sealed::read(reader, columns) else { return Ok(None) };
+        let projected = Key { columns: (0..columns.len()).collect(), primary: false };
+        let mut level = Level::default();
+        let mut starts = Vec::with_capacity(rows.chunk_count() + 1);
+        let mut taken = Vec::new();
+        let mut scratch = Vec::new();
+        // The number of the next row, and the place in the file of the next one there, gone or not.
+        let (mut number, mut place) = (0_u64, 0_u64);
+        let mut note = |chunk: &Chunk, row: usize, place: u64| -> Result<()> {
+            match encode(chunk, &projected, row, &mut scratch)? {
+                Encoded::Null => {}
+                Encoded::Int(key) => {
+                    level.ints.insert(key, place);
+                }
+                Encoded::Bytes => {
+                    level.bytes.insert(scratch.as_slice().into(), place);
+                }
+            }
+            Ok(())
+        };
+        for part in 0..reader.parts() {
+            starts.push(number);
+            let size = reader.part_rows(part) as u64;
+            let lost = gone.map(|gone| gone.slots(part)).unwrap_or_default();
+            taken.extend(lost.iter().map(|&slot| place + u64::from(slot)));
+            if place >= sealed.covered {
+                let chunk = rows.read(part, columns)?;
+                let live = gone.and_then(|gone| gone.live(part, size as usize));
+                for row in 0..chunk.len() {
+                    let at = live.as_ref().map_or(row as u64, |live| u64::from(live[row]));
+                    note(&chunk, row, place + at)?;
+                }
+            } else if place + size > sealed.covered {
+                return Ok(None);
+            }
+            number += size - lost.len() as u64;
+            place += size;
+        }
+        for part in reader.parts()..rows.chunk_count() {
+            starts.push(number);
+            let chunk = rows.read(part, columns)?;
+            for row in 0..chunk.len() {
+                note(&chunk, row, place)?;
+                place += 1;
+            }
+            number += chunk.len() as u64;
+        }
+        starts.push(number);
+        if number != rows.len() as u64 || taken.len() as u64 > number / 4 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            placed,
+            columns: columns.to_vec(),
+            levels: vec![Arc::new(level)],
+            sealed: Some(Arc::new(sealed)),
+            starts,
+            taken,
+            sorted: OnceLock::new(),
+        }))
     }
 
     /// A copy that shares this one's levels and its keys in order, for a table that is about to
@@ -327,6 +404,7 @@ impl Located {
             placed: self.placed,
             columns: self.columns.clone(),
             levels: self.levels.clone(),
+            sealed: self.sealed.clone(),
             starts: self.starts.clone(),
             taken: self.taken.clone(),
             sorted: self.sorted.get().cloned().map(OnceLock::from).unwrap_or_default(),
@@ -358,7 +436,8 @@ impl Located {
     }
 
     fn len(&self) -> usize {
-        self.levels.iter().map(|level| level.len()).sum()
+        let sealed = self.sealed.as_ref().map_or(0, |sealed| sealed.len());
+        self.levels.iter().map(|level| level.len()).sum::<usize>() + sealed
     }
 
     /// Notes `keys`, the keys of the rows just appended after the first `before`, and works out
@@ -507,16 +586,27 @@ impl Located {
     fn sort(&self) -> Sorted {
         // Each key with how new its level is, newest first among equal keys, so the first of
         // a run of equal keys is the one kept.
+        // The run sealed at checkpoint is older than every level, and the levels count from one.
         let newest = |at: usize| usize::MAX - at;
-        if self.levels.iter().all(|level| level.bytes.is_empty()) {
+        let sealed = self.sealed.as_deref();
+        if sealed.is_none_or(Sealed::is_ints)
+            && self.levels.iter().all(|level| level.bytes.is_empty())
+        {
             let mut sorted: Vec<(i64, usize, u64)> = Vec::with_capacity(self.len());
+            if let Some(keys) = sealed.and_then(Sealed::ints) {
+                sorted.extend(
+                    keys.iter()
+                        .filter(|&&(_, number)| self.kept(number))
+                        .map(|&(key, number)| (key, newest(0), number)),
+                );
+            }
             for (at, level) in self.levels.iter().enumerate() {
                 sorted.extend(
                     level
                         .ints
                         .iter()
                         .filter(|&(_, &number)| self.kept(number))
-                        .map(|(&key, &number)| (key, newest(at), number)),
+                        .map(|(&key, &number)| (key, newest(at + 1), number)),
                 );
             }
             sorted.sort_unstable();
@@ -526,13 +616,20 @@ impl Located {
             );
         }
         let mut sorted: Vec<(Box<[u8]>, usize, u64)> = Vec::with_capacity(self.len());
+        if let Some(sealed) = sealed {
+            sorted.extend(
+                sealed
+                    .texts()
+                    .into_iter()
+                    .filter(|&(_, number)| self.kept(number))
+                    .map(|(key, number)| (key, newest(0), number)),
+            );
+        }
         for (at, level) in self.levels.iter().enumerate() {
             sorted.extend(
-                level
-                    .bytes
-                    .iter()
-                    .filter(|&(_, &number)| self.kept(number))
-                    .filter_map(|(key, &number)| Some((text_of(key)?.into(), newest(at), number))),
+                level.bytes.iter().filter(|&(_, &number)| self.kept(number)).filter_map(
+                    |(key, &number)| Some((text_of(key)?.into(), newest(at + 1), number)),
+                ),
             );
         }
         sorted.sort_unstable();
@@ -547,9 +644,13 @@ impl Located {
             && self.starts.last() == Some(&(rows.len() as u64))
     }
 
-    /// The part and the place in it of the row holding `key`, and its number, if one does.
-    fn find(&self, key: Encoded, scratch: &[u8]) -> Option<(usize, u32, u64)> {
-        let noted = self.levels.iter().rev().find_map(|level| level.find(key, scratch))?;
+    /// The part and the place in it of the row holding `key`, and its number, if one does. `key`
+    /// is encoded from `values` into `scratch`, and the run sealed at checkpoint takes the values.
+    fn find(&self, key: Encoded, scratch: &[u8], values: &[Value]) -> Option<(usize, u32, u64)> {
+        let noted = match self.levels.iter().rev().find_map(|level| level.find(key, scratch)) {
+            Some(noted) => noted,
+            None => self.sealed.as_ref()?.find(key, values, |noted| self.kept(noted))?,
+        };
         let number = self.number(noted)?;
         let (part, place) = self.place(number)?;
         Some((part, place, number))
@@ -601,6 +702,15 @@ impl Clone for Points {
             stale: AtomicBool::new(self.stale.load(Ordering::Relaxed)),
             again: Mutex::default(),
         }
+    }
+}
+
+/// The keys of `rows` out of a run sealed at checkpoint when there is one, and read from the rows
+/// when not.
+fn opened_or_built(rows: &Rows, key: &[usize], placed: u64) -> Result<Located> {
+    match Located::opened(rows, key, placed)? {
+        Some(located) => Ok(located),
+        None => Located::build(rows, key, placed),
     }
 }
 
@@ -786,7 +896,7 @@ impl Points {
                     again.as_ref()
                 }
             };
-            let Some((part, place, number)) = located.find(wanted, &scratch) else {
+            let Some((part, place, number)) = located.find(wanted, &scratch, values) else {
                 return Ok(None);
             };
             if rows.chunk_len(part)? <= place as usize {
@@ -1043,12 +1153,17 @@ impl Points {
             && slot.get().is_none()
         {
             // Under the lock, so two lookups building at once build once.
-            let located = Arc::new(Located::build(rows, key, placed)?);
+            let located = Arc::new(opened_or_built(rows, key, placed)?);
             return Ok(Arc::clone(slot.get_or_init(|| located)));
         } else if let Some(located) = held.iter().find(|held| held.fits(rows, placed, key)) {
             return Ok(Arc::clone(located));
         }
-        let located = Arc::new(Located::build(rows, key, placed)?);
+        // Once what was used turned out wrong, the keys are read from the rows and not from a run.
+        let located = Arc::new(if fresh {
+            Located::build(rows, key, placed)?
+        } else {
+            opened_or_built(rows, key, placed)?
+        });
         held.retain(|held| held.columns != key);
         held.push(Arc::clone(&located));
         Ok(located)

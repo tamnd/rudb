@@ -161,7 +161,10 @@ fn defaults_checks_and_indexes_come_back_after_a_reopen() {
     db.execute("ALTER TABLE d ALTER COLUMN a SET NOT NULL").expect("alters");
     db.execute("CHECKPOINT").expect("checkpoints");
     let after = size(&path);
-    assert!(after < before + before / 10, "the file went from {before} to {after} bytes");
+    // The table is not written again. The unique index gets a sealed run of its keys, under ten
+    // bytes a key, so the first lookup after a reopen reads that rather than every key.
+    let run = 10 * 2_000_000;
+    assert!(after < before + before / 10 + run, "the file went from {before} to {after} bytes");
     drop(db);
 
     let db = open(&path);
