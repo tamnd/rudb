@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rudb::LoadTarget;
 use rudb_common::{Fields, Value};
 use rudb_pgtypes::{
-    DateTimeInput, InputSettings, NoZones, PgType, RowEncoder, TypeError, UNIX_TO_POSTGRES_USECS,
-    ZoneAbbrevs, column_value,
+    DateTimeInput, InputSettings, PgType, RowEncoder, SessionZones, TypeError,
+    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, column_value,
 };
 use rudb_pgwire::{CommandTag, OutBuf};
 
@@ -1614,7 +1614,7 @@ impl Runner {
             datetime: DateTimeInput {
                 order: self.format.date_format.order,
                 zone: &self.zone,
-                zones: &NoZones,
+                zones: &SessionZones,
                 abbrevs: ZoneAbbrevs::postgres_default(),
                 now: now + UNIX_TO_POSTGRES_USECS,
             },

@@ -32,8 +32,8 @@ use rudb::{Connection, ErrorCode, Notice, QueryResult, Transaction};
 use rudb_common::guc::{self, Action, Origin, Settings};
 use rudb_common::session::Postgres;
 use rudb_pgtypes::{
-    ByteaOutput, DateFormat, DateTimeInput, IntervalStyle, NoZones, OutputSettings, RowEncoder,
-    TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
+    ByteaOutput, DateFormat, DateTimeInput, IntervalStyle, OutputSettings, RowEncoder,
+    SessionZones, TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
 };
 use rudb_pgwire::{
     CommandTag, Field, Frontend, Handshake, Level, OutBuf, QUERY_CANCELED, Replication, Session,
@@ -1390,7 +1390,7 @@ impl Runner {
                     datetime: DateTimeInput {
                         order: self.format.date_format.order,
                         zone: &self.zone,
-                        zones: &NoZones,
+                        zones: &SessionZones,
                         abbrevs: ZoneAbbrevs::postgres_default(),
                         now: now + UNIX_TO_POSTGRES_USECS,
                     },
