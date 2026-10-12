@@ -508,6 +508,10 @@ pub(crate) struct Binder<'a> {
     pub(crate) window_part: WindowPart,
     /// Uncorrelated scalar queries waiting to be joined into the select block that uses them.
     pub(crate) scalar_subqueries: Vec<PendingSubquery>,
+    /// The PostgreSQL type, with its type modifier, of each scalar query or `ARRAY(SELECT ...)`
+    /// whose column declares one, by the expression it binds to, so a target that is the query
+    /// keeps it.
+    pub(crate) subquery_types: Vec<(ExprRef, DeclaredType)>,
     /// Table indices of the queries this block will join in above its grouping, not below it.
     ///
     /// Only ever set while a `HAVING` is being rewritten over the aggregate. A column from one of
@@ -654,6 +658,7 @@ impl<'a> Binder<'a> {
             in_window: false,
             window_part: WindowPart::Arguments,
             scalar_subqueries: Vec::new(),
+            subquery_types: Vec::new(),
             joined_above: Vec::new(),
             outer_scopes: Vec::new(),
             placeholders: Vec::new(),
@@ -1044,7 +1049,7 @@ impl<'a> Binder<'a> {
                 not_null: false,
                 key: None,
                 default: None,
-                origin: None,
+                origin: written.origins.get(at).copied().flatten(),
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -1642,6 +1647,17 @@ impl<'a> Binder<'a> {
     pub(crate) fn through<'s>(&self, expr: ExprRef, input: &'s Scope) -> Option<&'s Visible> {
         let Expr::Column(binding) = *self.plan.expr(expr) else { return None };
         input.columns.iter().find(|column| column.binding == binding)
+    }
+
+    /// The table column that a target passes straight through, from below or, as PostgreSQL's
+    /// `markTargetListOrigins` finds it, from a query around this one.
+    fn origin_through(&self, expr: ExprRef, input: &Scope) -> Option<Origin> {
+        let Expr::Column(binding) = *self.plan.expr(expr) else { return None };
+        std::iter::once(input)
+            .chain(self.outer_scopes.iter().rev())
+            .flat_map(|visible| visible.columns.iter())
+            .find(|column| column.binding == binding)
+            .and_then(|column| column.origin)
     }
 
     /// `VALUES (1, 'a'), (2, 'b')`, as a query in its own right.
@@ -2907,7 +2923,7 @@ impl<'a> Binder<'a> {
                 ast.expr(target.expr),
                 ast::Expr::Column { .. } | ast::Expr::Positional { .. }
             );
-            let origin = self.through(expr, input).and_then(|column| column.origin);
+            let origin = self.origin_through(expr, input);
             origins.push(match ast.expr(target.expr) {
                 // A bare `current_user` is a one-part column to the parser, so this comes first.
                 _ if origin.is_none() && crate::context::gives_name(ast, target.expr) => {
@@ -2920,6 +2936,13 @@ impl<'a> Binder<'a> {
                     Some(Origin::typed(VOID))
                 }
                 _ if plain => origin,
+                // A scalar query is of the type that its column declares, as `exprTypmod` of a
+                // `SubLink` finds it, and is no table column.
+                ast::Expr::Subquery { .. } => self
+                    .subquery_types
+                    .iter()
+                    .find(|(at, _)| *at == expr)
+                    .map(|&(_, declared)| Origin::typed(declared)),
                 // A parameter is of the type that the client declared for it, as in PostgreSQL.
                 ast::Expr::Parameter { name } => {
                     self.parameters.declared_type(ast.string(name)).map(Origin::typed)
@@ -7984,7 +8007,7 @@ fn recursive_types(
 /// `exprTypmod` of PostgreSQL see it: the type that a declaration or a cast wrote, or for a table
 /// column the type of its values, whose modifier the logical type holds, as a `numeric(4,1)`
 /// column is a `DECIMAL(4,1)`. Anything else declares no type.
-fn declared_type(column: &Visible) -> Option<DeclaredType> {
+pub(crate) fn declared_type(column: &Visible) -> Option<DeclaredType> {
     let origin = column.origin?;
     if let Some(declared) = origin.ty {
         let held = rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(&column.ty)
