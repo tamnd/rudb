@@ -691,6 +691,7 @@ impl Located {
             // another, and this runs once, the first time a range read asks.
             for part in 0..rows.chunk_count() {
                 let chunk = rows.read(part, &self.columns)?;
+                // row at a time: each row is written out as its key.
                 for row in 0..chunk.len() {
                     while taken.next_if_eq(&noted).is_some() {
                         noted += 1;

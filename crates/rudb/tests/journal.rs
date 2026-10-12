@@ -674,7 +674,7 @@ fn a_sequence_hands_out_no_value_twice_across_a_crash() {
 /// The log's segments of each lane, by lane number, leaving out the spares.
 fn lanes(path: &Path) -> Vec<(u8, usize)> {
     let mut lanes: Vec<(u8, usize)> = Vec::new();
-    for entry in std::fs::read_dir(wal(path)).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(wal(path)).into_iter().flatten().filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.ends_with(".spare") {
             continue;
@@ -779,7 +779,7 @@ fn a_lost_lane_stops_replay_at_the_first_commit_it_held() {
     let written: Vec<u8> = lanes(&path).into_iter().map(|(lane, _)| lane).collect();
     assert_eq!(written, [0, 1]);
     crash(db);
-    for entry in std::fs::read_dir(wal(&path)).expect("the log is there").flatten() {
+    for entry in std::fs::read_dir(wal(&path)).expect("the log is there").filter_map(Result::ok) {
         if entry.file_name().to_string_lossy().starts_with("L01-") {
             std::fs::remove_file(entry.path()).expect("removes");
         }

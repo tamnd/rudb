@@ -473,7 +473,9 @@ fn an_exported_state_is_written_as_its_layout_and_reads_back_into_a_state() {
 /// Every file under `root`, as its path below it and what it holds, in path order.
 fn files(root: &std::path::Path) -> String {
     fn walk(directory: &std::path::Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory).expect("lists the directory").flatten() {
+        for entry in
+            std::fs::read_dir(directory).expect("lists the directory").filter_map(Result::ok)
+        {
             if entry.file_type().expect("has a type").is_dir() {
                 walk(&entry.path(), out);
             } else {
