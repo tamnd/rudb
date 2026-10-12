@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.12
+
+In the PostgreSQL dialect, #3053 refuses a window function in a window definition, in a FILTER, and a GROUPS frame that has no ORDER BY, with the errors of PostgreSQL. #3055 refuses a LATERAL reference across a RIGHT or a FULL join. #3056 reads a WITH definition that writes rows, and #3057 gives a write into a missing table the missing relation error of PostgreSQL. #3058 reads the definitions of a WITH RECURSIVE in the order of what they read, and refuses two definitions that read each other. #3060 reads each WITH definition where it is written, so a column count that does not match gives its error at the right place. #3061 checks the column types of a recursive definition against its non-recursive term, and keeps the declared typmod of a table column through a held definition and a set operation.
+
+On the engine side, #3054 gives each of two struct fields of one name its own value, and #3059 makes the in_range tests ask about values on the side that their assertions name.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.11
 
 In the PostgreSQL dialect, #3044 resolves `generate_series` over integers, bigints and numerics and gives its rows and its errors as PostgreSQL does. #3046 keeps the column origins and the `char(n)` rule on a prepared statement that reads by a range. #3047 makes the whole row of a relation null where an outer join padded it, so `count(b.*)` counts only the rows that matched. #3048 keeps a subquery in `FROM` that has no `LATERAL` from the entries to its left, and gives PostgreSQL's errors for a name that only they have.
