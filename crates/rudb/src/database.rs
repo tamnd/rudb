@@ -4162,19 +4162,24 @@ impl Shared {
     ///
     /// The revision is read under the committed catalog's lock, and every commit draws its
     /// revisions under the same lock held for writing, so the snapshot holds exactly the changes
-    /// drawn at or below it.
+    /// drawn at or below it. The transaction is numbered under that lock too, since a commit only
+    /// notes the rows it wrote while some transaction is open to meet them, and one that came
+    /// between the snapshot and the numbering would be in neither.
     fn snapshot(&self) {
         if !self.open().as_ref().is_some_and(|open| open.snapshot.is_none()) {
             return;
         }
-        let (base, at) = {
+        let (base, at, id) = {
             let committed = self.inner.catalog.read();
-            (committed.clone(), rudb_catalog::revision_now())
+            let at = rudb_catalog::revision_now();
+            (committed.clone(), at, self.registry().begin(at))
         };
         let shadow = self.committed_journal().as_ref().map(Journal::shadow);
         let mut open = self.open();
-        let Some(open) = open.as_mut().filter(|open| open.snapshot.is_none()) else { return };
-        let id = self.registry().begin(at);
+        let Some(open) = open.as_mut().filter(|open| open.snapshot.is_none()) else {
+            self.inner.registry.end(id, false);
+            return;
+        };
         *self.conn.catalog.write() = base.clone();
         *self.conn.staged.lock().unwrap_or_else(PoisonError::into_inner) = shadow;
         open.snapshot = Some(txn::Snapshot {
@@ -5070,7 +5075,7 @@ impl Shared {
         }
         let watched = transacting || self.registry().watched();
         let claim = if watched {
-            self.claim(table, false, &[spot.number], table.rows().len()).ok()?
+            self.claim(table, false, (&[spot.number], table.rows().len()), None).ok()?
         } else {
             None
         };
@@ -5181,7 +5186,12 @@ impl Shared {
         };
         let watched = transacting || self.registry().watched();
         let claim = if watched {
-            self.claim(table, false, &[spot.number], table.rows().len()).ok()?
+            // Only added to, which another writer adding to the row does not meet, unless waiting
+            // is off and every write of a row is to fail as the pin's does.
+            let delta = write.sets.iter().all(|(_, set)| matches!(set, Set::Add(..)))
+                && !self.inner.settings.lock_timeout().is_zero();
+            let at = (&[spot.number][..], table.rows().len());
+            self.claim(table, false, at, Some((sets, delta))).ok()?
         } else {
             None
         };
@@ -5309,7 +5319,8 @@ impl Shared {
         let number = [spot.number];
         let len = table.rows().len();
         let watched = transacting || self.registry().watched();
-        let claim = if watched { self.claim(table, true, &number, len).ok()? } else { None };
+        let claim =
+            if watched { self.claim(table, true, (&number, len), None).ok()? } else { None };
         let oid = table.oid();
         let logs = self.journal().as_ref().is_some_and(Journal::logs);
         let staged = logs.then(|| {
@@ -5474,18 +5485,32 @@ impl Shared {
         let wrote = snapshot.written.keys().copied().collect::<Vec<_>>();
         let merged = if commit {
             let workers = self.inner.pool.threads();
-            txn::merge(&mut committed, mine, &mut snapshot, workers)
+            let blend = self.registry().blends(snapshot.id);
+            txn::merge(&mut committed, mine, &mut snapshot, workers, &blend)
         } else {
-            Ok(())
+            Ok(Vec::new())
         };
         if commit
-            && merged.is_ok()
+            && let Ok(blended) = &merged
             && let Some(staged) = staged
             && let Some(journal) = self.committed_journal().as_mut()
         {
             // Records that number rows the commit found elsewhere would replay onto other rows,
             // so the commit checkpoints instead.
-            if snapshot.renumbered { journal.dirty() } else { journal.absorb(staged) }
+            if snapshot.renumbered {
+                journal.dirty();
+            } else {
+                journal.absorb(staged);
+            }
+            // The rows as the commit put them together with what others committed since, after
+            // the transaction's own records of them, so a replay ends where the commit did.
+            for (name, numbers, rows) in blended {
+                let fields = committed.table(name).map(|table| table.columns().to_vec());
+                let record = fields.ok().and_then(|fields| {
+                    journal.encode_update(&name.schema, &name.table, &fields, numbers, rows)
+                });
+                journal.stage(record);
+            }
         }
         self.inner.registry.end(snapshot.id, commit && merged.is_ok());
         if commit && merged.is_ok() {
@@ -5502,7 +5527,7 @@ impl Shared {
                 }
             }
         }
-        merged
+        merged.map(|_| ())
     }
 
     /// Refuses rows the open transaction is adding to `name` when a key of theirs was committed
@@ -5581,14 +5606,23 @@ impl Shared {
     /// transaction is open anywhere, which is when nobody could conflict.
     ///
     /// `scanned` is how many rows the scan read and `len` how many the table holds, and when they
-    /// differ the row numbers are not the table's and every row is claimed.
+    /// differ the row numbers are not the table's and every row is claimed. `columns` are the
+    /// columns an update writes when it says, and whether it only adds to them, which a delta does
+    /// (see `txn::Marks`), and every column otherwise.
     fn claim(
         &self,
         table: &rudb_catalog::Table,
         delete: bool,
-        flagged: &[u64],
-        scanned: usize,
+        (flagged, scanned): (&[u64], usize),
+        columns: Option<(&[usize], bool)>,
     ) -> Result<Option<txn::Marks>> {
+        let written = |mut marks: txn::Marks| {
+            if let Some((columns, delta)) = columns {
+                marks.columns = Some(columns.into());
+                marks.delta = delta;
+            }
+            marks
+        };
         let oid = table.oid();
         let whole = scanned != table.rows().len();
         let open = self.open();
@@ -5602,14 +5636,14 @@ impl Shared {
                     Some(written) => written.based(flagged, base),
                     None => flagged.iter().copied().filter(|&row| row < base).collect(),
                 };
-                let marks = txn::Marks { frame, rows, all: whole };
+                let marks = written(txn::Marks::rows(frame, rows, whole));
                 let clash = registry.clashes(Some(snapshot.id), oid, &marks, snapshot.at);
                 self.clashed(&registry, Some(snapshot.id), clash, delete)?;
                 marks
             }
             None if registry.watched() => {
                 let rows = if whole { BTreeSet::new() } else { flagged.iter().copied().collect() };
-                let marks = txn::Marks { frame: table.frame(), rows, all: whole };
+                let marks = written(txn::Marks::rows(table.frame(), rows, whole));
                 let clash = registry.clashes(None, oid, &marks, u64::MAX);
                 self.clashed(&registry, None, clash, delete)?;
                 marks
@@ -7894,7 +7928,7 @@ impl Shared {
                         foreign::missing(&catalog, name, &changed)?;
                         let table = catalog.table(name)?;
                         let claim = if watched {
-                            self.claim(table, false, &flagged, scanned)?
+                            self.claim(table, false, (&flagged, scanned), None)?
                         } else {
                             None
                         };
@@ -7966,7 +8000,7 @@ impl Shared {
                         let name = &insert.name;
                         let table = catalog.table(name)?;
                         let claim = if watched {
-                            self.claim(table, delete, &flagged, scanned)?
+                            self.claim(table, delete, (&flagged, scanned), None)?
                         } else {
                             None
                         };
@@ -9043,9 +9077,10 @@ fn rows_given(limit: &crate::prepared::Limit, given: crate::prepared::Given<'_>)
     }
 }
 
-/// The integer `was` of a column of type `ty` plus `by`, or minus it, for an `UPDATE` that sets a
-/// column to itself and a parameter. `None` for anything but integers the column holds as they
-/// are, or an answer that does not fit, which leaves it to the plan and its words for the overflow.
+/// The integer or decimal `was` of a column of type `ty` plus `by`, or minus it, for an `UPDATE`
+/// that sets a column to itself and a parameter or a whole number. `None` for anything but
+/// integers and decimals the column holds as they are, or an answer that does not fit, which
+/// leaves it to the plan and its words for the overflow.
 fn shifted(was: &Value, by: &Value, minus: bool, ty: &LogicalType) -> Option<Value> {
     let wide = |value: &Value| match value {
         Value::Integer(value) => Some(i128::from(*value)),
@@ -9053,7 +9088,26 @@ fn shifted(was: &Value, by: &Value, minus: bool, ty: &LogicalType) -> Option<Val
         _ => None,
     };
     if by.is_null() || was.is_null() {
-        return matches!(ty, LogicalType::Integer | LogicalType::BigInt).then_some(Value::Null);
+        let added =
+            matches!(ty, LogicalType::Integer | LogicalType::BigInt | LogicalType::Decimal { .. });
+        return added.then_some(Value::Null);
+    }
+    if let LogicalType::Decimal { width, scale } = *ty {
+        // Exactly, so only what needs no rounding into the column's scale, as the plan's sum
+        // cast back to the column does.
+        let Value::Decimal { unscaled: was, scale: held, .. } = *was else { return None };
+        let by = match *by {
+            Value::Decimal { unscaled, scale: given, .. } if given <= scale && held == scale => {
+                unscaled.checked_mul(10_i128.checked_pow(u32::from(scale - given))?)?
+            }
+            Value::Integer(_) | Value::BigInt(_) if held == scale => {
+                wide(by)?.checked_mul(10_i128.checked_pow(u32::from(scale))?)?
+            }
+            _ => return None,
+        };
+        let value = if minus { was.checked_sub(by)? } else { was.checked_add(by)? };
+        let fits = value.checked_abs()? < 10_i128.checked_pow(u32::from(width))?;
+        return fits.then_some(Value::Decimal { unscaled: value, width, scale });
     }
     let (was, by) = (wide(was)?, wide(by)?);
     let value = if minus { was - by } else { was + by };
