@@ -11,9 +11,15 @@
 //! hybrid encoding and its values plain. Dictionary pages and the delta encodings are how the pin
 //! gets its files smaller, and they are the next step rather than this one.
 //!
-//! Each column chunk records the smallest and the largest value and the null count, in the byte
-//! forms the reader's pruning reads, and says the bounds are exact, because nothing here shortens
-//! them.
+//! Each column chunk records its null count and, where the pin does, the smallest and the largest
+//! value in both the old `min` and `max` fields and the newer `min_value` and `max_value`, in the
+//! byte forms the reader's pruning reads. The pin keeps no bounds at all for a chunk that holds a
+//! NaN, keeps only the newer fields for an unsigned integer, whose order the old ones do not have,
+//! and keeps none for a `HUGEINT`, which it writes as a `DOUBLE`. A string or a blob bound is cut
+//! to 256 bytes the way the pin cuts it and then says it is not exact. A `FLOAT` or a `DOUBLE`
+//! chunk also records how many NaNs it holds, which is what the corpus expects of a DuckDB newer
+//! than the pin. The footer says every column sorts by its type, and carries the key value pairs
+//! `KV_METADATA` asks for.
 
 use std::cmp::Ordering;
 use std::io::Write;
@@ -25,12 +31,33 @@ use rudb_vector::{Chunk, Vector};
 use crate::metadata::Physical;
 use crate::thrift;
 
+/// How many bytes of a string or a blob a bound keeps, which is the pin's limit.
+const BOUND_BYTES: usize = 256;
+
 /// One column as it is stored.
 #[derive(Debug)]
 struct Column {
     name: String,
     ty: LogicalType,
     physical: Physical,
+    bounds: Bounds,
+    /// Whether `RETURN_STATS` reports the column's bounds, which the pin does not for an enum.
+    reported: bool,
+}
+
+/// Which bounds the pin keeps for a column, which follows the type the query gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bounds {
+    /// The old fields and the new ones: a signed number, a bool, a date, a time or a decimal.
+    Signed,
+    /// Only the new fields, for an unsigned integer.
+    Unsigned,
+    /// Both, cut on a character past [`BOUND_BYTES`], for a string.
+    Text,
+    /// Both, cut on a byte past [`BOUND_BYTES`], for a blob.
+    Bytes,
+    /// None at all, for a `HUGEINT` or a `UHUGEINT`.
+    None,
 }
 
 /// The per chunk totals the footer needs, filled in as the pages go out.
@@ -39,10 +66,100 @@ struct Written {
     values: i64,
     nulls: i64,
     nans: i64,
+    pages: i32,
     compressed: i64,
     uncompressed: i64,
     min: Option<Value>,
     max: Option<Value>,
+    /// Whether the minimum was cut short, which leaves it below the smallest value.
+    min_cut: bool,
+    /// Whether the maximum was cut short and raised, which leaves it above the largest value.
+    max_cut: bool,
+    /// Whether a long string could not be cut into an upper bound, which drops the bounds of the
+    /// chunk for good.
+    failed: bool,
+}
+
+impl Written {
+    /// Moves the bounds out to take in a value that is neither null nor NaN.
+    fn take(&mut self, value: &Value, bounds: Bounds) {
+        match bounds {
+            Bounds::None => {}
+            Bounds::Text => self.take_text(value, true),
+            Bounds::Bytes => self.take_text(value, false),
+            Bounds::Signed | Bounds::Unsigned => {
+                bound(&mut self.min, value, Ordering::Less);
+                bound(&mut self.max, value, Ordering::Greater);
+            }
+        }
+    }
+
+    /// The pin's string statistics: a value past [`BOUND_BYTES`] that becomes a bound is cut, and
+    /// later values are compared with the cut bound rather than with the value it came from.
+    fn take_text(&mut self, value: &Value, text: bool) {
+        if self.failed {
+            return;
+        }
+        let bytes = match value {
+            Value::Varchar(text) => text.as_bytes(),
+            Value::Blob(bytes) => bytes.as_slice(),
+            _ => return,
+        };
+        let make = |bytes: &[u8]| {
+            if text {
+                Value::Varchar(String::from_utf8_lossy(bytes).into_owned())
+            } else {
+                Value::Blob(bytes.to_vec())
+            }
+        };
+        if self.min.as_ref().is_none_or(|min| bytes < text_bytes(min)) {
+            self.min_cut = bytes.len() > BOUND_BYTES;
+            self.min = Some(make(if self.min_cut { cut_low(bytes, text) } else { bytes }));
+        }
+        if self.max.as_ref().is_none_or(|max| bytes > text_bytes(max)) {
+            self.max_cut = bytes.len() > BOUND_BYTES;
+            if !self.max_cut {
+                self.max = Some(make(bytes));
+            } else if let Some(high) = cut_high(bytes, text) {
+                self.max = Some(make(&high));
+            } else {
+                self.failed = true;
+                self.min = None;
+                self.max = None;
+            }
+        }
+    }
+}
+
+/// The bytes of a string or a blob bound.
+fn text_bytes(value: &Value) -> &[u8] {
+    match value {
+        Value::Varchar(text) => text.as_bytes(),
+        Value::Blob(bytes) => bytes,
+        _ => &[],
+    }
+}
+
+/// A lower bound of `bytes` no longer than [`BOUND_BYTES`]: the front of it, which for a string
+/// stops before a character that would be split.
+fn cut_low(bytes: &[u8], text: bool) -> &[u8] {
+    let mut end = BOUND_BYTES;
+    while text && end > 0 && bytes[end] & 0xC0 == 0x80 {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// An upper bound of `bytes` no longer than [`BOUND_BYTES`]: the front of it up to the last byte
+/// that can be raised by one, raised. For a string that is an ASCII byte below `0x7F`, so the bound
+/// stays whole characters, and for a blob any byte below `0xFF`. `None` when there is no such byte,
+/// which is a string of nothing but long characters or a blob of nothing but `0xFF`.
+fn cut_high(bytes: &[u8], text: bool) -> Option<Vec<u8>> {
+    let ceiling = if text { 0x7F } else { 0xFF };
+    let at = bytes[..BOUND_BYTES].iter().rposition(|&byte| byte < ceiling)?;
+    let mut high = bytes[..=at].to_vec();
+    high[at] += 1;
+    Some(high)
 }
 
 /// Writes one Parquet file, a row group at a time.
@@ -55,7 +172,10 @@ pub struct Writer<W: Write> {
     groups: Vec<thrift::Writer>,
     rows: i64,
     created_by: String,
+    key_values: Vec<(String, Vec<u8>)>,
     totals: Vec<ColumnStatistics>,
+    /// For each column, whether a row group has had no bounds, which leaves the file with none.
+    unbounded: Vec<bool>,
 }
 
 /// What one column of a file holds over all of its row groups, which is what a `COPY ... TO`
@@ -72,10 +192,15 @@ pub struct ColumnStatistics {
     pub nans: Option<i64>,
     /// How many bytes its column chunks take in the file, page headers and all.
     pub size: i64,
-    /// The smallest value that is neither null nor NaN, of the type it was stored as.
+    /// The smallest value that is neither null nor NaN, of the type it was stored as, or `None`
+    /// when a row group had no bounds. A string or a blob is cut the way its chunks' bounds are.
     pub min: Option<Value>,
     /// The largest.
     pub max: Option<Value>,
+    /// Whether [`ColumnStatistics::min`] is the smallest value rather than one cut short.
+    pub min_exact: bool,
+    /// Whether [`ColumnStatistics::max`] is the largest value rather than one cut and raised.
+    pub max_exact: bool,
 }
 
 /// The type a column of `ty` has to be cast to before it is handed to a [`Writer`].
@@ -147,12 +272,13 @@ fn physical_wire(physical: Physical) -> i32 {
 }
 
 impl<W: Write> Writer<W> {
-    /// Starts a file with these columns, each of a type [`storage`] hands back.
+    /// Starts a file with these columns, of the types the query gave them. The chunks handed in
+    /// later have each column cast to what [`storage`] makes of its type.
     ///
     /// # Errors
     ///
     /// For a codec other than `UNCOMPRESSED` and `SNAPPY`, for a column of a type [`storage`]
-    /// would have changed, or if the magic cannot be written.
+    /// refuses, or if the magic cannot be written.
     pub fn new(out: W, fields: &[Field], codec: Codec, created_by: &str) -> Result<Self> {
         if !matches!(codec, Codec::Uncompressed | Codec::Snappy) {
             return Err(Error::not_implemented(format!(
@@ -161,22 +287,40 @@ impl<W: Write> Writer<W> {
         }
         let mut columns = Vec::with_capacity(fields.len());
         for field in fields {
-            let physical = physical(&field.ty).ok_or_else(|| {
+            let ty = storage(&field.ty)?;
+            let physical = physical(&ty).ok_or_else(|| {
                 Error::not_implemented(format!(
                     "COPY TO a Parquet file with a column of type {} is not supported yet",
                     field.ty
                 ))
             })?;
-            columns.push(Column { name: field.name.clone(), ty: field.ty.clone(), physical });
+            let bounds = match (&field.ty, &ty) {
+                (LogicalType::HugeInt | LogicalType::UHugeInt, _) => Bounds::None,
+                (
+                    _,
+                    LogicalType::UTinyInt
+                    | LogicalType::USmallInt
+                    | LogicalType::UInteger
+                    | LogicalType::UBigInt,
+                ) => Bounds::Unsigned,
+                (_, LogicalType::Varchar) => Bounds::Text,
+                (_, LogicalType::Blob) => Bounds::Bytes,
+                _ => Bounds::Signed,
+            };
+            let reported = !matches!(field.ty, LogicalType::Enum(_));
+            columns.push(Column { name: field.name.clone(), ty, physical, bounds, reported });
         }
         let totals = columns
             .iter()
             .map(|column| ColumnStatistics {
                 name: column.name.clone(),
                 nans: matches!(column.physical, Physical::Float | Physical::Double).then_some(0),
+                min_exact: true,
+                max_exact: true,
                 ..ColumnStatistics::default()
             })
             .collect();
+        let unbounded = columns.iter().map(|column| !column.reported).collect();
         let mut writer = Self {
             out,
             at: 0,
@@ -185,10 +329,17 @@ impl<W: Write> Writer<W> {
             groups: Vec::new(),
             rows: 0,
             created_by: created_by.to_string(),
+            key_values: Vec::new(),
             totals,
+            unbounded,
         };
         writer.put(b"PAR1")?;
         Ok(writer)
+    }
+
+    /// Sets the key value pairs the footer carries, which is what `KV_METADATA` writes.
+    pub fn set_key_values(&mut self, pairs: Vec<(String, Vec<u8>)>) {
+        self.key_values = pairs;
     }
 
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
@@ -229,11 +380,20 @@ impl<W: Write> Writer<W> {
             totals.nulls += written.nulls;
             totals.nans = totals.nans.map(|nans| nans + written.nans);
             totals.size += written.compressed;
-            if let Some(min) = &written.min {
-                bound(&mut totals.min, min, Ordering::Less);
-            }
-            if let Some(max) = &written.max {
-                bound(&mut totals.max, max, Ordering::Greater);
+            // A row group with no bounds leaves the file with none, as in the pin, which still
+            // takes in the bounds of a group that kept none in the file only for its NaNs.
+            match (&written.min, &written.max) {
+                (Some(min), Some(max)) if !self.unbounded[column] => {
+                    bound(&mut totals.min, min, Ordering::Less);
+                    bound(&mut totals.max, max, Ordering::Greater);
+                    totals.min_exact &= !written.min_cut;
+                    totals.max_exact &= !written.max_cut;
+                }
+                _ => {
+                    self.unbounded[column] = true;
+                    totals.min = None;
+                    totals.max = None;
+                }
             }
         }
         let mut group = thrift::Writer::default();
@@ -266,6 +426,8 @@ impl<W: Write> Writer<W> {
                 || matches!(value, Value::Float(value) if value.is_nan())
             {
                 written.nans += 1;
+            } else {
+                written.take(&value, column.bounds);
             }
             defined.push(true);
             if column.physical == Physical::Boolean {
@@ -273,8 +435,6 @@ impl<W: Write> Writer<W> {
             } else {
                 plain(&value, column, &mut values, true)?;
             }
-            bound(&mut written.min, &value, Ordering::Less);
-            bound(&mut written.max, &value, Ordering::Greater);
         }
         if column.physical == Physical::Boolean {
             values = packed(&bits);
@@ -302,6 +462,7 @@ impl<W: Write> Writer<W> {
         self.put(&header)?;
         self.put(&stored)?;
         written.values += vector.len() as i64;
+        written.pages += 1;
         written.uncompressed += (header.len() + body.len()) as i64;
         written.compressed += (header.len() + stored.len()) as i64;
         Ok(())
@@ -312,27 +473,48 @@ impl<W: Write> Writer<W> {
         let column = &self.columns[at];
         let mut meta = thrift::Writer::default();
         meta.i32(1, physical_wire(column.physical));
-        meta.list_of_ints(2, &[0, 3]);
+        // The pin lists the encodings of the values only, which here is always `PLAIN`, and not
+        // the `RLE` of the definition levels.
+        meta.list_of_ints(2, &[0]);
         meta.list_of_strings(3, &[column.name.as_str()]);
         meta.i32(4, if self.codec == Codec::Snappy { 1 } else { 0 });
         meta.int(5, written.values);
         meta.int(6, written.uncompressed);
         meta.int(7, written.compressed);
         meta.int(9, first as i64);
-        let mut stats = thrift::Writer::default();
-        stats.int(3, written.nulls);
-        if let (Some(min), Some(max)) = (&written.min, &written.max) {
+        let mut bounds = None;
+        if let (Some(min), Some(max), 0) = (&written.min, &written.max, written.nans) {
             let (mut low, mut high) = (Vec::new(), Vec::new());
             if plain(max, column, &mut high, false).is_ok()
                 && plain(min, column, &mut low, false).is_ok()
             {
-                stats.binary(5, &high);
-                stats.binary(6, &low);
-                stats.boolean(7, true);
-                stats.boolean(8, true);
+                bounds = Some((low, high));
             }
         }
+        let mut stats = thrift::Writer::default();
+        if let Some((low, high)) = &bounds
+            && column.bounds != Bounds::Unsigned
+        {
+            stats.binary(1, high);
+            stats.binary(2, low);
+        }
+        stats.int(3, written.nulls);
+        if let Some((low, high)) = &bounds {
+            stats.binary(5, high);
+            stats.binary(6, low);
+            stats.boolean(7, !written.max_cut);
+            stats.boolean(8, !written.min_cut);
+        }
+        if matches!(column.physical, Physical::Float | Physical::Double) {
+            stats.int(9, written.nans);
+        }
         meta.nested(12, stats);
+        // Every page is a version one data page of plain values.
+        let mut pages = thrift::Writer::default();
+        pages.i32(1, 0);
+        pages.i32(2, 0);
+        pages.i32(3, written.pages);
+        meta.list_of_nested(13, vec![pages]);
         let mut chunk = thrift::Writer::default();
         chunk.int(2, first as i64);
         chunk.nested(3, meta);
@@ -381,7 +563,30 @@ impl<W: Write> Writer<W> {
         footer.list_of_nested(2, schema);
         footer.int(3, self.rows);
         footer.list_of_nested(4, std::mem::take(&mut self.groups));
+        if !self.key_values.is_empty() {
+            let pairs = self
+                .key_values
+                .iter()
+                .map(|(key, value)| {
+                    let mut pair = thrift::Writer::default();
+                    pair.string(1, key);
+                    pair.binary(2, value);
+                    pair
+                })
+                .collect();
+            footer.list_of_nested(5, pairs);
+        }
         footer.string(6, &self.created_by);
+        let orders = self
+            .columns
+            .iter()
+            .map(|_| {
+                let mut order = thrift::Writer::default();
+                order.nested(1, thrift::Writer::default());
+                order
+            })
+            .collect();
+        footer.list_of_nested(7, orders);
         let footer = footer.stop();
         self.put(&footer)?;
         self.put(&(footer.len() as u32).to_le_bytes())?;
@@ -601,6 +806,7 @@ mod tests {
     use rudb_vector::{Chunk, Vector};
 
     use super::Writer;
+    use crate::footer::{MetadataTable, RawFooter};
     use crate::metadata::{Metadata, Physical};
 
     fn column(ty: LogicalType, values: &[Value]) -> Vector {
@@ -676,6 +882,58 @@ mod tests {
             assert_eq!(stats.min, Some(1_u32.to_le_bytes().to_vec()));
             assert_eq!(stats.max, Some(200_u32.to_le_bytes().to_vec()));
         }
+    }
+
+    #[test]
+    fn the_footer_keeps_the_pins_statistics_orders_and_keys() {
+        let fields = vec![
+            Field::new("d", LogicalType::Double),
+            Field::new("u", LogicalType::UInteger),
+            Field::new("h", LogicalType::HugeInt),
+            Field::new("s", LogicalType::Varchar),
+            Field::new("b", LogicalType::Blob),
+        ];
+        let long = "z".repeat(300);
+        let chunk = Chunk::new(vec![
+            column(LogicalType::Double, &[Value::Double(1.5), Value::Double(f64::NAN)]),
+            column(LogicalType::UInteger, &[Value::UInteger(7), Value::UInteger(3)]),
+            column(LogicalType::Double, &[Value::Double(2.0), Value::Double(1.0)]),
+            column(LogicalType::Varchar, &[Value::Varchar("a".into()), Value::Varchar(long)]),
+            column(LogicalType::Blob, &[Value::Blob(vec![0xFF; 300]), Value::Blob(vec![1])]),
+        ])
+        .expect("a chunk");
+        let mut writer =
+            Writer::new(Vec::new(), &fields, Codec::Uncompressed, "rudb test").expect("starts");
+        writer.set_key_values(vec![("k".into(), b"v".to_vec())]);
+        writer.write_group(&[chunk]).expect("writes");
+        let totals = writer.statistics().to_vec();
+        let bytes = writer.finish().expect("finishes");
+        let len =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().expect("4"));
+        let tail = &bytes[bytes.len() - 8 - len as usize..bytes.len() - 8];
+        let footer = RawFooter::parse(tail, bytes.len() as u64).expect("parses");
+        let rows = MetadataTable::Columns.rows(&footer, "f.parquet").expect("rows");
+        let (d, u, h, s, b) = (&rows[0], &rows[1], &rows[2], &rows[3], &rows[4]);
+        assert_eq!((&d[10], &d[14], &d[15]), (&Value::Null, &Value::Null, &Value::Null));
+        assert_eq!(d[32], Value::BigInt(1));
+        assert_eq!(d[17], Value::Varchar("PLAIN".into()));
+        assert_eq!(d[31].to_string(), "[{'page_type': DATA_PAGE, 'encoding': PLAIN, 'count': 1}]");
+        assert_eq!((&u[10], &u[11]), (&Value::Null, &Value::Null));
+        assert_eq!((&u[14], &u[15]), (&Value::UInteger(3), &Value::UInteger(7)));
+        assert_eq!(u[32], Value::Null);
+        assert_eq!((&h[14], &h[15], &h[32]), (&Value::Null, &Value::Null, &Value::BigInt(0)));
+        let high = format!("{}{{", "z".repeat(255));
+        assert_eq!((&s[14], &s[15]), (&Value::Varchar("a".into()), &Value::Varchar(high)));
+        assert_eq!((&s[26], &s[27]), (&Value::Boolean(true), &Value::Boolean(false)));
+        assert_eq!((&b[14], &b[15], &b[12]), (&Value::Null, &Value::Null, &Value::BigInt(0)));
+        assert!(!totals[3].max_exact && totals[3].min_exact);
+        assert_eq!((&totals[4].min, &totals[4].max), (&None, &None));
+        assert_eq!(totals[0].nans, Some(1));
+        let file = MetadataTable::File.rows(&footer, "f.parquet").expect("rows");
+        let order = "'ColumnOrder(TYPE_ORDER=TypeDefinedOrder())'";
+        assert_eq!(file[0][9].to_string(), format!("[{}]", [order; 5].join(", ")));
+        let pairs = MetadataTable::KeyValue.rows(&footer, "f.parquet").expect("rows");
+        assert_eq!(pairs[0][1..], [Value::Blob(b"k".to_vec()), Value::Blob(b"v".to_vec())]);
     }
 
     #[test]
