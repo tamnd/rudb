@@ -26,7 +26,7 @@ use rudb_plan::{Arm, CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Pla
 
 use crate::binder::{AliasClause, Binder, PendingSubquery, WindowCall};
 use crate::fold;
-use crate::pgcalls::{Operator, Written};
+use crate::pgcalls::{Operator, Written, pg_operator_exists};
 use crate::scope::Scope;
 
 /// The pin's list macros over `list_concat`: the name, its parameters as the pin prints them, which
@@ -1432,6 +1432,10 @@ impl Binder<'_> {
             return Ok(done);
         }
         if self.semantics.operator_rules() == OperatorRules::Postgres {
+            if comparison_of(op).is_some() {
+                let types = [left, right].map(|side| self.plan().expr_type(side));
+                pg_operator_exists(ast, &operator_name(ast, op), &written.map(Some), &types)?;
+            }
             [left, right] =
                 self.pg_numeric_operands(ast, &operator_name(ast, op), &written, [left, right])?;
         }
@@ -2666,6 +2670,14 @@ impl Binder<'_> {
         }
         let spelled: Vec<ast::ExprRef> =
             std::iter::once(operand).chain(written.iter().copied()).collect();
+        // PostgreSQL compares with `=`, and with `<>` under `NOT IN`.
+        if self.semantics.operator_rules() == OperatorRules::Postgres {
+            let symbol = if negated { "<>" } else { "=" };
+            for (&item, &value) in written.iter().zip(&values[1..]) {
+                let types = [subject, value].map(|side| self.plan().expr_type(side));
+                pg_operator_exists(ast, symbol, &[Some(operand), Some(item)], &types)?;
+            }
+        }
         self.common_type(ast, &spelled, &mut values, None)?;
         self.share_collation(&mut values)?;
         let subject = values[0];
@@ -2694,7 +2706,8 @@ impl Binder<'_> {
     ) -> Result<ExprRef> {
         let subject = self.bind_expr(ast, operand, scope)?;
         let row = self.row_items(ast, operand, subject);
-        self.bind_mark_subquery(ast, subject, row, query, CompareOp::Equal, negated, scope)
+        let compared = Compared { operand, symbol: "=", op: CompareOp::Equal };
+        self.bind_mark_subquery(ast, subject, row, query, compared, negated, scope)
     }
 
     fn bind_quantified_subquery(
@@ -2707,12 +2720,14 @@ impl Binder<'_> {
         scope: &Scope,
     ) -> Result<ExprRef> {
         let subject = self.bind_expr(ast, operand, scope)?;
+        let symbol = operator_name(ast, op);
         let op = comparison_of(op).ok_or_else(|| {
             Error::binder("Only comparisons can be used before ANY or ALL".to_string())
         })?;
         let op = if all { negate_comparison(op) } else { op };
         let row = self.row_items(ast, operand, subject);
-        self.bind_mark_subquery(ast, subject, row, query, op, all, scope)
+        let compared = Compared { operand, symbol: &symbol, op };
+        self.bind_mark_subquery(ast, subject, row, query, compared, all, scope)
     }
 
     /// Binds `x op ANY (array)` or `x op ALL (array)`.
@@ -2793,6 +2808,10 @@ impl Binder<'_> {
                     .state(SqlState::WRONG_OBJECT_TYPE));
             }
         };
+        if self.semantics.operator_rules() == OperatorRules::Postgres {
+            let (symbol, types) = (operator_name(ast, op), [&subject_type, &element]);
+            pg_operator_exists(ast, &symbol, &[Some(operand), Some(array)], &types)?;
+        }
         if self.is_placeholder(subject) && element != LogicalType::Null {
             subject = self.cast_to(subject, &element);
         }
@@ -2890,10 +2909,11 @@ impl Binder<'_> {
         subject: ExprRef,
         row: Vec<ExprRef>,
         query: ast::QueryRef,
-        comparison: CompareOp,
+        compared: Compared<'_>,
         negate: bool,
         outer: &Scope,
     ) -> Result<ExprRef> {
+        let comparison = compared.op;
         let (node, inner, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
         // A row against a query of one column whose values are rows is one comparison of two rows,
         // and anything else of one column is a query of too few.
@@ -2919,6 +2939,17 @@ impl Binder<'_> {
                 ))
                 .state(SqlState::SYNTAX_ERROR));
             }
+            if self.semantics.operator_rules() == OperatorRules::Postgres
+                && let ast::Expr::Row { items } = ast.expr(compared.operand)
+                && ast.expr_list(items).len() == row.len()
+            {
+                for ((&item, &value), column) in
+                    ast.expr_list(items).iter().zip(&row).zip(&inner.columns)
+                {
+                    let types = [self.plan().expr_type(value), &column.ty];
+                    pg_operator_exists(ast, compared.symbol, &[Some(item), None], &types)?;
+                }
+            }
             return self.bind_mark_row(node, &inner, row, comparison, negate);
         }
         let [column] = inner.columns.as_slice() else {
@@ -2930,6 +2961,10 @@ impl Binder<'_> {
             .state(SqlState::SYNTAX_ERROR)
             .pg(format!("subquery has too {many} columns")));
         };
+        if self.semantics.operator_rules() == OperatorRules::Postgres {
+            let types = [self.plan().expr_type(subject), &column.ty];
+            pg_operator_exists(ast, compared.symbol, &[Some(compared.operand), None], &types)?;
+        }
         let candidate_type = column.ty.clone();
         if let (LogicalType::Struct(left), LogicalType::Struct(right)) =
             (self.plan().expr_type(subject), &candidate_type)
@@ -4870,6 +4905,15 @@ impl Binder<'_> {
         let constant = self.add_constant(Value::Boolean(wanted));
         self.compare(op, condition, constant)
     }
+}
+
+/// The comparison of `IN`, `ANY` or `ALL` against a subquery, with the operand written before it
+/// and the operator of `pg_operator` that PostgreSQL looks for.
+#[derive(Clone, Copy)]
+struct Compared<'a> {
+    operand: ast::ExprRef,
+    symbol: &'a str,
+    op: CompareOp,
 }
 
 /// What an argument of `coalesce`, `greatest` or `least` was written as, for the pin's rule that a
