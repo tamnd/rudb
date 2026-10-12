@@ -1187,6 +1187,15 @@ fn a_char_column_pads_on_output_and_ignores_trailing_spaces() {
     assert_eq!(messages[1].field(b'C').as_deref(), Some("22001"));
     let messages = client.query("select length(c), c from t where c = 'q'");
     assert_eq!(text(data_row(&messages[1])), "1,q   ");
+    // A bound with trailing spaces is the bound without them, on the short reads by a key too.
+    client.parse("", "select c from t where c >= $1 order by c limit 5", &[]);
+    client.describe(Target::Statement, "");
+    client.bind("", "", &[], &[Some(b"ab  ")]);
+    client.execute("", 0);
+    let messages = client.sync();
+    assert_eq!(tags(&messages), "1tT2DDCZ");
+    assert_eq!(text(data_row(&messages[4])), "ab  ");
+    assert_eq!(text(data_row(&messages[5])), "q   ");
     server.stop().unwrap();
 }
 
