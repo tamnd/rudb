@@ -117,6 +117,22 @@ pub fn default_opclass(oid: Oid, method: &str) -> Option<&'static Opclass> {
     }
 }
 
+/// The offset types of the `in_range` support functions of the default btree family of `input`,
+/// from `pg_amproc`, in the order of the type oids, which is the order `transformFrameOffset`
+/// reads them in. A type with none cannot have a `RANGE` frame with an offset.
+pub fn in_range_offsets(input: Oid) -> &'static [Oid] {
+    match input {
+        oid::INT2 | oid::INT4 => &[oid::INT8, oid::INT2, oid::INT4],
+        oid::INT8 => &[oid::INT8],
+        oid::FLOAT4 | oid::FLOAT8 => &[oid::FLOAT8],
+        oid::NUMERIC => &[oid::NUMERIC],
+        oid::DATE | oid::TIME | oid::TIMETZ | oid::TIMESTAMP | oid::TIMESTAMPTZ | oid::INTERVAL => {
+            &[oid::INTERVAL]
+        }
+        _ => &[],
+    }
+}
+
 /// `IsBinaryCoercible` for two built-in types: a value of `source` is a value of `target` with
 /// no change. The polymorphic types take each type of their kind, `record` takes a composite
 /// type, and a cast of `pg_cast` with the method `b` counts when it is implicit.

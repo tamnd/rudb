@@ -20,7 +20,7 @@ use rudb_kernels::pgregexp::{self, Function};
 use rudb_parse::ast::{BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, ast, deparse};
 use rudb_pgtypes::keywords::quote_identifier;
-use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef};
+use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, WindowBound};
 
 use crate::advisory::{no_such_function, spelled_call};
 use crate::binder::Binder;
@@ -405,6 +405,89 @@ impl Binder<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The offset of one end of a `RANGE` frame in a PostgreSQL session, coerced to the type that
+    /// `transformFrameOffset` chooses for it from the in_range functions of the type of the sort
+    /// key. The type of the offset is preferred where it is one of them, and the type of the key
+    /// where the offset is a string literal or a null. An end without an offset, and an offset or
+    /// a key of a type that PostgreSQL does not have, stay as they are.
+    pub(crate) fn pg_range_offset(
+        &mut self,
+        ast: &Ast,
+        written: ast::WindowBound,
+        bound: WindowBound,
+        key: &LogicalType,
+    ) -> Result<WindowBound> {
+        use rudb_pgtypes::{format_type, oid};
+        let (written, offset, preceding) = match (written, bound) {
+            (ast::WindowBound::Preceding(written), WindowBound::Preceding(offset)) => {
+                (written, offset, true)
+            }
+            (ast::WindowBound::Following(written), WindowBound::Following(offset)) => {
+                (written, offset, false)
+            }
+            _ => return Ok(bound),
+        };
+        let ty = self.plan().expr_type(offset).clone();
+        let untyped = ty == LogicalType::Null
+            || matches!(ast.expr(written), ast::Expr::Literal { kind: LiteralKind::String, .. });
+        let (Some(column), Some(node)) =
+            (exact_oid(key), if untyped { Some(oid::UNKNOWN) } else { exact_oid(&ty) })
+        else {
+            return Ok(bound);
+        };
+        // The input type of the operator class that sorts the key, which is `text` for a
+        // `varchar`.
+        let input =
+            rudb_pgtypes::default_opclass(column, "btree").map_or(column, |class| class.input);
+        let preferred = if node == oid::UNKNOWN { input } else { node };
+        let candidates = rudb_pgtypes::in_range_offsets(input);
+        let mut matches = 0;
+        let mut selected = None;
+        for &right in candidates {
+            if node != oid::UNKNOWN && !rudb_pgtypes::can_coerce_implicitly(node, right) {
+                continue;
+            }
+            matches += 1;
+            if selected != Some(preferred) {
+                selected = Some(right);
+            }
+        }
+        let refused = |message: String| {
+            Error::binder(message.clone())
+                .state(SqlState::FEATURE_NOT_SUPPORTED)
+                .pg(message)
+                .with_span(ast.leftmost_span(written))
+        };
+        let words = "RANGE with offset PRECEDING/FOLLOWING";
+        let (column, offset_type) = (format_type(input), format_type(node));
+        if candidates.is_empty() {
+            return Err(refused(format!("{words} is not supported for column type {column}")));
+        }
+        let Some(selected) = selected else {
+            let message = format!(
+                "{words} is not supported for column type {column} and offset type {offset_type}"
+            );
+            return Err(refused(message).hint("Cast the offset value to an appropriate type."));
+        };
+        if matches != 1 && selected != preferred {
+            let message = format!(
+                "{words} has multiple interpretations for column type {column} and offset type {offset_type}"
+            );
+            return Err(refused(message).hint("Cast the offset value to the exact intended type."));
+        }
+        let Some(target) = rudb_pgtypes::logical_type(selected) else {
+            return Ok(bound);
+        };
+        let offset = if untyped {
+            self.argument_as(ast, written, offset, &target)?
+        } else if ty != target {
+            self.cast_to(offset, &target)
+        } else {
+            offset
+        };
+        Ok(if preceding { WindowBound::Preceding(offset) } else { WindowBound::Following(offset) })
     }
 
     /// The call `written(arguments)` bound to the function of `pg_proc` that PostgreSQL finds for

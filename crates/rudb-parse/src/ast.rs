@@ -1891,6 +1891,10 @@ pub struct Ast {
     pub rows: Vec<Slice>,
     /// The window arena, holding what was inside the parentheses of every `OVER`.
     pub windows: Vec<WindowSpec>,
+    /// Source ranges of some windows, as the index of the window and its range, in the order of
+    /// the index. The PostgreSQL grammar gives each window one, at its opening parenthesis, which
+    /// is where an error about the whole window points.
+    pub window_spans: Vec<(u32, Span)>,
     /// The materialised `WITH` arena.
     pub ctes: Vec<Cte>,
     /// The `PIVOT` and `UNPIVOT` arena.
@@ -1989,6 +1993,12 @@ impl Ast {
     /// The source range of a from item.
     pub fn source_span(&self, source: SourceRef) -> Span {
         self.source_spans[source as usize]
+    }
+
+    /// The source range of a window, when it has one.
+    pub fn window_span(&self, window: WindowRef) -> Option<Span> {
+        let found = self.window_spans.binary_search_by_key(&window, |&(held, _)| held).ok()?;
+        Some(self.window_spans[found].1)
     }
 
     /// The source range of the name at `at` of a run of names, when it has one.

@@ -18,9 +18,9 @@ use rudb_catalog::{Catalog, DETACHED, Entry, FileStamp, QualifiedName, Table, sa
 use rudb_common::bounds::Zones;
 use rudb_common::{
     AggregateTypes, Collations, CommonTypes, ConditionTypes, DeclaredType, DistinctOrder,
-    EmptyTargets, Error, ErrorTexts, Field, FunctionRules, JoinColumns, LogicalType, Origin,
-    RecursiveUnion, Result, Semantics, Session, ShowBehavior, SortOperators, SortedTargets, Span,
-    SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
+    EmptyTargets, Error, ErrorTexts, Field, FrameOffsets, FunctionRules, JoinColumns, LogicalType,
+    Origin, RecursiveUnion, Result, Semantics, Session, ShowBehavior, SortOperators, SortedTargets,
+    Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
     Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, Retype, TYPES_SET,
@@ -7085,8 +7085,22 @@ impl<'a> Binder<'a> {
         let offsets = [parts.frame.start, parts.frame.end]
             .iter()
             .any(|end| matches!(end, WindowBound::Preceding(_) | WindowBound::Following(_)));
+        let pg_offsets = self.semantics.frame_offsets() == FrameOffsets::Postgres;
         if parts.frame.unit == WindowUnit::Range && offsets && parts.order.len() != 1 {
+            if pg_offsets {
+                let message =
+                    "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column";
+                return Err(Error::binder(message)
+                    .state(SqlState::WINDOWING_ERROR)
+                    .pg(message)
+                    .placed_at(ast.window_span(spec)));
+            }
             return Err(Error::binder("RANGE frames must have only one ORDER BY expression"));
+        }
+        if pg_offsets && parts.frame.unit == WindowUnit::Range && offsets {
+            let key = self.plan.expr_type(parts.order[0].expr).clone();
+            parts.frame.start = self.pg_range_offset(ast, held.start, parts.frame.start, &key)?;
+            parts.frame.end = self.pg_range_offset(ast, held.end, parts.frame.end, &key)?;
         }
         if self.semantics.unknown_types() == UnknownTypes::Postgres {
             self.pg_aggregate_unknowns(ast, name, args, &mut parts.args)?;

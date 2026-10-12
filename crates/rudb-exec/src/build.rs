@@ -3889,7 +3889,13 @@ impl<'a> Building<'a, '_> {
             Node::Window { input, index, partition, order, frame, expressions } => {
                 let below = self.node(input)?;
                 let written = Written { index, partition, order, frame, expressions };
-                let (window, out) = Window::new(plan, &below.schema, &written, memory)?;
+                let (window, out) = Window::new(
+                    plan,
+                    &below.schema,
+                    &written,
+                    memory,
+                    self.session.semantics().frame_offsets(),
+                )?;
                 let window = window.in_session(self.session);
                 let schema = window.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Window", None);
