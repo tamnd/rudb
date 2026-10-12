@@ -432,10 +432,11 @@ pub(crate) const RANGES: [(Oid, Oid, Oid); 6] = [
     (oid::INT8RANGE, oid::INT8, oid::INT8MULTIRANGE),
 ];
 
-/// `get_element_type`: the element type of an array type.
+/// `get_element_type`: the element type of an array type. `_record` is a pseudo-type, but it is
+/// an array of `record`, so a polymorphic function takes an array of rows.
 pub(crate) fn element_type(array: Oid) -> Option<Oid> {
     TypeInfo::get(array)
-        .filter(|info| info.category == b'A' && info.elem != 0)
+        .filter(|info| (info.category == b'A' || info.oid == oid::RECORD_ARRAY) && info.elem != 0)
         .map(|info| info.elem)
 }
 
@@ -786,7 +787,7 @@ mod tests {
 
     #[test]
     fn an_operator_finds_the_operator_that_postgresql_finds() {
-        use oid::{INT4, INT4_ARRAY, NUMERIC, TEXT, UNKNOWN};
+        use oid::{INT4, INT4_ARRAY, NUMERIC, RECORD, RECORD_ARRAY, TEXT, UNKNOWN};
         let code = |name: &str, args: &[Oid]| match resolve_operator(name, args) {
             OperatorResolution::Found(operator) => operator.code,
             other => panic!("{name} {args:?}: {other:?}"),
@@ -794,6 +795,9 @@ mod tests {
         assert_eq!(code("||", &[INT4_ARRAY, INT4]), "array_append");
         assert_eq!(code("||", &[INT4, INT4_ARRAY]), "array_prepend");
         assert_eq!(code("||", &[INT4_ARRAY, INT4_ARRAY]), "array_cat");
+        // `_record` is a pseudo-type, but it is an array of rows.
+        assert_eq!(code("||", &[RECORD_ARRAY, RECORD]), "array_append");
+        assert_eq!(code("||", &[RECORD, RECORD_ARRAY]), "array_prepend");
         assert_eq!(code("||", &[UNKNOWN, UNKNOWN]), "textcat");
         assert_eq!(code("||", &[TEXT, INT4]), "textanycat");
         assert_eq!(code("@>", &[INT4_ARRAY, INT4_ARRAY]), "arraycontains");

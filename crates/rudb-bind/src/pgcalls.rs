@@ -76,9 +76,35 @@ pub(crate) fn operand_oids(
     (0..written.len())
         .map(|at| match untyped(at) {
             true => Some(rudb_pgtypes::oid::UNKNOWN),
-            false => exact_oid(&types[at]),
+            false => exact_oid(&types[at]).or_else(|| record_oid(&types[at])),
         })
         .collect()
+}
+
+/// `record` for a row and `record[]` for an array of rows, which are the anonymous composite
+/// types of PostgreSQL. A row binds back as itself, so a polymorphic function over a `record`
+/// takes the row that it was given, as `record_types` finds it.
+fn record_oid(ty: &LogicalType) -> Option<rudb_pgtypes::Oid> {
+    match ty {
+        LogicalType::Struct(_) => Some(rudb_pgtypes::oid::RECORD),
+        LogicalType::List(element) if matches!(**element, LogicalType::Struct(_)) => {
+            Some(rudb_pgtypes::oid::RECORD_ARRAY)
+        }
+        _ => None,
+    }
+}
+
+/// The row of the operands whose types are `record` and `record[]` in `oids`, when they all have
+/// the same one. PostgreSQL holds rows of other columns in one `record[]`, which a list here
+/// cannot hold.
+fn record_types(oids: &[rudb_pgtypes::Oid], types: &[LogicalType]) -> Option<LogicalType> {
+    let mut rows = oids.iter().zip(types).filter_map(|(&oid, ty)| match (oid, ty) {
+        (rudb_pgtypes::oid::RECORD, row) => Some(row),
+        (rudb_pgtypes::oid::RECORD_ARRAY, LogicalType::List(row)) => Some(&**row),
+        _ => None,
+    });
+    let row = rows.next()?;
+    rows.all(|other| other == row).then(|| row.clone())
 }
 
 /// A function of `pg_proc` named `written` whose every form returns a set that a kernel here
@@ -929,10 +955,18 @@ impl Binder<'_> {
         }
         let generic = rudb_pgtypes::enforce_generic_types(oids, operator.args, operator.result)
             .map_err(|error| Error::from(error).unplaced())?;
-        let Some(returns) = rudb_pgtypes::logical_type(generic.result) else { return Ok(None) };
+        let types: Vec<LogicalType> =
+            bound.iter().map(|&operand| self.plan().expr_type(operand).clone()).collect();
+        let row = record_types(oids, &types);
+        let actual = |oid| match (oid, &row) {
+            (rudb_pgtypes::oid::RECORD, Some(row)) => Some(row.clone()),
+            (rudb_pgtypes::oid::RECORD_ARRAY, Some(row)) => Some(LogicalType::list(row.clone())),
+            _ => rudb_pgtypes::logical_type(oid),
+        };
+        let Some(returns) = actual(generic.result) else { return Ok(None) };
         let mut cast = Vec::with_capacity(bound.len());
         for (index, &oid) in generic.args.iter().enumerate() {
-            let Some(ty) = rudb_pgtypes::logical_type(oid) else { return Ok(None) };
+            let Some(ty) = actual(oid) else { return Ok(None) };
             cast.push(self.argument_as(ast, written[index], bound[index], &ty)?);
         }
         Ok(Some(self.pgproc_kernel(proc.src, &cast, returns)))
