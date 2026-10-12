@@ -28,6 +28,7 @@
 //! [`any_decayed`].
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use rudb_catalog::{Catalog, QualifiedName, Rows, Table};
 use rudb_common::bounds::{Bound, scale_of};
@@ -44,19 +45,29 @@ pub(crate) type Before = Vec<(QualifiedName, Table)>;
 
 /// Whether some clustered table of `database` has decayed past `depth`.
 pub(crate) fn any_decayed(catalog: &Catalog, database: &str, depth: f64) -> bool {
-    catalog.stored_tables_in(database).any(|table| decayed(table, depth).is_some())
+    catalog.stored_tables_in(database).any(|table| decayed(table, depth, false).is_some())
 }
 
 /// Puts each clustered table of `database` that has decayed past `depth` back in the order its
-/// declaration asks for, and hands back what each one was.
+/// declaration asks for, and hands back what each one was. A table `whole` names is put in order
+/// however little it decayed, since the checkpoint writes it whole anyway and in order costs no
+/// more than as it is.
 ///
 /// # Errors
 ///
 /// If the rows of one cannot be read or put back, which leaves every table as it was.
-pub(crate) fn reorder(catalog: &mut Catalog, database: &str, depth: f64) -> Result<Before> {
+pub(crate) fn reorder(
+    catalog: &mut Catalog,
+    database: &str,
+    depth: f64,
+    whole: &BTreeSet<String>,
+) -> Result<Before> {
     let due = catalog
         .stored_tables_in(database)
-        .filter_map(|table| Some((table.name().clone(), decayed(table, depth)?)))
+        .filter_map(|table| {
+            let whole = whole.contains(&table.name().table);
+            Some((table.name().clone(), decayed(table, depth, whole)?))
+        })
         .collect::<Vec<_>>();
     let workers = std::thread::available_parallelism().map_or(1, usize::from);
     let mut before = Vec::with_capacity(due.len());
@@ -85,8 +96,9 @@ pub(crate) fn restore(catalog: &mut Catalog, before: Before) {
 }
 
 /// The width a decayed clustered table is sorted by, or `None` for a table that is fine as it is,
-/// is not clustered or is not in the file yet.
-fn decayed(table: &Table, depth: f64) -> Option<Width> {
+/// is not clustered or is not in the file yet. With `whole` any decay is enough, as long as
+/// reordering is on at all.
+fn decayed(table: &Table, depth: f64, whole: bool) -> Option<Width> {
     if depth.is_nan() || depth <= 0.0 {
         return None;
     }
@@ -113,7 +125,8 @@ fn decayed(table: &Table, depth: f64) -> Option<Width> {
         })
         .collect::<Vec<_>>();
     let decay = measure(&parts);
-    (decay.depth > depth && decay.out.saturating_mul(SHARE) >= decay.rows).then_some(width)
+    (whole || (decay.depth > depth && decay.out.saturating_mul(SHARE) >= decay.rows))
+        .then_some(width)
 }
 
 /// The width an automatic declaration comes to over the rows the file holds, the way the binder
