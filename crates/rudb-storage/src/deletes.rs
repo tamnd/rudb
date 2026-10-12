@@ -268,6 +268,9 @@ pub enum Refusal {
     /// The row's hot stripe is being frozen and is no longer written in place. The caller moves
     /// the row into the head, as for a frozen row.
     Freezing,
+    /// The row's frozen stripe was thawed and is written in place again. The caller updates the
+    /// row in its hot stripe instead of moving it.
+    Thawed,
 }
 
 /// The kind of write a statement made, which is what picks the text of its conflict.
@@ -328,6 +331,13 @@ impl DeleteVector {
     #[must_use]
     pub fn recent(&self) -> usize {
         self.recent.len()
+    }
+
+    /// The list above the base: `(slot, ts)` sorted by slot, with `ts` a commit timestamp or an
+    /// uncommitted transaction's id with the top bit set.
+    #[must_use]
+    pub fn entries(&self) -> &[(u32, u64)] {
+        &self.recent
     }
 
     /// Whether nothing was ever deleted, which lets a scan skip building masks altogether.
