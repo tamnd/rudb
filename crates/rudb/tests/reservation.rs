@@ -15,11 +15,8 @@ use rudb::{Database, Value};
 /// The query filters on an expression the planner cannot see into, so it takes the filter to keep a
 /// fifth of the rows, which is four hundred thousand and above the key's count. The presize pass
 /// takes the count as the ceiling and asks for room for that many groups. The filter keeps eighty
-/// thousand rows in fifteen thousand six hundred groups, which is enough for the aggregate to
-/// partition on four threads, and each of its sixty four shared partitions takes its share of the
-/// ceiling: sixteen thousand buckets, eight megabytes over all of them, for a few hundred groups
-/// each. The second key column is one value, so the key is not a single integer the `dense` pass
-/// would turn into an array.
+/// thousand rows in fifteen thousand six hundred groups. The second key column is one value, so the
+/// key is not a single integer the `dense` pass would turn into an array.
 fn database(name: &str) -> (Database, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!(
         "rudb-reservation-{name}-{}-{}.rdb",
@@ -39,14 +36,26 @@ fn database(name: &str) -> (Database, std::path::PathBuf) {
     (database, path)
 }
 
+/// The grouping under a limit of three hundred thousand, which caps the presize there and says how
+/// big each thread's own table is: a limit on the groups means the aggregate never partitions, so
+/// the table a thread starts with is the one it answers out of and takes room for every group the
+/// cap allows, eight megabytes of buckets. A partitioned aggregate is no good for this, because one
+/// with integer keys only partitions from sixteen thousand groups a thread or when the budget is
+/// already half used, so whether it took the room at all would come down to the machine.
 const QUERY: &str =
-    "SELECT k, c, count(*), sum(v) FROM t WHERE v % 25 = 0 GROUP BY k, c ORDER BY k";
+    "SELECT k, c, count(*), sum(v) FROM t WHERE v % 25 = 0 GROUP BY k, c LIMIT 300000";
 
+/// The rows of `sql` in key order, since a limit over a grouping gives them in no order.
 fn rows(database: &Database, sql: &str) -> rudb::Result<Vec<Vec<Value>>> {
     let result = database.query(sql)?;
-    Ok((0..result.len())
+    let mut rows: Vec<Vec<Value>> = (0..result.len())
         .map(|row| (0..result.width()).map(|column| result.value_at(row, column)).collect())
-        .collect())
+        .collect();
+    rows.sort_by_key(|row| match row.first() {
+        Some(Value::Integer(key)) => *key,
+        _ => i32::MAX,
+    });
+    Ok(rows)
 }
 
 #[test]
@@ -62,7 +71,7 @@ fn room_the_budget_cannot_hold_is_declined_and_the_table_grows_instead() {
         "the test needs the presize to overshoot, and the plan says it did not:\n{plan}"
     );
 
-    // The partitions' room is eight megabytes and the groups need a fraction of it.
+    // Each table's room is eight megabytes and the groups need a fraction of it.
     database.execute("SET memory_limit = '6MB'").expect("sets the limit");
     assert_eq!(rows(&database, QUERY).expect("runs inside the limit"), roomy);
 
