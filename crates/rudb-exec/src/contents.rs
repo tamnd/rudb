@@ -1,5 +1,6 @@
 //! `read_text(path)` and `read_blob(path)`, one row per file with the whole of it in a column, and
-//! `glob(path)`, one row per file with only its name.
+//! `glob(path)`, one row per file with only its name, and the four that print a Parquet footer,
+//! `parquet_metadata`, `parquet_schema`, `parquet_kv_metadata` and `parquet_file_metadata`.
 //!
 //! The binder expanded the patterns, so the arguments are one constant per file in the order the
 //! rows go out. The files are read while the operator is built, like the other metadata tables
@@ -9,9 +10,12 @@
 
 use std::time::UNIX_EPOCH;
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
-use rudb_functions::{TableFunction, content_fields};
+use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
+use rudb_functions::{TableFunction, content_fields, parquet_footer};
+use rudb_kernels::cast_in_time_zone;
+use rudb_parquet::MetadataTable;
 use rudb_plan::{Expr, Plan, Slice};
+use rudb_vector::Vector;
 
 use crate::metadata::{Metadata, text};
 
@@ -64,6 +68,44 @@ pub(crate) fn contents(
         rows.push(vec![text(&path), content, Value::BigInt(size), modified]);
     }
     Metadata::new(name, &content_fields(blob), &rows, plan, index, columns)
+}
+
+/// The rows of one of the four functions that print a Parquet footer, a file after another.
+///
+/// A statistic comes back from the footer in its column's type and is turned into text here, in
+/// the session's time zone, which is where a `TIMESTAMPTZ` bound gets the offset it prints with.
+///
+/// # Errors
+///
+/// When a file is missing or is not Parquet, and what [`MetadataTable::rows`] reports.
+pub(crate) fn parquet_tables(
+    function: TableFunction,
+    table: MetadataTable,
+    plan: &Plan,
+    args: Slice,
+    index: u32,
+    columns: Slice,
+    time_zone: SessionTimeZone,
+) -> Result<Metadata> {
+    let fields = table.fields();
+    let mut rows = Vec::new();
+    for path in paths(plan, args)? {
+        let footer = parquet_footer(&path)?;
+        for mut row in table.rows(&footer, &path)? {
+            for (value, field) in row.iter_mut().zip(&fields) {
+                let typed = !matches!(value, Value::Null | Value::Varchar(_));
+                if field.ty == LogicalType::Varchar && typed {
+                    let held =
+                        Vector::from_values(value.logical_type(), std::slice::from_ref(value))?;
+                    let cast =
+                        cast_in_time_zone(&held, &LogicalType::Varchar, false, Some(time_zone))?;
+                    *value = cast.value_at(0);
+                }
+            }
+            rows.push(row);
+        }
+    }
+    Metadata::new(function.name(), &fields, &rows, plan, index, columns)
 }
 
 /// The file names the binder folded the arguments into, in the order the rows go out.

@@ -540,6 +540,15 @@ pub fn parquet_outline(path: &str) -> Result<Footers> {
     Ok(Footers { fields: outline.fields(), rows, distincts: Vec::new(), zones: None })
 }
 
+/// The whole footer of the Parquet file at `path`, for the `parquet_metadata` family.
+///
+/// # Errors
+///
+/// When the file is missing, and everything [`rudb_parquet::RawFooter::read`] reports.
+pub fn parquet_footer(path: &str) -> Result<rudb_parquet::RawFooter> {
+    rudb_parquet::RawFooter::read(open_file(path)?.as_ref(), path)
+}
+
 /// What the row groups of one column said about how many distinct values it holds.
 ///
 /// Two numbers rather than one, because a column's distinct count is not in the footer and what is

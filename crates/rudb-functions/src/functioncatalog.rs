@@ -300,6 +300,10 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ReadText,
     TableFunction::ReadBlob,
     TableFunction::Glob,
+    TableFunction::ParquetMetadata,
+    TableFunction::ParquetSchema,
+    TableFunction::ParquetKvMetadata,
+    TableFunction::ParquetFileMetadata,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
     TableFunction::RudbDeviceCard,
@@ -362,6 +366,10 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::Glob
+        | TableFunction::ParquetMetadata
+        | TableFunction::ParquetSchema
+        | TableFunction::ParquetKvMetadata
+        | TableFunction::ParquetFileMetadata
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => vec![1],
@@ -415,6 +423,10 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         | TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::Glob
+        | TableFunction::ParquetMetadata
+        | TableFunction::ParquetSchema
+        | TableFunction::ParquetKvMetadata
+        | TableFunction::ParquetFileMetadata
         | TableFunction::JsonEach
         | TableFunction::JsonTree
         | TableFunction::PragmaTableInfo

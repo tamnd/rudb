@@ -170,6 +170,18 @@ impl<'a> Reader<'a> {
         Ok(self.byte()? as i8)
     }
 
+    /// Reads an eight byte little endian double, which the geospatial statistics are written in.
+    ///
+    /// # Errors
+    ///
+    /// If the bytes run out.
+    pub(crate) fn read_double(&mut self) -> Result<f64> {
+        let bytes = self.take(8)?;
+        let mut held = [0_u8; 8];
+        held.copy_from_slice(bytes);
+        Ok(f64::from_le_bytes(held))
+    }
+
     /// Reads a zigzag varint.
     ///
     /// The three integer widths are one function because they are one wire format. A file that
