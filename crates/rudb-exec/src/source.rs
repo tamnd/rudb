@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
 use rudb_common::stage::{self, Stage};
-use rudb_common::{Error, Field, LogicalType, Result, Session, SessionTimeZone, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Session, SessionTimeZone, SqlState, Value};
 use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
@@ -3569,7 +3569,10 @@ pub(crate) fn moments(
     let forward = *months > 0 || *days > 0 || *micros > 0;
     let backward = *months < 0 || *days < 0 || *micros < 0;
     if !forward && !backward {
-        return Err(Error::binder("interval cannot be 0!"));
+        return Err(Error::binder("interval cannot be 0!")
+            .state(SqlState::INVALID_PARAMETER_VALUE)
+            .pg("step size cannot equal zero")
+            .unplaced());
     }
     if forward && backward {
         return Err(Error::binder(

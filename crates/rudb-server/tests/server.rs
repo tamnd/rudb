@@ -3010,6 +3010,89 @@ fn string_to_table_and_normalize_give_the_rows_and_the_values_of_postgres() {
 }
 
 #[test]
+fn generate_series_resolves_and_gives_its_rows_as_in_postgres() {
+    let dirs = Dirs::new("pgseries");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map_or(String::new(), |v| String::from_utf8(v).unwrap()))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    client.query("set timezone = 'UTC'");
+    // The rows are the ones that PostgreSQL 19 gives. A string literal is of type `unknown`, so
+    // the call takes the function whose types fit the other arguments.
+    let cases: [(&str, &[&str]); 12] = [
+        (
+            "select count(*) from generate_series(now(), now() + '1 day'::interval, '1 hour');",
+            &["25"],
+        ),
+        (
+            "select g, pg_typeof(g) from generate_series('2020-01-01'::date, '2020-01-02', '12 hours') g;",
+            &[
+                "2020-01-01 00:00:00+00|timestamp with time zone",
+                "2020-01-01 12:00:00+00|timestamp with time zone",
+                "2020-01-02 00:00:00+00|timestamp with time zone",
+            ],
+        ),
+        ("select * from generate_series(1.5, 2.25, 0.25);", &["1.5", "1.75", "2.00", "2.25"]),
+        ("select * from generate_series(1, 2, 0.30);", &["1", "1.30", "1.60", "1.90"]),
+        ("select g, pg_typeof(g) from generate_series(1, '2') g;", &["1|integer", "2|integer"]),
+        ("select pg_typeof(g) from generate_series(1, 2::int8) g limit 1;", &["bigint"]),
+        ("select * from generate_series(1.5, 3) with ordinality;", &["1.5|1", "2.5|2"]),
+        ("select generate_series(2, 1, -0.5);", &["2", "1.5", "1.0"]),
+        ("select pg_typeof(generate_series(1, 2)) limit 1;", &["integer"]),
+        ("select * from generate_series(2147483646, 2147483647, 2);", &["2147483646"]),
+        ("select * from generate_series(3, 1);", &[]),
+        ("select count(*) from generate_series(1, 100000);", &["100000"]),
+    ];
+    for (sql, expected) in cases {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), format!("T{}CZ", "D".repeat(expected.len())), "{sql}");
+        let rows: Vec<String> =
+            messages[1..=expected.len()].iter().map(|m| text(data_row(m))).collect();
+        assert_eq!(rows, expected, "{sql}");
+    }
+    for (sql, state, message) in [
+        (
+            "select * from generate_series('1', '3');",
+            "42725",
+            "function generate_series(unknown, unknown) is not unique",
+        ),
+        (
+            "select * from generate_series(1::int2, 3::int2);",
+            "42725",
+            "function generate_series(smallint, smallint) is not unique",
+        ),
+        ("select * from generate_series(1, 3, 0);", "22023", "step size cannot equal zero"),
+        ("select generate_series(1, 3, 0);", "22023", "step size cannot equal zero"),
+        (
+            "select * from generate_series('2020-01-01'::timestamp, '2020-01-02', '0 days');",
+            "22023",
+            "step size cannot equal zero",
+        ),
+        ("select * from generate_series(1, 'NaN'::numeric);", "22023", "stop value cannot be NaN"),
+        (
+            "select generate_series(1, 2, '-infinity'::numeric);",
+            "22023",
+            "step size cannot be infinity",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert!(["EZ", "TEZ"].contains(&tags(&messages).as_str()), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+    }
+    // An error of the resolution points at the name of the function.
+    let messages = client.query("select * from generate_series('1', '3');");
+    assert_eq!(messages[0].field(b'P').as_deref(), Some("15"));
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_array_functions_resolve_their_types_and_give_the_values_of_postgres() {
     let dirs = Dirs::new("pgarrays");
     let server = Server::start(dirs.config()).unwrap();

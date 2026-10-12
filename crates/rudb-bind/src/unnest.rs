@@ -254,7 +254,12 @@ impl Binder<'_> {
     }
 
     /// Adds the unnest of `arg` to the block, and gives the column of what it makes.
-    fn push_unnest(&mut self, arg: ExprRef, depth: usize, produced: LogicalType) -> ExprRef {
+    pub(crate) fn push_unnest(
+        &mut self,
+        arg: ExprRef,
+        depth: usize,
+        produced: LogicalType,
+    ) -> ExprRef {
         let index = match self.unnest_index {
             Some(index) => index,
             None => {

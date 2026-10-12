@@ -9,15 +9,15 @@
 use rudb_common::{LogicalType, Result, Value};
 
 use crate::{
-    pgarray, pgdatetime, pgformattype, pgmath, pgnormalize, pgregression, pgstring, pgunicode,
-    pgvariance,
+    pgarray, pgdatetime, pgformattype, pgmath, pgnormalize, pgregression, pgseries, pgstring,
+    pgunicode, pgvariance,
 };
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// The C functions of each module of kernels, sorted.
-const SOURCES: [&[&str]; 9] = [
+const SOURCES: [&[&str]; 10] = [
     pgmath::SOURCES,
     pgvariance::SOURCES,
     pgregression::SOURCES,
@@ -27,6 +27,7 @@ const SOURCES: [&[&str]; 9] = [
     pgunicode::SOURCES,
     pgarray::SOURCES,
     pgformattype::SOURCES,
+    pgseries::SOURCES,
 ];
 
 /// The C functions of each module that are not strict, as `proisstrict` has them.
@@ -70,7 +71,11 @@ pub fn volatile(name: &str) -> bool {
 /// The C function with a kernel that gives as an array the rows of the C function `src`, which
 /// returns a set. A call of `src` is an unnest of that array.
 pub fn rows_of(src: &str) -> Option<&'static str> {
-    pgstring::ROWS.iter().find(|(rows, _)| *rows == src).map(|&(_, array)| array)
+    pgstring::ROWS
+        .iter()
+        .chain(pgseries::ROWS)
+        .find(|(rows, _)| *rows == src)
+        .map(|&(_, array)| array)
 }
 
 /// The value of a call of a kernel of a C function, or `None` for any other name. A null
@@ -103,6 +108,9 @@ pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         return Ok(Some(value));
     }
     if let Some(value) = pgregression::call(src, args)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = pgseries::call(src, args)? {
         return Ok(Some(value));
     }
     pgarray::proc_call(src, args, returns)

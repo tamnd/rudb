@@ -14,6 +14,20 @@ use rudb_plan::{ColumnBinding, Expr, Node, NodeRef};
 use crate::binder::Binder;
 use crate::ordinality::ORDINALITY;
 use crate::scope::{Scope, Visible};
+use crate::unnest::UnnestCall;
+
+/// The values of a function source as the binder made them, with the unnests that give their
+/// rows.
+struct Made {
+    values: Vec<rudb_plan::ExprRef>,
+    /// The name of the function of each value.
+    written: Vec<String>,
+    unnests: Vec<UnnestCall>,
+    /// The table index of the unnests, when there are any.
+    index: Option<u32>,
+    /// The number of scalar subqueries that were waiting before the arguments were bound.
+    waiting: usize,
+}
 
 impl Binder<'_> {
     /// The call of a function source that is bound as a value, or `None` when the source is a
@@ -95,6 +109,55 @@ impl Binder<'_> {
         let unnests = std::mem::replace(&mut self.unnests, outer_unnests);
         let index = std::mem::replace(&mut self.unnest_index, outer_index);
         bound?;
+        let made = Made { values, written, unnests, index, waiting };
+        self.value_relation(ast, made, alias, columns, ordinality)
+    }
+
+    /// The relation of the rows of the array `list`, for a call in `FROM` of a function that
+    /// returns a set, which PostgreSQL names `written`. A scalar subquery of the arguments since
+    /// `waiting` is put under the rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_list_source(
+        &mut self,
+        ast: &Ast,
+        list: rudb_plan::ExprRef,
+        written: &str,
+        waiting: usize,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+        ordinality: bool,
+    ) -> Result<(NodeRef, Scope)> {
+        let LogicalType::List(element) = self.plan().expr_type(list).clone() else {
+            return Err(Error::internal(format!(
+                "the rows of {written} from a value that is not a list"
+            )));
+        };
+        let outer_unnests = std::mem::take(&mut self.unnests);
+        let outer_index = self.unnest_index.take();
+        let value = self.push_unnest(list, 1, *element);
+        let unnests = std::mem::replace(&mut self.unnests, outer_unnests);
+        let index = std::mem::replace(&mut self.unnest_index, outer_index);
+        let made = Made {
+            values: vec![value],
+            written: vec![written.to_owned()],
+            unnests,
+            index,
+            waiting,
+        };
+        self.value_relation(ast, made, alias, columns, ordinality)
+    }
+
+    /// The relation of the values of a function source: their unnests side by side, numbered
+    /// for `WITH ORDINALITY`, with a column for each value or for each field of a row.
+    fn value_relation(
+        &mut self,
+        ast: &Ast,
+        made: Made,
+        alias: ast::StrRef,
+        columns: ast::Slice,
+        ordinality: bool,
+    ) -> Result<(NodeRef, Scope)> {
+        let Made { values, written, unnests, index, waiting } = made;
         let mut input = self.add_node(Node::Dummy);
         for pending in self.scalar_subqueries.split_off(waiting) {
             input = self.attach_subquery(input, pending);
@@ -159,7 +222,7 @@ impl Binder<'_> {
                 _ if let Some(column) = JsonSet::of(name).and_then(JsonSet::column) => {
                     exprs.push((read, column.to_owned()));
                 }
-                _ if calls.len() == 1 && alias != NONE => exprs.push((read, label.clone())),
+                _ if values.len() == 1 && alias != NONE => exprs.push((read, label.clone())),
                 _ => exprs.push((read, name.clone())),
             }
         }

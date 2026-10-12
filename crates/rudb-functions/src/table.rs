@@ -65,7 +65,7 @@
 //! binds the name the way `DESCRIBE` binds one and hands back the rows, which is why nothing in
 //! `rudb_exec` knows either name.
 
-use rudb_common::{Error, Field, LogicalType, Result};
+use rudb_common::{Error, Field, LogicalType, Result, SqlState};
 use rudb_kernels::json::scan;
 use rudb_parquet::MetadataTable;
 
@@ -1706,10 +1706,13 @@ pub fn series(function: TableFunction, start: i64, stop: i64, step: i64) -> Resu
 ///
 /// # Errors
 ///
-/// When the step is zero, with DuckDB's own wording.
+/// When the step is zero, with DuckDB's own wording, and with PostgreSQL's in a PostgreSQL session.
 pub fn series_length(function: TableFunction, start: i64, stop: i64, step: i64) -> Result<usize> {
     if step == 0 {
-        return Err(Error::binder("interval cannot be 0!"));
+        return Err(Error::binder("interval cannot be 0!")
+            .state(SqlState::INVALID_PARAMETER_VALUE)
+            .pg("step size cannot equal zero")
+            .unplaced());
     }
     Ok(length(function, start, stop, step))
 }
