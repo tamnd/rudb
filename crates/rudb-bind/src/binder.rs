@@ -346,6 +346,11 @@ struct Materialized {
     name: String,
     /// What it produces, in order, under the declared names when a column list was written.
     fields: Vec<Field>,
+    /// Where each column of `fields` comes from, which a read keeps as a read of a definition
+    /// that is put in place does. A column of a recursive definition has no table, and has the
+    /// type its non-recursive term declares, as `markTargetListOrigin` and `analyzeCTE` of
+    /// PostgreSQL leave it.
+    origins: Vec<Option<Origin>>,
     /// The number a `recurring.` read of it is paired with, which is `cte` for a definition that
     /// does not read itself and so has no such read.
     recurring: u32,
@@ -969,11 +974,13 @@ impl<'a> Binder<'a> {
         self.next_cte += 1;
         let fields = scope.fields();
         let finished = fields.clone();
+        let origins = scope.origins();
         self.materialized.push(Materialized {
             written: index,
             cte,
             name,
             fields,
+            origins,
             recurring: cte,
             finished,
             output: Some(table),
@@ -1101,11 +1108,22 @@ impl<'a> Binder<'a> {
         let recurring = cte + 1;
         self.next_cte += 2;
         let output = self.plan.node(anchor).table_index();
+        let mut origins: Vec<Option<Origin>> = scope
+            .columns
+            .iter()
+            .filter(|column| !column.hidden)
+            .map(|column| declared_type(column).map(Origin::typed))
+            .collect();
+        origins.resize(table.len(), None);
+        for fold in &folds {
+            origins[fold.into as usize] = None;
+        }
         self.materialized.push(Materialized {
             written: index,
             cte,
             name: name.clone(),
             fields: working,
+            origins,
             recurring,
             finished: table.clone(),
             output,
@@ -1125,6 +1143,9 @@ impl<'a> Binder<'a> {
             .state(SqlState::SYNTAX_ERROR)
             .pg("each UNION query must have the same number of columns")
             .with_span(first_column(ast, right)));
+        }
+        if self.semantics.common_types() == CommonTypes::Postgres {
+            recursive_types(ast, &name, (left, &scope), (right, &other))?;
         }
         let (recursive, over) = self.project_onto(recursive, &other, &fields, &name)?;
         let (recursive, over) = match &added {
@@ -1945,35 +1966,20 @@ impl<'a> Binder<'a> {
             let mut types = [None; 2];
             let mut typmods = [None; 2];
             for (side, (query, _, scope)) in sides.iter().enumerate() {
-                let ty = &scope.columns[at].ty;
-                written[side] = written_column(ast, *query, at, scope.len());
-                let unknown = match written[side].map(|expr| ast.expr(expr)) {
+                let (expr, ty) = side_type(ast, *query, scope, at);
+                written[side] = expr;
+                match ty {
                     // A parameter of no type takes the type of the other side in `conform`.
-                    Some(ast::Expr::Parameter { .. }) => {
+                    SideType::Parameter | SideType::Other => {
                         common.push((None, None));
                         continue 'column;
                     }
-                    Some(ast::Expr::Literal { kind: LiteralKind::String, .. }) => true,
-                    _ => *ty == LogicalType::Null,
-                };
-                if unknown {
-                    continue;
+                    SideType::Unknown => {}
+                    SideType::Typed(oid, typmod) => {
+                        types[side] = Some(oid);
+                        typmods[side] = Some(typmod);
+                    }
                 }
-                let declared =
-                    scope.columns[at].origin.and_then(|origin| origin.ty).filter(|declared| {
-                        rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(ty)
-                    });
-                let oid = match (declared, written[side]) {
-                    (Some(declared), _) => Some(declared.oid),
-                    (None, Some(expr)) => written_oid(ast, expr, ty),
-                    (None, None) => postgres_oid(ty),
-                };
-                let Some(oid) = oid else {
-                    common.push((None, None));
-                    continue 'column;
-                };
-                types[side] = Some(oid);
-                typmods[side] = Some(declared.map_or(-1, |declared| declared.typmod));
             }
             let oid = rudb_pgtypes::common_type(&types).map_err(|mismatch| {
                 let first = rudb_pgtypes::format_type(mismatch.first);
@@ -4083,6 +4089,7 @@ impl<'a> Binder<'a> {
         let fields = if recurring { held.finished.clone() } else { held.fields.clone() };
         let text = held.name.clone();
         let output = held.output;
+        let origins = held.origins.clone();
         let label = if alias == NONE { text.clone() } else { ast.string(alias).to_string() };
         let name = self.plan.intern(&text);
         let index = self.fresh_index();
@@ -4107,7 +4114,7 @@ impl<'a> Binder<'a> {
                 not_null: field.not_null,
                 key: None,
                 default: None,
-                origin: None,
+                origin: origins.get(at).copied().flatten(),
                 qualified: false,
                 also: None,
                 hidden: false,
@@ -7914,6 +7921,125 @@ struct Sorted {
     position: usize,
     written: ast::ExprRef,
     extra: bool,
+}
+
+/// Checks the types of the columns of a recursive definition, as `analyzeCTE` of PostgreSQL does.
+///
+/// The non-recursive term fixes the type of each column, where a literal of no type is a `text`,
+/// and the recursive term reads the rows of the round before at those types. The two terms then
+/// meet as the sides of any `UNION` do, and the column has to come out of the union with the type
+/// and the type modifier of the non-recursive term. Otherwise it is an error at the column of the
+/// non-recursive term.
+fn recursive_types(
+    ast: &Ast,
+    name: &str,
+    (left, anchor): (ast::QueryRef, &Scope),
+    (right, other): (ast::QueryRef, &Scope),
+) -> Result<()> {
+    for at in 0..anchor.len() {
+        let (oid, typmod) = match side_type(ast, left, anchor, at).1 {
+            SideType::Typed(oid, typmod) => (oid, typmod),
+            SideType::Unknown => (rudb_pgtypes::oid::TEXT, -1),
+            SideType::Parameter | SideType::Other => continue,
+        };
+        let (written, recursive) = side_type(ast, right, other, at);
+        let SideType::Typed(other_oid, other_typmod) = recursive else { continue };
+        let common =
+            rudb_pgtypes::common_type(&[Some(oid), Some(other_oid)]).map_err(|mismatch| {
+                let first = rudb_pgtypes::format_type(mismatch.first);
+                let second = rudb_pgtypes::format_type(mismatch.other);
+                let span = match mismatch.at {
+                    0 => set_op_column(ast, left, at, anchor.len()),
+                    _ => written
+                        .map_or_else(|| first_column(ast, right), |expr| ast.leftmost_span(expr)),
+                };
+                Error::binder(format!(
+                    "{} types {first} and {second} cannot be matched",
+                    SetOp::Union.name()
+                ))
+                .state(SqlState::DATATYPE_MISMATCH)
+                .with_span(span)
+            })?;
+        let overall = if oid == common && other_oid == common && typmod == other_typmod {
+            typmod
+        } else {
+            -1
+        };
+        if common != oid || overall != typmod {
+            return Err(Error::binder(format!(
+                "recursive query \"{name}\" column {} has type {} in non-recursive term but type {} overall",
+                at + 1,
+                rudb_pgtypes::format_type_with_typmod(oid, typmod),
+                rudb_pgtypes::format_type_with_typmod(common, overall),
+            ))
+            .state(SqlState::DATATYPE_MISMATCH)
+            .hint("Cast the output of the non-recursive term to the correct type.")
+            .with_span(set_op_column(ast, left, at, anchor.len())));
+        }
+    }
+    Ok(())
+}
+
+/// The PostgreSQL type that a column declares, with its type modifier, as `exprType` and
+/// `exprTypmod` of PostgreSQL see it: the type that a declaration or a cast wrote, or for a table
+/// column the type of its values, whose modifier the logical type holds, as a `numeric(4,1)`
+/// column is a `DECIMAL(4,1)`. Anything else declares no type.
+fn declared_type(column: &Visible) -> Option<DeclaredType> {
+    let origin = column.origin?;
+    if let Some(declared) = origin.ty {
+        let held = rudb_pgtypes::logical_type(declared.oid).as_ref() == Some(&column.ty)
+            || postgres_oid(&column.ty) == Some(declared.oid);
+        return held.then_some(declared);
+    }
+    let oid = postgres_oid(&column.ty).filter(|_| origin.has_table())?;
+    Some(DeclaredType { oid, typmod: rudb_pgtypes::pg_type(&column.ty).typmod })
+}
+
+/// What `select_common_type` of PostgreSQL sees in a column of a side of a set operation.
+enum SideType {
+    /// A parameter of no type, which takes the type of the other side.
+    Parameter,
+    /// A string literal or a null, which has no type of its own.
+    Unknown,
+    /// A PostgreSQL type and its type modifier, which is -1 when it has none.
+    Typed(u32, i32),
+    /// A type that PostgreSQL does not have, such as a struct, which leaves the column to the pin.
+    Other,
+}
+
+/// The expression that a side of a set operation writes as its column `at`, when there is one,
+/// and what `select_common_type` sees in the column.
+///
+/// A side reads as the type its column declares, so a `char(n)` column is a `bpchar` and not the
+/// `text` its value is, and it has the type modifier of the declaration.
+fn side_type(
+    ast: &Ast,
+    query: ast::QueryRef,
+    scope: &Scope,
+    at: usize,
+) -> (Option<ast::ExprRef>, SideType) {
+    let ty = &scope.columns[at].ty;
+    let written = written_column(ast, query, at, scope.len());
+    let unknown = match written.map(|expr| ast.expr(expr)) {
+        Some(ast::Expr::Parameter { .. }) => return (written, SideType::Parameter),
+        Some(ast::Expr::Literal { kind: LiteralKind::String, .. }) => true,
+        _ => *ty == LogicalType::Null,
+    };
+    if unknown {
+        return (written, SideType::Unknown);
+    }
+    let declared = declared_type(&scope.columns[at]);
+    let oid = match (declared, written) {
+        (Some(declared), _) => Some(declared.oid),
+        (None, Some(expr)) => written_oid(ast, expr, ty),
+        (None, None) => postgres_oid(ty),
+    };
+    match oid {
+        Some(oid) => {
+            (written, SideType::Typed(oid, declared.map_or(-1, |declared| declared.typmod)))
+        }
+        None => (written, SideType::Other),
+    }
 }
 
 /// The expression that a side of a set operation writes as its column `at`, when the side is a

@@ -8397,3 +8397,57 @@ fn a_with_definition_is_read_where_it_is_written() {
     }
     server.stop().unwrap();
 }
+
+/// The non-recursive term of a recursive definition fixes the types of its columns, and the column
+/// has to come out of the union with that type and type modifier. A read of a held definition
+/// keeps the type its columns declare.
+#[test]
+fn a_recursive_definition_keeps_the_types_of_its_non_recursive_term() {
+    let dirs = Dirs::new("pgrecursivetypes");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query("create temp table held (a numeric(4,1))");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    let sql = "with recursive x as (select a from held union all select a from x) select * from x";
+    let messages = client.query(sql);
+    let description = messages.iter().find(|message| message.tag == b'T').unwrap();
+    assert_eq!(typed_shape(description), [("a".to_owned(), 1700, 262_149)]);
+    let sql = "with recursive foo(i, j) as (select 1, 'a' union all select i + 1, j || 'b' \
+               from foo where i < 3) select string_agg(j, ' ') from foo";
+    assert_eq!(scalar(&mut client, sql), "a ab abb");
+    for (sql, message, place) in [
+        (
+            "with recursive foo(i) as (select 1 union all select (i + 1)::numeric(10,0) \
+             from foo where i < 3) select * from foo",
+            "recursive query \"foo\" column 1 has type integer in non-recursive term but type \
+             numeric overall",
+            "34",
+        ),
+        (
+            "with recursive foo(i) as (select 1::numeric(3,0) union all select i + 1 \
+             from foo where i < 3) select * from foo",
+            "recursive query \"foo\" column 1 has type numeric(3,0) in non-recursive term but \
+             type numeric overall",
+            "34",
+        ),
+        (
+            "with recursive foo(i, j) as (select 1, 'a'::text union all select i + 1, 1 \
+             from foo where i < 3) select * from foo",
+            "UNION types text and integer cannot be matched",
+            "74",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some("42804"), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), Some(place), "{sql}");
+        if place == "34" {
+            let hint = "Cast the output of the non-recursive term to the correct type.";
+            assert_eq!(error.field(b'H').as_deref(), Some(hint), "{sql}");
+        }
+    }
+    server.stop().unwrap();
+}
