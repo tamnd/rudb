@@ -125,3 +125,30 @@ fn a_link_declared_for_one_session_is_known_to_every_later_one() {
         assert_eq!(rows(&db, QUERY), wanted, "{threads} threads");
     }
 }
+
+/// A temporary table is in no file, so a foreign key from one or to one is no link a checkpoint can
+/// build, and the checkpoint passes over it. Before, the build looked for the temporary table in
+/// the file and every checkpoint after the key was made failed with `the file holds no table`.
+#[test]
+fn a_foreign_key_of_a_temporary_table_does_not_stop_a_checkpoint() {
+    let file =
+        File(std::env::temp_dir().join(format!("rudb-temp-foreign-{}.rudb", std::process::id())));
+    let _ = std::fs::remove_file(&file.0);
+    let name = file.0.to_str().expect("a UTF-8 temporary path");
+    let db = Database::open(name).expect("a new file");
+    for sql in [
+        "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+        "INSERT INTO parent VALUES (1), (2)",
+        "CREATE TEMP TABLE child(id INTEGER REFERENCES parent(id))",
+        "CREATE TEMP TABLE kept(id INTEGER PRIMARY KEY)",
+        "CREATE TEMP TABLE pointing(id INTEGER REFERENCES kept(id))",
+        "INSERT INTO kept VALUES (1)",
+        "INSERT INTO pointing VALUES (1)",
+        "INSERT INTO child VALUES (2)",
+    ] {
+        db.execute(sql).expect(sql);
+    }
+    db.execute("CHECKPOINT").expect("the checkpoint passes over the temporary tables");
+    db.execute("VACUUM").expect("the vacuum passes over them too");
+    assert_eq!(rows(&db, "SELECT count(*) FROM child JOIN parent USING (id)"), [[Value::BigInt(1)]]);
+}

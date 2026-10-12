@@ -3522,7 +3522,7 @@ fn index(
     for link in &declared {
         let [column] = &link.parent.columns[..] else { continue };
         let Some(table) = catalog
-            .tables()
+            .stored_tables_in(DEFAULT_CATALOG)
             .find(|table| table.name().table.eq_ignore_ascii_case(&link.parent.table))
         else {
             continue;
@@ -3565,7 +3565,7 @@ fn index(
         rudb_native::graph::build_links(path, &edges)?;
         for edge in &edges {
             let Some(name) = catalog
-                .tables()
+                .stored_tables_in(DEFAULT_CATALOG)
                 .find(|table| table.name().table == edge.child)
                 .map(|table| table.name().clone())
             else {
@@ -3662,7 +3662,9 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
     let mut edges = Vec::new();
     for link in declared {
         let find = |name: &str| {
-            catalog.tables().find(|table| table.name().table.eq_ignore_ascii_case(name))
+            catalog
+                .stored_tables_in(DEFAULT_CATALOG)
+                .find(|table| table.name().table.eq_ignore_ascii_case(name))
         };
         let (Some(child_table), Some(parent_table)) =
             (find(&link.child.table), find(&link.parent.table))
