@@ -841,6 +841,21 @@ impl Binder<'_> {
                     .pg(format!("column \"{word}\" does not exist")));
                 }
             }
+            // A subquery that PostgreSQL read without `LATERAL` does not see the entries to its
+            // left, and a name that only one of them has is told so.
+            let (table, column) = match parts {
+                [column] => (None, *column),
+                [.., table, column] => (Some(*table), *column),
+                [] => (None, ""),
+            };
+            if let Some(error) = self
+                .closed_scopes
+                .iter()
+                .rev()
+                .find_map(|left| left.closed_to(compare, table, column))
+            {
+                return Err(error);
+            }
             // With nothing in scope here or outside, the pin says the `FROM` clause is missing.
             if scope.len() == 0 && self.outer_scopes.iter().all(|outer| outer.len() == 0) {
                 return Err(match parts {
@@ -861,11 +876,9 @@ impl Binder<'_> {
             }
             let Err(error) = scope.resolve(compare, parts) else { unreachable!() };
             // PostgreSQL names the nearest columns in a hint.
-            let (table, column) = match parts {
-                [column] => (None, *column),
-                [.., table, column] => (Some(*table), *column),
-                [] => return Err(error),
-            };
+            if parts.is_empty() {
+                return Err(error);
+            }
             let scopes = std::iter::once(scope).chain(self.outer_scopes.iter().rev());
             return Err(match crate::scope::nearest(scopes, table, column) {
                 Some(hint) if error.reported_state() == SqlState::UNDEFINED_COLUMN => {

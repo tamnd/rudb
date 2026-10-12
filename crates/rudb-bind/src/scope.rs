@@ -497,6 +497,47 @@ impl Scope {
         error.pg(format!("missing FROM-clause entry for table \"{table}\""))
     }
 
+    /// The complaint about a name that this scope has and does not lend, because the name is in a
+    /// subquery to its right that PostgreSQL read without `LATERAL`, or `None` when the scope does
+    /// not have it. The words are those of `errorMissingColumn` and `errorMissingRTE` in
+    /// `parse_relation.c`.
+    pub(crate) fn closed_to(
+        &self,
+        compare: IdentifierCompare,
+        table: Option<&str>,
+        column: &str,
+    ) -> Option<Error> {
+        if let Some(table) = table {
+            let held = self.columns.iter().find(|held| compare.same(&held.table, table))?;
+            let table = &held.table;
+            return Some(
+                Error::binder(format!("Referenced table \"{table}\" not found in FROM clause!"))
+                    .state(SqlState::UNDEFINED_TABLE)
+                    .pg(format!("invalid reference to FROM-clause entry for table \"{table}\""))
+                    .detail(format!(
+                        "There is an entry for table \"{table}\", but it cannot be referenced \
+                         from this part of the query."
+                    ))
+                    .hint("To reference that table, you must mark this subquery with LATERAL."),
+            );
+        }
+        let held = self
+            .columns
+            .iter()
+            .find(|held| !(held.qualified || held.hidden) && compare.same(&held.name, column))?;
+        Some(
+            Error::binder(format!("Referenced column \"{column}\" not found in FROM clause!"))
+                .state(SqlState::UNDEFINED_COLUMN)
+                .pg(format!("column \"{column}\" does not exist"))
+                .detail(format!(
+                    "There is a column named \"{column}\" in table \"{}\", but it cannot be \
+                     referenced from this part of the query.",
+                    held.table
+                ))
+                .hint("To reference that column, you must mark this subquery with LATERAL."),
+        )
+    }
+
     /// The `Candidate bindings:` part of a complaint about a name that is not here, empty when
     /// there is nothing in scope to suggest.
     ///

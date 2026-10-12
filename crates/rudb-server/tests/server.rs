@@ -3153,6 +3153,71 @@ fn the_whole_row_of_a_relation_is_null_where_an_outer_join_padded_it() {
 }
 
 #[test]
+fn a_subquery_without_lateral_does_not_see_the_entries_to_its_left() {
+    let dirs = Dirs::new("pglateral");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create temp table i8 (q1 int8, q2 int8);");
+    client.query("insert into i8 values (123, 456), (4567, 123);");
+    // The `q2` in `y` skips the `q2` of `x` to its left and reads the one of the outer row, as in
+    // PostgreSQL 19.
+    let messages = client.query(
+        "select q1, (select r from (select q1 as q2) x, (select q2 as r) y) from i8 order by 1;",
+    );
+    assert_eq!(tags(&messages), "TDDCZ");
+    let rows: Vec<Vec<Option<Vec<u8>>>> = messages[1..=2].iter().map(data_row).collect();
+    let rows: Vec<String> = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| String::from_utf8(value.unwrap()).unwrap())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    assert_eq!(rows, ["123|456", "4567|123"]);
+    client.query("select * from i8 x, lateral (select x.q2 as r) y;");
+    let column = "To reference that column, you must mark this subquery with LATERAL.";
+    let table = "To reference that table, you must mark this subquery with LATERAL.";
+    for (sql, state, message, detail, hint, position) in [
+        (
+            "select * from i8 x, (select q2 as r) y;",
+            "42703",
+            "column \"q2\" does not exist",
+            "There is a column named \"q2\" in table \"x\", but it cannot be referenced from this part of the query.",
+            column,
+            "29",
+        ),
+        (
+            "select * from i8 x left join (select q2 as r) y on true;",
+            "42703",
+            "column \"q2\" does not exist",
+            "There is a column named \"q2\" in table \"x\", but it cannot be referenced from this part of the query.",
+            column,
+            "38",
+        ),
+        (
+            "select * from i8 x, (select x.q2 as r) y;",
+            "42P01",
+            "invalid reference to FROM-clause entry for table \"x\"",
+            "There is an entry for table \"x\", but it cannot be referenced from this part of the query.",
+            table,
+            "29",
+        ),
+    ] {
+        let messages = client.query(sql);
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'D').as_deref(), Some(detail), "{sql}");
+        assert_eq!(error.field(b'H').as_deref(), Some(hint), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), Some(position), "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_array_functions_resolve_their_types_and_give_the_values_of_postgres() {
     let dirs = Dirs::new("pgarrays");
     let server = Server::start(dirs.config()).unwrap();
