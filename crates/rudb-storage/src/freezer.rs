@@ -4,10 +4,11 @@
 //! stripes [`to_freeze`] picks, the quiet sealed ones and, while the hot set is over `hot_limit`,
 //! the coldest, along with the thawed stripes the thaw rule says are quiet again. It thaws the
 //! frozen stripes the rule says are worth it. Then it moves every freeze it holds on as far as it
-//! can go: a stripe whose rows are final is encoded, one stripe at a time, and an encoded stripe is
-//! swapped in once no statement reading its table has a snapshot from before its F. A freeze that
-//! has to wait, for a write in flight or for an old snapshot, is kept for the next pass, so a pass
-//! never blocks on a writer or a reader.
+//! can go: a stripe whose rows are final is encoded, one stripe at a time, and swapped in. A freeze
+//! that has to wait for a write in flight is kept for the next pass, so a pass never blocks on a
+//! writer. Nor on a reader: a statement with a snapshot from before a stripe's F reads what it
+//! sees differently out of the stripe's graveyard, see [`crate::graveyard`], and each pass drops
+//! the graveyards no statement needs any more.
 //!
 //! The pages are the file's business, so the freezer is handed an [`Encoder`] that writes a
 //! stripe's pages and reads them back for a thaw. Nothing it writes is referenced until the next
@@ -78,31 +79,31 @@ pub struct Pass {
     pub swapped: usize,
     /// Stripes thawed.
     pub thawed: usize,
-    /// Freezes still held, waiting for a write in flight or an old snapshot.
+    /// Freezes still held, waiting for a write in flight or for an encode that failed.
     pub waiting: usize,
+    /// Graveyards dropped, see [`StripeDirectory::bury`].
+    pub buried: usize,
 }
 
 /// A freeze the freezer holds, by the table it is of.
 #[derive(Debug)]
-enum Held<W> {
+enum Held {
     /// Begun, its rows not yet final.
     Settling(Arc<StripeDirectory>, Arc<HotStripe>),
     /// Its rows final, not yet encoded, which is where a failed encode leaves it.
     Settled(Arc<StripeDirectory>, Freeze),
-    /// Encoded, waiting to be swapped in, with the time the encode took.
-    Written(Arc<StripeDirectory>, Freeze, W, u64),
 }
 
 /// The freezer's state across passes.
 #[derive(Debug)]
-pub struct Freezer<W> {
+pub struct Freezer {
     hot_limit: usize,
     quiet_ms: u64,
     temper: Temper,
-    held: Vec<Held<W>>,
+    held: Vec<Held>,
 }
 
-impl<W> Freezer<W> {
+impl Freezer {
     /// A freezer for a hot set of at most `hot_limit` bytes, which freezes a sealed stripe once it
     /// has gone `quiet_ms` without a commit.
     #[must_use]
@@ -127,7 +128,7 @@ impl<W> Freezer<W> {
     ///
     /// The first error of `encoder`. The pass stops there, and what it had not done is done by the
     /// next one.
-    pub fn pass<E: Encoder<Written = W>>(
+    pub fn pass<E: Encoder>(
         &mut self,
         tables: &[Arc<StripeDirectory>],
         horizons: &Horizons,
@@ -136,6 +137,9 @@ impl<W> Freezer<W> {
         encoder: &mut E,
     ) -> Result<Pass> {
         let mut pass = Pass::default();
+        for table in tables {
+            pass.buried += table.bury(horizons, clock);
+        }
         let picked = self.temper.look(tables, now_ms);
         let cold = to_freeze(tables, now_ms, self.quiet_ms, self.hot_limit);
         for (index, id) in cold.into_iter().chain(picked.freeze) {
@@ -170,26 +174,20 @@ impl<W> Freezer<W> {
                 let started = Instant::now();
                 match encoder.encode(table, freeze) {
                     Ok(written) => {
-                        let Held::Settled(table, freeze) = one else { unreachable!() };
-                        one = Held::Written(table, freeze, written, elapsed_ns(started));
+                        let ns = elapsed_ns(started);
                         pass.encoded += 1;
+                        let Held::Settled(table, freeze) = one else { unreachable!() };
+                        let id = freeze.stripe().id();
+                        let frozen = table.publish(freeze, horizons);
+                        encoder.swapped(&table, &frozen, written);
+                        self.temper.froze(table.table(), id, now_ms, ns);
+                        pass.swapped += 1;
+                        continue;
                     }
                     Err(error) => failed = Some(error),
                 }
             }
-            if let Held::Written(table, freeze, written, ns) = one {
-                let id = freeze.stripe().id();
-                match table.publish(freeze, horizons, clock) {
-                    Ok(frozen) => {
-                        encoder.swapped(&table, &frozen, written);
-                        self.temper.froze(table.table(), id, now_ms, ns);
-                        pass.swapped += 1;
-                    }
-                    Err(freeze) => held.push(Held::Written(table, freeze, written, ns)),
-                }
-            } else {
-                held.push(one);
-            }
+            held.push(one);
         }
         self.held = held;
         pass.waiting = self.held.len();
@@ -213,10 +211,12 @@ mod tests {
 
     use super::{Encoder, Freezer, Pass};
     use crate::deletes::{Base, DeleteVector};
+    use crate::graveyard::Cell;
     use crate::horizon::{Horizons, Reads};
     use crate::hot::{HotStripe, Width};
+    use crate::park::Wait;
     use crate::stripes::{Freeze, FrozenStripe, Inserter, Stripe, StripeDirectory};
-    use crate::undo::UndoSpace;
+    use crate::undo::{UndoBuffer, UndoSpace};
 
     /// Keeps each frozen stripe's values as of its F, the way pages would.
     #[derive(Default)]
@@ -296,21 +296,31 @@ mod tests {
         let pass = freezer.pass(&tables, &horizons, &clock, 2_000, &mut pages).expect("pass");
         assert_eq!(pass, Pass::default(), "nothing quiet yet");
 
-        // A snapshot from before F holds the swap back, and the next pass makes it.
-        horizons.begin(0, &clock, Reads::Tables(vec![0]));
+        // A snapshot from before F does not hold the swap back: the row written since goes in
+        // the graveyard, which a pass drops once the statement ended.
+        let old = horizons.begin(0, &clock, Reads::Tables(vec![0]));
+        let mut buffer = UndoBuffer::default();
+        sealed.update(7, &[(0, Some(70))], 2, 5, Wait::NEVER, &mut buffer).expect("update");
+        sealed.commit_write(7, 5, 3);
         clock.store(3, Ordering::SeqCst);
+        // The commit noted its time by the process's clock, which other tests have run on.
+        sealed.touch(1_000);
         let pass = freezer.pass(&tables, &horizons, &clock, 31_000, &mut pages).expect("pass");
-        assert_eq!((pass.began, pass.encoded, pass.swapped, pass.waiting), (1, 1, 0, 1));
-        assert!(matches!(table.find(sealed.id()), Some(Stripe::Hot(_))));
-        horizons.end(0);
-        let pass = freezer.pass(&tables, &horizons, &clock, 31_000, &mut pages).expect("pass");
-        assert_eq!((pass.encoded, pass.swapped, pass.waiting), (0, 1, 0));
-        assert!(matches!(table.find(sealed.id()), Some(Stripe::Frozen(_))));
+        assert_eq!((pass.began, pass.encoded, pass.swapped, pass.waiting), (1, 1, 1, 0));
+        let Some(Stripe::Frozen(frozen)) = table.find(sealed.id()) else { panic!("frozen") };
+        let graveyard = frozen.graveyard().expect("a snapshot from before");
+        assert_eq!(graveyard.seen(7, old), Some(Some(&[Some(Cell::Fixed(7))][..])));
         assert!(matches!(table.find(open.id()), Some(Stripe::Hot(_))), "open, so left hot");
         assert_eq!(pages.swapped, [sealed.id()]);
-        assert_eq!(pages.stripes[0].1[7], Some(7));
-        assert_eq!(table.count(3, 0), 150);
+        assert_eq!(pages.stripes[0].1[7], Some(70));
+        assert_eq!((table.count(old, 0), table.count(3, 0)), (150, 150));
         assert_eq!(freezer.temper().turns(0).freezes, 1);
+        let pass = freezer.pass(&tables, &horizons, &clock, 31_000, &mut pages).expect("pass");
+        assert_eq!(pass, Pass::default(), "the statement still runs");
+        horizons.end(0);
+        let pass = freezer.pass(&tables, &horizons, &clock, 31_000, &mut pages).expect("pass");
+        assert_eq!(pass, Pass { buried: 1, ..Pass::default() });
+        assert!(frozen.graveyard().is_none());
     }
 
     #[test]
