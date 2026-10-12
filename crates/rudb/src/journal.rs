@@ -283,6 +283,11 @@ pub(crate) struct Journal {
     anchored: bool,
     /// Whether the log writer of each lane runs, by the lane's number, see [`wake_writer`].
     writers: Vec<Arc<AtomicBool>>,
+    /// The records committed since a checkpoint in flight took its copy of the catalog, while one
+    /// is. See [`Self::since`].
+    window: Option<Window>,
+    /// The checkpoint writing the file on a thread of its own, see `database::launch`.
+    pub(crate) flight: Option<crate::database::Flight>,
 }
 
 /// Starts the log writer when it does not run. It syncs the lane every [`WRITER_DELAY`] while a
@@ -324,6 +329,20 @@ fn write_behind(lane: &Weak<Lane>, writer: &AtomicBool) {
     }
     writer.store(false, Ordering::Release);
 }
+
+/// What was committed while a checkpoint wrote the file from a copy of the catalog: the records of
+/// each commit in order, which played over the copy give the catalog as it is now. Broken by a
+/// commit the log did not carry, after which they do not.
+#[derive(Debug, Default)]
+struct Window {
+    records: Vec<(Kind, Vec<u8>)>,
+    bytes: usize,
+    broken: bool,
+}
+
+/// The most bytes of records a [`Window`] keeps before it gives up. A checkpoint that lands after
+/// more than this writes the tables changed since again at the next one rather than play them over.
+const WINDOW_BYTES: usize = 64 << 20;
 
 /// A block queued in the lane that its commit has not waited for yet.
 #[derive(Debug)]
@@ -402,6 +421,8 @@ impl Journal {
             dirty: false,
             anchored: anchor.is_some(),
             writers: Vec::new(),
+            window: None,
+            flight: None,
         };
         let Some(anchor) = anchor else {
             if writable {
@@ -564,6 +585,8 @@ impl Journal {
             anchored: self.anchored,
             logged: 0,
             writers: Vec::new(),
+            window: None,
+            flight: None,
         }
     }
 
@@ -600,6 +623,9 @@ impl Journal {
     /// Marks the commit to checkpoint.
     pub(crate) fn dirty(&mut self) {
         self.dirty = true;
+        if let Some(window) = &mut self.window {
+            window.broken = true;
+        }
         self.staged.clear();
         self.staged_bytes = 0;
     }
@@ -654,9 +680,32 @@ impl Journal {
         for record in &staged {
             block.push(record.kind, 0, &record.payload)?;
         }
+        if let Some(window) = &mut self.window {
+            // Kept before the lane has it, and the window broken if it does not take it, since
+            // the commit that follows a refused block is a checkpoint the log does not carry.
+            window.bytes += staged.iter().map(|record| record.payload.len()).sum::<usize>();
+            window.broken |= window.bytes > WINDOW_BYTES;
+            if !window.broken {
+                window
+                    .records
+                    .extend(staged.iter().map(|record| (record.kind, record.payload.clone())));
+            }
+        }
         let number = worker % lanes.unwrap_or(self.auto).clamp(1, MOST_LANES);
-        let lane = self.lane(number)?;
-        let end = lane.enqueue(&block)?;
+        let lane = match self.lane(number) {
+            Ok(lane) => lane,
+            Err(error) => {
+                self.break_window();
+                return Err(error);
+            }
+        };
+        let end = match lane.enqueue(&block) {
+            Ok(end) => end,
+            Err(error) => {
+                self.break_window();
+                return Err(error);
+            }
+        };
         let after = (number != self.lane_of_last).then_some(self.last);
         self.last = ts;
         self.lane_of_last = number;
@@ -673,6 +722,53 @@ impl Journal {
             return Ok(None);
         }
         Ok(Some(Pending { lane, end, sync, ts, after, cut: Arc::clone(&self.cut) }))
+    }
+
+    /// Marks the window broken, for a commit it does not hold all of.
+    fn break_window(&mut self) {
+        if let Some(window) = &mut self.window {
+            window.broken = true;
+        }
+    }
+
+    /// Starts keeping the records of every commit from here on, for a checkpoint that just took
+    /// its copy of the catalog. See [`Self::since`].
+    pub(crate) fn open_window(&mut self) {
+        self.window = Some(Window::default());
+    }
+
+    /// Whether the log replays over the file, which a checkpoint off the commit path needs: the
+    /// file has an anchor and replay left nothing out.
+    pub(crate) fn steady(&self) -> bool {
+        self.anchored && !self.torn
+    }
+
+    /// The payload bytes committed to the log since the last checkpoint, see [`Self::over`].
+    pub(crate) fn logged(&self) -> u64 {
+        self.logged
+    }
+
+    /// Stops keeping records and hands back what was committed since [`Self::open_window`], the
+    /// records staged for the commit under way included, since what they say is in the catalog
+    /// already. `None` when a commit in that time was not logged, so the records do not say all of
+    /// what changed.
+    ///
+    /// # Errors
+    ///
+    /// If a record kept does not read back.
+    pub(crate) fn since(&mut self) -> Result<Option<Vec<Replayed>>> {
+        let Some(window) = self.window.take() else { return Ok(None) };
+        if window.broken || self.dirty {
+            return Ok(None);
+        }
+        let staged = self.staged.iter().map(|record| (record.kind, record.payload.clone()));
+        let mut records = Vec::with_capacity(window.records.len() + self.staged.len());
+        for (kind, payload) in window.records.into_iter().chain(staged) {
+            if matches!(kind, Kind::Insert | Kind::Update | Kind::Delete | Kind::Ddl) {
+                records.push(read_record(kind, Payload::new(payload))?);
+            }
+        }
+        Ok(Some(records))
     }
 
     /// Lane `number`, opened if it is not yet.
@@ -759,6 +855,59 @@ impl Journal {
         let mut block = Block::new(0, self.last, self.last);
         block.push(Kind::Checkpoint, 0, &Checkpointed::encode(&entries))?;
         let lane = &opened[self.lane_of_last.min(opened.len() - 1)];
+        lane.enqueue(&block)?;
+        lane.write_out()
+    }
+
+    /// [`Self::checkpointed`] for a checkpoint that wrote `anchor` from a copy of the catalog
+    /// while commits went on: only what is at or below the anchor's cut is made redundant. The
+    /// segments each lane had begun when the anchor was taken go, and the ones after, which hold
+    /// what was committed since, stay for a replay. `logged` is what the log held then.
+    ///
+    /// # Errors
+    ///
+    /// If a segment cannot be renamed or removed, or the record cannot be written.
+    pub(crate) fn landed(
+        &mut self,
+        anchor: &LogAnchor,
+        logged: u64,
+        tables: &[i64],
+        generation: u64,
+    ) -> Result<()> {
+        for lane in self.opened() {
+            lane.write_out()?;
+        }
+        self.anchored = true;
+        self.logged = self.logged.saturating_sub(logged);
+        let durable = anchor.durable;
+        self.cut.raise(durable);
+        // A lane this run has not written to holds only commits from before it opened, which the
+        // file has now. One it has written to since keeps them until its segments are retired.
+        for lane in std::mem::take(&mut self.found) {
+            if self.lanes.get(usize::from(lane)).is_none_or(Option::is_none) {
+                self.remove_lane(lane)?;
+            }
+        }
+        let opened =
+            self.lanes.iter().enumerate().filter_map(|(at, lane)| Some((at, lane.as_ref()?)));
+        let opened = opened.map(|(at, lane)| (at, Arc::clone(lane))).collect::<Vec<_>>();
+        if opened.is_empty() {
+            return Ok(());
+        }
+        for (at, lane) in &opened {
+            if let Some(start) = anchor.lanes.get(*at) {
+                lane.retire(start.sequence)?;
+            }
+        }
+        let entries = tables
+            .iter()
+            .filter_map(|&oid| u32::try_from(oid).ok())
+            .map(|table| Checkpointed { table, stripe: 0, c_s: durable, root: 0, generation })
+            .collect::<Vec<_>>();
+        let mut block = Block::new(0, durable, durable);
+        block.push(Kind::Checkpoint, 0, &Checkpointed::encode(&entries))?;
+        let at = opened.iter().position(|(at, _)| *at == self.lane_of_last).unwrap_or(0);
+        let lane = &opened[at].1;
         lane.enqueue(&block)?;
         lane.write_out()
     }

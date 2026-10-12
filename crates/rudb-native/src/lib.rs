@@ -1512,6 +1512,11 @@ struct Entry {
     patched: bool,
 }
 
+/// Where `entry` has its table, see [`Filed`].
+fn filed(entry: &Entry) -> Filed {
+    (entry.directory.offset, entry.gone.as_ref().map(|page| page.offset))
+}
+
 type StoredIntegerExtremes = Option<Option<(i128, i128)>>;
 
 /// The rows a `DELETE` took out of a committed table, recorded beside its stripes rather than by
@@ -5625,7 +5630,16 @@ pub struct Reader {
     directory: u64,
     /// What opening the file cost, which is a number rather than a claim.
     opening: Opening,
+    /// Where the directory and the gone rows this reader was opened from sit. See
+    /// [`Reader::filed`].
+    filed: Filed,
 }
+
+/// Where a table's directory and its record of gone rows sit in a file, which tells one version of
+/// a table in a file from another: a commit that writes the table again or marks more of its rows
+/// gone writes a new one somewhere else, and the old one cannot be written over while a reader of
+/// it is open, see [`free`].
+pub type Filed = (u64, Option<u64>);
 
 /// What [`Reader::open`] read before it returned.
 ///
@@ -8102,6 +8116,7 @@ impl Catalog {
             self.pool.clone(),
             free::hold(&self.key, self.generation, free::tag(name)),
         )?;
+        reader.filed = filed(entry);
         if let Some(page) = &entry.gone {
             let mut bytes = vec![0; page.length as usize];
             read_at(&*self.file, page.offset, &mut bytes)?;
@@ -8131,6 +8146,13 @@ impl Catalog {
             reader.gone = Some(Arc::new(gone));
         }
         Ok(reader)
+    }
+
+    /// Where the file has the table `name`, see [`Filed`], or `None` when it holds no table by
+    /// that name.
+    #[must_use]
+    pub fn filed(&self, name: &str) -> Option<Filed> {
+        self.entries.iter().find(|entry| entry.name == name).map(filed)
     }
 
     /// The entry of a table no row was deleted from, which is the only kind whose counts the
@@ -8494,6 +8516,7 @@ impl Reader {
             size,
             directory,
             opening,
+            filed: (0, None),
         })
     }
 
@@ -8511,6 +8534,14 @@ impl Reader {
             indexes: self.indexes.load(Atomic::Relaxed),
             dictionaries: self.opened.load(Atomic::Relaxed),
         }
+    }
+
+    /// Where the directory and the gone rows this reader was opened from sit in the file, see
+    /// [`Filed`]. A reader the file no longer has at that place is of a version of the table a
+    /// later commit replaced.
+    #[must_use]
+    pub fn filed(&self) -> Filed {
+        self.filed
     }
 
     /// Where the file's bytes went, from the directory alone.

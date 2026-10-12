@@ -2131,6 +2131,13 @@ impl Table {
         self.frame
     }
 
+    /// Takes the numbering of the rows `frame` names, for a table built again with the same rows in
+    /// the same places as the one that had it, so a transaction that read that one still finds
+    /// its rows by number.
+    pub fn renumber_as(&mut self, frame: u64) {
+        self.frame = frame;
+    }
+
     /// The row whose key over the columns `key` is `values`, with the columns `columns`, found
     /// where the table noted the key rather than by reading the table, `13-the-point-path.md`.
     ///

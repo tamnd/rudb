@@ -2408,6 +2408,8 @@ fn persist_main(
     let Some(journal) = journal.as_mut() else {
         return persist(path, catalog, pages, DEFAULT_CATALOG);
     };
+    // A checkpoint in flight lands first, since this one writes the file from where it left it.
+    land(catalog, journal, true)?;
     let anchor = journal.anchor();
     // What the file is about to say of each counter, read before it is written, so a value a
     // counter hands out while the file is written is logged at the next commit.
@@ -2426,6 +2428,179 @@ fn persist_main(
     let tables =
         catalog.stored_tables_in(DEFAULT_CATALOG).map(rudb_catalog::Table::oid).collect::<Vec<_>>();
     journal.checkpointed(&tables, catalog.generation())
+}
+
+/// A checkpoint of the default database on a thread of its own, which a commit that takes the log
+/// past `checkpoint_threshold` starts rather than write the file before it returns,
+/// `engine-v4/10-freezing-and-checkpoint.md` section 10.6.
+///
+/// It writes a copy of the catalog as it was when it started, with the log's anchor as it was
+/// then, so the file says it holds every commit up to that cut. Commits go on meanwhile, logged as
+/// before, and the log keeps every one after the cut. [`land`] puts the file it wrote back into
+/// the catalog and recycles what the cut made redundant.
+pub(crate) struct Flight {
+    handle: std::thread::JoinHandle<Result<Catalog>>,
+    /// The anchor the file is being written with.
+    anchor: LogAnchor,
+    /// What the log held when the copy was taken, which the file now covers.
+    logged: u64,
+    /// The tables of the copy, by name, with each one's oid and revision then.
+    tables: Vec<(QualifiedName, i64, u64)>,
+    /// What the file is about to say of each counter, see [`persist_main`].
+    counters: Vec<(Arc<rudb_common::sequence::Counter>, u64)>,
+}
+
+impl std::fmt::Debug for Flight {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Flight")
+            .field("durable", &self.anchor.durable)
+            .field("logged", &self.logged)
+            .field("tables", &self.tables.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Starts a [`Flight`] of the default database, under the writer, catalog and log locks of the
+/// commit that took the log past its threshold. Says whether one is in flight afterwards: false
+/// when the log is not one a later open replays over the file, and the caller checkpoints inline.
+fn launch(
+    path: &Path,
+    catalog: &Catalog,
+    pages: &rudb_native::PagePool,
+    journal: &mut Journal,
+) -> bool {
+    if journal.flight.is_some() {
+        return true;
+    }
+    if !journal.steady() || journal.needs_checkpoint() {
+        return false;
+    }
+    let anchor = journal.anchor();
+    let counters: Vec<_> = catalog
+        .sequences()
+        .filter(|held| same_name(&held.name().catalog, DEFAULT_CATALOG))
+        .map(|held| (Arc::clone(held.counter()), held.counter().snapshot().1))
+        .collect();
+    let tables = catalog
+        .stored_tables_in(DEFAULT_CATALOG)
+        .map(|table| (table.name().clone(), table.oid(), table.revision()))
+        .collect();
+    let mut copy = catalog.clone();
+    let (file, written, pool) = (path.to_path_buf(), anchor.clone(), pages.clone());
+    let spawned =
+        std::thread::Builder::new().name("rudb-checkpoint".to_string()).spawn(move || {
+            persist_anchored(&file, &mut copy, &pool, DEFAULT_CATALOG, Some(&written), false)
+                .map(|()| copy)
+        });
+    let Ok(handle) = spawned else { return false };
+    journal.open_window();
+    journal.flight = Some(Flight { handle, anchor, logged: journal.logged(), tables, counters });
+    true
+}
+
+/// Puts the file a [`Flight`] wrote back into `catalog`, once it is done, or with `wait` after
+/// waiting for it.
+///
+/// A table nothing changed since the copy was taken reads the file's version of it from here on. A
+/// changed one is played forward from that version by the records committed since, the way an open
+/// replays the log, when they say all of what changed and play back to the same rows. Any other is
+/// left reading what it read, and the next checkpoint writes it again whole, see [`stale`].
+///
+/// A checkpoint that failed lands as nothing: the file is as it was, the log keeps everything, and
+/// the next commit past the threshold starts another.
+///
+/// # Errors
+///
+/// If the log cannot recycle what the file now holds.
+fn land(catalog: &mut Catalog, journal: &mut Journal, wait: bool) -> Result<()> {
+    let Some(flight) = journal.flight.take_if(|flight| wait || flight.handle.is_finished()) else {
+        return Ok(());
+    };
+    let since = journal.since();
+    let written = match flight.handle.join() {
+        Ok(Ok(written)) => written,
+        Ok(Err(_)) | Err(_) => return Ok(()),
+    };
+    let since = since.ok().flatten();
+    let mut changed = Vec::new();
+    for (name, oid, revision) in &flight.tables {
+        let Ok(table) = catalog.table(name) else { continue };
+        if table.oid() != *oid {
+            continue;
+        }
+        if table.revision() != *revision {
+            changed.push(name.clone());
+            continue;
+        }
+        let reader = match written.table(name).map(rudb_catalog::Table::rows) {
+            Ok(rudb_catalog::Rows::Native(reader) | rudb_catalog::Rows::Masked(reader, ..)) => {
+                reader.clone()
+            }
+            _ => continue,
+        };
+        if let Ok(table) = catalog.table_mut(name) {
+            let _ = table.rebind_native(reader);
+        }
+    }
+    if let Some(since) = since
+        && !changed.is_empty()
+    {
+        rebase(catalog, &written, &changed, since);
+    }
+    for (counter, uses) in flight.counters {
+        counter.covered(uses);
+    }
+    let tables = flight.tables.iter().map(|(_, oid, _)| *oid).collect::<Vec<_>>();
+    journal.landed(&flight.anchor, flight.logged, &tables, written.generation())
+}
+
+/// Plays the tables `changed` forward from the version of them a [`Flight`] wrote, in `written`,
+/// by `since`, the records committed after it took its copy, and puts each one that comes out with
+/// the rows it has now in its place in `catalog`.
+///
+/// Only when the records hold no schema change, other than the `setval` a commit logs for its
+/// counters, since a replay that ran one again would run it on a copy of the catalog that has it
+/// already. The rows come out in the same order, so each table keeps the numbering it had and a
+/// transaction that read it still finds its rows by number.
+fn rebase(
+    catalog: &mut Catalog,
+    written: &Catalog,
+    changed: &[QualifiedName],
+    since: Vec<Replayed>,
+) {
+    let statement = |replayed: &Replayed| {
+        replayed.statement().ok().flatten().is_none_or(|sql| !sql.starts_with("SELECT setval("))
+    };
+    if since.iter().any(|replayed| replayed.is_statement() && statement(replayed)) {
+        return;
+    }
+    let named = |replayed: &Replayed, name: &QualifiedName| {
+        same_name(&replayed.schema, &name.schema) && same_name(&replayed.table, &name.table)
+    };
+    let mut since = since;
+    for name in changed {
+        let records;
+        (records, since) = since
+            .into_iter()
+            .partition(|replayed| !replayed.is_statement() && named(replayed, name));
+        let Ok(now) = catalog.table(name) else { continue };
+        let Ok(then) = written.table(name) else { continue };
+        if now.columns() != then.columns() || now.oid() != then.oid() {
+            continue;
+        }
+        let (now, frame) = (now.clone(), now.frame());
+        let Ok(slot) = catalog.table_mut(name) else { continue };
+        *slot = then.clone();
+        let played = replay_changes(catalog, records).is_ok()
+            && catalog.table(name).is_ok_and(|table| table.rows().len() == now.rows().len());
+        let Ok(slot) = catalog.table_mut(name) else { continue };
+        if played {
+            slot.renumber_as(frame);
+        } else {
+            *slot = now;
+        }
+    }
 }
 
 /// A `VACUUM` of the default database: a checkpoint, and then the whole file written again when
@@ -2502,13 +2677,15 @@ fn persist_anchored(
     // Every table already in the file, and every declaration in the file already the one the
     // catalog holds. The second half is what stops a `CLUSTER BY` on a table that was checkpointed
     // before the declaration existed from being decided as nothing to do and quietly lost.
+    let held = committed(path)?;
+    let stale = stale(catalog, &names, held.as_ref());
     let mut clean = true;
     for table in catalog.stored_tables_in(database) {
-        clean &= table.rows().is_stored()
+        clean &= !stale.contains(&table.name().table)
+            && table.rows().is_stored()
             && table.clustering_is_stored()
             && table.declared_is_stored()?;
     }
-    let held = committed(path)?;
     // The views are compared by what they are rather than by their whole record, because the column
     // list on a record is a cache the binder writes over every time somebody selects from the view.
     // Comparing that too would make a plain `SELECT` from a view leave the file looking out of date,
@@ -2536,16 +2713,18 @@ fn persist_anchored(
     // happened to them, so nothing has to be written again. Everything the file holds is still the
     // right bytes in the right place and the commit is a new catalog naming the same pages, with
     // the rows gone written down beside the tables they went from.
-    let restated = !whole && restate(path, catalog, &names, held.as_ref())?;
-    let marks = marks(catalog, &names)?;
+    let restated = !whole && restate(path, catalog, &names, held.as_ref(), &stale)?;
+    let marks = marks(catalog, &names, &stale)?;
     let marked = catalog.stored_tables_in(database).all(|table| {
-        (table.rows().is_stored() || table.rows().markable()) && table.clustering_is_stored()
+        !stale.contains(&table.name().table)
+            && (table.rows().is_stored() || table.rows().markable())
+            && table.clustering_is_stored()
     });
     if restated && marked && held.is_some_and(|held| held.tables == wanted(&names)) {
         rudb_native::Writer::restate_marking(path, &views, anchor, &marks)?;
         return rebind(path, catalog, &names, pages);
     }
-    if restated && appended(path, catalog, &names, &views, anchor, marks)? {
+    if restated && appended(path, catalog, &names, &views, anchor, marks, &stale)? {
         return rebind(path, catalog, &names, pages);
     }
     let temporary = scratch(path)?;
@@ -2590,11 +2769,13 @@ fn restate(
     catalog: &Catalog,
     names: &[QualifiedName],
     held: Option<&Held>,
+    stale: &BTreeSet<String>,
 ) -> Result<bool> {
     let Some(held) = held else { return Ok(true) };
     for name in names {
         let table = catalog.table(name)?;
-        let carried = table.rows().is_stored() || table.rows().markable();
+        let carried =
+            !stale.contains(&name.table) && (table.rows().is_stored() || table.rows().markable());
         if !carried || table.declared_is_stored()? || !held.tables.contains(&name.table) {
             continue;
         }
@@ -2659,15 +2840,45 @@ fn committed(path: &Path) -> Result<Option<Held>> {
     let held = rudb_native::Catalog::open(path)?;
     Ok(Some(Held {
         tables: held.names().map(str::to_string).collect(),
+        filed: held
+            .names()
+            .filter_map(|name| Some((name.to_string(), held.filed(name)?)))
+            .collect(),
         views: held.views().cloned().collect(),
         anchor: held.log_anchor().cloned(),
     }))
+}
+
+/// The tables of `names` whose rows are read from a version of the table that the committed file
+/// `held` no longer has, see `rudb_native::Filed`.
+///
+/// A checkpoint that wrote the file from a copy of the catalog while commits went on leaves those
+/// behind, see [`land`]: a table changed since the copy was taken keeps reading the pages it read
+/// before, and the file has the copy's version of it. What the checkpoint paths carry forward,
+/// extend or mark gone they do by the file's version, so such a table is written again whole.
+fn stale(catalog: &Catalog, names: &[QualifiedName], held: Option<&Held>) -> BTreeSet<String> {
+    names
+        .iter()
+        .filter(|name| {
+            let Ok(table) = catalog.table(name) else { return false };
+            let reader = match table.rows() {
+                rudb_catalog::Rows::Native(reader)
+                | rudb_catalog::Rows::Grown(reader, _)
+                | rudb_catalog::Rows::Masked(reader, ..) => reader,
+                rudb_catalog::Rows::Memory(_) => return false,
+            };
+            held.and_then(|held| held.filed.get(&name.table)) != Some(&reader.filed())
+        })
+        .map(|name| name.table.clone())
+        .collect()
 }
 
 /// What the committed file says it holds, without reading a table directory for any of it.
 struct Held {
     /// The names of its tables, which is all a checkpoint has to know about them.
     tables: BTreeSet<String>,
+    /// Where it has each of them, see [`stale`].
+    filed: BTreeMap<String, rudb_native::Filed>,
     /// Its views, whole, since a view is entirely in the catalog level.
     views: Vec<rudb_native::ViewEntry>,
     /// How much of the log it holds.
@@ -3405,6 +3616,7 @@ fn appended(
     views: &[rudb_native::ViewEntry],
     anchor: Option<&LogAnchor>,
     mut marks: Vec<(String, rudb_native::GoneRows)>,
+    stale: &BTreeSet<String>,
 ) -> Result<bool> {
     let Some(held) = held_rows(path)? else { return Ok(false) };
     if held.is_empty() {
@@ -3428,6 +3640,7 @@ fn appended(
     };
     let native = names
         .iter()
+        .filter(|name| !stale.contains(&name.table))
         .filter(|name| catalog.table(name).is_ok_and(|table| table.rows().is_stored()))
         .map(|name| name.table.clone())
         .chain(marks.iter().filter(|(name, _)| !growing(name)).map(|(name, _)| name.clone()))
@@ -3439,7 +3652,7 @@ fn appended(
     // generation writes the appended rows after them. Where it has to be written whole instead,
     // which is a file of an older format, it is one of the disagreements below.
     let mut extended = BTreeMap::new();
-    for name in &dirty {
+    for name in dirty.iter().filter(|name| !stale.contains(&name.table)) {
         let table = catalog.table(name)?;
         let Some((rows, parts)) = table.rows().grown_from() else { continue };
         if !table.file_declares_clustering() {
@@ -3518,9 +3731,10 @@ fn appended(
 fn marks(
     catalog: &Catalog,
     names: &[QualifiedName],
+    stale: &BTreeSet<String>,
 ) -> Result<Vec<(String, rudb_native::GoneRows)>> {
     let mut marks = Vec::new();
-    for name in names {
+    for name in names.iter().filter(|name| !stale.contains(&name.table)) {
         if let Some(gone) = catalog.table(name)?.rows().marks()? {
             marks.push((name.table.clone(), gone));
         }
@@ -5454,9 +5668,14 @@ impl Shared {
         }
     }
 
-    /// Whether the log has passed `checkpoint_threshold` since the last checkpoint.
+    /// Whether the log has passed `checkpoint_threshold` since the last checkpoint, or four times
+    /// that while a checkpoint is in flight, see [`Self::checkpoint`].
     fn over(&self, journal: &Journal) -> bool {
-        journal.over(self.inner.settings.checkpoint_threshold())
+        let threshold = self.inner.settings.checkpoint_threshold();
+        match journal.flight {
+            Some(_) => journal.over(threshold.saturating_mul(4)),
+            None => journal.over(threshold),
+        }
     }
 
     /// [`Self::over`], taking the journal's lock for the look.
@@ -5487,6 +5706,9 @@ impl Shared {
         let mut catalog = self.committed();
         let mut journal = self.committed_journal();
         let Some(held) = journal.as_mut() else { return Ok(()) };
+        // A checkpoint in flight that is done lands here, so the commit after it finds the log
+        // short again.
+        land(&mut catalog, held, false)?;
         stage_counters(&catalog, held);
         // A block the lane refused is followed by the checkpoint, which makes the same rows
         // durable the slow way.
@@ -5497,7 +5719,7 @@ impl Shared {
                 self.inner.settings.log_lanes(),
             ) {
                 Ok(None) if !self.over(held) => return Ok(()),
-                Ok(None) => {}
+                Ok(None) => return self.checkpoint(path, &mut catalog, &mut journal),
                 Ok(Some(pending)) => {
                     if self.inner.settings.visibility() == Visibility::Committed {
                         drop(journal);
@@ -5514,6 +5736,9 @@ impl Shared {
                         if waited.is_ok() && !journal.as_ref().is_some_and(|held| self.over(held)) {
                             return Ok(());
                         }
+                        if waited.is_ok() {
+                            return self.checkpoint(path, &mut catalog, &mut journal);
+                        }
                         return persist_main(
                             path,
                             &mut catalog,
@@ -5522,16 +5747,58 @@ impl Shared {
                             false,
                         );
                     }
-                    if pending.wait().is_ok()
-                        && !journal.as_ref().is_some_and(|held| self.over(held))
-                    {
-                        return Ok(());
+                    if pending.wait().is_ok() {
+                        if !journal.as_ref().is_some_and(|held| self.over(held)) {
+                            return Ok(());
+                        }
+                        return self.checkpoint(path, &mut catalog, &mut journal);
                     }
                 }
                 Err(_) => {}
             }
         }
         persist_main(path, &mut catalog, &self.inner.pages, &mut journal, false)
+    }
+
+    /// The checkpoint a commit makes once the log it wrote passed `checkpoint_threshold`: started
+    /// on a thread of its own under `background_checkpoint`, see [`Flight`], and written before it
+    /// returns otherwise.
+    ///
+    /// A log that grows to four times the threshold while one is in flight waits for it, so a
+    /// checkpoint slower than the commits does not leave the log to grow without end.
+    fn checkpoint(
+        &self,
+        path: &Path,
+        catalog: &mut Catalog,
+        journal: &mut Option<Journal>,
+    ) -> Result<()> {
+        if self.inner.settings.background_checkpoint()
+            && let Some(held) = journal.as_mut()
+        {
+            if held.flight.is_some() {
+                land(catalog, held, true)?;
+                if !self.over(held) {
+                    return Ok(());
+                }
+            }
+            if launch(path, catalog, &self.inner.pages, held) {
+                return Ok(());
+            }
+        }
+        persist_main(path, catalog, &self.inner.pages, journal, false)
+    }
+
+    /// Lands the checkpoint in flight, if there is one, for a write of the file that does not go
+    /// through [`persist_main`]. `catalog` is the committed one, held.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot recycle what the file now holds.
+    fn land_flight(&self, catalog: &mut Catalog) -> Result<()> {
+        match self.committed_journal().as_mut() {
+            Some(journal) => land(catalog, journal, true),
+            None => Ok(()),
+        }
     }
 
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, with the pin's refusals for the ones that do not fit.
@@ -7452,6 +7719,9 @@ impl Shared {
             Bound::Setting(setting)
                 if setting.pragma && setting.name.eq_ignore_ascii_case("device_card_refresh") =>
             {
+                // The card goes into the file, which a checkpoint in flight may be writing.
+                drop(catalog);
+                self.land_flight(&mut self.committed())?;
                 self.refresh_device_card()?;
                 Ok(QueryResult::empty())
             }
@@ -7600,6 +7870,8 @@ impl Shared {
                     && create.name.catalog.eq_ignore_ascii_case(DEFAULT_CATALOG)
                     && !self.transacting();
                 if let Some(path) = self.inner.path.as_ref().filter(|_| writable) {
+                    // The sink writes the file, so a checkpoint writing it on a thread lands first.
+                    self.land_flight(&mut catalog)?;
                     let fresh = create.source.is_some() && catalog.table(&create.name).is_err();
                     let alone = fresh && !path.exists() && catalog.stored_tables().count() == 0;
                     if fresh && (alone || appendable(path, &catalog, &create.name)?) {
@@ -7896,6 +8168,8 @@ impl Shared {
                         && insert.checks.is_none()
                         && catalog.table(&insert.name).is_ok_and(|table| table.foreign().is_empty())
                 }) {
+                    // The sink writes the file, so a checkpoint writing it on a thread lands first.
+                    self.land_flight(&mut catalog)?;
                     let target = catalog.table(&insert.name)?;
                     // Rows go from the source to the file without the table being held in memory on
                     // the way, which is the difference between loading a table and having to fit
