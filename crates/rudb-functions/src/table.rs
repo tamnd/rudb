@@ -67,6 +67,7 @@
 
 use rudb_common::{Error, Field, LogicalType, Result};
 use rudb_kernels::json::scan;
+use rudb_parquet::MetadataTable;
 
 use crate::entrycatalog::{
     column_fields, constraint_fields, database_fields, dependency_fields, index_fields,
@@ -115,6 +116,14 @@ pub enum TableFunction {
     ReadBlob,
     /// `glob(path)`, one row per file a pattern or a list of them names, with nothing read.
     Glob,
+    /// `parquet_metadata(path)`, a row per column chunk of each row group of each file.
+    ParquetMetadata,
+    /// `parquet_schema(path)`, a row per schema element of each file.
+    ParquetSchema,
+    /// `parquet_kv_metadata(path)`, a row per key and value each file's writer kept.
+    ParquetKvMetadata,
+    /// `parquet_file_metadata(path)`, a row per file.
+    ParquetFileMetadata,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
     /// `rudb_links()`, every relationship declared and what is stored for it.
@@ -217,6 +226,10 @@ impl TableFunction {
             Self::ReadText => "read_text",
             Self::ReadBlob => "read_blob",
             Self::Glob => "glob",
+            Self::ParquetMetadata => "parquet_metadata",
+            Self::ParquetSchema => "parquet_schema",
+            Self::ParquetKvMetadata => "parquet_kv_metadata",
+            Self::ParquetFileMetadata => "parquet_file_metadata",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
@@ -409,6 +422,19 @@ impl TableFunction {
         matches!(self, Self::ReadText | Self::ReadBlob | Self::Glob)
     }
 
+    /// Which footer table this prints, and `None` for a function that does not print a Parquet
+    /// footer.
+    #[must_use]
+    pub const fn parquet_table(self) -> Option<MetadataTable> {
+        match self {
+            Self::ParquetMetadata => Some(MetadataTable::Columns),
+            Self::ParquetSchema => Some(MetadataTable::Schema),
+            Self::ParquetKvMetadata => Some(MetadataTable::KeyValue),
+            Self::ParquetFileMetadata => Some(MetadataTable::File),
+            _ => None,
+        }
+    }
+
     /// Which of the JSON readers this is, and `None` for a function that is not one.
     #[must_use]
     pub const fn json(self) -> Option<scan::Function> {
@@ -462,6 +488,10 @@ impl TableFunction {
             ("read_text", Self::ReadText),
             ("read_blob", Self::ReadBlob),
             ("glob", Self::Glob),
+            ("parquet_metadata", Self::ParquetMetadata),
+            ("parquet_schema", Self::ParquetSchema),
+            ("parquet_kv_metadata", Self::ParquetKvMetadata),
+            ("parquet_file_metadata", Self::ParquetFileMetadata),
         ] {
             if name.eq_ignore_ascii_case(spelled) {
                 return Some(function);
@@ -906,6 +936,12 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         | TableFunction::ReadJsonObjects
         | TableFunction::ReadNdjsonObjects
         | TableFunction::ReadSingleJsonFile => Some(Columns::Json),
+        TableFunction::ParquetMetadata
+        | TableFunction::ParquetSchema
+        | TableFunction::ParquetKvMetadata
+        | TableFunction::ParquetFileMetadata => {
+            function.parquet_table().map(|table| Columns::Fixed(table.fields()))
+        }
         TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::Glob
@@ -1004,6 +1040,10 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::Glob
+        | TableFunction::ParquetMetadata
+        | TableFunction::ParquetSchema
+        | TableFunction::ParquetKvMetadata
+        | TableFunction::ParquetFileMetadata
         | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow

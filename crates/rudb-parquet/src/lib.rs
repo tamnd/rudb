@@ -16,6 +16,9 @@
 //! [`Writer`] is the write path, which `COPY ... TO 'file.parquet'` drives: a flat schema, plain
 //! values and snappy pages, with the statistics the reader's pruning reads.
 //!
+//! [`RawFooter`] reads the whole footer with nothing dropped, for the `parquet_metadata` family of
+//! table functions, and [`MetadataTable`] turns it into their rows.
+//!
 //! # What a file has to be for this to read it
 //!
 //! A flat schema. Nested types are the format's own recursion and reading them needs repetition
@@ -35,6 +38,7 @@
 mod arena;
 mod chunk;
 mod delta;
+mod footer;
 mod hybrid;
 mod metadata;
 mod page;
@@ -45,6 +49,7 @@ mod values;
 mod write;
 
 pub use chunk::{Page, Pages};
+pub use footer::{MetadataTable, RawFooter};
 pub use metadata::{
     ColumnChunk, Encoding, Metadata, Outline, Physical, Region, RowGroup, SchemaColumn, Stats,
 };

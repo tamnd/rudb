@@ -64,7 +64,7 @@ use rudb_vector::{Chunk, Data, NO_ROW, VECTOR_SIZE, Vector};
 
 use crate::buffer::Buffered;
 use crate::consistent::{Answer, Collect, Reduction};
-use crate::contents::contents;
+use crate::contents::{contents, parquet_tables};
 use crate::cutoff::{self, Cutoff};
 use crate::devicecard::device_card;
 use crate::enginenames::{
@@ -2577,6 +2577,21 @@ impl<'a> Building<'a, '_> {
                 @ (TableFunction::ReadText | TableFunction::ReadBlob | TableFunction::Glob),
             ) => {
                 let table = contents(function, plan, args, index, columns)?;
+                let schema = table.schema().clone();
+                let counters = self.watch(reference, id, pipeline, "Metadata", Some(name));
+                Segment::new(Arc::new(Watched::new(table, counters)), schema)
+            }
+            Some(
+                function @ (TableFunction::ParquetMetadata
+                | TableFunction::ParquetSchema
+                | TableFunction::ParquetKvMetadata
+                | TableFunction::ParquetFileMetadata),
+            ) => {
+                let kind = function
+                    .parquet_table()
+                    .ok_or_else(|| Error::internal("a parquet table with no footer table"))?;
+                let zone = self.session.session_time_zone();
+                let table = parquet_tables(function, kind, plan, args, index, columns, zone)?;
                 let schema = table.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Metadata", Some(name));
                 Segment::new(Arc::new(Watched::new(table, counters)), schema)

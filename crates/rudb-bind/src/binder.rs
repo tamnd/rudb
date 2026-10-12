@@ -4430,6 +4430,13 @@ impl<'a> Binder<'a> {
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
             }
+            // The footer tables take their patterns the way the file readers do, a pattern that
+            // matches nothing included, which is an error here and no rows for `read_text`.
+            Columns::Fixed(fields) if resolved.function.parquet_table().is_some() => {
+                let paths = self.file_paths(cast[0], resolved.function.name())?;
+                cast = paths.iter().map(|path| self.path_constant(path)).collect();
+                fields
+            }
             Columns::Fixed(fields) => fields,
             columns => {
                 // The one argument is a pattern, and what replaces it is one constant per file it
