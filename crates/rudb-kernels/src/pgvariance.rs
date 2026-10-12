@@ -7,8 +7,11 @@
 //! updates in the steps of Youngs and Cramer, finished into a `double precision`. The pin keeps a
 //! Welford state for both in [`crate::aggregate`]. The binder gives a PostgreSQL session the names
 //! of these states, which are the names of PostgreSQL's final functions.
+//!
+//! A query can call `float8_accum` and `float8_combine` on a state written as a `float8[]` too,
+//! and those calls go through the same steps.
 
-use rudb_common::{Error, Result, Value};
+use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_pgtypes::Numeric;
 
 use crate::general::Measure;
@@ -163,6 +166,59 @@ impl ExactSpread {
     }
 }
 
+/// The C functions of this module that a call reaches, sorted.
+pub(crate) const SOURCES: &[&str] = &["float8_accum", "float8_combine"];
+
+/// The value of a call of `float8_accum` or `float8_combine` outside an aggregate, or `None` for
+/// another C function. A finite sum that overflows is an error here and not at an answer.
+pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
+    let state = match (src, args) {
+        ("float8_accum", [state, Value::Double(value)]) => {
+            let mut state = FloatSpread::read(state, src)?;
+            state.add(*value);
+            state
+        }
+        ("float8_combine", [left, right]) => {
+            let mut state = FloatSpread::read(left, src)?;
+            state.combine(&FloatSpread::read(right, src)?)?;
+            state
+        }
+        _ => return Ok(None),
+    };
+    if state.overflowed {
+        return Err(overflow());
+    }
+    Ok(Some(transition(&[state.count, state.sum, state.squared])))
+}
+
+/// The values of a state written as a `float8[]` of `N` elements, as `check_float8_array` takes
+/// them for the C function `caller`. A null element is an error, as it is there.
+pub(crate) fn transition_of<const N: usize>(state: &Value, caller: &str) -> Result<[f64; N]> {
+    let values = match state {
+        Value::List { values, .. } => values.as_slice(),
+        _ => &[],
+    };
+    let doubles: Option<Vec<f64>> = values
+        .iter()
+        .map(|value| match value {
+            Value::Double(value) => Some(*value),
+            _ => None,
+        })
+        .collect();
+    doubles.and_then(|doubles| <[f64; N]>::try_from(doubles).ok()).ok_or_else(|| {
+        let message = format!("{caller}: expected {N}-element float8 array");
+        Error::internal(message.clone()).pg(message).unplaced()
+    })
+}
+
+/// A state written as a `float8[]`, as the C functions give it.
+pub(crate) fn transition(values: &[f64]) -> Value {
+    Value::List {
+        element: LogicalType::Double,
+        values: values.iter().map(|&value| Value::Double(value)).collect(),
+    }
+}
+
 /// `float8_var_pop` and the others over `real` and `double precision`, kept as `float8_accum`
 /// keeps them. The count is a double, as it is in PostgreSQL's state.
 #[derive(Debug, Clone)]
@@ -186,6 +242,12 @@ impl FloatSpread {
             overflowed: false,
             measure: measure(name, "float8_")?,
         })
+    }
+
+    /// The state that a `float8[]` of three elements writes.
+    fn read(state: &Value, caller: &str) -> Result<Self> {
+        let [count, sum, squared] = transition_of(state, caller)?;
+        Ok(Self { count, sum, squared, overflowed: false, measure: Measure::VarPop })
     }
 
     /// Adds one value, which is a `real` or a `double precision`.
@@ -322,5 +384,20 @@ mod tests {
         huge.add(1e308);
         huge.add(1e308);
         assert!(huge.finish().is_err());
+    }
+
+    #[test]
+    fn a_call_reads_and_writes_the_state_as_a_float8_array() {
+        let state = |values: &[f64]| transition(values);
+        let accumulated =
+            call("float8_accum", &[state(&[4.0, 140.0, 2900.0]), Value::Double(100.0)]);
+        assert_eq!(accumulated.unwrap(), Some(state(&[5.0, 240.0, 6280.0])));
+        let combined =
+            call("float8_combine", &[state(&[3.0, 60.0, 200.0]), state(&[2.0, 180.0, 200.0])]);
+        assert_eq!(combined.unwrap(), Some(state(&[5.0, 240.0, 6280.0])));
+        let short = call("float8_accum", &[state(&[4.0, 140.0]), Value::Double(100.0)]);
+        assert!(short.unwrap_err().to_string().contains("expected 3-element float8 array"));
+        let huge = call("float8_accum", &[state(&[1.0, 1e308, 0.0]), Value::Double(1e308)]);
+        assert!(huge.is_err());
     }
 }
