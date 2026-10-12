@@ -1,10 +1,10 @@
 //! `VACUUM` and `ANALYZE`, checked the way the session reads them.
 //!
-//! rudb keeps the statistics of a table up to date as rows are written, and a table has no dead
-//! rows to reclaim, so neither statement has work to do on the data. What is left is what the
-//! statement says about itself: the options, the tables and the columns, with the errors of the
-//! pin or of PostgreSQL as [`Maintenance`] chooses. A PostgreSQL `VACUUM` does not run in a
-//! transaction block, and the layer that knows the transaction refuses it there.
+//! rudb keeps the statistics of a table up to date as rows are written, so `ANALYZE` has no work
+//! to do on the data, and the space a `VACUUM` gives back is the database's to find. What is left
+//! here is what the statement says about itself: the options, the tables and the columns, with
+//! the errors of the pin or of PostgreSQL as [`Maintenance`] chooses. A PostgreSQL `VACUUM` does
+//! not run in a transaction block, and the layer that knows the transaction refuses it there.
 //!
 //! The PostgreSQL checks are the ones of `ExecVacuum` in `vacuum.c`, in its order, and of
 //! `validate_va_cols_list` in `analyze.c`.

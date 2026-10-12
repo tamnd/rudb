@@ -3975,14 +3975,6 @@ fn excluded_returning(ast: &Ast, query: Option<ast::QueryRef>) -> Result<()> {
     Ok(())
 }
 
-/// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.
-///
-/// The source the transform built is `SELECT *, condition, values... FROM table`. A row the
-/// condition holds for gets the new values in the named columns for an `UPDATE`, and every other
-/// row comes through as it was. A null condition is a row that did not match, which is what a
-/// searched `CASE` does with one, so the one expression covers both. After the table's columns
-/// comes the flag saying which rows matched, which are the rows an `UPDATE` changed and the rows a
-/// `DELETE` takes out.
 /// The error for a `SET` of a column that the table does not have, at the column when the
 /// transform kept its place.
 fn missing_update_column(column: &str, table: &str, span: Option<Span>) -> Error {
@@ -4000,6 +3992,14 @@ fn repeated_update_column(column: &str) -> Error {
         .unplaced()
 }
 
+/// An `UPDATE` or a `DELETE`, bound to the query that produces every row the table has afterwards.
+///
+/// The source the transform built is `SELECT *, condition, values... FROM table`. A row the
+/// condition holds for gets the new values in the named columns for an `UPDATE`, and every other
+/// row comes through as it was. A null condition is a row that did not match, which is what a
+/// searched `CASE` does with one, so the one expression covers both. After the table's columns
+/// comes the flag saying which rows matched, which are the rows an `UPDATE` changed and the rows a
+/// `DELETE` takes out.
 fn change(
     ast: &Ast,
     catalog: &Catalog,
