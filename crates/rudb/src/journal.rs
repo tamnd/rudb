@@ -36,13 +36,13 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::{Filesystem, RealFilesystem};
 use rudb_native::{LaneStart, LogAnchor};
 use rudb_txn::log::{
-    Block, Checkpointed, CommitSync, Kind, Lane, Options, Payload, SEGMENT_BYTES, SEGMENT_HEADER,
-    remove_spare, replay, segments, spares,
+    Block, Checkpointed, CommitSync, Cut, Kind, Lane, Options, Payload, SEGMENT_BYTES,
+    SEGMENT_HEADER, lanes, remove_spare, replay, segments, spares,
 };
 use rudb_vector::{Chunk, Data, Selection, StringColumn, VECTOR_SIZE, Validity, Vector};
 
-/// The lane every record goes to, until there are more.
-const LANE: u8 = 0;
+/// The most lanes a log is written with, `09-the-log.md` section 9.2.
+pub(crate) const MOST_LANES: usize = 16;
 
 /// The payload layout records are written in. Layout 1 put every value of an Insert or Update
 /// with a tag of its own; layout 2 puts a column a run at a time where it can, and replay reads
@@ -256,8 +256,20 @@ pub(crate) struct Journal {
     database: u64,
     /// The newest commit timestamp handed out, or the cut the file was opened at.
     last: u64,
-    /// Opened at the first commit, because opening one makes a segment.
-    lane: Option<Arc<Lane>>,
+    /// The lanes by number, each opened at the first commit that goes to it, because opening one
+    /// makes a segment. As many as the most the log was written with in this run.
+    lanes: Vec<Option<Arc<Lane>>>,
+    /// The lanes the log found when it was opened, whose segments a checkpoint removes.
+    found: Vec<u8>,
+    /// The lane of the newest commit, which the next one depends on.
+    lane_of_last: usize,
+    /// How far every commit is, which a commit that depends on one in another lane waits for.
+    cut: Arc<Cut>,
+    /// Whether replay left out commits that lost what they depend on, which a later open would
+    /// read again, so the next commit checkpoints rather than log after them.
+    torn: bool,
+    /// The lanes `log_lanes = auto` writes with: what the device card chose, one without a card.
+    auto: usize,
     /// Records waiting for the commit.
     staged: Vec<Record>,
     staged_bytes: usize,
@@ -269,8 +281,8 @@ pub(crate) struct Journal {
     /// Whether the file has an anchor this log is replayed against. Until it does a commit
     /// checkpoints, because a log beside a file without one is taken for another file's.
     anchored: bool,
-    /// Whether the log writer runs, see [`wake_writer`].
-    writer: Arc<AtomicBool>,
+    /// Whether the log writer of each lane runs, by the lane's number, see [`wake_writer`].
+    writers: Vec<Arc<AtomicBool>>,
 }
 
 /// Starts the log writer when it does not run. It syncs the lane every [`WRITER_DELAY`] while a
@@ -319,17 +331,33 @@ pub(crate) struct Pending {
     lane: Arc<Lane>,
     end: u64,
     sync: CommitSync,
+    /// Its commit timestamp.
+    ts: u64,
+    /// The commit it depends on, when that one went to another lane, whose sync this one's does
+    /// not carry.
+    after: Option<u64>,
+    cut: Arc<Cut>,
 }
 
 impl Pending {
     /// Waits until the block is as far as the commit's `commit_sync` asks, leading the lane's next
     /// write and sync when nobody else is, which carries every block queued behind this one too.
+    /// Then, for a commit that depends on one in another lane, until the cut says that one is as
+    /// far too, `09-the-log.md` section 9.7.
     ///
     /// # Errors
     ///
-    /// If the lane failed, now or earlier.
+    /// If the lane failed, now or earlier, or the lane of the commit this one depends on did.
     pub(crate) fn wait(self) -> Result<()> {
-        self.lane.settle(self.end, self.sync).map(|_| ())
+        if let Err(error) = self.lane.settle(self.end, self.sync) {
+            self.cut.fail();
+            return Err(error);
+        }
+        self.cut.reached(self.ts);
+        match self.after {
+            Some(after) => self.cut.wait(after),
+            None => Ok(()),
+        }
     }
 }
 
@@ -362,28 +390,61 @@ impl Journal {
             dir: dir.clone(),
             database: anchor.map_or_else(fresh_id, |anchor| anchor.database),
             last: anchor.map_or(0, |anchor| anchor.durable),
-            lane: None,
+            lanes: Vec::new(),
+            found: lanes(fs.as_ref(), &dir)?,
+            lane_of_last: 0,
+            cut: Arc::new(Cut::new(0)),
+            torn: false,
+            auto: auto_lanes(path),
             staged: Vec::new(),
             staged_bytes: 0,
             logged: 0,
             dirty: false,
             anchored: anchor.is_some(),
-            writer: Arc::default(),
+            writers: Vec::new(),
         };
         let Some(anchor) = anchor else {
             if writable {
                 journal.remove_all()?;
             }
+            journal.cut = Arc::new(Cut::new(journal.last));
             return Ok((journal, Vec::new()));
         };
-        let read = replay(fs.as_ref(), &dir, LANE, anchor.database)?;
-        let mut changes = Vec::new();
-        for block in read.blocks {
-            let ts = block.commit.commit_ts;
-            if !anchor.replays(ts) {
-                continue;
+        // Every lane's blocks, put in the order of their commits. A commit is replayed only when
+        // the one it depends on was, or is in the file, or is void: one that lost its dependency
+        // in a lane whose tail a crash took was never acknowledged, `12-recovery.md` section 12.4.
+        let mut blocks = Vec::new();
+        for &lane in &journal.found {
+            let read = replay(fs.as_ref(), &dir, lane, anchor.database)?;
+            blocks.extend(
+                read.blocks.into_iter().filter(|block| anchor.replays(block.commit.commit_ts)),
+            );
+        }
+        blocks.sort_by_key(|block| block.commit.commit_ts);
+        let newest = blocks.last().map(|block| block.commit.commit_ts);
+        let mut done = anchor.durable;
+        let mut kept = 0;
+        for block in &blocks {
+            while let Some(next) = done.checked_add(1)
+                && anchor.voids.binary_search(&next).is_ok()
+            {
+                done = next;
             }
-            journal.last = journal.last.max(ts);
+            if block.commit.dep_ts > done {
+                break;
+            }
+            done = done.max(block.commit.commit_ts);
+            kept += 1;
+        }
+        if kept < blocks.len() {
+            // What was left out may be read again by a later open, so the timestamps go on past
+            // them and the first commit checkpoints, which moves the cut over them for good.
+            journal.torn = true;
+        }
+        journal.last = journal.last.max(newest.unwrap_or(0));
+        journal.cut = Arc::new(Cut::new(journal.last));
+        let mut changes = Vec::new();
+        for block in blocks.into_iter().take(kept) {
             for record in block.records {
                 let kind = record.header.kind;
                 if matches!(kind, Kind::Insert | Kind::Update | Kind::Delete | Kind::Ddl) {
@@ -491,13 +552,18 @@ impl Journal {
             dir: self.dir.clone(),
             database: self.database,
             last: self.last,
-            lane: None,
+            lanes: Vec::new(),
+            found: Vec::new(),
+            lane_of_last: self.lane_of_last,
+            cut: Arc::clone(&self.cut),
+            torn: false,
+            auto: self.auto,
             staged: Vec::new(),
             staged_bytes: 0,
             dirty: false,
             anchored: self.anchored,
             logged: 0,
-            writer: Arc::default(),
+            writers: Vec::new(),
         }
     }
 
@@ -547,7 +613,7 @@ impl Journal {
 
     /// Whether the commit has to checkpoint.
     pub(crate) fn needs_checkpoint(&self) -> bool {
-        self.dirty || (!self.anchored && !self.staged.is_empty())
+        self.dirty || ((self.torn || !self.anchored) && !self.staged.is_empty())
     }
 
     /// Whether the log has grown to `threshold` bytes since the last checkpoint, after which the
@@ -568,7 +634,16 @@ impl Journal {
     ///
     /// If the lane cannot be opened or written. The staged records are dropped either way; a
     /// failed commit is followed by a checkpoint, which the caller asks for.
-    pub(crate) fn enqueue(&mut self, sync: CommitSync) -> Result<Option<Pending>> {
+    ///
+    /// The block goes to lane `worker` modulo `lanes`, `None` for the lanes the device card chose.
+    /// It depends on the commit before it, which every commit here does since they are made one at
+    /// a time, and waits for that one too when it went to another lane.
+    pub(crate) fn enqueue(
+        &mut self,
+        sync: CommitSync,
+        worker: usize,
+        lanes: Option<usize>,
+    ) -> Result<Option<Pending>> {
         if self.staged.is_empty() {
             return Ok(None);
         }
@@ -579,40 +654,64 @@ impl Journal {
         for record in &staged {
             block.push(record.kind, 0, &record.payload)?;
         }
-        let lane = match &self.lane {
-            Some(lane) => Arc::clone(lane),
-            None => {
-                let options = Options { segment_bytes: SEGMENT, ..Options::new(self.database) };
-                let lane = Arc::new(Lane::open(Arc::clone(&self.fs), &self.dir, options)?);
-                self.lane = Some(Arc::clone(&lane));
-                lane
-            }
-        };
+        let number = worker % lanes.unwrap_or(self.auto).clamp(1, MOST_LANES);
+        let lane = self.lane(number)?;
         let end = lane.enqueue(&block)?;
+        let after = (number != self.lane_of_last).then_some(self.last);
         self.last = ts;
+        self.lane_of_last = number;
         self.logged += staged.iter().map(|record| record.payload.len() as u64).sum::<u64>();
         if sync == CommitSync::None {
+            self.cut.reached(ts);
             if lane.unwritten() >= QUEUED {
                 lane.write_out()?;
             }
-            wake_writer(&lane, &self.writer);
+            if self.writers.len() <= number {
+                self.writers.resize_with(number + 1, Arc::default);
+            }
+            wake_writer(&lane, &self.writers[number]);
             return Ok(None);
         }
-        Ok(Some(Pending { lane, end, sync }))
+        Ok(Some(Pending { lane, end, sync, ts, after, cut: Arc::clone(&self.cut) }))
+    }
+
+    /// Lane `number`, opened if it is not yet.
+    fn lane(&mut self, number: usize) -> Result<Arc<Lane>> {
+        if self.lanes.len() <= number {
+            self.lanes.resize(number + 1, None);
+        }
+        if let Some(lane) = &self.lanes[number] {
+            return Ok(Arc::clone(lane));
+        }
+        let options = Options {
+            lane: u8::try_from(number).map_err(|_| Error::internal("a log lane past 255"))?,
+            segment_bytes: SEGMENT,
+            ..Options::new(self.database)
+        };
+        let lane = Arc::new(Lane::open(Arc::clone(&self.fs), &self.dir, options)?);
+        self.lanes[number] = Some(Arc::clone(&lane));
+        Ok(lane)
+    }
+
+    /// The lanes opened so far.
+    fn opened(&self) -> impl Iterator<Item = &Arc<Lane>> {
+        self.lanes.iter().flatten()
     }
 
     /// The anchor a checkpoint of everything committed so far writes into the file.
     pub(crate) fn anchor(&self) -> LogAnchor {
-        let (sequence, offset) = match &self.lane {
-            Some(lane) => lane.position(),
-            None => (0, SEGMENT_HEADER as u64),
-        };
-        LogAnchor {
-            database: self.database,
-            durable: self.last,
-            lanes: vec![LaneStart { sequence, offset }],
-            voids: Vec::new(),
+        let lanes = self.lanes.iter().map(|lane| {
+            let (sequence, offset) = match lane {
+                Some(lane) => lane.position(),
+                None => (0, SEGMENT_HEADER as u64),
+            };
+            LaneStart { sequence, offset }
+        });
+        let mut lanes = lanes.collect::<Vec<_>>();
+        if lanes.is_empty() {
+            lanes.push(LaneStart { sequence: 0, offset: SEGMENT_HEADER as u64 });
         }
+        LogAnchor { database: self.database, durable: self.last, lanes, voids: Vec::new() }
     }
 
     /// Recycles what a checkpoint that wrote [`Self::anchor`] made redundant: the staged state
@@ -630,14 +729,28 @@ impl Journal {
     pub(crate) fn checkpointed(&mut self, tables: &[i64], generation: u64) -> Result<()> {
         // Blocks still queued under `commit_sync = none` go out first, so none of them is left to
         // be written into a segment this is about to remove.
-        if let Some(lane) = &self.lane {
+        for lane in self.opened() {
             lane.write_out()?;
         }
         self.discard();
         self.anchored = true;
+        self.torn = false;
         self.logged = 0;
-        let Some(lane) = &self.lane else { return self.remove_all() };
-        lane.retire(lane.position().0)?;
+        // Every commit is in the file now, the ones a lane failed to write included.
+        self.cut.raise(self.last);
+        // The segments of lanes this run has not written to hold only commits the file has now.
+        for lane in std::mem::take(&mut self.found) {
+            if self.lanes.get(usize::from(lane)).is_none_or(Option::is_none) {
+                self.remove_lane(lane)?;
+            }
+        }
+        let opened = self.opened().cloned().collect::<Vec<_>>();
+        if opened.is_empty() {
+            return self.remove_all();
+        }
+        for lane in &opened {
+            lane.retire(lane.position().0)?;
+        }
         let entries = tables
             .iter()
             .filter_map(|&oid| u32::try_from(oid).ok())
@@ -645,6 +758,7 @@ impl Journal {
             .collect::<Vec<_>>();
         let mut block = Block::new(0, self.last, self.last);
         block.push(Kind::Checkpoint, 0, &Checkpointed::encode(&entries))?;
+        let lane = &opened[self.lane_of_last.min(opened.len() - 1)];
         lane.enqueue(&block)?;
         lane.write_out()
     }
@@ -658,7 +772,7 @@ impl Journal {
         self.discard();
         // A lane still shared with a committer outlives this, and its spares thread with it, so
         // that thread is stopped here rather than left to make a spare after the removal.
-        if let Some(lane) = self.lane.take() {
+        for lane in std::mem::take(&mut self.lanes).into_iter().flatten() {
             lane.stop();
         }
         self.logged = 0;
@@ -669,16 +783,34 @@ impl Journal {
         Ok(())
     }
 
-    /// Removes every segment and spare of the lane.
+    /// Removes every segment and spare of every lane.
     fn remove_all(&self) -> Result<()> {
-        for (_, path) in segments(self.fs.as_ref(), &self.dir, LANE)? {
+        for lane in lanes(self.fs.as_ref(), &self.dir)? {
+            self.remove_lane(lane)?;
+        }
+        Ok(())
+    }
+
+    /// Removes every segment and spare of `lane`.
+    fn remove_lane(&self, lane: u8) -> Result<()> {
+        for (_, path) in segments(self.fs.as_ref(), &self.dir, lane)? {
             self.fs.remove(&path)?;
         }
-        for path in spares(self.fs.as_ref(), &self.dir, LANE)? {
+        for path in spares(self.fs.as_ref(), &self.dir, lane)? {
             remove_spare(self.fs.as_ref(), &path)?;
         }
         Ok(())
     }
+}
+
+/// The lanes the device card of the directory `path` is in chose, when this process has a card for
+/// it, and one otherwise.
+fn auto_lanes(path: &Path) -> usize {
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    rudb_io::device::device_key(dir)
+        .ok()
+        .and_then(|key| rudb_io::device::kept(&key))
+        .map_or(1, |card| usize::try_from(card.lanes).unwrap_or(1).clamp(1, MOST_LANES))
 }
 
 /// An id for a database that has never had one, which only has to differ from other databases'.

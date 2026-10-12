@@ -147,6 +147,29 @@ pub fn segments(fs: &dyn Filesystem, dir: &Path, lane: u8) -> Result<Vec<(u64, P
     Ok(found)
 }
 
+/// The lanes with a segment or a spare in `dir`, in order. No directory is no lanes.
+///
+/// # Errors
+///
+/// If the directory cannot be listed.
+pub fn lanes(fs: &dyn Filesystem, dir: &Path) -> Result<Vec<u8>> {
+    if !fs.is_dir(dir) {
+        return Ok(Vec::new());
+    }
+    let mut found: Vec<u8> = fs
+        .read_dir(dir)?
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let name = name.strip_suffix(".spare").unwrap_or(name);
+            parse_segment_name(name).map(|(lane, _)| lane)
+        })
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
+}
+
 /// The name a retired segment of `lane` waits under until the lane recycles it: its old name with
 /// `.spare` after it, which [`parse_segment_name`] does not read as a segment's, so neither replay
 /// nor [`segments`] sees it.

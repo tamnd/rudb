@@ -670,3 +670,132 @@ fn a_sequence_hands_out_no_value_twice_across_a_crash() {
     let db = open(&path);
     assert_eq!(rows(&db, "SELECT nextval('s')"), [[Value::BigInt(after + 1)]]);
 }
+
+/// The log's segments of each lane, by lane number, leaving out the spares.
+fn lanes(path: &Path) -> Vec<(u8, usize)> {
+    let mut lanes: Vec<(u8, usize)> = Vec::new();
+    for entry in std::fs::read_dir(wal(path)).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".spare") {
+            continue;
+        }
+        let Some(lane) = name.strip_prefix('L').and_then(|rest| rest.get(..2)?.parse().ok()) else {
+            continue;
+        };
+        match lanes.iter_mut().find(|(have, _)| *have == lane) {
+            Some((_, count)) => *count += 1,
+            None => lanes.push((lane, 1)),
+        }
+    }
+    lanes.sort_unstable();
+    lanes
+}
+
+#[test]
+fn log_lanes_is_a_setting_that_reads_back_and_refuses_what_it_is_not() {
+    let db = Database::new();
+    let read = |db: &Database| db.setting("log_lanes").expect("reads back");
+    assert_eq!(read(&db), "auto");
+    db.execute("SET log_lanes = 4").expect("sets");
+    assert_eq!(read(&db), "4");
+    for refused in ["0", "17", "'many'"] {
+        let error = db.execute(&format!("SET log_lanes = {refused}")).expect_err("refused");
+        assert!(error.to_string().contains("log_lanes is auto or a number"), "{error}");
+    }
+    db.execute("SET log_lanes = 'auto'").expect("sets");
+    assert_eq!(read(&db), "auto");
+    db.execute("SET log_lanes = 2").expect("sets");
+    db.execute("RESET log_lanes").expect("resets");
+    assert_eq!(read(&db), "auto");
+}
+
+/// With four lanes, connections write their commits to different ones, which sync apart, and a
+/// crash after they all returned loses none of them: replay puts the lanes back together in the
+/// order of the commits.
+#[test]
+fn commits_spread_over_lanes_all_survive_a_crash_in_the_order_they_committed() {
+    for visibility in ["durable", "committed"] {
+        let path = path(&format!("lanes-{visibility}"));
+        let db = open(&path);
+        db.execute("SET log_lanes = 4").expect("sets");
+        db.execute(&format!("SET visibility = '{visibility}'")).expect("sets");
+        db.execute("CREATE TABLE t (id INTEGER, name VARCHAR)").expect("creates");
+        db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, n BIGINT)").expect("creates");
+        db.execute("INSERT INTO t VALUES (0, 'zero')").expect("inserts");
+        db.execute("INSERT INTO c VALUES (1, 0)").expect("inserts");
+        let writers: Vec<_> = (0..8)
+            .map(|writer| {
+                let connection = db.connect();
+                std::thread::spawn(move || {
+                    for row in 0..60 {
+                        let id = 1 + writer * 60 + row;
+                        connection
+                            .execute(&format!("INSERT INTO t VALUES ({id}, 'row {id}')"))
+                            .expect("inserts");
+                        // One row every lane writes, so replay has to apply them in order.
+                        connection.execute("UPDATE c SET n = n + 1 WHERE id = 1").expect("adds");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("the writer finished");
+        }
+        let written = lanes(&path);
+        assert!(written.len() > 1, "{visibility}: the commits went to one lane: {written:?}");
+        crash(db);
+
+        let db = open(&path);
+        assert_eq!(
+            rows(&db, "SELECT count(*), count(DISTINCT id), sum(id) FROM t"),
+            vec![vec![Value::BigInt(481), Value::BigInt(481), Value::HugeInt(115_440)]],
+            "{visibility}"
+        );
+        assert_eq!(rows(&db, "SELECT n FROM c"), vec![vec![Value::BigInt(480)]], "{visibility}");
+        db.close().expect("closes");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(wal(&path));
+    }
+}
+
+/// A lane whose segments a crash took leaves a gap in the commits, and every commit after the gap
+/// depends on what was lost, so replay stops there even where the other lane still has them. The
+/// next commit checkpoints, so what was left out is never read again.
+#[test]
+fn a_lost_lane_stops_replay_at_the_first_commit_it_held() {
+    let path = path("lost-lane");
+    let db = open(&path);
+    db.execute("SET log_lanes = 2").expect("sets");
+    db.execute("CREATE TABLE t (id INTEGER)").expect("creates");
+    db.execute("INSERT INTO t VALUES (0)").expect("inserts");
+    // The first connection and the next one write to lanes 0 and 1, by turns.
+    let other = db.connect();
+    for id in 1..=6 {
+        let sql = format!("INSERT INTO t VALUES ({id})");
+        let done = if id % 2 == 1 { db.execute(&sql) } else { other.execute(&sql) };
+        done.expect("inserts");
+    }
+    drop(other);
+    let written: Vec<u8> = lanes(&path).into_iter().map(|(lane, _)| lane).collect();
+    assert_eq!(written, [0, 1]);
+    crash(db);
+    for entry in std::fs::read_dir(wal(&path)).expect("the log is there").flatten() {
+        if entry.file_name().to_string_lossy().starts_with("L01-") {
+            std::fs::remove_file(entry.path()).expect("removes");
+        }
+    }
+
+    let db = open(&path);
+    let ids = "SELECT id FROM t ORDER BY id";
+    assert_eq!(rows(&db, ids), vec![vec![Value::Integer(0)], vec![Value::Integer(1)]]);
+    db.execute("INSERT INTO t VALUES (7)").expect("inserts");
+    db.execute("INSERT INTO t VALUES (8)").expect("inserts");
+    crash(db);
+
+    let db = open(&path);
+    let got = rows(&db, ids).into_iter().map(|row| row[0].clone()).collect::<Vec<_>>();
+    assert_eq!(got, [0, 1, 7, 8].map(Value::Integer).to_vec(), "commits 3 and 5 stay lost");
+    db.close().expect("closes");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(wal(&path));
+}
