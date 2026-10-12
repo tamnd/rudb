@@ -4884,11 +4884,11 @@ impl Shared {
     /// Rolls back what the open transaction did and lets go of its snapshot, leaving it open as
     /// `BEGIN` left it, for its first statement to run again.
     fn give_up_snapshot(&self) -> Result<()> {
-        let taken =
-            self.open().as_mut().and_then(|open| Some((open.snapshot.take()?, open.serializable)));
+        let taken = self.open().as_mut().and_then(|open| open.snapshot.take());
         match taken {
-            Some((snapshot, serializable)) => {
-                let closed = Open { snapshot: Some(snapshot), ..Open::new(false, false) };
+            Some(snapshot) => {
+                let serializable = self.conn.reads.noting();
+                let closed = Open { snapshot: Some(snapshot), ..Open::new(false) };
                 let closed = self.close_transaction(closed, false);
                 // Closing let go of what it read, and the statement reads it all again.
                 self.conn.reads.begin(serializable);
@@ -5182,19 +5182,16 @@ impl Shared {
     ///
     /// Inside a transaction it reads the transaction's own catalog, taking the snapshot if the
     /// transaction has not yet, so it sees what the transaction wrote and nothing committed since,
-    /// as the plan does there. A read claims no row, so there is nothing else to note, and an
-    /// aborted transaction never gets here, see [`Shared::in_transaction`]. A read takes the
-    /// catalog's read lock and nothing else, as [`Shared::query`] does.
+    /// as the plan does there. A read claims no row, so there is nothing else to note but the key
+    /// a serializable transaction read, and an aborted transaction never gets here, see
+    /// [`Shared::in_transaction`]. A read takes the catalog's read lock and nothing else, as
+    /// [`Shared::query`] does.
     pub(crate) fn lookup(
         &self,
         lookup: &crate::prepared::Lookup,
         given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
-        // A serializable transaction notes what it reads from the plan.
-        if self.conn.reads.noting() {
-            return None;
-        }
         let values =
             lookup.equal.iter().map(|(_, item)| given.value(item)).collect::<Option<Vec<_>>>()?;
         let catalog = self.read();
@@ -5232,6 +5229,9 @@ impl Shared {
             // reads it.
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
+        if !unanswered {
+            self.conn.reads.note_key(table, &target.key, &values);
+        }
         (!unanswered).then_some(result)
     }
 
@@ -5244,9 +5244,6 @@ impl Shared {
         given: crate::prepared::Given<'_>,
         sql: &str,
     ) -> Option<Result<QueryResult>> {
-        if self.conn.reads.noting() {
-            return None;
-        }
         let [(_, bound)] = range.lookup.equal.as_slice() else { return None };
         let bound = given.value(bound)?;
         let limit = rows_given(&range.limit, given)?;
@@ -5284,6 +5281,10 @@ impl Shared {
             .with_origins(&target.origins);
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
+        // A serializable transaction takes a short range for a read of the whole table.
+        if !unanswered {
+            self.conn.reads.note_table(table.oid());
+        }
         (!unanswered).then_some(result)
     }
 
@@ -5347,6 +5348,11 @@ impl Shared {
             );
             Ok(if target.zoned { result.in_session(self.session()) } else { result })
         });
+        // A serializable transaction takes a read over the front of a key for a read of the whole
+        // table, as it does a short range.
+        if !unanswered {
+            self.conn.reads.note_table(table.oid());
+        }
         (!unanswered).then_some(result)
     }
 
@@ -5362,12 +5368,9 @@ impl Shared {
         // only. Nothing does in one that is aborted.
         let refused = match self.open().as_ref() {
             Some(open) => match shape {
-                Shape::Lookup(_) | Shape::Range(_) | Shape::Front(_) => {
-                    open.aborted || open.serializable
-                }
-                Shape::Insert(_) => open.aborted || open.read_only,
-                Shape::Write(_) | Shape::Upsert(_) => {
-                    open.aborted || open.read_only || open.serializable
+                Shape::Lookup(_) | Shape::Range(_) | Shape::Front(_) => open.aborted,
+                Shape::Insert(_) | Shape::Write(_) | Shape::Upsert(_) => {
+                    open.aborted || open.read_only
                 }
             },
             None => false,
@@ -5482,7 +5485,7 @@ impl Shared {
         }
         // An aborted or read only transaction is refused by the plan, in its words.
         let transacting = match self.open().as_ref() {
-            Some(open) if open.aborted || open.read_only || open.serializable => return None,
+            Some(open) if open.aborted || open.read_only => return None,
             open => open.is_some(),
         };
         let writing = (!transacting).then(|| self.writing());
@@ -5497,7 +5500,9 @@ impl Shared {
         }
         let values: Vec<Value> = key.iter().map(|&at| row[at].clone()).collect();
         let all: Vec<usize> = (0..fields.len()).collect();
-        let Some((spot, held)) = table.spot(&key, &values, &all).ok()?? else {
+        let spotted = table.spot(&key, &values, &all).ok()??;
+        self.conn.reads.note_key(table, &key, &values);
+        let Some((spot, held)) = spotted else {
             // Nobody holds the key, so the row goes in.
             let staged = self.journals(&name).then(|| vec![row.clone()]);
             if transacting {
@@ -5669,7 +5674,7 @@ impl Shared {
             .collect::<Option<Vec<_>>>()?;
         // An aborted or read only transaction is refused by the plan, in its words.
         let transacting = match self.open().as_ref() {
-            Some(open) if open.aborted || open.read_only || open.serializable => return None,
+            Some(open) if open.aborted || open.read_only => return None,
             open => open.is_some(),
         };
         let writing = (!transacting).then(|| self.writing());
@@ -5688,7 +5693,9 @@ impl Shared {
         if !writes_in_place(&catalog, &target) || !keys_fit(table, &target.key, &keys) {
             return None;
         }
-        let Some((spot, row)) = table.spot(&target.key, &keys, &target.columns).ok()?? else {
+        let spotted = table.spot(&target.key, &keys, &target.columns).ok()??;
+        self.conn.reads.note_key(table, &target.key, &keys);
+        let Some((spot, row)) = spotted else {
             // No row holds the key, so nothing changes and there is nothing to commit.
             drop(catalog);
             drop(writing);
@@ -5803,7 +5810,7 @@ impl Shared {
             .map(|(_, item)| given.value(item))
             .collect::<Option<Vec<_>>>()?;
         let transacting = match self.open().as_ref() {
-            Some(open) if open.aborted || open.read_only || open.serializable => return None,
+            Some(open) if open.aborted || open.read_only => return None,
             open => open.is_some(),
         };
         let writing = (!transacting).then(|| self.writing());
@@ -5821,7 +5828,9 @@ impl Shared {
             return None;
         }
         let table = catalog.table(name).ok()?;
-        let Some((spot, _)) = table.spot(&target.key, &keys, &target.key).ok()?? else {
+        let spotted = table.spot(&target.key, &keys, &target.key).ok()??;
+        self.conn.reads.note_key(table, &target.key, &keys);
+        let Some((spot, _)) = spotted else {
             drop(catalog);
             drop(writing);
             return Some(kept(sql, 0, |_| QueryResult::changed(0)));
@@ -6017,7 +6026,7 @@ impl Shared {
                         "cannot start a transaction within a transaction",
                     ));
                 }
-                *open = Some(Open::new(read_only, serializable));
+                *open = Some(Open::new(read_only));
                 // The transaction begins when the client sent the statement, as in PostgreSQL.
                 let received = self.conn.received.load(Ordering::Acquire);
                 let begun = if received == 0 { rudb_bind::micros_now() } else { received };
@@ -6060,6 +6069,8 @@ impl Shared {
         self.conn.private.store(false, Ordering::Release);
         let mut committed = self.committed();
         let wrote = snapshot.written.keys().copied().collect::<Vec<_>>();
+        // A transaction that changed nothing is serializable at its snapshot, see `crate::serial`.
+        let reads = reads.filter(|_| mine.generation() != snapshot.base.generation());
         let merged = if commit {
             let workers = self.inner.pool.threads();
             let blend = self.registry().blends(snapshot.id);
@@ -7510,7 +7521,7 @@ impl Shared {
     fn atomically(&self, run: impl FnOnce() -> Result<QueryResult>) -> Result<QueryResult> {
         let own = !self.transacting();
         if own {
-            *self.open() = Some(Open::new(false, false));
+            *self.open() = Some(Open::new(false));
         }
         let result = run();
         if !own {
@@ -7711,7 +7722,7 @@ impl Shared {
         if self.implicit_statement(ast) {
             // A transaction of its own, so the rows are found and changed on a copy of the
             // catalog without the writer lock, and only the commit waits for it.
-            *self.open() = Some(Open::new(false, false));
+            *self.open() = Some(Open::new(false));
             let result = kept(sql, parse_ns, |noted| {
                 self.execute_mirrored(ast, sql, parameters, cancel, parse_ns, true, noted)
             });
