@@ -119,6 +119,7 @@ pub fn seal(reader: &Reader, columns: &[usize]) -> Result<Option<Vec<u8>>> {
                 }
             } else {
                 let column = chunk.column(0)?;
+                // row at a time: the fallback for a part `int_block` cannot read as a block.
                 for row in 0..chunk.len() {
                     let key = match column.value_at(row) {
                         Value::Integer(key) => i64::from(key),
@@ -150,6 +151,8 @@ pub fn seal(reader: &Reader, columns: &[usize]) -> Result<Option<Vec<u8>>> {
                     continue;
                 }
                 values.clear();
+                // row at a time: a key of several columns or of text is normalized from the values
+                // of its row, once a checkpoint.
                 for column in 0..columns.len() {
                     let value = chunk.column(column)?.value_at(row);
                     if value.is_null() {
