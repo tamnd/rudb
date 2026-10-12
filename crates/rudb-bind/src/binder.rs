@@ -3771,9 +3771,11 @@ impl<'a> Binder<'a> {
     fn bind_one_source(&mut self, ast: &Ast, source: ast::SourceRef) -> Result<(NodeRef, Scope)> {
         match ast.source(source) {
             // An error about the table points at its name, as it does in both dialects.
-            ast::Source::Table { name, alias, columns } => self
-                .bind_table(ast, name, alias, columns)
-                .map_err(|error| error.with_fallback_span(ast.source_span(source))),
+            ast::Source::Table { name, alias, columns } => {
+                let future = ast.names_future_definition(source);
+                self.bind_table(ast, name, alias, columns, future)
+                    .map_err(|error| error.with_fallback_span(ast.source_span(source)))
+            }
             ast::Source::Function { name, args, alias, columns, pragma } => {
                 let ordinality = ast.with_ordinality(source);
                 if let Some(call) = self.value_call(ast, source, name) {
@@ -4057,12 +4059,15 @@ impl<'a> Binder<'a> {
         Ok((node, scope))
     }
 
+    /// A table, or what else the name means. `future` is true for a name of a `WITH` definition
+    /// that the place cannot read, see [`ast::Ast::future_sources`].
     fn bind_table(
         &mut self,
         ast: &Ast,
         name: ast::Slice,
         alias: ast::StrRef,
         columns: ast::Slice,
+        future: bool,
     ) -> Result<(NodeRef, Scope)> {
         let parts: Vec<&str> = ast.name(name).collect();
         // The source of a pivot, read by the query written for the pivot.
@@ -4090,7 +4095,17 @@ impl<'a> Binder<'a> {
         let resolved = match catalog.resolve(&parts) {
             Ok(resolved) => resolved,
             Err(missing) => {
-                let missing = missing_relation(missing, &parts);
+                let mut missing = missing_relation(missing, &parts);
+                if future {
+                    let detail = format!(
+                        "There is a WITH item named \"{}\", but it cannot be referenced from this \
+                         part of the query.",
+                        parts.join(".")
+                    );
+                    missing = missing
+                        .detail(detail)
+                        .hint("Use WITH RECURSIVE, or re-order the WITH items to remove forward references.");
+                }
                 return self.bind_replacement_scan(ast, &parts, alias, columns, missing);
             }
         };
@@ -4386,7 +4401,7 @@ impl<'a> Binder<'a> {
                 // takes none, and `pragma_database_list()` with parentheses is a missing function
                 // on the pin too.
                 if args.is_empty() && self.catalog.resolve(&parts).is_ok() {
-                    return self.bind_table(ast, name, alias, columns);
+                    return self.bind_table(ast, name, alias, columns, false);
                 }
                 let spelled = function_name.strip_prefix("pragma_").unwrap_or(function_name);
                 return Err(Error::catalog(format!(

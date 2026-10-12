@@ -13,6 +13,7 @@
 //! not build yet is [`Refused::NotYet`], with the name of the node, and the caller uses the DuckDB
 //! transform for that statement until it does.
 
+mod depend;
 mod expr;
 mod index;
 mod query;
@@ -190,6 +191,10 @@ struct Transform<'a> {
     windows: Vec<(String, WindowRef, bool)>,
     /// The `WITH` definitions in scope, innermost last.
     scope: Vec<Definition>,
+    /// The names of the definitions of each `WITH` without `RECURSIVE` that the query being read
+    /// cannot read yet, the one being read and those after it, as `p_future_ctes` of PostgreSQL
+    /// holds them. The last definition of a `WITH` comes first, so the one being read is last.
+    future: Vec<String>,
     /// How many queries deep the query being transformed is, counting itself.
     depth: usize,
     /// The slots of the recursive definitions whose own query is being transformed, each with the
@@ -213,6 +218,7 @@ impl<'a> Transform<'a> {
             span: Span::new(0, 0),
             windows: Vec::new(),
             scope: Vec::new(),
+            future: Vec::new(),
             depth: 0,
             recursing: Vec::new(),
             self_reads: Vec::new(),

@@ -8297,3 +8297,56 @@ fn a_write_into_a_missing_table_is_a_missing_relation_at_its_name() {
     }
     server.stop().unwrap();
 }
+
+/// The definitions of a `WITH RECURSIVE` are read in the order of what they read, so one can read
+/// a definition after it, and two that read each other are refused. A definition of a `WITH`
+/// without `RECURSIVE` that reads one after it gets the detail and the hint of PostgreSQL 19.
+#[test]
+fn a_recursive_with_reads_its_definitions_in_the_order_of_what_they_read() {
+    let dirs = Dirs::new("pgwithorder");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let sql = "with recursive x(id) as (select * from y union all select id + 1 from x \
+               where id < 3), y(id) as (values (1)) select string_agg(id::text, ' ') from x";
+    assert_eq!(scalar(&mut client, sql), "1 2 3");
+    let sql = "with recursive a as (with b as (select 2) select * from b), \
+               b as (select * from a) select * from b";
+    assert_eq!(scalar(&mut client, sql), "2");
+    for (sql, code, message, place) in [
+        (
+            "with recursive a as (select * from b), b as (select * from a) select 1",
+            "0A000",
+            "mutual recursion between WITH items is not implemented",
+            "16",
+        ),
+        (
+            "with x as (select 1), y as (select 2), y as (select 3), x as (select 4) select 1",
+            "42712",
+            "WITH query name \"x\" specified more than once",
+            "57",
+        ),
+        (
+            "with t1 as (select * from t2), t2 as (select 1 as a) select * from t1",
+            "42P01",
+            "relation \"t2\" does not exist",
+            "27",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), Some(place), "{sql}");
+        if code == "42P01" {
+            let detail = "There is a WITH item named \"t2\", but it cannot be referenced from \
+                          this part of the query.";
+            assert_eq!(error.field(b'D').as_deref(), Some(detail));
+            let hint =
+                "Use WITH RECURSIVE, or re-order the WITH items to remove forward references.";
+            assert_eq!(error.field(b'H').as_deref(), Some(hint));
+        }
+    }
+    server.stop().unwrap();
+}
