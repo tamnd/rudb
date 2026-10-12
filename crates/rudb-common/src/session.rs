@@ -231,6 +231,7 @@ pub struct Semantics {
     window_order: WindowOrder,
     sorted_targets: SortedTargets,
     skipped_rows: SkippedRows,
+    frame_offsets: FrameOffsets,
     empty_targets: EmptyTargets,
     unread_queries: UnreadQueries,
     row_comparisons: RowComparisons,
@@ -294,6 +295,7 @@ impl Default for Semantics {
             window_order: WindowOrder::Pin,
             sorted_targets: SortedTargets::Pin,
             skipped_rows: SkippedRows::Pin,
+            frame_offsets: FrameOffsets::Pin,
             empty_targets: EmptyTargets::Pin,
             unread_queries: UnreadQueries::Pin,
             row_comparisons: RowComparisons::Pin,
@@ -510,6 +512,11 @@ impl Semantics {
     #[must_use]
     pub fn skipped_rows(self) -> SkippedRows {
         self.skipped_rows
+    }
+    /// How a window frame reads the offset of a `PRECEDING` or a `FOLLOWING`.
+    #[must_use]
+    pub fn frame_offsets(self) -> FrameOffsets {
+        self.frame_offsets
     }
     /// Whether a `SELECT` can have no targets.
     #[must_use]
@@ -1115,6 +1122,21 @@ pub enum SkippedRows {
     Postgres,
 }
 
+/// How a window frame reads the offset of a `PRECEDING` or a `FOLLOWING`, as in `RANGE BETWEEN
+/// '1 day' PRECEDING AND CURRENT ROW`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameOffsets {
+    /// As on the pin: a `RANGE` offset is added to the sort key and subtracted from it with `+`
+    /// and `-`, so the offset needs a type that the two take, and a sum that overflows is an error.
+    #[default]
+    Pin,
+    /// As in PostgreSQL: the type of a `RANGE` offset comes from the in_range functions of the
+    /// type of the sort key, which `transformFrameOffset` chooses from, and the frame calls the
+    /// function, so a sum past the end of the type is past every row. A null offset and a
+    /// negative one are the errors of PostgreSQL.
+    Postgres,
+}
+
 /// Whether a `SELECT` can have no targets, as in `SELECT FROM t`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EmptyTargets {
@@ -1581,6 +1603,7 @@ impl Session {
             self.semantics.window_order = WindowOrder::Postgres;
             self.semantics.sorted_targets = SortedTargets::Postgres;
             self.semantics.skipped_rows = SkippedRows::Postgres;
+            self.semantics.frame_offsets = FrameOffsets::Postgres;
             self.semantics.empty_targets = EmptyTargets::Postgres;
             self.semantics.unread_queries = UnreadQueries::Postgres;
             self.semantics.row_comparisons = RowComparisons::Postgres;

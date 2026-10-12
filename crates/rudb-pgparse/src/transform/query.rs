@@ -794,7 +794,10 @@ impl Transform<'_> {
             spec.order = self.ast.order_slice(items);
         }
         self.frame(&mut spec, def)?;
-        Ok(self.ast.push_window(spec))
+        let window = self.ast.push_window(spec);
+        let span = self.at(def.location);
+        self.ast.window_spans.push((window, span));
+        Ok(window)
     }
 
     /// The frame of a window from the bits of `frameOptions`. The bits of the end are the bits of

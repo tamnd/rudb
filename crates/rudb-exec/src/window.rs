@@ -37,8 +37,8 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use rudb_common::{
-    Error, Field, FunctionRules, LogicalType, Memory, Reservation, Result, Session, SqlState,
-    TieOrder, Value,
+    Error, Field, FrameOffsets, FunctionRules, LogicalType, Memory, Reservation, Result, Session,
+    SqlState, TieOrder, Value,
 };
 use rudb_functions::resolve;
 use rudb_kernels::Accumulator;
@@ -330,6 +330,9 @@ pub(crate) struct Window {
     frame: WindowFrame,
     offsets: Offsets,
     ranged: Ranged,
+    /// How a `RANGE` distance is measured, from the session. PostgreSQL asks the `in_range`
+    /// function of the key's type, and `ranged` is then empty and not read.
+    measured: FrameOffsets,
     /// The input's types followed by one per call, which are the output's.
     types: Vec<LogicalType>,
     schema: Schema,
@@ -369,6 +372,9 @@ impl Window {
         &self.schema
     }
 
+    /// `measured` comes from the session and is known here because the pin resolves the arithmetic
+    /// of a `RANGE` distance when the operator is built, which PostgreSQL does not do at all.
+    ///
     /// # Errors
     ///
     /// If a key or an argument does not resolve against the input's schema, if an expression the
@@ -380,6 +386,7 @@ impl Window {
         input: &Schema,
         written: &Written,
         memory: &Memory,
+        measured: FrameOffsets,
     ) -> Result<(Self, Buffered)> {
         let Written { index, partition, order, frame, expressions } = *written;
         let order = plan.sort_key_list(order).to_vec();
@@ -460,7 +467,7 @@ impl Window {
 
         // Worked out here rather than per row, because the types are the plan's and do not change
         // between rows. A `RANGE` end with no distance is the peer group and needs none of this.
-        let ranged = if frame.unit == WindowUnit::Range {
+        let ranged = if frame.unit == WindowUnit::Range && measured == FrameOffsets::Pin {
             let key = order.first().map(|key| plan.expr_type(key.expr).clone());
             Ranged {
                 start: moved(plan, key.as_ref(), frame.start, &order)?,
@@ -484,6 +491,7 @@ impl Window {
             frame,
             offsets,
             ranged,
+            measured,
             types,
             schema,
             memory: memory.clone(),
@@ -919,6 +927,9 @@ impl Window {
             .sorting
             .get(self.partitions)
             .ok_or_else(|| Error::internal("a RANGE distance with no order key to measure from"))?;
+        if self.measured == FrameOffsets::Postgres {
+            return self.in_range(rows, peers, at, column, sort, after);
+        }
         let key = &rows[at].0[self.partitions];
         if key.is_null() {
             return Ok(if after {
@@ -999,6 +1010,83 @@ impl Window {
         Ok(low)
     }
 
+    /// One end of a `RANGE` frame as PostgreSQL finds it, which is by asking the `in_range` function
+    /// of the key's type about each row rather than by working out the place and looking for it.
+    ///
+    /// The difference shows at the edges of the type. `x + 10` on the largest `int4` overflows,
+    /// and `in_range` answers that every row is before that place instead. A NaN sorts after every
+    /// number and is past any finite place, and an infinite distance from an infinite key of the
+    /// same side covers every row. The start is the first row that `in_range` puts at or past the
+    /// place and the end is the first row after the last one it puts at or before it. The rows are
+    /// sorted by the key, so both are binary searches. The function is asked once about the current
+    /// row against itself before that, so a negative distance is refused even in a partition where
+    /// the search does not have to ask.
+    ///
+    /// The nulls sort together at one end and are not measured. A row with a null key has its peer
+    /// group as the frame, and for any other row the nulls are before the frame when they sort
+    /// first and after it when they sort last.
+    fn in_range(
+        &self,
+        rows: &[Windowed],
+        peers: &[usize],
+        at: usize,
+        column: Option<usize>,
+        sort: SortKey,
+        after: bool,
+    ) -> Result<usize> {
+        let column =
+            column.ok_or_else(|| Error::internal("a frame distance the window did not gather"))?;
+        let offset = &rows[at].0[column];
+        if offset.is_null() {
+            let end = if after { "ending" } else { "starting" };
+            return Err(Error::invalid_input(format!("frame {end} offset must not be null"))
+                .state(SqlState::NULL_VALUE_NOT_ALLOWED));
+        }
+        let key = &rows[at].0[self.partitions];
+        if key.is_null() {
+            return Ok(if after {
+                last_of(peers, peers[at]) + 1
+            } else {
+                first_of(peers, peers[at])
+            });
+        }
+        let written = if after { self.frame.end } else { self.frame.start };
+        let mut sub = matches!(written, WindowBound::Preceding(_));
+        let mut less = after;
+        if sort.descending {
+            sub = !sub;
+            less = !less;
+        }
+        rudb_kernels::in_range(key, key, offset, sub, less)?;
+        let mut failed = None;
+        let mut inside = |row: &Windowed| {
+            let here = &row.0[self.partitions];
+            if failed.is_some() {
+                return false;
+            }
+            match rudb_kernels::in_range(here, key, offset, sub, less) {
+                Ok(inside) => inside,
+                Err(error) => {
+                    failed = Some(error);
+                    false
+                }
+            }
+        };
+        let found = if after {
+            rows.partition_point(|row| {
+                if row.0[self.partitions].is_null() { sort.nulls_first } else { inside(row) }
+            })
+        } else {
+            rows.partition_point(|row| {
+                if row.0[self.partitions].is_null() { sort.nulls_first } else { !inside(row) }
+            })
+        };
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(found),
+        }
+    }
+
     /// One end of a frame that was written as a distance, as a row number.
     ///
     /// `back` says which way the distance runs and `after` says whether the answer is the end of
@@ -1015,7 +1103,7 @@ impl Window {
         back: bool,
         after: bool,
     ) -> Result<usize> {
-        let offset = self.distance_at(rows, at, column, back)?;
+        let offset = self.distance_at(rows, at, column, back, after)?;
         // A distance written as `1 PRECEDING` runs backwards and one written as `-1 PRECEDING` runs
         // forwards again, which upstream accepts rather than refusing. The frame it leaves usually
         // covers nothing, since a start after the end is an empty frame, and that is an answer of
@@ -1056,10 +1144,24 @@ impl Window {
         at: usize,
         column: Option<usize>,
         back: bool,
+        after: bool,
     ) -> Result<i64> {
         let column =
             column.ok_or_else(|| Error::internal("a frame distance the window did not gather"))?;
         let value = &rows[at].0[column];
+        // PostgreSQL names the end of the frame rather than the word, and refuses a count that runs
+        // backwards where the pin reads it as a frame that covers nothing.
+        if self.measured == FrameOffsets::Postgres {
+            let end = if after { "ending" } else { "starting" };
+            if value.is_null() {
+                return Err(Error::invalid_input(format!("frame {end} offset must not be null"))
+                    .state(SqlState::NULL_VALUE_NOT_ALLOWED));
+            }
+            if negative(value) {
+                return Err(Error::invalid_input(format!("frame {end} offset must not be negative"))
+                    .state(SqlState::INVALID_PRECEDING_OR_FOLLOWING_SIZE));
+            }
+        }
         let named = || {
             let unit = match self.frame.unit {
                 WindowUnit::Rows => "ROWS",

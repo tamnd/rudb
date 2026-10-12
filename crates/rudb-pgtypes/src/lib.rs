@@ -171,7 +171,7 @@ pub use numeric::{
 };
 pub use opclasses::{
     Amop, Opclass, OrderingOperator, binary_coercible, default_opclass, equality_for_ordering,
-    has_equality, has_ordering, ordering_operator,
+    has_equality, has_ordering, in_range_offsets, ordering_operator,
 };
 pub use operators::{Operator, hashable, operators, operators_of};
 pub use param::{

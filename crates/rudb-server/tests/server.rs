@@ -1342,6 +1342,87 @@ fn a_window_or_an_aggregate_where_postgres_refuses_one_has_its_error() {
     server.stop().unwrap();
 }
 
+/// A `RANGE` frame with an offset asks the `in_range` function of the key's type, so a sum past the
+/// type, an infinite offset and a NaN key give the frames that PostgreSQL gives. The offset takes
+/// the type that PostgreSQL chooses for it, and a frame that cannot have one, an offset that is null
+/// or negative and a window with the wrong number of keys are refused as PostgreSQL refuses them.
+#[test]
+fn a_range_frame_with_an_offset_is_the_frame_that_postgres_gives() {
+    let dirs = Dirs::new("pgrangeoffset");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, value) in [
+        (
+            "select string_agg(x || ':' || l, ',') from (select x, last_value(x) over (order by x range between current row and 2147450884 following) l from generate_series(2147483644, 2147483646) x) s",
+            "2147483644:2147483646,2147483645:2147483646,2147483646:2147483646",
+        ),
+        (
+            "select string_agg(id || ':' || f || ':' || l, ',') from (select id, first_value(id) over w f, last_value(id) over w l from (values (1,'-inf'::float8),(2,-2.1),(3,0),(4,'inf'),(5,'nan')) t(id,v) window w as (order by v range between 'inf' preceding and 'inf' preceding)) s",
+            "1:1:1,2:1:1,3:1:1,4:1:4,5:5:5",
+        ),
+        (
+            "select string_agg(id || ':' || f || ':' || l, ',') from (select id, first_value(id) over w f, last_value(id) over w l from (values (1,'-inf'::numeric),(2,-2.1),(3,0),(4,'inf'),(5,'nan')) t(id,v) window w as (order by v desc range between 1.1 preceding and 1.1 following)) s",
+            "5:5:5,4:4:4,3:3:3,2:2:2,1:1:1",
+        ),
+        (
+            "select string_agg(coalesce(d::text, 'null') || ':' || c, ',') from (select d, count(*) over (order by d desc nulls last range between '1 day' preceding and '36 hours' following) c from (select date '2020-01-01' + x d from generate_series(1,4) x union all select null) s) s",
+            "2020-01-05:2,2020-01-04:3,2020-01-03:3,2020-01-02:2,null:1",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    // The texts, the codes and the places are the ones that PostgreSQL 19 gives.
+    for (sql, code, message, place) in [
+        (
+            "select sum(x) over (order by x::numeric range between 1.1::float8 preceding and 1 following) from generate_series(1,3) x",
+            "0A000",
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type numeric and offset type double precision",
+            Some("55"),
+        ),
+        (
+            "select sum(x) over (order by x::text range between 1 preceding and 1 following) from generate_series(1,3) x",
+            "0A000",
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type text",
+            Some("52"),
+        ),
+        (
+            "select sum(x) over (order by x, x+1 range between 1 preceding and 1 following) from generate_series(1,3) x",
+            "42P20",
+            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+            Some("20"),
+        ),
+        (
+            "select sum(x) over (order by x range between -1 preceding and 1 following) from generate_series(1,3) x",
+            "22013",
+            "invalid preceding or following size in window function",
+            None,
+        ),
+        (
+            "select sum(x) over (order by x rows between -1 preceding and 1 following) from generate_series(1,3) x",
+            "22013",
+            "frame starting offset must not be negative",
+            None,
+        ),
+        (
+            "select sum(x) over (order by x range between 1 preceding and null following) from generate_series(1,3) x",
+            "22004",
+            "frame ending offset must not be null",
+            None,
+        ),
+    ] {
+        // An error from the executor comes after the row description and one from the binder before.
+        let messages = client.query(sql);
+        assert!(tags(&messages).ends_with("EZ"), "{sql}");
+        let error = &messages[messages.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), place, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 #[test]
 fn the_ordered_set_aggregates_of_postgres_give_its_values_and_its_errors() {
     let dirs = Dirs::new("orderedset");
