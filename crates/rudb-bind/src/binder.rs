@@ -522,7 +522,7 @@ pub(crate) struct Binder<'a> {
     pub(crate) lateral_scopes: Vec<usize>,
     /// The left neighbours of each closed FROM entry being bound, which a name in the entry does
     /// not reach. They are kept to say why a name that one of them has is not found.
-    pub(crate) closed_scopes: Vec<Scope>,
+    pub(crate) closed_scopes: Vec<(Scope, ast::Closed)>,
     pub(crate) correlations: Vec<Vec<ColumnBinding>>,
     /// The column a `COLUMNS` stands for while the expression it is in is bound for that column.
     pub(crate) star_entry: Option<crate::columns::Picked>,
@@ -3713,8 +3713,8 @@ impl<'a> Binder<'a> {
         source: ast::SourceRef,
         left: &Scope,
     ) -> Result<(NodeRef, Scope, Vec<ColumnBinding>)> {
-        if ast.closed(source) {
-            self.closed_scopes.push(left.clone());
+        if let Some(closed) = ast.closed(source) {
+            self.closed_scopes.push((left.clone(), closed));
             let bound = self.bind_source(ast, source);
             self.closed_scopes.pop();
             let (node, scope) = bound?;
