@@ -3163,6 +3163,13 @@ impl Vector {
         }
     }
 
+    /// Whether the values are strings read out of storage one at a time, see [`TextSource`], which
+    /// have no bytes in memory to hand over in one piece.
+    #[must_use]
+    pub fn is_stored_text(&self) -> bool {
+        matches!(self.body, Body::ExternalText { .. })
+    }
+
     /// How the value at `rank` compares against `wanted`. See [`TextSource::compare_rank`].
     pub fn compare_rank(&self, rank: usize, wanted: &[u8]) -> Result<Ordering> {
         match &self.body {

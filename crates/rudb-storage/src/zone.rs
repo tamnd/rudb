@@ -675,7 +675,7 @@ fn unpacked(vector: &Vector, packed: &Packed<'_>) -> Walked {
 /// for it, which is why [`stringy`] still picks whichever of the rows and the values is shorter.
 fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
     if strings(values) {
-        return stringy(vector, values);
+        return stringy(vector, Some(codes), values);
     }
     let Some(data) = values.data() else { return wider(values) };
     // A code pointing at a null is a row whose value this would have to invent, so the walk stops
@@ -754,7 +754,7 @@ fn coded(vector: &Vector, codes: &[u32], values: &Vector) -> Walked {
 /// thousand rows of one value cost one multiply.
 fn runs(vector: &Vector, stops: &[u32], values: &Vector) -> Walked {
     if strings(values) {
-        return stringy(vector, values);
+        return stringy(vector, None, values);
     }
     let Some(data) = values.data() else { return wider(values) };
     // A null inside a run belongs to one row and the run's value belongs to the rest, and this walks
@@ -813,16 +813,83 @@ fn runs(vector: &Vector, stops: &[u32], values: &Vector) -> Walked {
 /// of a column, so scanning it per chunk does the same work once per chunk. On `hits` at a million
 /// rows that is `SearchPhrase`, whose dictionary is far larger than a chunk: 90 milliseconds of the
 /// load went on that one column, against 10 for `URL`, which is plain and several times its size.
-fn stringy(vector: &Vector, values: &Vector) -> Walked {
-    if values.len() > vector.len() {
-        return Walked::ends(text(vector));
+///
+/// Where the rows are codes, see [`used`], they are read through the codes they use.
+fn stringy(vector: &Vector, codes: Option<&[u32]>, values: &Vector) -> Walked {
+    if values.len() <= vector.len() {
+        return wider(values);
     }
-    wider(values)
+    match codes.and_then(|codes| used(vector, codes, values)) {
+        Some(ends) => Walked::ends(ends),
+        None => Walked::ends(text(vector)),
+    }
+}
+
+/// The ends of a column of codes into strings, read off the codes the rows use rather than off
+/// every row.
+///
+/// A table sorted on its way into a file reaches the writer as codes into the dictionary of the
+/// table it was sorted out of, and that dictionary is in the file, not in memory. The rows then
+/// point all over it, and reading a row's string is a page of the file a row. With the order of
+/// the dictionary in hand an end is a rank and no string is read but the two ends. Without it the
+/// codes are sorted, so each one used is read once and the reads walk the dictionary in the order
+/// it is stored. `None` when a code is past the values, which the walk over the rows reports the
+/// usual way.
+fn used(vector: &Vector, codes: &[u32], values: &Vector) -> Option<(Option<Bound>, Option<Bound>)> {
+    let codes = codes.get(..vector.len())?;
+    let validity = vector.validity();
+    let nullable = validity.has_nulls(vector.len());
+    let mut held: Vec<u32> = codes
+        .iter()
+        .enumerate()
+        .filter(|&(row, _)| !nullable || validity.is_valid(row))
+        .map(|(_, &code)| code)
+        .collect();
+    if held.iter().any(|&code| code as usize >= values.len()) {
+        return None;
+    }
+    let bound =
+        |code: u32| values.bytes_at(code as usize).map(|bytes| Bound::Bytes(bytes.to_vec()));
+    let ranks = if values.validity().has_nulls(values.len()) {
+        None
+    } else {
+        values.code_ranks_for(held.len())
+    };
+    if let Some(ranks) = ranks {
+        let rank = |code: u32| ranks.get(code as usize).copied().unwrap_or(u32::MAX);
+        let low = held.iter().copied().min_by_key(|&code| rank(code));
+        let high = held.iter().copied().max_by_key(|&code| rank(code));
+        return Some((low.and_then(bound), high.and_then(bound)));
+    }
+    held.sort_unstable();
+    held.dedup();
+    let mut low: Option<&[u8]> = None;
+    let mut high: Option<&[u8]> = None;
+    for &code in &held {
+        let Some(bytes) = values.bytes_at(code as usize) else { continue };
+        if low.is_none_or(|end| bytes < end) {
+            low = Some(bytes);
+        }
+        if high.is_none_or(|end| bytes > end) {
+            high = Some(bytes);
+        }
+    }
+    Some((
+        low.map(|bytes| Bound::Bytes(bytes.to_vec())),
+        high.map(|bytes| Bound::Bytes(bytes.to_vec())),
+    ))
 }
 
 /// Whether a set of values is text, which is walked by [`text`] rather than gathered.
+///
+/// Strings read out of a file count, though they have neither form in memory. They used to fall
+/// through to [`wider`], which walked every value of the dictionary for every chunk: a part of
+/// `movie_info` sorted by movie went over all 2.7 million values of `info` to find its two ends,
+/// and that was most of loading JOB sorted by its keys.
 fn strings(values: &Vector) -> bool {
-    values.text_parts().is_some() || matches!(values.data(), Some(Data::Varlen(_)))
+    values.text_parts().is_some()
+        || matches!(values.data(), Some(Data::Varlen(_)))
+        || values.is_stored_text()
 }
 
 /// The bounds a column that points somewhere else falls back to, which are its values.
@@ -1068,6 +1135,9 @@ struct End {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use rudb_common::{LogicalType, Value};
     use rudb_vector::{Bitmap, Chunk, Validity, Vector};
 
@@ -1354,6 +1424,53 @@ mod tests {
         assert_eq!(range.high, Some(Bound::Bytes(b"grace".to_vec())), "not turing");
         let probes = vec![Probe { column: 0, op: Op::Equal, value: Bound::Bytes(b"ada".to_vec()) }];
         assert!(zone.skips(&probes));
+    }
+
+    /// Strings that stay in the file, the way a table sorted on its way in hands them to the writer,
+    /// with a count of how many were read.
+    #[derive(Debug)]
+    struct Filed {
+        values: Vec<Vec<u8>>,
+        reads: AtomicUsize,
+    }
+
+    impl rudb_vector::TextSource for Filed {
+        fn len(&self) -> usize {
+            self.values.len()
+        }
+
+        fn bytes_at(&self, index: usize) -> rudb_common::Result<Option<&[u8]>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.values.get(index).map(Vec::as_slice))
+        }
+
+        fn footprint(&self) -> usize {
+            self.values.iter().map(Vec::len).sum()
+        }
+    }
+
+    /// A chunk of codes into a dictionary that is still in the file reads the strings its codes
+    /// name, each once, and none of the rest. It used to read all of them for every chunk.
+    #[test]
+    fn a_dictionary_left_in_the_file_is_read_only_where_the_codes_point() {
+        let values: Vec<String> =
+            (0..1000).map(|at| format!("value-{:04}", (at * 7919) % 1000)).collect();
+        let source = Arc::new(Filed {
+            values: values.iter().map(|text| text.as_bytes().to_vec()).collect(),
+            reads: AtomicUsize::new(0),
+        });
+        let filed = Vector::external_text(LogicalType::Varchar, Arc::clone(&source) as Arc<_>)
+            .expect("a filed vector");
+        let codes = vec![5, 900, 5, 17, 900];
+        let vector = Vector::dictionary(codes.clone(), filed).expect("five rows of a thousand");
+        let zone = Zone::of(&Chunk::new(vec![vector]).expect("a chunk"));
+        let range = zone.column(0).expect("one column");
+        let mut held: Vec<&String> = codes.iter().map(|&code| &values[code as usize]).collect();
+        held.sort();
+        assert_eq!(range.low, Some(Bound::Bytes(held[0].as_bytes().to_vec())));
+        assert_eq!(range.high, Some(Bound::Bytes(held[4].as_bytes().to_vec())));
+        let reads = source.reads.load(Ordering::Relaxed);
+        assert!(reads <= 3, "three codes in use and {reads} strings read");
     }
 
     /// A dictionary holds values no row points at, so its own two ends are wider than the column.
