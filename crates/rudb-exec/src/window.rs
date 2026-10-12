@@ -1158,8 +1158,10 @@ impl Window {
                     .state(SqlState::NULL_VALUE_NOT_ALLOWED));
             }
             if negative(value) {
-                return Err(Error::invalid_input(format!("frame {end} offset must not be negative"))
-                    .state(SqlState::INVALID_PRECEDING_OR_FOLLOWING_SIZE));
+                return Err(Error::invalid_input(format!(
+                    "frame {end} offset must not be negative"
+                ))
+                .state(SqlState::INVALID_PRECEDING_OR_FOLLOWING_SIZE));
             }
         }
         let named = || {

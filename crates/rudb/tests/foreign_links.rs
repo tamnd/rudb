@@ -150,5 +150,8 @@ fn a_foreign_key_of_a_temporary_table_does_not_stop_a_checkpoint() {
     }
     db.execute("CHECKPOINT").expect("the checkpoint passes over the temporary tables");
     db.execute("VACUUM").expect("the vacuum passes over them too");
-    assert_eq!(rows(&db, "SELECT count(*) FROM child JOIN parent USING (id)"), [[Value::BigInt(1)]]);
+    assert_eq!(
+        rows(&db, "SELECT count(*) FROM child JOIN parent USING (id)"),
+        [[Value::BigInt(1)]]
+    );
 }

@@ -687,13 +687,17 @@ impl Located {
         let mut key = Vec::new();
         let mut normal = None;
         'read: {
+            // row at a time: a normalized key is the bytes of one row's values written one after
+            // another, and this runs once, the first time a range read asks.
             for part in 0..rows.chunk_count() {
                 let chunk = rows.read(part, &self.columns)?;
+                // row at a time: each row is written out as its key.
                 for row in 0..chunk.len() {
                     while taken.next_if_eq(&noted).is_some() {
                         noted += 1;
                     }
                     values.clear();
+                    // row at a time: the values of one row, for its key.
                     for column in 0..self.columns.len() {
                         values.push(chunk.column(column)?.value_at(row));
                     }
@@ -1011,6 +1015,8 @@ fn normalized(chunks: &[Chunk], columns: &[usize]) -> Result<Option<Vec<Box<[u8]
     let mut values = Vec::with_capacity(columns.len());
     let mut key = Vec::new();
     for chunk in chunks {
+        // row at a time: a normalized key is the bytes of one row's values written one after
+        // another.
         for row in 0..chunk.len() {
             values.clear();
             for &column in columns {

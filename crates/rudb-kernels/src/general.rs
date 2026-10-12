@@ -530,7 +530,8 @@ impl General {
     pub(crate) const fn takes_reals(&self, arguments: usize) -> bool {
         matches!(
             (self, arguments),
-            (Self::Paired(_) | Self::FloatPairs(_), 2) | (Self::Powers(_) | Self::FloatSpread(_), 1)
+            (Self::Paired(_) | Self::FloatPairs(_), 2)
+                | (Self::Powers(_) | Self::FloatSpread(_), 1)
         )
     }
 

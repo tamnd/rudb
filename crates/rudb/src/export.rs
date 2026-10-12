@@ -360,6 +360,8 @@ fn write_partitioned(
             let vector = chunk.column(column)?;
             keys.push(cast_in_time_zone(vector, &LogicalType::Varchar, false, Some(zone))?);
         }
+        // row at a time: a partition is named by the text of its row's key values, so each row
+        // builds its directory name and is looked up by it.
         for row in 0..chunk.len() {
             let mut directory = String::new();
             let mut texts = Vec::with_capacity(keys.len());
@@ -447,7 +449,7 @@ fn write_partitioned(
 /// Whether a directory holds a file at any depth.
 fn holds_files(directory: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else { return false };
-    entries.flatten().any(|entry| {
+    entries.filter_map(Result::ok).any(|entry| {
         entry.file_type().is_ok_and(|kind| !kind.is_dir()) || holds_files(&entry.path())
     })
 }
@@ -456,7 +458,7 @@ fn holds_files(directory: &Path) -> bool {
 /// `OVERWRITE` does.
 fn remove_files(directory: &Path) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(directory) else { return Ok(()) };
-    for entry in entries.flatten() {
+    for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             remove_files(&path)?;

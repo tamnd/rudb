@@ -7870,7 +7870,10 @@ fn an_aggregate_reads_a_string_literal_as_postgres() {
         assert!(tags.ends_with("EZ"), "{tags}");
         let error = &messages[tags.len() - 2];
         assert_eq!(error.field(b'C').as_deref(), Some("42725"), "{sql}");
-        assert_eq!(error.field(b'D').as_deref(), Some("Could not choose a best candidate function."));
+        assert_eq!(
+            error.field(b'D').as_deref(),
+            Some("Could not choose a best candidate function.")
+        );
     }
     server.stop().unwrap();
 }
