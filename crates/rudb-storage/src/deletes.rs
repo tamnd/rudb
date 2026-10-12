@@ -265,6 +265,9 @@ pub enum Refusal {
     /// Another transaction wrote the row first: it holds the row, or committed a change to it
     /// after this transaction's snapshot. First writer wins, so this one aborts.
     Conflict,
+    /// The row's hot stripe is being frozen and is no longer written in place. The caller moves
+    /// the row into the head, as for a frozen row.
+    Freezing,
 }
 
 /// The kind of write a statement made, which is what picks the text of its conflict.
@@ -423,6 +426,17 @@ impl DeleteVector {
             }
         }
         any
+    }
+
+    /// Sets the base to `slots`, sorted and distinct, which is how a freeze hands the frozen stripe
+    /// the slots that were holes or deleted in the hot one.
+    ///
+    /// # Panics
+    ///
+    /// If it has a base already.
+    pub fn set_base(&mut self, slots: &[u32]) {
+        assert_eq!(self.base, Base::Empty, "a delete vector gets its base once");
+        self.base = Base::of(slots);
     }
 
     /// Moves every delete committed at or before `horizon` into the base, which is what a

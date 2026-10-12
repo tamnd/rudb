@@ -23,16 +23,25 @@
 //! length and the first 4 bytes, then either the next 8 bytes inline, for strings up to 12 bytes,
 //! or the chunk and offset of the whole string in the stripe's [`Arena`]. An update writes a new
 //! view in place and the column never shifts.
+//!
+//! A stripe is frozen in steps, `10-freezing-and-checkpoint.md` section 10.3. It is sealed, so
+//! it leases no more slots, and then marked freezing. From then on a row of it is not written in
+//! place: an update is refused with [`Refusal::Freezing`] and the caller moves the row, and a
+//! delete goes into a delete vector the stripe keeps beside it, which the frozen stripe takes over
+//! as its own, so a transaction that deleted a row before the swap commits it after. An insert
+//! into a slot leased before the seal is refused too. Once no write of the stripe is in flight
+//! and the clock has passed every commit stamped on it, its rows as of the clock are final, and
+//! [`HotStripe::settled`] says which slots the frozen stripe starts out with deleted.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use rudb_common::Error;
 
 use crate::arena::{Arena, Place, Space};
-use crate::deletes::{PART_ROWS, PART_WORDS, Refusal, STRIPE_ROWS, UNCOMMITTED};
+use crate::deletes::{DeleteVector, PART_ROWS, PART_WORDS, Refusal, STRIPE_ROWS, UNCOMMITTED};
 use crate::park::{self, Wait};
 use crate::undo::{ABORTED, Image, Row, UndoBuffer, UndoKind, UndoRef, UndoSpace};
 
@@ -50,6 +59,25 @@ const ROWS: usize = PART_ROWS as usize;
 
 /// What `deleted` holds for a live row.
 const LIVE: u64 = u64::MAX;
+
+/// A stripe that takes inserts.
+const OPEN: u8 = 0;
+
+/// A stripe that leases no more slots, because it is full or was sealed early.
+const SEALED: u8 = 1;
+
+/// A stripe being frozen, whose rows are no longer written in place.
+const FREEZING: u8 = 2;
+
+/// A stripe a frozen one has replaced.
+const FROZEN: u8 = 3;
+
+/// Milliseconds since the first call, the clock a stripe's last commit is kept in.
+#[must_use]
+pub fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// The lock word's bit for a row a writer holds. The holder's id has the top bit set already.
 pub(crate) const HELD: u64 = 1 << 63;
@@ -239,6 +267,14 @@ pub struct HotStripe {
     undo: Parts<AtomicU32>,
     arena: Arena,
     undos: Arc<UndoSpace>,
+    /// [`OPEN`], [`SEALED`], [`FREEZING`] or [`FROZEN`].
+    state: AtomicU8,
+    /// The newest commit timestamp stamped on a row of it.
+    changed: AtomicU64,
+    /// When a row of it last committed, in [`now_ms`].
+    touched: AtomicU64,
+    /// The deletes since its freeze began, which the frozen stripe keeps as its own.
+    pending: OnceLock<Arc<Mutex<DeleteVector>>>,
 }
 
 impl HotStripe {
@@ -271,6 +307,10 @@ impl HotStripe {
             undo: Parts::new(ROWS),
             arena: Arena::new(),
             undos,
+            state: AtomicU8::new(OPEN),
+            changed: AtomicU64::new(0),
+            touched: AtomicU64::new(now_ms()),
+            pending: OnceLock::new(),
         }
     }
 
@@ -300,15 +340,39 @@ impl HotStripe {
         self.reserved.load(Ordering::Acquire).min(STRIPE_ROWS)
     }
 
-    /// Whether every slot is handed out, which seals the stripe against inserts.
+    /// Whether every slot is handed out or it was sealed early, either of which closes it to
+    /// inserts.
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.reserved.load(Ordering::Relaxed) >= STRIPE_ROWS
+            || self.state.load(Ordering::Relaxed) != OPEN
+    }
+
+    /// Closes it to inserts before it is full, which is how the freezer takes the open stripe when
+    /// the hot set is over its limit, and says whether it was open. The table's next insert makes
+    /// a new stripe, and the slots past the ones handed out are never used.
+    pub fn seal(&self) -> bool {
+        self.state.compare_exchange(OPEN, SEALED, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    /// Whether a freeze of it began.
+    #[must_use]
+    pub fn is_freezing(&self) -> bool {
+        self.state.load(Ordering::SeqCst) >= FREEZING
+    }
+
+    /// When a row of it last committed, in [`now_ms`].
+    #[must_use]
+    pub fn touched(&self) -> u64 {
+        self.touched.load(Ordering::Relaxed)
     }
 
     /// Hands out up to `want` consecutive slots, with every part they touch allocated, or `None`
-    /// once the stripe is full.
+    /// once the stripe is full or sealed.
     pub fn lease(&self, want: u32) -> Option<Range<u32>> {
+        if self.state.load(Ordering::Relaxed) != OPEN {
+            return None;
+        }
         let first = self.reserved.fetch_add(want, Ordering::AcqRel);
         if first >= STRIPE_ROWS {
             return None;
@@ -446,14 +510,25 @@ impl HotStripe {
     /// written before this, and the release here is what makes a reader that sees the stamp see
     /// them too.
     ///
+    /// False when a freeze of the stripe began first. The rows are holes then, and the caller
+    /// writes them again into the table's open stripe.
+    ///
     /// # Panics
     ///
     /// If a slot was never leased.
-    pub fn insert(&self, slots: Range<u32>, txn: u64) {
-        for slot in slots {
+    pub fn insert(&self, slots: Range<u32>, txn: u64) -> bool {
+        for slot in slots.clone() {
             let (part, at) = place(slot);
             cells(self.created.get(part))[at].store(txn | UNCOMMITTED, Ordering::Release);
         }
+        // Against the store in `begin_freeze`: either the freeze finds these stamps and waits for
+        // them, or this finds the freeze and takes them back.
+        fence(Ordering::SeqCst);
+        if self.state.load(Ordering::SeqCst) < FREEZING {
+            return true;
+        }
+        self.restamp(&self.created, slots, txn | UNCOMMITTED, 0);
+        false
     }
 
     /// Stamps the inserts `txn` made at `slots` with its commit timestamp `ts`.
@@ -463,6 +538,7 @@ impl HotStripe {
     /// If a slot was never leased.
     pub fn commit_insert(&self, slots: Range<u32>, txn: u64, ts: u64) {
         self.restamp(&self.created, slots, txn | UNCOMMITTED, ts);
+        self.stamped(ts);
     }
 
     /// Takes back the inserts `txn` made at `slots`. They become holes, which no snapshot sees.
@@ -485,7 +561,8 @@ impl HotStripe {
     /// [`Refusal::Gone`] when `txn` does not see the row, and [`Refusal::Conflict`] when another
     /// transaction holds it or changed it after `snapshot`. Both leave the row as it was. A row
     /// another transaction holds is waited for as `wait` allows, and a wait that runs out is a
-    /// conflict too.
+    /// conflict too. [`Refusal::Freezing`] once a freeze of the stripe began, and the caller
+    /// moves the row instead.
     ///
     /// # Panics
     ///
@@ -521,6 +598,9 @@ impl HotStripe {
     /// `txn` can tell or was already deleted, and [`Refusal::Conflict`] when another transaction
     /// holds it or changed it after `snapshot`, after waiting for it as `wait` allows.
     ///
+    /// Once a freeze of the stripe began the delete goes into the delete vector the frozen
+    /// stripe will keep instead, with the same answers.
+    ///
     /// # Panics
     ///
     /// If the slot is past the end of the stripe or the undo space is used up.
@@ -533,7 +613,10 @@ impl HotStripe {
         buffer: &mut UndoBuffer,
     ) -> Result<(), Refusal> {
         let me = txn | UNCOMMITTED;
-        self.claim(slot, snapshot, me, wait)?;
+        match self.claim(slot, snapshot, me, wait) {
+            Err(Refusal::Freezing) => return self.delete_pending(slot, snapshot, txn),
+            claimed => claimed?,
+        }
         let (part, at) = place(slot);
         let deleted = &self.deleted.get_or(part, || AtomicU64::new(LIVE))[at];
         self.push_undo(slot, UndoKind::Delete, me, &[], buffer);
@@ -545,9 +628,13 @@ impl HotStripe {
     /// go. A row `txn` does not hold is left alone.
     pub fn commit_write(&self, slot: u32, txn: u64, ts: u64) {
         let me = txn | UNCOMMITTED;
+        if let Some(pending) = self.pending.get() {
+            lock(pending).commit(txn, ts);
+        }
         if !self.holds(slot, me) {
             return;
         }
+        self.stamped(ts);
         let (part, at) = place(slot);
         self.walk_own(slot, me, |record| record.stamp(ts));
         if let Some(deleted) = self.deleted.get(part) {
@@ -566,6 +653,9 @@ impl HotStripe {
     /// If a column an undo record names does not exist, which it always does.
     pub fn abort_write(&self, slot: u32, txn: u64) {
         let me = txn | UNCOMMITTED;
+        if let Some(pending) = self.pending.get() {
+            lock(pending).abort(txn);
+        }
         if !self.holds(slot, me) {
             return;
         }
@@ -665,13 +755,18 @@ impl HotStripe {
                 return if deleted == Some(me) { Err(Refusal::Gone) } else { Ok(()) };
             }
             let held = me | (word & (WAITERS | DELTA));
-            match lock.compare_exchange_weak(word, held, Ordering::AcqRel, Ordering::Acquire) {
+            match lock.compare_exchange_weak(word, held, Ordering::SeqCst, Ordering::Acquire) {
                 Ok(_) => break,
                 Err(now) => word = now,
             }
         }
+        // Against `settled`, which marks the freeze and then reads the lock words: either it
+        // finds this row held and waits, or this finds the freeze and lets the row go.
+        fence(Ordering::SeqCst);
         let deleted = self.deleted.get(part).map_or(LIVE, |part| part[at].load(Ordering::Acquire));
-        let refusal = if deleted != LIVE {
+        let refusal = if self.state.load(Ordering::SeqCst) >= FREEZING {
+            Some(Refusal::Freezing)
+        } else if deleted != LIVE {
             Some(if deleted <= snapshot { Refusal::Gone } else { Refusal::Conflict })
         } else if self.newest_change(slot) > snapshot {
             Some(Refusal::Conflict)
@@ -684,6 +779,98 @@ impl HotStripe {
                 Err(refusal)
             }
             None => Ok(()),
+        }
+    }
+
+    /// [`Self::delete`] once a freeze began: the checks a claim makes, without taking the row, and
+    /// then an entry in the delete vector the frozen stripe keeps, which is the row's lock from
+    /// here on.
+    pub(crate) fn delete_pending(&self, slot: u32, snapshot: u64, txn: u64) -> Result<(), Refusal> {
+        let me = txn | UNCOMMITTED;
+        let (part, at) = place(slot);
+        let created = self.created.get(part).map_or(0, |part| part[at].load(Ordering::Acquire));
+        if created.wrapping_sub(1) >= snapshot && created != me {
+            return Err(Refusal::Gone);
+        }
+        let word = self.lock.get(part).map_or(0, |lock| lock[at].load(Ordering::SeqCst));
+        let mine = word & HELD != 0 && word & !(WAITERS | DELTA) == me;
+        if word & HELD != 0 && !mine {
+            return Err(Refusal::Conflict);
+        }
+        let deleted = self.deleted.get(part).map_or(LIVE, |part| part[at].load(Ordering::Acquire));
+        if deleted == me || (deleted != LIVE && deleted <= snapshot) {
+            return Err(Refusal::Gone);
+        }
+        if deleted != LIVE || (!mine && self.newest_change(slot) > snapshot) {
+            return Err(Refusal::Conflict);
+        }
+        lock(self.pending()).delete(slot, snapshot, txn)
+    }
+
+    /// The delete vector the frozen stripe keeps, made when the freeze begins.
+    pub(crate) fn pending(&self) -> &Arc<Mutex<DeleteVector>> {
+        self.pending.get_or_init(Arc::default)
+    }
+
+    /// Begins a freeze, `10-freezing-and-checkpoint.md` section 10.3 step 1: the stripe is sealed
+    /// and its rows are no longer written in place. False when a freeze already began.
+    pub fn begin_freeze(&self) -> bool {
+        self.pending();
+        self.state.fetch_max(FREEZING, Ordering::SeqCst) < FREEZING
+    }
+
+    /// Marks it replaced by the frozen stripe.
+    pub(crate) fn frozen(&self) {
+        self.state.store(FROZEN, Ordering::SeqCst);
+    }
+
+    /// Steps 2 and 3 of a freeze that [`Self::begin_freeze`] began: once no row of it is held,
+    /// no insert into it is uncommitted, and `clock` is at or past every commit stamped on it,
+    /// the clock F as of which its rows are final, the slots it hands to the frozen stripe, and
+    /// the ones among them that are holes or deleted at F, sorted. `None` while a write is in
+    /// flight.
+    ///
+    /// # Panics
+    ///
+    /// If no freeze began.
+    #[must_use]
+    pub fn settled(&self, clock: &AtomicU64) -> Option<(u64, u32, Vec<u32>)> {
+        assert!(self.is_freezing(), "a freeze began");
+        let rows = self.reserved();
+        let mut gone = Vec::new();
+        for slot in 0..rows {
+            let (part, at) = place(slot);
+            if let Some(lock) = self.lock.get(part)
+                && lock[at].load(Ordering::SeqCst) & (HELD | DELTA) != 0
+            {
+                return None;
+            }
+            let created = self.created.get(part).map_or(0, |part| part[at].load(Ordering::SeqCst));
+            if created & UNCOMMITTED != 0 {
+                return None;
+            }
+            let deleted =
+                self.deleted.get(part).map_or(LIVE, |part| part[at].load(Ordering::Acquire));
+            if created == 0 || deleted != LIVE {
+                gone.push(slot);
+            }
+        }
+        let at = clock.load(Ordering::SeqCst);
+        (at >= self.changed.load(Ordering::SeqCst)).then_some((at, rows, gone))
+    }
+
+    /// Sets when a row of it last committed, for a test of the freezer's choice.
+    #[cfg(test)]
+    pub(crate) fn touch(&self, ms: u64) {
+        self.touched.store(ms, Ordering::Relaxed);
+    }
+
+    /// Notes a commit at `ts` to a row of it.
+    fn stamped(&self, ts: u64) {
+        self.changed.fetch_max(ts, Ordering::SeqCst);
+        let now = now_ms();
+        if self.touched.load(Ordering::Relaxed) != now {
+            self.touched.store(now, Ordering::Relaxed);
         }
     }
 
@@ -865,6 +1052,10 @@ impl HotStripe {
         let created = self.created.get(part).map_or(0, |part| part[at].load(Ordering::Acquire));
         let deleted = self.deleted.get(part).map_or(LIVE, |part| part[at].load(Ordering::Acquire));
         seen(created, deleted, snapshot, txn | UNCOMMITTED)
+            && !self
+                .pending
+                .get()
+                .is_some_and(|pending| lock(pending).is_deleted(slot, snapshot, txn))
     }
 
     /// Sets bit `i` of `mask` for every slot `i` of part `part` that is visible to a reader at
@@ -892,6 +1083,16 @@ impl HotStripe {
             *out = bits;
             count += bits.count_ones() as usize;
         }
+        if let Some(pending) = self.pending.get() {
+            let mut gone = [0_u64; PART_WORDS];
+            if lock(pending).mask(part as u32, snapshot, txn, &mut gone) {
+                count = 0;
+                for (word, gone) in mask.iter_mut().zip(gone) {
+                    *word &= !gone;
+                    count += word.count_ones() as usize;
+                }
+            }
+        }
         count
     }
 
@@ -912,6 +1113,11 @@ impl HotStripe {
             + self.undo.allocated() * ROWS * 4;
         columns + stamps + usize::try_from(self.arena.bytes()).unwrap_or(usize::MAX)
     }
+}
+
+/// Locks a delete vector, through a poisoned lock too: a panic leaves it whole.
+fn lock(deletes: &Mutex<DeleteVector>) -> std::sync::MutexGuard<'_, DeleteVector> {
+    deletes.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The longest string a view holds inline.
@@ -968,9 +1174,13 @@ impl Lease {
     }
 
     /// Up to `want` consecutive slots, from what the worker holds or from a new lease when that is
-    /// used up. Empty when the stripe is full, and the worker moves to the table's next open
-    /// stripe.
+    /// used up. Empty when the stripe is full or sealed, and the worker moves to the table's next
+    /// open stripe.
     pub fn take(&mut self, want: u32) -> Range<u32> {
+        if self.stripe.state.load(Ordering::Relaxed) != OPEN {
+            self.next = self.end;
+            return 0..0;
+        }
         if self.next == self.end {
             let Some(slots) = self.stripe.lease(self.size.max(want.min(LARGEST_LEASE))) else {
                 return 0..0;
