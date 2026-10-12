@@ -9,9 +9,10 @@
 //!
 //! The mapping covers the file as long as it was when it was opened. The caller promises that the
 //! bytes it asks for are never rewritten in place while it is held and that the file is never cut
-//! shorter than the mapping. The native format keeps both: a page is written again only once it is
-//! on the free list and no open reader's generation can reach it, a rewrite goes to a new file that
-//! is renamed over the old one, and nothing truncates. The header slots are written in place, so
+//! shorter than the bytes it asks for. Touching a mapped page past the end of the file is a
+//! `SIGBUS`. The native format keeps both: a page is written again, or cut off the end of the file,
+//! only once it is on the free list and no open reader's generation can reach it, and a rewrite
+//! goes to a new file that is renamed over the old one. The header slots are written in place, so
 //! those are read with a positional read and not through here.
 //!
 //! Where a mapping cannot be made, [`Mapped::open`] says so with `None` and the caller reads the way

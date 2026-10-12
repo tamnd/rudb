@@ -2935,6 +2935,9 @@ impl Writer {
         }
         let owed = held.iter().filter(|entry| entry.gone.is_some()).map(|entry| entry.name.clone());
         let owed = owed.collect();
+        // Where this commit starts writing on the end, which is under `size` when the runs on the
+        // end of the file were left off.
+        let written_back = space.end();
         let mut writer = Self {
             file,
             // What is not written into a run given back goes on the end of the file, so that the
@@ -2943,7 +2946,7 @@ impl Writer {
             space,
             wrote: 0,
             owned: Vec::new(),
-            written_back: size,
+            written_back,
             wide,
             dictionaries: fields
                 .iter()
@@ -4839,18 +4842,9 @@ impl Writer {
                 "table {name} had rows gone from it and is extended without saying which"
             )));
         }
-        let catalog = encode_catalog(
-            &tables,
-            &self.views,
-            self.card.as_ref(),
-            self.anchor.as_ref(),
-            &self.space.list(),
-        )?;
-        if catalog.len() > MAX_DIRECTORY {
-            return Err(invalid("catalog exceeds the configured bound"));
-        }
-        // On the end and not into a run, since it is the catalog that lists the runs.
-        let offset = self.space.append(catalog.len() as u64)?;
+        let (offset, catalog) = placed_catalog(&mut self.space, |free| {
+            encode_catalog(&tables, &self.views, self.card.as_ref(), self.anchor.as_ref(), free)
+        })?;
         self.file.write_at(offset, &catalog)?;
         if let Some(profile) = &profile {
             profile.moved(Stage::Publish, 0, catalog.len() as u64, 0);
@@ -4871,6 +4865,7 @@ impl Writer {
         // generation before this is still intact and still valid until this write lands.
         self.file.write_at(slot_offset(self.generation), &slot.bytes())?;
         synced(&*self.file, profile.as_deref())?;
+        cut(&*self.file, self.space.end());
         Ok(self.table)
     }
 
@@ -4884,7 +4879,8 @@ impl Writer {
     ///
     /// It is the same commit as [`Writer::finish`] with nothing appended before it. The table
     /// entries are carried forward by directory pointer the way an append carries them, the new
-    /// catalog goes on the end, and the slot write at the end is what publishes it.
+    /// catalog goes into a run nothing reads or on the end, and the slot write at the end is what
+    /// publishes it.
     ///
     /// The log anchor is `anchor` when there is one and the one the file holds when not.
     ///
@@ -4926,14 +4922,10 @@ impl Writer {
             mark_gone(&mut out, held, gone)?;
         }
         let anchor = anchor.cloned().or(held);
-        let catalog = encode_catalog(
-            &closed,
-            views,
-            card_for(path, card).as_ref(),
-            anchor.as_ref(),
-            &out.space.list(),
-        )?;
-        out.publish(slot, &catalog)
+        let card = card_for(path, card);
+        out.publish(slot, |free| {
+            encode_catalog(&closed, views, card.as_ref(), anchor.as_ref(), free)
+        })
     }
 
     /// Commits a generation that writes down the device card this process has for the device the
@@ -4977,14 +4969,10 @@ impl Writer {
         }
         let file = RealFilesystem::new().open(path, OpenMode::ReadWrite)?;
         let out = Out::new(path, &*file, size, slot, free)?;
-        let catalog = encode_catalog(
-            &entries,
-            &views,
-            card_for(path, card).as_ref(),
-            anchor.as_ref(),
-            &out.space.list(),
-        )?;
-        out.publish(slot, &catalog)
+        let card = card_for(path, card);
+        out.publish(slot, |free| {
+            encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), free)
+        })
     }
 
     /// The earlier name for [`Self::certify_summaries`].
@@ -5043,14 +5031,15 @@ impl<'a> Out<'a> {
         Ok(Self { file, space, placed: Vec::new() })
     }
 
-    /// Writes `catalog` on the end of the file and publishes it as the generation after `slot`,
-    /// with the same two syncs in the same order as [`Writer::finish`].
-    fn publish(mut self, slot: Slot, catalog: &[u8]) -> Result<()> {
-        if catalog.len() > MAX_DIRECTORY {
-            return Err(invalid("catalog exceeds the configured bound"));
-        }
-        let offset = self.space.append(catalog.len() as u64)?;
-        self.file.write_at(offset, catalog)?;
+    /// Writes the catalog `encode` makes of the free list and publishes it as the generation after
+    /// `slot`, with the same two syncs in the same order as [`Writer::finish`].
+    fn publish(
+        mut self,
+        slot: Slot,
+        encode: impl Fn(&[free::Freed]) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        let (offset, catalog) = placed_catalog(&mut self.space, encode)?;
+        self.file.write_at(offset, &catalog)?;
         self.file.sync()?;
         let generation = slot
             .generation
@@ -5060,11 +5049,43 @@ impl<'a> Out<'a> {
             offset,
             length: u32::try_from(catalog.len()).map_err(|_| invalid("catalog length overflow"))?,
             generation,
-            hash: checksum(catalog),
+            hash: checksum(&catalog),
         };
         self.file.write_at(slot_offset(generation), &committed.bytes())?;
         self.file.sync()?;
+        cut(self.file, self.space.end());
         Ok(())
+    }
+}
+
+/// Encodes the catalog `encode` makes of the free list and finds it a place, see
+/// [`free::Space::catalog`]. A catalog that took its place out of a run is encoded again, since the
+/// list it holds changed.
+fn placed_catalog(
+    space: &mut free::Space,
+    encode: impl Fn(&[free::Freed]) -> Result<Vec<u8>>,
+) -> Result<(u64, Vec<u8>)> {
+    let catalog = encode(&space.list())?;
+    if catalog.len() > MAX_DIRECTORY {
+        return Err(invalid("catalog exceeds the configured bound"));
+    }
+    let (offset, moved) = space.catalog(catalog.len() as u64)?;
+    if !moved {
+        return Ok((offset, catalog));
+    }
+    let again = encode(&space.list())?;
+    if again.len() != catalog.len() {
+        return Err(invalid("catalog changed length when it took its place"));
+    }
+    Ok((offset, again))
+}
+
+/// Cuts the file at `end` once a commit that left off the runs past it is published. The cut is
+/// not part of the commit, so one that fails is not an error: the file is longer than it has to be,
+/// and the bytes past `end` are on no list until a `VACUUM` writes the file again.
+fn cut(file: &dyn rudb_io::File, end: u64) {
+    if file.len().is_ok_and(|len| len > end) {
+        let _ = file.truncate(end);
     }
 }
 
@@ -5251,9 +5272,8 @@ pub fn extendable(
 /// every query more slowly.
 ///
 /// Nothing the committed generation reads is overwritten. The payloads, the extent tables and the
-/// new directory for this table go into free runs no open reader can reach or on the end, the new
-/// catalog goes on the end, and the last write is the header slot, exactly as [`Writer::finish`]
-/// does it. So a crash anywhere in here leaves the generation before it intact.
+/// new directory for this table and the new catalog go into free runs no open reader can reach or
+/// on the end, and the last write is the header slot, exactly as [`Writer::finish`] does it. So a crash anywhere in here leaves the generation before it intact.
 ///
 /// An attachment replaces any section of the same kind and id, and every other section is carried
 /// through untouched, including one whose kind this build does not know. The table's own generation
@@ -5336,9 +5356,9 @@ pub fn attach(
     };
     // The views the file already had, written back unchanged. Attaching a section to a table says
     // nothing about a view and must not drop one.
-    let catalog =
-        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), &out.space.list())?;
-    out.publish(slot, &catalog)?;
+    out.publish(slot, |free| {
+        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), free)
+    })?;
     Ok(held)
 }
 
@@ -5407,9 +5427,9 @@ pub fn strip_sections(path: impl AsRef<Path>, picked: impl Fn(&[u8; 8]) -> bool)
     if dropped == 0 {
         return Ok(0);
     }
-    let catalog =
-        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), &out.space.list())?;
-    out.publish(slot, &catalog)?;
+    out.publish(slot, |free| {
+        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), free)
+    })?;
     Ok(dropped)
 }
 
@@ -5485,9 +5505,9 @@ pub fn restate(
         length: u32::try_from(encoded.len()).map_err(|_| invalid("directory length overflow"))?,
         hash: checksum(&encoded),
     };
-    let catalog =
-        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), &out.space.list())?;
-    out.publish(slot, &catalog)?;
+    out.publish(slot, |free| {
+        encode_catalog(&entries, &views, card.as_ref(), anchor.as_ref(), free)
+    })?;
     Ok(true)
 }
 
@@ -18700,6 +18720,37 @@ mod tests {
         assert!(size < held + one / 2, "the copies the reader kept were used: {held} to {size}");
         assert_eq!(summed(&path), shuffled_sum(13, FREE_ROWS));
         assert_eq!(summed_by(&other), (24, 3));
+        fs::remove_file(&path).expect("clean up");
+    }
+
+    /// A table written again much smaller leaves its old copy on the end of the file, and once
+    /// nothing can read it the file is cut where what is still read ends.
+    #[test]
+    fn a_table_written_again_smaller_lets_the_file_be_cut_short() {
+        let path = path("free-cut");
+        let fields = vec![Field::required("id", LogicalType::Integer)];
+        let mut writer = Writer::create(&path, "items", fields.clone()).expect("new file");
+        append_shuffled(&mut writer, 0, FREE_ROWS);
+        writer.finish().expect("commit");
+        let one = file_size(&path);
+        for round in 1..6 {
+            let mut writer = Writer::replace(&path, "items", fields.clone()).expect("replaces");
+            append_shuffled(&mut writer, round, 1_000);
+            writer.finish().expect("commit");
+            assert_eq!(summed(&path), shuffled_sum(round, 1_000), "round {round}");
+        }
+        let size = file_size(&path);
+        assert!(size < one / 4, "the file went from {one} to {size} bytes");
+        assert!(free_list(&path).iter().all(|run| run.offset + run.length <= size));
+        // A reader of the small copy keeps it, and the file is cut no shorter than what it reads.
+        let old = Catalog::open(&path).expect("opens").table("items").expect("the table");
+        for round in 6..10 {
+            let mut writer = Writer::replace(&path, "items", fields.clone()).expect("replaces");
+            append_shuffled(&mut writer, round, 1_000);
+            writer.finish().expect("commit");
+        }
+        assert_eq!(summed_by(&old), shuffled_sum(5, 1_000));
+        assert_eq!(summed(&path), shuffled_sum(9, 1_000));
         fs::remove_file(&path).expect("clean up");
     }
 
