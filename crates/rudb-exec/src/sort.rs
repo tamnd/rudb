@@ -118,7 +118,7 @@ use rudb_vector::{
 };
 
 use crate::key::Digest;
-use crate::merged::{ORDER, Sorted, order_of, ordering};
+use crate::merged::{KEY, ORDER, Run, Sorted, Stretch, order_of, ordering};
 use crate::normal::{self, Normal};
 use crate::pairs::in_parallel;
 use crate::prepared::{Prepared, Scratch};
@@ -192,7 +192,7 @@ pub(crate) struct Sort {
     /// a time and what is resident is a chunk a run rather than the answer.
     held: Mutex<Reservation>,
     /// The sorted runs the instances wrote, once they have combined.
-    runs: Mutex<Vec<Runs>>,
+    runs: Mutex<Vec<Run>>,
     /// How many instances of this sort there are, which decides what share of the limit each gets.
     ///
     /// Every instance is made before any row moves, so this stops changing before it is first read.
@@ -692,7 +692,7 @@ pub(crate) struct Gathered {
     /// The morsel this instance is reading and how many of its rows have arrived.
     place: Place,
     /// The sorted runs this instance has written, each one a batch that did not fit.
-    runs: Vec<Runs>,
+    runs: Vec<Run>,
 }
 
 /// How far through a morsel an instance is, which is the second half of an [`Arrival`].
@@ -839,7 +839,7 @@ impl Sort {
         chunks: Vec<Chunk>,
         mut rows: Keyed,
         charged: &mut Vec<Reservation>,
-    ) -> Result<Runs> {
+    ) -> Result<Run> {
         rows.sort(&self.keys)?;
         let total = rows.len();
         if u32::try_from(total).is_err() {
@@ -853,7 +853,23 @@ impl Sort {
         let mut types = self.types.clone();
         types.push(LogicalType::Blob);
         let mut file = Runs::new("sort", types)?;
-        file.begin(total)?;
+        // Cut where the leading key changes, so that a merge can be split into pieces by that key
+        // and each piece reads only its own blocks of this run. See [`crate::merged::Pieces`].
+        let lead = self.widths.as_ref().and_then(|widths| widths.first().copied()).unwrap_or(0);
+        let starts = stretches(&orders, lead);
+        let cuts = file.begin_at(total, starts.as_deref().unwrap_or(&[]))?;
+        let stretches = starts.map(|starts| {
+            starts
+                .iter()
+                .zip(cuts.iter().skip(1))
+                .enumerate()
+                .map(|(at, (&start, blocks))| Stretch {
+                    key: orders[start][..lead].to_vec(),
+                    blocks: blocks.clone(),
+                    rows: starts.get(at + 1).copied().unwrap_or(total) - start,
+                })
+                .collect()
+        });
         // Laid and written one column at a time, and this is the whole reason the run file is
         // written the way it is. The sort is spilling because it has run out of memory, so the one
         // thing it cannot do on the way out is hold a second copy of what it is holding, and a run
@@ -861,15 +877,38 @@ impl Sort {
         lay(&self.types, chunks, &order, total, charged, |whole| file.column(whole))?;
         // The ordering column, a block at a time, because `orders` is already the bytes and turning
         // the whole of it into a column would be those bytes twice over.
-        for block in 0..total.div_ceil(VECTOR_SIZE) {
-            let start = block * VECTOR_SIZE;
-            let Some(orders) = orders.get(start..(start + VECTOR_SIZE).min(total)) else {
+        let blocks: Vec<_> = file.blocks().collect();
+        for block in blocks {
+            let Some(orders) = orders.get(block) else {
                 return Err(Error::internal("a sorted run with fewer keys in it than rows"));
             };
             file.part(&ordering(orders)?)?;
         }
-        Ok(file)
+        Ok(Run { file, stretches })
     }
+}
+
+/// The most stretches a run lists. A leading key with more values than this is not a partition,
+/// and a merge cut by it would be cut no better than by rows.
+const MAX_STRETCHES: usize = 4096;
+
+/// The rows of a sorted run where the first `lead` bytes of the order change, starting with the
+/// first row, or `None` for an empty run, one with no leading key, or one with more than
+/// [`MAX_STRETCHES`] of them.
+fn stretches(orders: &[[u8; ORDER]], lead: usize) -> Option<Vec<usize>> {
+    if orders.is_empty() || lead == 0 || lead > KEY {
+        return None;
+    }
+    let mut starts = vec![0];
+    for (row, pair) in orders.windows(2).enumerate() {
+        if pair[0][..lead] != pair[1][..lead] {
+            if starts.len() == MAX_STRETCHES {
+                return None;
+            }
+            starts.push(row + 1);
+        }
+    }
+    Some(starts)
 }
 
 impl Sink for Sort {
