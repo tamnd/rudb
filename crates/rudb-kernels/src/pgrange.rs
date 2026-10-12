@@ -356,8 +356,9 @@ mod tests {
         let (val, base) = (Value::Integer(i32::MAX), Value::Integer(i32::MAX - 1));
         // The end of `x RANGE BETWEEN CURRENT ROW AND 4 FOLLOWING` at the top of int4.
         assert!(in_range(&val, &base, &Value::Integer(4), false, true).unwrap());
+        // 7 is past 10 - 4 with an offset of another width.
         assert!(
-            !in_range(&Value::Integer(5), &Value::Integer(10), &Value::BigInt(4), true, true)
+            !in_range(&Value::Integer(7), &Value::Integer(10), &Value::BigInt(4), true, true)
                 .unwrap()
         );
         let error = in_range(&val, &base, &Value::Integer(-1), true, false).unwrap_err();
@@ -413,8 +414,10 @@ mod tests {
         let year = interval(12, 0, 0);
         assert!(in_range(&year, &infinity, &infinity, true, false).unwrap());
         assert!(!in_range(&year, &infinity, &infinity, false, false).unwrap());
-        assert!(in_range(&interval(0, 400, 0), &year, &interval(0, 30, 0), false, true).unwrap());
-        assert!(!in_range(&interval(0, 400, 0), &year, &interval(0, 30, 0), true, true).unwrap());
+        // A year compares as 360 days, so 380 days is within a year and 30 days and past a year
+        // less 30 days.
+        assert!(in_range(&interval(0, 380, 0), &year, &interval(0, 30, 0), false, true).unwrap());
+        assert!(!in_range(&interval(0, 380, 0), &year, &interval(0, 30, 0), true, true).unwrap());
         let stamp = Value::Timestamp(0);
         assert!(in_range(&stamp, &Value::Timestamp(i64::MAX), &infinity, true, true).unwrap());
         assert!(in_range(&stamp, &Value::Timestamp(-i64::MAX), &year, false, false).unwrap());
