@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.11
+
+In the PostgreSQL dialect, #3044 resolves `generate_series` over integers, bigints and numerics and gives its rows and its errors as PostgreSQL does. #3046 keeps the column origins and the `char(n)` rule on a prepared statement that reads by a range. #3047 makes the whole row of a relation null where an outer join padded it, so `count(b.*)` counts only the rows that matched. #3048 keeps a subquery in `FROM` that has no `LATERAL` from the entries to its left, and gives PostgreSQL's errors for a name that only they have.
+
+On the engine side, #3045 reads the lines of a time zone when the zone is first used. #3042 fixes the build of `export.rs`, #3040 lets the release gate through its row loops, flattens, fmt and doc steps, and #3041 and #3043 add tests for a limit with ties and for the reservation on a table.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.10
 
 In the PostgreSQL dialect, #3033 chooses and applies the offset of a RANGE frame as PostgreSQL does, over numbers, dates, times and intervals. #3034 reads a `timetz` literal and a zone name in date and time input. #3036 reads the delimiter of `string_agg` on each row, leaves out the first one, and joins `bytea` values. #3037 lets a query call `float8_accum`, `float8_combine`, `float8_regr_accum` and `float8_regr_combine` directly, with the same arrays and the same errors as PostgreSQL. #3038 lets an ON CONFLICT DO UPDATE hold a subquery in a value or in its condition.
