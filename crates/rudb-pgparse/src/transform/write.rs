@@ -7,19 +7,115 @@
 use rudb_common::{Error, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Conflict, ConflictAction, ExprRef, Insert, Overriding, QueryRef, Slice, Statement, StrRef,
+    Conflict, ConflictAction, Cte, ExprRef, Insert, Overriding, QueryRef, Slice, Statement, StrRef,
     Truncate,
 };
 use rudb_parse::build::{Assignment, Change};
 
-use super::{Made, Transform, clause, not_yet};
+use super::query::SelfRead;
+use super::{Definition, Made, Transform, clause, not_yet};
 use crate::nodes::{
-    DeleteStmt, DropBehavior, InsertStmt, List, MultiAssignRef, Node, OnConflictAction,
-    OnConflictClause, OverridingKind, RangeVar, ReturningClause, SubLinkType, TruncateStmt,
-    UpdateStmt, WithClause,
+    CommonTableExpr, DeleteStmt, DropBehavior, InsertStmt, List, MultiAssignRef, Node,
+    OnConflictAction, OnConflictClause, OverridingKind, RangeVar, ReturningClause, SubLinkType,
+    TruncateStmt, UpdateStmt, WithClause,
 };
 
 impl Transform<'_> {
+    /// A `WITH` definition that is an `INSERT`, an `UPDATE` or a `DELETE`, with the checks of
+    /// `transformWithClause` and `checkWellFormedRecursion` in `parse_cte.c`.
+    ///
+    /// PostgreSQL takes one only in the `WITH` of the statement itself. Under `WITH RECURSIVE` the
+    /// name is in scope in the statement, and a statement that reads it is refused. The definition
+    /// has its slot in `Ast::ctes` before the statement is read, and [`Self::settle`] holds it
+    /// whether it is read or not, since it runs once in either case.
+    pub(super) fn written_definition(
+        &mut self,
+        cte: &CommonTableExpr,
+        written: &Node,
+        declared: Slice,
+        recursive: bool,
+    ) -> Made<Definition> {
+        let name = cte.ctename.as_deref().unwrap_or_default();
+        let at = self.at(cte.location);
+        if self.depth > 1 {
+            return Err(Error::parser(
+                "WITH clause containing a data-modifying statement must be at the top level",
+            )
+            .state(SqlState::FEATURE_NOT_SUPPORTED)
+            .with_span(at)
+            .into());
+        }
+        let slot = self.ast.ctes.len() as u32;
+        let interned = self.intern(name);
+        self.ast.ctes.push(Cte {
+            name: interned,
+            query: NONE,
+            columns: declared,
+            recursive: false,
+            key: Slice::default(),
+            dml: None,
+            search: None,
+            cycle: None,
+        });
+        let materialized = cte.ctematerialized;
+        let mark = self.scope.len();
+        if recursive {
+            // A read of the name in the statement is a read of the definition itself.
+            self.scope.push(Definition {
+                name: name.to_string(),
+                declared,
+                materialized,
+                query: NONE,
+                slot,
+                recursive: true,
+                reads: Vec::new(),
+                dml: None,
+            });
+        }
+        let reads = self.self_reads.len();
+        // The statement is a query below the top level, where a `WITH` of its own cannot write.
+        self.depth += 1;
+        let made = match written {
+            Node::InsertStmt(insert) => self.insert(insert),
+            Node::UpdateStmt(update) => self.update(update),
+            Node::DeleteStmt(delete) => self.delete(delete),
+            node => Err(not_yet(node)),
+        };
+        self.depth -= 1;
+        self.scope.truncate(mark);
+        let statement = made?;
+        let (found, others): (Vec<SelfRead>, Vec<SelfRead>) =
+            self.self_reads.split_off(reads).into_iter().partition(|read| read.cte == slot);
+        self.self_reads.extend(others.into_iter().map(|read| SelfRead { nested: true, ..read }));
+        if !found.is_empty() {
+            return Err(Error::parser(format!(
+                "recursive query \"{name}\" must not contain data-modifying statements"
+            ))
+            .state(SqlState::INVALID_RECURSION)
+            .with_span(at)
+            .into());
+        }
+        let (Statement::Insert(index) | Statement::Update(index) | Statement::Delete(index)) =
+            statement
+        else {
+            return clause("CommonTableExpr");
+        };
+        let query = self.ast.inserts[index as usize].source;
+        let held = &mut self.ast.ctes[slot as usize];
+        held.query = query;
+        held.dml = Some(statement);
+        Ok(Definition {
+            name: name.to_string(),
+            declared,
+            materialized,
+            query,
+            slot,
+            recursive: false,
+            reads: Vec::new(),
+            dml: Some(statement),
+        })
+    }
+
     /// A writing statement, with the definitions of its `WITH` in scope.
     ///
     /// The definitions are settled at the depth of the statement, which is no query, so only a

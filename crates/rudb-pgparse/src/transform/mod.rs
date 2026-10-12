@@ -169,6 +169,9 @@ struct Definition {
     /// Each read of the definition: the source that was put in its place, and the alias and the
     /// column names written on the read.
     reads: Vec<(SourceRef, StrRef, Slice)>,
+    /// The `INSERT`, the `UPDATE` or the `DELETE` of a definition that writes rows, which is held
+    /// in its slot whether it is read or not.
+    dml: Option<Statement>,
 }
 
 struct Transform<'a> {

@@ -8226,3 +8226,48 @@ fn a_volatile_target_is_computed_after_the_sort_as_postgres() {
     );
     server.stop().unwrap();
 }
+
+/// A `WITH` definition that writes rows runs once in the PostgreSQL grammar, and the definitions
+/// before it can feed it. One below the top level, one that reads itself and a read of one with
+/// no `RETURNING` are refused with the errors of PostgreSQL 19.
+#[test]
+fn a_written_definition_runs_once_and_is_refused_where_postgres_refuses_it() {
+    let dirs = Dirs::new("pgwrittencte");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    client.query("create temp table y (a int)");
+    let sql = "with w as (insert into y values (1), (2) returning a), \
+               x as (insert into y select a + 10 from w returning a) select sum(a) from x";
+    assert_eq!(scalar(&mut client, sql), "23");
+    assert_eq!(scalar(&mut client, "with w as (delete from y where a > 10) select 1"), "1");
+    assert_eq!(scalar(&mut client, "select string_agg(a::text, ' ' order by a) from y"), "1 2");
+    for (sql, code, message, place) in [
+        (
+            "select * from (with w as (update y set a = a returning *) select * from w) s",
+            "0A000",
+            "WITH clause containing a data-modifying statement must be at the top level",
+            "21",
+        ),
+        (
+            "with recursive w as (insert into y select * from w) values (false)",
+            "42P19",
+            "recursive query \"w\" must not contain data-modifying statements",
+            "16",
+        ),
+        (
+            "with w as (insert into y values (0)) select * from w",
+            "0A000",
+            "WITH query \"w\" does not have a RETURNING clause",
+            "52",
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        let error = &messages[0];
+        assert_eq!(error.field(b'C').as_deref(), Some(code), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').as_deref(), Some(place), "{sql}");
+    }
+    server.stop().unwrap();
+}
