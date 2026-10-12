@@ -30,7 +30,7 @@
 //! many threads ran or, now, on where the spills happened to fall.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rudb_common::{Error, LogicalType, Result, Value};
@@ -53,6 +53,9 @@ pub(crate) const ORDER: usize = KEY + 16;
 pub(crate) struct Sorted {
     stage: Arc<Mutex<Stage>>,
     handed: Arc<AtomicU64>,
+    /// How many rows the sink reading this wants in one morsel, or zero for no wish. See
+    /// [`Source::gather`].
+    asked: Arc<AtomicUsize>,
 }
 
 /// Where a sort's answer is.
@@ -75,7 +78,11 @@ impl Default for Sorted {
 impl Sorted {
     /// A handle nothing has been handed to yet.
     pub(crate) fn new() -> Self {
-        Self { stage: Arc::new(Mutex::new(Stage::Waiting)), handed: Arc::new(AtomicU64::new(0)) }
+        Self {
+            stage: Arc::new(Mutex::new(Stage::Waiting)),
+            handed: Arc::new(AtomicU64::new(0)),
+            asked: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Hands over an answer that fitted.
@@ -102,28 +109,39 @@ impl Sorted {
         *self.stage.lock().map_err(poisoned)? = Stage::Merging(Merge { heads, types });
         Ok(())
     }
+}
 
-    /// How many chunks are waiting, which only a sort that fitted can answer.
-    fn held(&self) -> Option<usize> {
-        match &*self.stage.lock().ok()? {
-            Stage::Held(chunks) => Some(chunks.len()),
-            Stage::Waiting | Stage::Merging(_) => None,
-        }
-    }
+/// How many of a fitted sort's `chunks` go in one morsel, for a sink that asked for `asked` rows in
+/// one.
+///
+/// A load into a native file is the sink that asks. It never lets a stripe span two morsels, so a
+/// morsel a chunk was a stripe a chunk: a clustered `lineitem` of three million rows went to the
+/// file as 367 stripes of one part each. The first stripe is also the one a varchar column's
+/// dictionary is decided on, and eight thousand rows of a table sorted on a date held a new
+/// `l_comment` in nearly every row, so the column lost its dictionary and every part of it was an
+/// FSST page with a symbol table of its own.
+fn per_morsel(chunks: &[Chunk], asked: usize) -> usize {
+    let rows = chunks.iter().map(Chunk::len).sum::<usize>();
+    let each = rows.div_ceil(chunks.len().max(1)).max(1);
+    (asked / each).max(1)
 }
 
 impl Source for Sorted {
     fn morsel(&self) -> Option<Morsel> {
         let index = self.handed.fetch_add(1, Ordering::Relaxed);
-        match self.held() {
-            // One morsel a chunk, the same as any finished operator's buffer.
-            Some(chunks) if index < chunks as u64 => Some(Morsel::new(index, index, index + 1)),
-            Some(_) => None,
+        match &*self.stage.lock().ok()? {
+            // One morsel a chunk, the same as any finished operator's buffer, unless the sink asked
+            // for more rows than that.
+            Stage::Held(chunks) => {
+                let per = per_morsel(chunks, self.asked.load(Ordering::Relaxed)) as u64;
+                let start = index.checked_mul(per)?;
+                let end = start.saturating_add(per).min(chunks.len() as u64);
+                (start < end).then(|| Morsel::new(index, start, end))
+            }
             // One morsel ever. A merge is a single pass over every run at once and a second thread
             // taking a morsel of it would be a second pass, which is a different answer and not a
             // faster one.
-            None if index == 0 => Some(Morsel::new(0, 0, 1)),
-            None => None,
+            Stage::Waiting | Stage::Merging(_) => (index == 0).then(|| Morsel::new(0, 0, 1)),
         }
     }
 
@@ -133,11 +151,19 @@ impl Source for Sorted {
             Stage::Held(chunks) => {
                 let rows = chunks.iter().map(Chunk::len).sum::<usize>();
                 let useful = rows.div_ceil(50_000).clamp(1, 4);
-                Some(chunks.len().min(threads).min(useful))
+                let morsels =
+                    chunks.len().div_ceil(per_morsel(chunks, self.asked.load(Ordering::Relaxed)));
+                Some(morsels.min(threads).min(useful))
             }
             Stage::Waiting => Some(0),
             Stage::Merging(_) => Some(1),
         }
+    }
+
+    /// Remembered for [`Sorted::morsel`], which hands a fitted sort out a run of chunks at a time
+    /// up to this many rows.
+    fn gather(&self, rows: usize) {
+        self.asked.store(rows, Ordering::Relaxed);
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
@@ -150,7 +176,7 @@ impl Source for Sorted {
                 };
                 *out = chunk.clone();
                 morsel.advance(1);
-                Ok(Progress::Done)
+                Ok(if morsel.is_drained() { Progress::Done } else { Progress::More })
             }
             Stage::Waiting => Err(Error::internal("a sort was read before it finished")),
             Stage::Merging(merge) => match merge.next()? {
@@ -493,6 +519,41 @@ mod tests {
         assert_eq!(sorted.read(&mut morsel, &mut out).expect("readable"), Progress::Done);
         assert_eq!(out.value_at(0, 0), Value::BigInt(1));
         assert!(sorted.morsel().is_none(), "and no second chunk");
+    }
+
+    /// A sink that asks for more rows than a chunk gets runs of chunks, in order, and the last run
+    /// is whatever is left.
+    #[test]
+    fn a_sort_that_fitted_hands_out_runs_of_chunks_when_asked() {
+        let chunks = (0..5)
+            .map(|at| {
+                let column = Vector::flat(LogicalType::BigInt, Data::Int64(vec![at, at].into()))
+                    .expect("bigints are an i64 layout");
+                Chunk::new(vec![column]).expect("one column")
+            })
+            .collect();
+        let sorted = Sorted::new();
+        sorted.hold(chunks).expect("held");
+        sorted.gather(4);
+        assert_eq!(sorted.morsels(16, 1), Some(1), "ten rows are one instance's worth");
+        let mut seen = Vec::new();
+        while let Some(mut morsel) = sorted.morsel() {
+            let mut first = Vec::new();
+            loop {
+                let mut out = Chunk::empty(&[]);
+                let progress = sorted.read(&mut morsel, &mut out).expect("readable");
+                first.push(out.value_at(0, 0));
+                if progress == Progress::Done {
+                    break;
+                }
+            }
+            seen.push(first);
+        }
+        let bigint = Value::BigInt;
+        assert_eq!(
+            seen,
+            vec![vec![bigint(0), bigint(1)], vec![bigint(2), bigint(3)], vec![bigint(4)]]
+        );
     }
 
     #[test]
