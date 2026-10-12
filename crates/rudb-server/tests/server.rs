@@ -7623,6 +7623,39 @@ fn a_limit_in_a_correlated_subquery_reads_the_outer_row_as_postgres() {
 }
 
 #[test]
+fn an_aggregate_reads_a_string_literal_as_postgres() {
+    let dirs = Dirs::new("pgaggunknown");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    // The answers are the ones that PostgreSQL 19 gives. A string literal takes the type of the
+    // aggregate that PostgreSQL finds for it, over a group and over a window.
+    for (sql, expected) in [
+        (
+            "select concat_ws('|', corr(g, 'NaN'), regr_r2(g, 'NaN'), min('a'), \
+             string_agg('x', ',')) from generate_series(1, 3) g",
+            "NaN|NaN|a|x,x,x",
+        ),
+        (
+            "select string_agg(coalesce(c::text, 'null'), ' ') from (select corr(g, '2') \
+             over (order by g) c from generate_series(1, 3) g) q",
+            "null null null",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), expected, "{sql}");
+    }
+    for sql in ["select avg('4') from generate_series(1, 2)", "select sum('x') over ()"] {
+        let messages = client.query(sql);
+        let tags = tags(&messages);
+        assert!(tags.ends_with("EZ"), "{tags}");
+        let error = &messages[tags.len() - 2];
+        assert_eq!(error.field(b'C').as_deref(), Some("42725"), "{sql}");
+        assert_eq!(error.field(b'D').as_deref(), Some("Could not choose a best candidate function."));
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_pair_statistic_of_a_constant_column_is_null_as_postgres() {
     let dirs = Dirs::new("pgpairs");
     let server = Server::start(dirs.config()).unwrap();

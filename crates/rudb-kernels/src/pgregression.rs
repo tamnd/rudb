@@ -249,7 +249,8 @@ fn r2(sxx: f64, syy: f64, sxy: f64) -> f64 {
         }
         false => numerator / denominator,
     };
-    answer.min(1.0)
+    // A NaN stays a NaN, where `f64::min` would give the one.
+    if answer > 1.0 { 1.0 } else { answer }
 }
 
 /// The `Sx * Sxy / Sxx` that `regr_intercept` takes from the sum of the `y` values, through the
@@ -344,6 +345,9 @@ mod tests {
         state.add(1.0, 1e308);
         state.add(1.0, 1e308);
         assert!(state.finish().is_err());
+        let nan: Vec<(f64, f64)> = (1..=3).map(|g| (f64::from(g), f64::NAN)).collect();
+        let Value::Double(r2) = answer("float8_regr_r2", &nan) else { panic!("a double") };
+        assert!(r2.is_nan());
         let mut infinite = FloatPairs::named("float8_corr").unwrap();
         infinite.add(1.0, f64::INFINITY);
         infinite.add(2.0, 3.0);
