@@ -7817,6 +7817,7 @@ mod tests {
                 let quantifier = if all { "ALL" } else { "ANY" };
                 format!("{} {op:?} {quantifier} ({})", show(ast, operand), show(ast, array))
             }
+            Expr::MultiAssign { source, column, .. } => format!("{}[{column}]", show(ast, source)),
         }
     }
 

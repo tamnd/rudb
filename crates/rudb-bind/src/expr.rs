@@ -393,6 +393,9 @@ impl Binder<'_> {
             ast::Expr::Exists { query, negated } => {
                 self.bind_exists_subquery(ast, query, negated, scope)
             }
+            ast::Expr::MultiAssign { source, column, columns } => {
+                self.bind_multi_assign(ast, source, column, columns, scope)
+            }
         }
     }
 
@@ -548,6 +551,51 @@ impl Binder<'_> {
             self.subquery_types.push((expr, declared));
         }
         Ok(expr)
+    }
+
+    /// One column of `SET (a, b) = (SELECT ...)`, as `transformMultiAssignRef` of PostgreSQL
+    /// binds it. The first column of the list to get here binds the query and joins it in the way
+    /// a scalar query is joined, and each column reads its own column of the one row. A query
+    /// with another number of columns than the list is error 42601 at the query.
+    fn bind_multi_assign(
+        &mut self,
+        ast: &Ast,
+        source: ast::ExprRef,
+        column: u32,
+        columns: u32,
+        outer: &Scope,
+    ) -> Result<ExprRef> {
+        if let Some((_, values)) = self.multi_assigned.iter().find(|(at, _)| *at == source) {
+            let Some((binding, ty)) = values.get(column as usize).cloned() else {
+                return Err(Error::internal(format!("column {column} of a multiple assignment")));
+            };
+            return Ok(self.add_expr(Expr::Column(binding), ty));
+        }
+        let ast::Expr::Subquery { query, array: false } = ast.expr(source) else {
+            return Err(Error::internal("a multiple assignment from something not a query"));
+        };
+        let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
+        if scope.len() != columns as usize {
+            return Err(Error::binder("number of columns does not match number of values")
+                .state(SqlState::SYNTAX_ERROR)
+                .placed_at(Some(ast.expr_span(source))));
+        }
+        let values: Vec<_> =
+            scope.columns.iter().map(|column| (column.binding, column.ty.clone())).collect();
+        let Some(&(first, _)) = values.first() else {
+            return Err(Error::internal("a multiple assignment of no columns"));
+        };
+        self.scalar_subqueries.push(PendingSubquery {
+            node,
+            kind: rudb_plan::JoinKind::Single,
+            conditions: Vec::new(),
+            dependent: !correlations.is_empty(),
+            reads: correlations,
+            index: first.table,
+            inside_aggregate: self.in_aggregate,
+        });
+        self.multi_assigned.push((source, values));
+        self.bind_multi_assign(ast, source, column, columns, outer)
     }
 
     /// The input of the sort at the top of a query, the expression the query's one column is over
@@ -5061,7 +5109,9 @@ pub(crate) fn first_aggregate(
                 .or_else(|| ast.order_list(held.order).iter().find_map(|item| first(item.expr)))
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
-        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => None,
+        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } | ast::Expr::MultiAssign { .. } => {
+            None
+        }
     }
 }
 
@@ -5450,6 +5500,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             let exists = format!("EXISTS({})", rudb_parse::deparse::query(ast, query));
             if negated { format!("(NOT {exists})") } else { exists }
         }
+        ast::Expr::MultiAssign { .. } => "subquery".to_string(),
     }
 }
 

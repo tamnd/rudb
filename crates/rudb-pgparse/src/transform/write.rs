@@ -7,8 +7,8 @@
 use rudb_common::{Error, Span, SqlState};
 use rudb_parse::NONE;
 use rudb_parse::ast::{
-    Conflict, ConflictAction, Cte, ExprRef, Insert, Overriding, QueryRef, Slice, Statement, StrRef,
-    Truncate,
+    Conflict, ConflictAction, Cte, Expr, ExprRef, Insert, Overriding, QueryRef, Slice, Statement,
+    StrRef, Truncate,
 };
 use rudb_parse::build::{Assignment, Change};
 
@@ -406,8 +406,8 @@ impl Transform<'_> {
     }
 
     /// The values of `(a, b) = source`, one for each column. The source is a `ROW` with one value
-    /// for each column. A sub-select is not built yet. Any other source is the error of
-    /// PostgreSQL.
+    /// for each column, or a sub-select whose one row gives them, which the binder checks has a
+    /// column for each. Any other source is the error of PostgreSQL.
     fn row_source(&mut self, assign: &MultiAssignRef) -> Made<Vec<ExprRef>> {
         match &assign.source {
             Some(Node::RowExpr(row)) => {
@@ -423,8 +423,13 @@ impl Transform<'_> {
                 }
                 Ok(values)
             }
-            Some(Node::SubLink(link)) if link.subLinkType == SubLinkType::EXPR_SUBLINK => {
-                clause("MultiExprSubLink")
+            Some(source @ Node::SubLink(link)) if link.subLinkType == SubLinkType::EXPR_SUBLINK => {
+                let query = self.expr(source)?;
+                let columns = u32::try_from(assign.ncolumns).unwrap_or_default();
+                let values = (0..columns).map(|column| {
+                    self.push(Expr::MultiAssign { source: query, column, columns }, link.location)
+                });
+                Ok(values.collect())
             }
             source => {
                 let location = crate::actions::exprLocation(source.as_ref());
