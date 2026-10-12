@@ -7680,6 +7680,31 @@ fn fetch_first_with_ties_keeps_the_rows_that_tie_as_postgres() {
 }
 
 #[test]
+fn string_agg_reads_a_delimiter_on_each_row_and_joins_bytea_as_postgres() {
+    let dirs = Dirs::new("pgstragg");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let rows = "(values ('a', '-'), ('b', null), ('c', '+'), (null, '*'), ('e', '/')) s(a, d)";
+    let bytes = "(values ('\\xff'::bytea), ('\\xaa')) b(v)";
+    // The answers are the ones that PostgreSQL 19 gives.
+    for (sql, expected) in [
+        (format!("select string_agg(a, d) from {rows}"), "ab+c/e"),
+        (format!("select string_agg(a, d order by a desc) from {rows}"), "e+cb-a"),
+        (format!("select string_agg(a, null) from {rows}"), "abce"),
+        (format!("select string_agg(a, ',' order by a desc) from {rows}"), "e,c,b,a"),
+        (format!("select coalesce(string_agg(a, d), 'none') from {rows} where a > 'z'"), "none"),
+        (format!("select string_agg(v, '') from {bytes}"), "\\xffaa"),
+        (format!("select string_agg(v, decode('ee', 'hex')) from {bytes}"), "\\xffeeaa"),
+        (format!("select string_agg(v, null) from {bytes}"), "\\xffaa"),
+        (format!("select pg_typeof(string_agg(v, ''))::text from {bytes}"), "bytea"),
+    ] {
+        assert_eq!(scalar(&mut client, &sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn a_limit_in_a_correlated_subquery_reads_the_outer_row_as_postgres() {
     let dirs = Dirs::new("pgcorrlim");
     let server = Server::start(dirs.config()).unwrap();

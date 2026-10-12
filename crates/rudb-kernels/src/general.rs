@@ -31,6 +31,7 @@ use crate::lttb::{Plot, Points};
 use crate::number::{approximate, fit, integral};
 use crate::pgorderedset::OrderedSet;
 use crate::pgregression::FloatPairs;
+use crate::pgstringagg::Delimited;
 use crate::pgvariance::{ExactSpread, FloatSpread};
 use crate::quantile::{self, Column, Held, Holistic, Sample};
 use crate::statistics::{Moment, Paired, Pairing, Powers};
@@ -123,6 +124,8 @@ pub(crate) enum General {
     /// `corr`, the covariances and the `regr_*` family of a PostgreSQL session, in
     /// [`crate::pgregression`].
     FloatPairs(FloatPairs),
+    /// `string_agg` of a PostgreSQL session, in [`crate::pgstringagg`].
+    Delimited(Delimited),
     /// `fsum` and `favg`, a sum with Kahan's running error, in the pin's steps.
     Kahan { value: f64, err: f64, count: u64, average: bool },
     /// `count_if`, the rows that were true, and whether any row was not null.
@@ -232,6 +235,9 @@ impl General {
         if let Some(state) = FloatPairs::named(name) {
             return Some(Self::FloatPairs(state));
         }
+        if let Some(state) = Delimited::named(name) {
+            return Some(Self::Delimited(state));
+        }
         if name == "avg" {
             return Timed::new(returns).map(Self::Timed);
         }
@@ -328,6 +334,7 @@ impl General {
             Self::Set(state) => state.update(args)?,
             Self::Paired(state) => state.update(args)?,
             Self::FloatPairs(state) => state.update(args)?,
+            Self::Delimited(state) => state.update(args)?,
             _ if value.is_null() => {}
             Self::Counted { key, .. } if args.len() > 1 => {
                 let mut binned = Binned::new(false, key.clone());
@@ -770,6 +777,7 @@ impl General {
             (Self::ExactSpread(state), Self::ExactSpread(theirs)) => state.combine(theirs)?,
             (Self::FloatSpread(state), Self::FloatSpread(theirs)) => state.combine(theirs)?,
             (Self::FloatPairs(state), Self::FloatPairs(theirs)) => state.combine(theirs)?,
+            (Self::Delimited(state), Self::Delimited(theirs)) => state.combine(theirs),
             (
                 Self::Kahan { value, err, count, .. },
                 Self::Kahan { value: theirs, err: their_err, count: more, .. },
@@ -921,6 +929,7 @@ impl General {
             Self::ExactSpread(state) => state.finish()?,
             Self::FloatSpread(state) => state.finish()?,
             Self::FloatPairs(state) => state.finish()?,
+            Self::Delimited(state) => state.finish()?,
             Self::Joined { seen: false, .. } => Value::Null,
             Self::Joined { text, .. } => Value::Varchar(text.clone()),
             Self::Ordered { .. }

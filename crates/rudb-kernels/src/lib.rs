@@ -105,6 +105,7 @@ pub mod pgproc;
 mod pgrange;
 pub mod pgregexp;
 mod pgregression;
+mod pgstringagg;
 mod pgstring;
 mod pgunicode;
 mod pgvariance;
