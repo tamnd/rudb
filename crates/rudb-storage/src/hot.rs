@@ -754,6 +754,42 @@ impl HotStripe {
         }
     }
 
+    /// Takes the records of the chain of `slot` that `spare` picks out of it, each alone, in one
+    /// walk down the chain, and returns them. `spare` is asked oldest first, so it judges each
+    /// record against the chain as the ones before it left it. The record above one taken out is
+    /// pointed past it. A record at the head is not asked and stays, because a writer checks the
+    /// head for a change committed after its snapshot. Only the collector calls this, one call at
+    /// a time.
+    ///
+    /// Taking the records out one at a time, each with a walk from the head to the record above
+    /// it, made a round quadratic in the length of a chain, and a row updated thousands of times
+    /// under an old snapshot kept the collector at it long enough that it fell behind.
+    pub(crate) fn prune(&self, slot: u32, spare: &mut dyn FnMut(UndoRef) -> bool) -> Vec<UndoRef> {
+        let (part, at) = place(slot);
+        let Some(undo) = self.undo.get(part) else { return Vec::new() };
+        let mut chain = Vec::new();
+        let mut next = undo[at].load(Ordering::Acquire);
+        while let Some(record) = self.undos.record(next) {
+            chain.push(next);
+            next = record.prev();
+        }
+        let mut taken = Vec::new();
+        // The record above is not asked yet, so it is still in the chain.
+        for at in (1..chain.len()).rev() {
+            if !spare(chain[at]) {
+                continue;
+            }
+            let (Some(record), Some(newer)) =
+                (self.undos.record(chain[at]), self.undos.record(chain[at - 1]))
+            else {
+                continue;
+            };
+            newer.set_prev(record.prev());
+            taken.push(chain[at]);
+        }
+        taken
+    }
+
     /// Runs `f` over the undo records of `slot` that `me` wrote, newest first.
     fn walk_own(&self, slot: u32, me: u64, mut f: impl FnMut(crate::undo::Record<'_>)) {
         let (part, at) = place(slot);

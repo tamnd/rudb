@@ -23,8 +23,18 @@
 //! back needs the record to undo it, and that reader began before the abort. The third, once every
 //! statement running at the second has ended, puts the chunk on the free list, because a reader
 //! that loaded a reference just before it was cut may still read the record's `ts`.
+//!
+//! A record above the horizon can be needed by nobody too, the interval pruning of section 8.9 after
+//! Alhomssi and Leis. An update committed at `T` over one committed at `P` is read only by a
+//! snapshot from `P` up to `T`: one before `P` reads the older record's values after it, and one
+//! at `T` or later stops at it. When no statement holds a snapshot in between and the older record
+//! has every column this one has, the collector takes it out of its chain on its own, and from
+//! then on it counts as below the horizon. Its chunk still waits for the statements that were
+//! running when it was taken out, since one of them may hold a reference to it. A long transaction
+//! then keeps the versions it reads, not every version since it began, once the statement it was
+//! running has ended.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -101,6 +111,8 @@ struct Rounds {
     found: Vec<Held>,
     /// Out of every chain at the epoch given.
     cut: Vec<Held>,
+    /// Records of waiting chunks taken out of their chains above the horizon.
+    pruned: HashSet<UndoRef>,
 }
 
 /// A chunk on its way to the free list: the units used, the epoch of the step it took last, and
@@ -122,6 +134,8 @@ pub struct Collected {
     pub cut: usize,
     /// Chunks put on the free list.
     pub freed: usize,
+    /// Records above the horizon taken out of their chains, since no snapshot reads them.
+    pub pruned: usize,
 }
 
 /// Where the collector finds a record's chain, which is the hot stripe the rid names in the
@@ -131,6 +145,12 @@ pub trait Heads {
     /// still hot and the record is still in its chain, and every record older than it as well
     /// when `older` says so.
     fn unlink(&self, table: u32, rid: u64, record: UndoRef, older: bool);
+
+    /// Takes the records `spare` picks out of the chain of `rid` in `table`, each alone, if the
+    /// row's stripe is still hot, in one walk down the chain, and returns them. `spare` is asked
+    /// oldest first, each against the chain as the ones before it left it. The record at the head
+    /// is not asked, and stays.
+    fn prune(&self, table: u32, rid: u64, spare: &mut dyn FnMut(UndoRef) -> bool) -> Vec<UndoRef>;
 }
 
 impl Default for UndoSpace {
@@ -182,6 +202,8 @@ impl UndoSpace {
         let Ok(mut rounds) = self.collector.try_lock() else { return Collected::default() };
         let rounds = &mut *rounds;
         let mut done = Collected::default();
+        // Before any slot is read, so a statement the reads miss has a snapshot at or past it.
+        let upto = clock.load(Ordering::SeqCst);
         rounds.waiting.append(&mut self.sealed.lock().unwrap_or_else(PoisonError::into_inner));
 
         let (ready, cut): (Vec<_>, Vec<_>) =
@@ -205,6 +227,10 @@ impl UndoSpace {
         let mut cut = Vec::with_capacity(ready.len());
         for held in ready {
             for (at, record) in self.records(held.chunk, held.units) {
+                // Out of its chain already, and nobody walks to it.
+                if rounds.pruned.remove(&at) {
+                    continue;
+                }
                 let (ts, row) = (record.ts(), (record.table(), record.rid()));
                 if ts == ABORTED {
                     aborted.push((row, at));
@@ -224,14 +250,16 @@ impl UndoSpace {
 
         let mut oldest = HashMap::new();
         let mut found = Vec::new();
+        let pruned = &rounds.pruned;
         rounds.waiting.retain(|&(chunk, units)| {
             let mut tables = Vec::new();
-            let below = self.records(chunk, units).all(|(_, record)| {
+            let below = self.records(chunk, units).all(|(at, record)| {
                 let (ts, table) = (record.ts(), record.table());
                 if !tables.contains(&table) {
                     tables.push(table);
                 }
                 ts == ABORTED
+                    || pruned.contains(&at)
                     || (ts & UNCOMMITTED == 0
                         && ts
                             <= *oldest
@@ -245,6 +273,35 @@ impl UndoSpace {
         });
         done.found = found.len();
 
+        // Then the records of the chunks still waiting that no snapshot falls under, a row's chain
+        // at a time and oldest first, so each one is judged against the chain as the ones before
+        // it left it.
+        let committed = |ts: u64| ts & UNCOMMITTED == 0 && ts != ABORTED;
+        let mut chains: HashMap<(u32, u64), HashSet<UndoRef>> = HashMap::new();
+        for &(chunk, units) in &rounds.waiting {
+            for (at, record) in self.records(chunk, units) {
+                let ts = record.ts();
+                if record.kind() == UndoKind::Update
+                    && committed(ts)
+                    && ts <= upto
+                    && !rounds.pruned.contains(&at)
+                {
+                    chains.entry((record.table(), record.rid())).or_default().insert(at);
+                }
+            }
+        }
+        let mut snapshots = HashMap::new();
+        for ((table, rid), asked) in chains {
+            let held: &Vec<u64> =
+                snapshots.entry(table).or_insert_with(|| horizons.snapshots(table));
+            let taken = heads.prune(table, rid, &mut |at| {
+                asked.contains(&at)
+                    && self.record(at).is_some_and(|record| self.spare(record, upto, held))
+            });
+            done.pruned += taken.len();
+            rounds.pruned.extend(taken);
+        }
+
         // After the cuts and the reads of every stamp above, so a statement that begins at this
         // epoch or later cannot reach a record cut here, and one that saw a value an abort took
         // back began before it.
@@ -252,6 +309,46 @@ impl UndoSpace {
         rounds.cut.extend(cut.into_iter().map(|held| Held { epoch, ..held }));
         rounds.found.extend(found.into_iter().map(|held| Held { epoch, ..held }));
         done
+    }
+
+    /// Whether `record` is a committed update no statement can read, though it is above its
+    /// table's horizon: the write before it in the chain is a committed update of every column it
+    /// has, at `P`, and none of `snapshots` is from `P` up to its own timestamp. Only a commit at or
+    /// below `upto`, what the clock held before the snapshots were read, since a statement that
+    /// begins later reads past it anyway.
+    ///
+    /// The write before it is the first record down the chain of another timestamp, past the other
+    /// pieces of a wide update. An aborted one there is not passed, because a reader that stops at
+    /// this record today would walk on into it.
+    fn spare(&self, record: Record<'_>, upto: u64, snapshots: &[u64]) -> bool {
+        let committed = |ts: u64| ts & UNCOMMITTED == 0 && ts != ABORTED;
+        let ts = record.ts();
+        if record.kind() != UndoKind::Update || !committed(ts) || ts > upto {
+            return false;
+        }
+        let mut next = record.prev();
+        let older = loop {
+            let Some(older) = self.record(next) else { return false };
+            if older.ts() != ts {
+                break older;
+            }
+            next = older.prev();
+        };
+        let then = older.ts();
+        if older.kind() != UndoKind::Update || !committed(then) || then >= ts {
+            return false;
+        }
+        let first = snapshots.partition_point(|&snapshot| snapshot < then);
+        if snapshots.get(first).is_some_and(|&snapshot| snapshot < ts) {
+            return false;
+        }
+        let mut columns = Vec::new();
+        let mut piece = Some(older);
+        while let Some(record) = piece.filter(|record| record.ts() == then) {
+            columns.extend(record.images().map(|image| image.column));
+            piece = self.record(record.prev());
+        }
+        record.images().all(|image| columns.contains(&image.column))
     }
 
     /// The records in the first `units` units of `chunk`, oldest first.
@@ -577,6 +674,21 @@ mod tests {
                     directory.unlink(table, rid, record, older);
                 }
             }
+
+            fn prune(
+                &self,
+                table: u32,
+                rid: u64,
+                spare: &mut dyn FnMut(UndoRef) -> bool,
+            ) -> Vec<UndoRef> {
+                for directory in &self.0 {
+                    let taken = directory.prune(table, rid, &mut *spare);
+                    if !taken.is_empty() {
+                        return taken;
+                    }
+                }
+                Vec::new()
+            }
         }
 
         fn table(space: &Arc<UndoSpace>, id: u32) -> Arc<StripeDirectory> {
@@ -660,25 +772,49 @@ mod tests {
             let (orders, stock) = (table(&space, 1), table(&space, 2));
             let (order, item) = (rows(&orders, 1)[0], rows(&stock, 1)[0]);
             let clock = AtomicU64::new(1);
-            let horizons = Horizons::new(1);
+            let horizons = Horizons::new(2);
             let heads = Tables(vec![Arc::clone(&orders), Arc::clone(&stock)]);
             let old = horizons.begin(0, &clock, Reads::Tables(vec![1]));
             let (mut first, mut second) = (UndoBuffer::default(), UndoBuffer::default());
-            updates(&orders, order, &clock, 3_000, &mut first);
+            updates(&orders, order, &clock, 10, &mut first);
+            let later = horizons.begin(1, &clock, Reads::Tables(vec![1]));
+            updates(&orders, order, &clock, 2_990, &mut first);
             updates(&stock, item, &clock, 3_000, &mut second);
             first.seal(&space);
             second.seal(&space);
             let made = space.chunks() as usize;
 
-            for _ in 0..3 {
-                space.collect(&horizons, &clock, &heads);
+            let mut pruned = 0;
+            for _ in 0..5 {
+                pruned += space.collect(&horizons, &clock, &heads).pruned;
             }
+            // Every chunk of `stock` is free. The records of `orders` between the one each
+            // snapshot reads and the row's newest are out of the chain, but the two statements
+            // began before they were taken out and may hold a reference to one, so their chunks
+            // wait for them.
+            assert!(pruned > 2_900, "{pruned} pruned");
             let kept = space.live_chunks();
             assert!(kept < made && kept >= made / 2 - 1, "{kept} of {made}");
             assert_eq!(as_of(&orders, order, old), Some(0), "the old snapshot still reads");
-            assert_eq!(as_of(&orders, order, old + 10), Some(u128::from(old + 10)));
+            assert_eq!(as_of(&orders, order, later), Some(u128::from(later)));
+
+            // Each transaction goes on with statements at the snapshot it has. Those begin after
+            // the records were taken out, so of `orders` only the first chunk, which has the
+            // records the two snapshots read, and the last, which has the row's newest record,
+            // are left.
+            for _ in 0..3 {
+                horizons.end(0);
+                horizons.end(1);
+                horizons.resume(0, old);
+                horizons.resume(1, later);
+                space.collect(&horizons, &clock, &heads);
+            }
+            assert_eq!(space.live_chunks(), 2, "{made} made");
+            assert_eq!(as_of(&orders, order, old), Some(0), "the old snapshot still reads");
+            assert_eq!(as_of(&orders, order, later), Some(u128::from(later)));
 
             horizons.end(0);
+            horizons.end(1);
             for _ in 0..3 {
                 space.collect(&horizons, &clock, &heads);
             }
@@ -718,6 +854,84 @@ mod tests {
             assert_eq!(space.collect(&horizons, &clock, &heads).cut, 1_498);
             assert_eq!(space.collect(&horizons, &clock, &heads).freed, made);
             assert_eq!(as_of(&items, rid, 1), Some(0));
+        }
+
+        #[test]
+        fn a_record_no_snapshot_reads_is_pruned_above_the_horizon() {
+            let space = Arc::new(UndoSpace::new());
+            let items = table(&space, 1);
+            let rid = rows(&items, 1)[0];
+            let clock = AtomicU64::new(1);
+            let horizons = Horizons::new(2);
+            let heads = Tables(vec![Arc::clone(&items)]);
+            let mut buffer = UndoBuffer::default();
+            let old = horizons.begin(0, &clock, Reads::Tables(vec![1]));
+            updates(&items, rid, &clock, 100, &mut buffer);
+            let later = horizons.begin(1, &clock, Reads::Tables(vec![1]));
+            updates(&items, rid, &clock, 100, &mut buffer);
+            buffer.seal(&space);
+            // Kept are the first update, which nothing older is under, the one over the update
+            // the later snapshot reads, and the newest.
+            let round = space.collect(&horizons, &clock, &heads);
+            assert_eq!((round.found, round.pruned), (0, 197));
+            assert_eq!(space.collect(&horizons, &clock, &heads).pruned, 0, "pruned once");
+            let now = clock.load(Ordering::SeqCst);
+            assert_eq!(as_of(&items, rid, old), Some(0));
+            assert_eq!(as_of(&items, rid, later), Some(u128::from(later)));
+            assert_eq!(as_of(&items, rid, now), Some(u128::from(now)));
+            assert_eq!(as_of(&items, rid, now - 1), Some(u128::from(now - 1)));
+
+            // Once both statements end, the rest are below the horizon and the chunk goes.
+            horizons.end(0);
+            horizons.end(1);
+            for _ in 0..3 {
+                space.collect(&horizons, &clock, &heads);
+            }
+            assert_eq!(space.live_chunks(), 0);
+            assert_eq!(as_of(&items, rid, now), Some(u128::from(now)));
+        }
+
+        #[test]
+        fn a_record_is_pruned_only_over_one_with_every_column_it_has() {
+            let space = Arc::new(UndoSpace::new());
+            let items = Arc::new(
+                StripeDirectory::new(&[Width::Eight, Width::Eight], Arc::clone(&space)).in_table(1),
+            );
+            let rid = rows(&items, 1)[0];
+            let Some(Stripe::Hot(stripe)) = items.find(rid.stripe()) else { panic!("hot") };
+            stripe.write(rid.slot(), 1, Some(0));
+            let clock = AtomicU64::new(1);
+            let horizons = Horizons::new(1);
+            let heads = Tables(vec![Arc::clone(&items)]);
+            let mut buffer = UndoBuffer::default();
+            let old = horizons.begin(0, &clock, Reads::Tables(vec![1]));
+            // Columns 1, 0, 0, 1, 1 at timestamps 2 to 6. Only the second update of column 0 is
+            // over one of the same column with no snapshot between. The second of column 1 is
+            // the newest, and the first is over an update of column 0.
+            for (ts, column) in [(2_u64, 1_usize), (3, 0), (4, 0), (5, 1), (6, 1)] {
+                stripe
+                    .update(
+                        rid.slot(),
+                        &[(column, Some(u128::from(ts)))],
+                        ts - 1,
+                        ts,
+                        Wait::NEVER,
+                        &mut buffer,
+                    )
+                    .expect("nobody else writes it");
+                stripe.commit_write(rid.slot(), ts, ts);
+                clock.store(ts, Ordering::SeqCst);
+            }
+            buffer.seal(&space);
+            assert_eq!(space.collect(&horizons, &clock, &heads).pruned, 1);
+            let read = |snapshot| {
+                let mut out = [None, None];
+                stripe.read_as_of(rid.slot(), &[0, 1], snapshot, 0, &mut out);
+                out
+            };
+            assert_eq!(read(old), [Some(0), Some(0)]);
+            assert_eq!(read(6), [Some(4), Some(6)]);
+            horizons.end(0);
         }
 
         /// Writers, readers and the collector at once. Every value a reader sees is checked
