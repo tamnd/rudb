@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.13
+
+In the PostgreSQL dialect, #3063 lets an array of rows take a row with the concatenation operator. #3066 refuses a comparison of two types that PostgreSQL has no operator for, with error 42883, in a comparison, an IN list, a quantified comparison and a subquery. #3067 keeps the table columns and the declared types of the columns of a data changing WITH definition, of a column read from a query around a LATERAL one, and of a scalar query and ARRAY(SELECT ...) in the row description. #3069 sets a list of columns from the row of a query, or from ROW(t.*), in UPDATE and in ON CONFLICT DO UPDATE.
+
+On the engine side, #3064 drops a materialisation whose only read was a scalar query that nothing reads, #3065 finds the ends of a sorted string column from the codes it uses, and #3068 hands a fitted sort out in runs of chunks to a sink that asks for more rows.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.12
 
 In the PostgreSQL dialect, #3053 refuses a window function in a window definition, in a FILTER, and a GROUPS frame that has no ORDER BY, with the errors of PostgreSQL. #3055 refuses a LATERAL reference across a RIGHT or a FULL join. #3056 reads a WITH definition that writes rows, and #3057 gives a write into a missing table the missing relation error of PostgreSQL. #3058 reads the definitions of a WITH RECURSIVE in the order of what they read, and refuses two definitions that read each other. #3060 reads each WITH definition where it is written, so a column count that does not match gives its error at the right place. #3061 checks the column types of a recursive definition against its non-recursive term, and keeps the declared typmod of a table column through a held definition and a set operation.
