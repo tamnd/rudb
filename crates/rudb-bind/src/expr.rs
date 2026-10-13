@@ -139,6 +139,9 @@ impl Binder<'_> {
                 Err(Error::binder("row expansion via \"*\" is not supported here")
                     .state(SqlState::FEATURE_NOT_SUPPORTED))
             }
+            ast::Expr::Column { name } if ast.relation_row(expr) => {
+                self.bind_relation_row(ast, name, scope)
+            }
             ast::Expr::Column { name } => self.bind_column(ast, name, scope),
             ast::Expr::Positional { index } => {
                 let found = scope.positional(index).map_err(|total| {
@@ -789,7 +792,12 @@ impl Binder<'_> {
         Ok(constant)
     }
 
-    fn bind_column(&mut self, ast: &Ast, name: ast::Slice, scope: &Scope) -> Result<ExprRef> {
+    pub(crate) fn bind_column(
+        &mut self,
+        ast: &Ast,
+        name: ast::Slice,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
         let parts: Vec<&str> = ast.name(name).collect();
         self.bind_column_parts(Some(ast), &parts, scope)
     }

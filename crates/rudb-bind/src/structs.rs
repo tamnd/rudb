@@ -170,6 +170,29 @@ impl Binder<'_> {
         Ok(Some(self.add_expr(Expr::Case { arms, otherwise: None }, ty)))
     }
 
+    /// `t.*` in a row or a call, which PostgreSQL reads as the whole row of the relation `t` and
+    /// never as a column named `t`, so in `row(x.*) FROM generate_series(1, 2) x` it is the row of
+    /// the function and not its column. A qualified name binds as a column reference does.
+    ///
+    /// # Errors
+    ///
+    /// If no relation in scope has the name, which is `42P01` as PostgreSQL has it.
+    pub(crate) fn bind_relation_row(
+        &mut self,
+        ast: &Ast,
+        name: ast::Slice,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let parts: Vec<&str> = ast.name(name).collect();
+        let [word] = parts[..] else { return self.bind_column(ast, name, scope) };
+        if let Some(row) = self.whole_row(word, scope)? {
+            return Ok(row);
+        }
+        Err(Error::binder(format!("Referenced table \"{word}\" not found in FROM clause!"))
+            .state(SqlState::UNDEFINED_TABLE)
+            .pg(format!("missing FROM-clause entry for table \"{word}\"")))
+    }
+
     /// `(r).*`: each field of a composite value as a value of its own, with the name of its
     /// column.
     ///
@@ -191,8 +214,10 @@ impl Binder<'_> {
             }
             ty => {
                 let name = rudb_pgtypes::format_type(rudb_pgtypes::pg_type(&ty).oid);
+                // PostgreSQL gives no position for it.
                 return Err(Error::binder(format!("type {name} is not composite"))
-                    .state(SqlState::WRONG_OBJECT_TYPE));
+                    .state(SqlState::WRONG_OBJECT_TYPE)
+                    .unplaced());
             }
         };
         Ok(self.struct_fields(value, &fields))
