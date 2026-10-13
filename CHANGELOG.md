@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.15
+
+In the PostgreSQL dialect, #3075 builds json and jsonb values from any type as PostgreSQL does, with to_json, row_to_json, json_build_object and the jsonb forms of each. #3076 reads t.* in a row or a call as the row of the relation t. #3080 adds the json and jsonb operators and functions that read a value, and #3081 adds the jsonb operators that test and change a value. #3082 compares jsonb values in the order of PostgreSQL, casts a jsonb value to the scalar types, and refuses a cast that pg_cast does not allow with error 42846. #3083 folds only the immutable functions at plan time, so the error of a stable call or of a call that returns a set comes after the RowDescription, as in PostgreSQL.
+
+On the engine side, #3077 carries a checkpoint past a dropped table instead of rewriting the file, #3078 keeps a short string chunk on codes when plain wins by a few bytes, and #3079 runs a statement outside a block again when a commit lands between its snapshot and its write.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.14
 
 In the PostgreSQL dialect, #3071 reads a qualified star in an expression, such as `t.*` in a function argument or a comparison, as the whole row of the table. #3073 refuses a json or a jsonb value that is nested deeper than max_stack_depth allows, with the stack depth error of PostgreSQL, in a literal, a parameter, COPY and a cast at run time.
