@@ -9,8 +9,8 @@
 use rudb_common::{LogicalType, Result, Value};
 
 use crate::{
-    pgarray, pgdatetime, pgformattype, pgjsonbuild, pgjsonfuncs, pgmath, pgnormalize,
-    pgregression, pgseries, pgstring, pgunicode, pgvariance, pgwindow,
+    pgarray, pgdatetime, pgformattype, pgjsonbuild, pgjsonfuncs, pgmath, pgnormalize, pgregression,
+    pgseries, pgstring, pgunicode, pgvariance, pgwindow,
 };
 
 /// The prefix of the name of a kernel of a C function.
