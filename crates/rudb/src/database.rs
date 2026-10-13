@@ -4860,10 +4860,12 @@ impl Shared {
         // since the snapshot gives the snapshot up and runs again with a new one, once the other
         // is done, since the client has seen nothing under the old one. That is the transaction
         // begun a little later, which snapshot isolation allows, section 8.7 of the concurrency
-        // spec. Without waiting there is no retry, as on the pin.
+        // spec. Without waiting there is no retry, as on the pin. A statement outside a block is
+        // the first statement of its own transaction, and it meets a row committed since its
+        // snapshot when the holder commits between the snapshot and the write reaching the row.
         let lock_timeout = self.inner.settings.lock_timeout();
         let first = !lock_timeout.is_zero()
-            && self.open().as_ref().is_some_and(|open| open.snapshot.is_none());
+            && self.open().as_ref().is_none_or(|open| open.snapshot.is_none());
         let deadline = first.then(|| Instant::now() + lock_timeout);
         let result = loop {
             self.conn.met.store(false, Ordering::Release);
