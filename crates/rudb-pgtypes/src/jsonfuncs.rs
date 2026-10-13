@@ -153,45 +153,60 @@ impl<'a> Doc<'a> {
         }
     }
 
-    /// The text of `node` with the fields whose value is `null` left out, and the elements that
-    /// are `null` too with `in_arrays` set. `colon` and `comma` are the separators of the output.
-    fn strip_nulls(
-        &self,
-        node: usize,
-        in_arrays: bool,
-        (colon, comma): (&str, &str),
-        out: &mut String,
-    ) {
+    /// The text of the value with the fields whose value is `null` left out, and the elements
+    /// that are `null` too with `in_arrays` set. `colon` and `comma` are the separators of the
+    /// output. A value nested to any depth takes no recursion.
+    fn strip_nulls(&self, in_arrays: bool, (colon, comma): (&str, &str), out: &mut String) {
         let null = |node: usize| matches!(self.shape(node), Shape::Scalar(Kind::Null, _));
-        match self.shape(node) {
-            Shape::Scalar(Kind::String, Some(text)) => escape_json(text, out),
-            Shape::Scalar(..) => out.push_str(self.span(node)),
-            Shape::Array(items) => {
-                out.push('[');
-                let mut first = true;
-                for &item in items.iter().filter(|&&item| !(in_arrays && null(item))) {
-                    if !first {
-                        out.push_str(comma);
+        // The open arrays and objects, each with the place of its next child and whether it has
+        // written a child yet.
+        let mut stack: Vec<(usize, usize, bool)> = Vec::new();
+        let mut next = Some(self.root);
+        loop {
+            if let Some(node) = next.take() {
+                match self.shape(node) {
+                    Shape::Scalar(Kind::String, Some(text)) => escape_json(text, out),
+                    Shape::Scalar(..) => out.push_str(self.span(node)),
+                    Shape::Array(_) => {
+                        out.push('[');
+                        stack.push((node, 0, false));
                     }
-                    first = false;
-                    self.strip_nulls(item, in_arrays, (colon, comma), out);
-                }
-                out.push(']');
-            }
-            Shape::Object(fields) => {
-                out.push('{');
-                let mut first = true;
-                for (key, value) in fields.iter().filter(|(_, value)| !null(*value)) {
-                    if !first {
-                        out.push_str(comma);
+                    Shape::Object(_) => {
+                        out.push('{');
+                        stack.push((node, 0, false));
                     }
-                    first = false;
-                    escape_json(key, out);
-                    out.push_str(colon);
-                    self.strip_nulls(*value, in_arrays, (colon, comma), out);
                 }
-                out.push('}');
             }
+            let Some((node, at, wrote)) = stack.last_mut() else { break };
+            let child = match self.shape(*node) {
+                Shape::Array(items) => {
+                    let kept = items[*at..].iter().position(|&item| !(in_arrays && null(item)));
+                    kept.map(|skip| (None, items[*at + skip], skip))
+                }
+                Shape::Object(fields) => {
+                    let kept = fields[*at..].iter().position(|&(_, value)| !null(value));
+                    kept.map(|skip| {
+                        let (key, value) = &fields[*at + skip];
+                        (Some(key), *value, skip)
+                    })
+                }
+                Shape::Scalar(..) => None,
+            };
+            let Some((key, child, skip)) = child else {
+                out.push(if matches!(self.shape(*node), Shape::Array(_)) { ']' } else { '}' });
+                stack.pop();
+                continue;
+            };
+            *at += skip + 1;
+            if *wrote {
+                out.push_str(comma);
+            }
+            *wrote = true;
+            if let Some(key) = key {
+                escape_json(key, out);
+                out.push_str(colon);
+            }
+            next = Some(child);
         }
     }
 }
@@ -311,7 +326,7 @@ pub fn json_strip_nulls(text: &str, in_arrays: bool, jsonb: bool) -> Result<Stri
     let doc = Doc::read(text)?;
     let separators = if jsonb { (": ", ", ") } else { (":", ",") };
     let mut out = String::with_capacity(text.len());
-    doc.strip_nulls(doc.root, in_arrays, separators, &mut out);
+    doc.strip_nulls(in_arrays, separators, &mut out);
     Ok(out)
 }
 
@@ -436,5 +451,7 @@ mod tests {
             r#"{"b": [1]}"#
         );
         assert_eq!(json_typeof(" 1.0 ").unwrap(), "number");
+        let deep = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert_eq!(json_strip_nulls(&deep, true, false).unwrap(), deep);
     }
 }
