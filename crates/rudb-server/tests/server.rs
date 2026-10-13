@@ -7039,6 +7039,49 @@ fn the_jsonb_operators_test_and_change_a_value() {
 }
 
 #[test]
+fn the_jsonb_values_compare_and_cast_as_postgresql_does() {
+    let dirs = Dirs::new("jsonb-cmp");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut value = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            return format!("{code} {}", error.field(b'M').unwrap_or_default());
+        }
+        let row = messages.iter().find(|m| m.tag == b'D').unwrap();
+        let values = data_row(row).into_iter().map(|value| {
+            value.map_or_else(|| "NULL".to_string(), |value| String::from_utf8(value).unwrap())
+        });
+        values.collect::<Vec<_>>().join("|")
+    };
+    // The values of the PostgreSQL 19 oracle.
+    for (sql, expected) in [
+        (
+            r#"select '[]'::jsonb < 'null', '1.0'::jsonb = '1', '{"a":1}'::jsonb > '[1,2,3]'"#,
+            "t|t|t",
+        ),
+        (r#"select jsonb_cmp('{"b":1}', '{"a":2}'), jsonb_cmp('"b"', '"ab"')"#, "1|1"),
+        (r#"select '{"a":[1]}'::jsonb > '{"a":1}', '[1,2]'::jsonb <> '[1,2.00]'"#, "t|f"),
+        (
+            "select 'null'::jsonb::int4 is null, '1.5'::jsonb::int4, '-1.5'::jsonb::int2, '2.5'::jsonb::int8",
+            "t|2|-2|3",
+        ),
+        ("select 'true'::jsonb::bool, '1e2'::jsonb::numeric, '0.1'::jsonb::float4", "t|100|0.1"),
+        ("select '1.26'::jsonb::numeric(3,1)", "1.3"),
+        ("select '1'::jsonb::bool", "22023 cannot cast jsonb numeric to type boolean"),
+        ("select '[1]'::jsonb::numeric", "22023 cannot cast jsonb array to type numeric"),
+        ("select '70000'::jsonb::int2", "22003 smallint out of range"),
+        ("select '1'::json::int4", "42846 cannot cast type json to integer"),
+        ("select 1::int8::bool", "42846 cannot cast type bigint to boolean"),
+    ] {
+        assert_eq!(value(sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
     let dirs = Dirs::new("pg-regexp");
     let server = Server::start(dirs.config()).unwrap();

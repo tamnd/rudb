@@ -445,7 +445,10 @@ impl Binder<'_> {
         try_cast: bool,
     ) -> Result<ExprRef> {
         let cast = match declared {
-            Some(declared) if !try_cast => self.read_string(input, declared, target),
+            Some(declared) if !try_cast => match self.pg_cast(input, declared.oid, target)? {
+                Some(cast) => Some(cast),
+                None => self.read_string(input, declared, target),
+            },
             _ => None,
         };
         let cast = match cast {
@@ -456,6 +459,48 @@ impl Binder<'_> {
             Some(declared) => self.pg_length(cast, declared, true),
             None => Ok(cast),
         }
+    }
+
+    /// The cast of `input` to the PostgreSQL type `target` as `pg_cast` has it, when the cast of
+    /// the engine does not answer as PostgreSQL does: a cast that `pg_cast` does not allow is the
+    /// error of PostgreSQL, and a cast by a function whose kernel the engine cast does not match,
+    /// such as `jsonb` to `integer`, is the kernel of the function, whose value then takes the
+    /// modifier of `ty`, as of `numeric(3, 1)`. `None` leaves the cast to the engine.
+    fn pg_cast(
+        &mut self,
+        input: ExprRef,
+        target: rudb_pgtypes::Oid,
+        ty: &LogicalType,
+    ) -> Result<Option<ExprRef>> {
+        use rudb_pgtypes::{CoercionContext, CoercionPath, TypeInfo};
+        let Some(source) = crate::pgcalls::exact_oid(self.plan().expr_type(input)) else {
+            return Ok(None);
+        };
+        let built_in = TypeInfo::get(target).is_some_and(|info| info.kind == b'b');
+        if source == target || !built_in {
+            return Ok(None);
+        }
+        if rudb_pgtypes::find_coercion_pathway(source, target, CoercionContext::Explicit)
+            == CoercionPath::None
+        {
+            let message = format!(
+                "cannot cast type {} to {}",
+                rudb_pgtypes::format_type(source),
+                rudb_pgtypes::format_type(target)
+            );
+            return Err(Error::binder(message.clone())
+                .state(SqlState::CANNOT_COERCE)
+                .pg(message)
+                .with_span(self.current_span));
+        }
+        let Some(proc) = rudb_pgtypes::cast_function(source, target)
+            .filter(|proc| rudb_kernels::pgproc::cast(proc.src))
+        else {
+            return Ok(None);
+        };
+        let Some(returns) = rudb_pgtypes::logical_type(target) else { return Ok(None) };
+        let call = self.pgproc_kernel(proc.src, &[input], returns);
+        self.checked_cast_to(call, ty, false).map(Some)
     }
 
     /// Binds an uncorrelated scalar query and returns its one output as a column expression.

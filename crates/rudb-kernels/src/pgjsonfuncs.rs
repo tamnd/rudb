@@ -5,11 +5,17 @@
 //! `json_array_length`, `json_typeof`, `json_strip_nulls` and the `jsonb` form of each. The
 //! functions of `jsonb` that test a value or give a changed value are those of `?`, `?|`, `?&`,
 //! `@>`, `<@`, `||`, `-` and `#-`, `jsonb_set`, `jsonb_set_lax`, `jsonb_insert` and
-//! `jsonb_pretty`.
+//! `jsonb_pretty`. The functions that order two `jsonb` values are `jsonb_cmp` and those of `=`,
+//! `<>`, `<`, `<=`, `>` and `>=`. The casts of a `jsonb` value to `boolean`, `numeric`,
+//! `smallint`, `integer`, `bigint`, `real` and `double precision` are functions too.
 //!
 //! The operators of the engine with these names are the ones of the pin, which read a path of
-//! JSONPath, test a list or join two texts. So each operator of PostgreSQL over `json` or `jsonb`
-//! is the kernel of its function, as [`OPERATORS`] has them.
+//! JSONPath, test a list, join two texts or compare two texts. So each operator of PostgreSQL over
+//! `json` or `jsonb` is the kernel of its function, as [`OPERATORS`] has them. A cast of the
+//! engine reads the text of the value, so each cast of `jsonb` to a scalar type is the kernel of
+//! its function too, as [`CASTS`] has them.
+
+use std::cmp::Ordering;
 
 use rudb_common::{Error, Result, Value};
 use rudb_pgtypes::TypeError;
@@ -28,6 +34,8 @@ pub(crate) const SOURCES: &[&str] = &[
     "jsonb_array_element",
     "jsonb_array_element_text",
     "jsonb_array_length",
+    "jsonb_bool",
+    "jsonb_cmp",
     "jsonb_concat",
     "jsonb_contained",
     "jsonb_contains",
@@ -35,12 +43,24 @@ pub(crate) const SOURCES: &[&str] = &[
     "jsonb_delete_array",
     "jsonb_delete_idx",
     "jsonb_delete_path",
+    "jsonb_eq",
     "jsonb_exists",
     "jsonb_exists_all",
     "jsonb_exists_any",
     "jsonb_extract_path",
     "jsonb_extract_path_text",
+    "jsonb_float4",
+    "jsonb_float8",
+    "jsonb_ge",
+    "jsonb_gt",
     "jsonb_insert",
+    "jsonb_int2",
+    "jsonb_int4",
+    "jsonb_int8",
+    "jsonb_le",
+    "jsonb_lt",
+    "jsonb_ne",
+    "jsonb_numeric",
     "jsonb_object_field",
     "jsonb_object_field_text",
     "jsonb_pretty",
@@ -54,7 +74,7 @@ pub(crate) const SOURCES: &[&str] = &[
 pub(crate) const NULLS: &[&str] = &["jsonb_set_lax"];
 
 /// The C functions of the operators `->`, `->>`, `#>`, `#>>`, `?`, `?|`, `?&`, `@>`, `<@`, `||`,
-/// `-` and `#-`.
+/// `-`, `#-`, `=`, `<>`, `<`, `<=`, `>` and `>=`.
 pub(crate) const OPERATORS: &[&str] = &[
     "json_array_element",
     "json_array_element_text",
@@ -71,18 +91,41 @@ pub(crate) const OPERATORS: &[&str] = &[
     "jsonb_delete_array",
     "jsonb_delete_idx",
     "jsonb_delete_path",
+    "jsonb_eq",
     "jsonb_exists",
     "jsonb_exists_all",
     "jsonb_exists_any",
     "jsonb_extract_path",
     "jsonb_extract_path_text",
+    "jsonb_ge",
+    "jsonb_gt",
+    "jsonb_le",
+    "jsonb_lt",
+    "jsonb_ne",
     "jsonb_object_field",
     "jsonb_object_field_text",
+];
+
+/// The C functions of the casts of `jsonb` to the scalar types, sorted.
+pub(crate) const CASTS: &[&str] = &[
+    "jsonb_bool",
+    "jsonb_float4",
+    "jsonb_float8",
+    "jsonb_int2",
+    "jsonb_int4",
+    "jsonb_int8",
+    "jsonb_numeric",
 ];
 
 /// The value of the C function `src` over `args`, or `None` for another function.
 pub(crate) fn call(src: &str, args: &[Value]) -> Result<Option<Value>> {
     if let Some(value) = jsonb_call(src, args)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = jsonb_order(src, args)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = jsonb_cast(src, args)? {
         return Ok(Some(value));
     }
     let base = src.strip_prefix("jsonb").or_else(|| src.strip_prefix("json")).unwrap_or(src);
@@ -179,6 +222,64 @@ fn jsonb_call(src: &str, args: &[Value]) -> Result<Option<Value>> {
     Ok(Some(Value::Boolean(tested.map_err(placed)?)))
 }
 
+/// The value of `jsonb_cmp` or of the function of a comparison operator over two `jsonb` values,
+/// or `None` for another function.
+fn jsonb_order(src: &str, args: &[Value]) -> Result<Option<Value>> {
+    let (Some(test), [Value::Varchar(a), Value::Varchar(b)]) = (src.strip_prefix("jsonb_"), args)
+    else {
+        return Ok(None);
+    };
+    let holds: fn(Ordering) -> bool = match test {
+        "cmp" => {
+            let order = rudb_pgtypes::jsonb_cmp(a, b).map_err(placed)?;
+            return Ok(Some(Value::Integer(order as i32)));
+        }
+        "eq" => Ordering::is_eq,
+        "ne" => Ordering::is_ne,
+        "lt" => Ordering::is_lt,
+        "le" => Ordering::is_le,
+        "gt" => Ordering::is_gt,
+        "ge" => Ordering::is_ge,
+        _ => return Ok(None),
+    };
+    Ok(Some(Value::Boolean(holds(rudb_pgtypes::jsonb_cmp(a, b).map_err(placed)?))))
+}
+
+/// The value of a cast of a `jsonb` value to a scalar type, as `jsonb_bool`, `jsonb_numeric` and
+/// the others give it, or `None` for another function. A number becomes an integer or a float as
+/// the casts of `numeric` make it.
+fn jsonb_cast(src: &str, args: &[Value]) -> Result<Option<Value>> {
+    let [Value::Varchar(doc)] = args else { return Ok(None) };
+    let type_name = match src {
+        "jsonb_bool" => {
+            let value = rudb_pgtypes::jsonb_bool(doc).map_err(placed)?;
+            return Ok(Some(value.map_or(Value::Null, Value::Boolean)));
+        }
+        "jsonb_numeric" => "numeric",
+        "jsonb_int2" => "smallint",
+        "jsonb_int4" => "integer",
+        "jsonb_int8" => "bigint",
+        "jsonb_float4" => "real",
+        "jsonb_float8" => "double precision",
+        _ => return Ok(None),
+    };
+    use rudb_pgtypes::{jsonb_float, jsonb_integer, jsonb_numeric};
+    let value = match src {
+        "jsonb_numeric" => {
+            jsonb_numeric(doc, type_name).map(|n| n.map(|number| Value::Numeric(number.to_bytes())))
+        }
+        "jsonb_int2" => jsonb_integer(doc, type_name).map(|n| n.map(Value::SmallInt)),
+        "jsonb_int4" => jsonb_integer(doc, type_name).map(|n| n.map(Value::Integer)),
+        "jsonb_int8" => jsonb_integer(doc, type_name).map(|n| n.map(Value::BigInt)),
+        // A `real` is the float of the text, which a `double precision` holds exactly.
+        "jsonb_float4" => {
+            jsonb_float(doc, false).map(|n| n.map(|float| Value::Float(float as f32)))
+        }
+        _ => jsonb_float(doc, true).map(|n| n.map(Value::Double)),
+    };
+    Ok(Some(value.map_err(placed)?.unwrap_or(Value::Null)))
+}
+
 /// The elements of a `text[]`, with `None` for a null.
 fn texts(list: &Value) -> Result<Vec<Option<&str>>> {
     let Value::List { values, .. } = list else {
@@ -245,5 +346,20 @@ mod tests {
         assert_eq!(call("jsonb_set_lax", &lax).unwrap(), Some(Value::Null));
         let error = call("jsonb_delete_idx", &[doc, Value::Integer(0)]).unwrap_err();
         assert_eq!(error.message(), "cannot delete from object using integer index");
+    }
+
+    #[test]
+    fn the_jsonb_comparisons_and_casts_read_the_value() {
+        let got = call("jsonb_eq", &[text("[1.0]"), text("[1]")]).unwrap();
+        assert_eq!(got, Some(Value::Boolean(true)));
+        let got = call("jsonb_cmp", &[text("{}"), text("[1, 2]")]).unwrap();
+        assert_eq!(got, Some(Value::Integer(1)));
+        assert_eq!(call("jsonb_int4", &[text("-1.5")]).unwrap(), Some(Value::Integer(-2)));
+        assert_eq!(call("jsonb_int8", &[text("null")]).unwrap(), Some(Value::Null));
+        let error = call("jsonb_int2", &[text("70000")]).unwrap_err();
+        assert_eq!(error.message(), "smallint out of range");
+        let error = call("jsonb_float8", &[text("true")]).unwrap_err();
+        assert_eq!(error.message(), "cannot cast jsonb boolean to type double precision");
+        assert_eq!(call("jsonb_float4", &[text("0.5")]).unwrap(), Some(Value::Float(0.5)));
     }
 }

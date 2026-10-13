@@ -115,6 +115,7 @@ mod float;
 mod generated;
 mod json;
 mod jsonb;
+mod jsonbcmp;
 mod jsonbops;
 mod jsonbuild;
 mod jsonfuncs;
@@ -143,7 +144,7 @@ pub use array::{
 pub use binary::{Recv, name_recv, verify_utf8};
 pub use coerce::{
     Cast, CoercionContext, CoercionPath, Mismatch, can_coerce_assigned, can_coerce_implicitly,
-    common_type, find_cast, find_coercion_pathway, is_preferred,
+    cast_function, common_type, find_cast, find_coercion_pathway, is_preferred,
 };
 pub use collations::{Collation, collation, collation_by_oid};
 pub use datetime::{
@@ -165,6 +166,7 @@ pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
 pub use json::{StackDepth, json_in};
 pub use jsonb::{escape_json, jsonb_in, jsonb_recv, jsonb_send};
+pub use jsonbcmp::{jsonb_bool, jsonb_cmp, jsonb_float, jsonb_integer, jsonb_numeric};
 pub use jsonbops::{
     jsonb_concat, jsonb_contains, jsonb_delete, jsonb_delete_index, jsonb_delete_path,
     jsonb_exists, jsonb_exists_keys, jsonb_insert, jsonb_pretty, jsonb_set, jsonb_set_lax,
