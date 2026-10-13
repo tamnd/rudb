@@ -91,8 +91,8 @@ const LZ_FLOOR: usize = 4096;
 
 /// How many bytes more than the smallest encoding a coded one may cost and still be kept instead.
 ///
-/// A scan filters a part held as a dictionary or as FSST on its codes and one held plain on every
-/// string, so a column whose parts are all coded but one runs the slow kernel for that one. The
+/// A scan filters a part held as a dictionary or as FSST on its codes and one held plain, front
+/// coded or as LZ on every string, so a column whose parts are all coded but one runs the slow kernel for that one. The
 /// part that ends up plain is nearly always the short one at the end of a load: on the JOB load
 /// sorted by `movie_id`, the last eight rows of `movie_info` came out plain beside 1,811 coded
 /// parts. A dictionary of eight values costs a few bytes of codes over plain, and the slack stops
@@ -982,10 +982,12 @@ fn encode_at(values: &[&[u8]], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u
             best = Some((kind, bytes));
         }
     }
-    // A plain chunk at the top level gives way to a coded one that costs at most a few bytes more.
+    // A chunk at the top level that would be held off codes, plain, front coded or compressed with
+    // LZ, gives way to a coded one that costs at most a few bytes more.
     if depth == 0
-        && let (Some((Kind::Plain, plain)), Some((_, codes))) = (&best, &coded)
-        && codes.len() <= plain.len() + CODED_SLACK
+        && let (Some((kind, smallest)), Some((_, codes))) = (&best, &coded)
+        && matches!(kind, Kind::Plain | Kind::Front | Kind::Lz)
+        && codes.len() <= smallest.len() + CODED_SLACK
     {
         best = coded;
     }
@@ -2226,6 +2228,12 @@ mod tests {
         assert!(matches!(kind, Kind::Dict | Kind::Fsst), "{}", describe(&bytes).unwrap());
         let plain = encode_only(Kind::Plain, &borrow(&values)).unwrap().unwrap();
         assert!(bytes.len() <= plain.len() + CODED_SLACK);
+        // Values that share a prefix, which front coding held smallest.
+        let shared: Vec<Vec<u8>> =
+            (0..8).map(|at| format!("West Germany {at}").into_bytes()).collect();
+        let bytes = round_trip(&shared);
+        let kind = kind_of(&bytes);
+        assert!(matches!(kind, Kind::Dict | Kind::Fsst), "{}", describe(&bytes).unwrap());
     }
 
     #[test]
