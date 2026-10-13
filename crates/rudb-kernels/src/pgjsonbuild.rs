@@ -5,7 +5,7 @@
 //! `datum_to_json_internal`. The binder does the same with the kernels here: a number is its output
 //! text, a date and a timestamp are in the ISO 8601 form of [`TIME`], a `json` value is its text,
 //! an array is [`ARRAY`] over its elements and a row is [`RECORD`] over its fields. Any other value
-//! is the string of its output text. So the functions of `pg_proc` in [`DATUMS`] take the JSON
+//! is the string of its output text. So the functions of `pg_proc` in `DATUMS` take the JSON
 //! text of each argument that can be of any type, and only put the pieces together.
 
 use rudb_common::{Error, Result, SessionTimeZone, Value};
