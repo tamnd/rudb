@@ -6775,6 +6775,13 @@ fn a_star_after_a_record_is_a_column_for_each_field() {
         ("select (row(row(1, 2), 3)).*", "f1,f2", "(1,2)|3"),
         ("select sum((r).f1), (r).* from (select row(1, 2) r) s group by r", "sum,f1,f2", "1|1|2"),
         ("select row((r).*, 3) from (select row(1, 2) r) s", "row", "(1,2,3)"),
+        // `x.*` is the row of the relation `x`, though its one column is named `x` too.
+        ("select row(x.*, 3) from generate_series(1, 1) x", "row", "(1,3)"),
+        (
+            "select row(a.*) from (values (1, 'a')) t(a, b)",
+            "42P01 missing FROM-clause entry for table \"a\"",
+            "",
+        ),
         ("select (1).*", "42809 type integer is not composite", ""),
         ("select ('a'::text).*", "42809 type text is not composite", ""),
         (

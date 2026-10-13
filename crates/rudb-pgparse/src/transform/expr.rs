@@ -148,6 +148,7 @@ impl Transform<'_> {
             };
             let name = self.names(&fields[..fields.len() - 1])?;
             let mut item = self.push(Expr::Column { name }, column.location);
+            self.ast.relation_rows.push(item);
             if expand {
                 item = self.push(Expr::Fields { record: item }, column.location);
             }

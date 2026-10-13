@@ -1973,6 +1973,10 @@ pub struct Ast {
     /// `concat(VARIADIC array['a', 'b'])`. The last argument is the last named one when the call
     /// has named arguments, and otherwise the last one it carries.
     pub variadic_calls: Vec<ExprRef>,
+    /// The column references written `t.*` as an item of a row constructor or an argument of a
+    /// call, as PostgreSQL writes `row(t.*)` and `row_to_json(t.*)`. The name there is the name of
+    /// a relation and never of a column, as `transformWholeRowRef` reads it.
+    pub relation_rows: Vec<ExprRef>,
     /// The lists written `ARRAY[...]` rather than `[...]`. They are the same list, and only the
     /// name of a column holding one tells them apart.
     pub array_lists: Vec<ExprRef>,
@@ -2270,6 +2274,12 @@ impl Ast {
     /// Whether a call was written with `VARIADIC` before its last argument.
     pub fn variadic(&self, call: ExprRef) -> bool {
         self.variadic_calls.contains(&call)
+    }
+
+    /// Whether a column reference was written `t.*` in a row or a call, where `t` names only a
+    /// relation.
+    pub fn relation_row(&self, column: ExprRef) -> bool {
+        self.relation_rows.contains(&column)
     }
 
     /// Whether a call was written with `EXPORT_STATE` after it.
