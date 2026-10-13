@@ -1313,12 +1313,15 @@ impl Binder<'_> {
             _ => return Ok(None),
         };
         let target = self.plan().expr_type(bound[0]).clone();
-        let LogicalType::List(element) = &target else {
-            return Ok(None);
-        };
         if self.semantics.subscripts() != Subscripts::Postgres {
             return Ok(None);
         }
+        if target == LogicalType::Jsonb {
+            return self.jsonb_subscript(ast, name, arguments, bound).map(Some);
+        }
+        let LogicalType::List(element) = &target else {
+            return Ok(None);
+        };
         let returns = match name {
             pgarray::ARRAY_SUBSCRIPT => (**element).clone(),
             _ => target.clone(),
@@ -1337,6 +1340,62 @@ impl Binder<'_> {
         let name = self.plan_mut().intern(name);
         let args = self.plan_mut().add_expr_list(&args);
         Ok(Some(self.add_expr(Expr::Function { name, args }, returns)))
+    }
+
+    /// A subscript `value[key]` of a `jsonb` value, as `jsonb_subscript_transform` binds it and
+    /// `jsonb_subscript_fetch` reads it: the value at the path of the one key, as `#>` finds it.
+    /// The key is coerced to `integer` or else to `text`, and a string literal and a null are
+    /// `text`. An `integer` key is a path element by its text, so it is the position in an array
+    /// and the key of the same text in an object. A slice is an error.
+    fn jsonb_subscript(
+        &mut self,
+        ast: &Ast,
+        name: &str,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<ExprRef> {
+        if name == pgarray::ARRAY_SLICE {
+            // A bound that the parser filled in for an omitted one spans the brackets, and so the
+            // other bound too.
+            let omitted = |at: usize| {
+                let (outer, inner) =
+                    (ast.expr_span(arguments[at]), ast.expr_span(arguments[3 - at]));
+                outer.start <= inner.start && inner.end <= outer.end
+            };
+            let error = Error::binder("jsonb subscript does not support slices")
+                .state(SqlState::DATATYPE_MISMATCH);
+            let at = [2, 1].into_iter().find(|&at| !omitted(at));
+            return Err(error.placed_at(at.map(|at| ast.leftmost_span(arguments[at]))));
+        }
+        let ty = self.plan().expr_type(bound[1]).clone();
+        let source = operand_oids(ast, &arguments[1..2], std::slice::from_ref(&ty))
+            .and_then(|oids| oids.first().copied());
+        let key = match source {
+            Some(rudb_pgtypes::oid::UNKNOWN) => self.cast_to(bound[1], &LogicalType::Varchar),
+            Some(source)
+                if rudb_pgtypes::can_coerce_implicitly(source, rudb_pgtypes::oid::INT4) =>
+            {
+                let index = self.checked_cast_to(bound[1], &LogicalType::Integer, false)?;
+                self.cast_to(index, &LogicalType::Varchar)
+            }
+            Some(source)
+                if rudb_pgtypes::can_coerce_implicitly(source, rudb_pgtypes::oid::TEXT) =>
+            {
+                self.checked_cast_to(bound[1], &LogicalType::Varchar, false)?
+            }
+            _ => {
+                let shown = match source {
+                    Some(source) => rudb_pgtypes::format_type(source).into_owned(),
+                    None => ty.to_string(),
+                };
+                return Err(Error::binder(format!("subscript type {shown} is not supported"))
+                    .state(SqlState::DATATYPE_MISMATCH)
+                    .hint("jsonb subscript must be coercible to either integer or text.")
+                    .with_span(ast.leftmost_span(arguments[1])));
+            }
+        };
+        let path = self.call("list_value", vec![key])?;
+        Ok(self.pgproc_kernel("jsonb_extract_path", &[bound[0], path], LogicalType::Jsonb))
     }
 
     /// One subscript as an `integer`. A string literal is read by the input function of `integer`,

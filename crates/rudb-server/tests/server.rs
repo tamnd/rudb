@@ -666,6 +666,50 @@ fn format_type_names_a_type_by_its_oid() {
     server.stop().unwrap();
 }
 
+#[test]
+fn the_jsonb_subscripts_read_as_postgresql_does() {
+    let dirs = Dirs::new("jsonb-sub");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for (sql, value) in [
+        ("select ('[1, \"2\", null]'::jsonb)[-2]", "\"2\""),
+        ("select ('{\"1\": 1}'::jsonb)[1]", "1"),
+        ("select ('[1,2]'::jsonb)['1']", "2"),
+        ("select ('[1,2]'::jsonb)[1::int2]", "2"),
+        ("select pg_typeof(('[1,2]'::jsonb)[1])", "jsonb"),
+        (
+            "select ('{\"a\": [\"a1\", {\"b1\": [\"aaa\", \"bbb\", \"ccc\"]}]}'::jsonb)['a'][1]['b1'][2]",
+            "\"ccc\"",
+        ),
+        ("select ('[1,2]'::jsonb)[1] = '2'", "t"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    // A subscript that is not an integer or a text, and a slice, fail at the subscript.
+    for (sql, message, position) in [
+        (
+            "select ('[1, \"2\", null]'::jsonb)[1.0]",
+            "subscript type numeric is not supported",
+            Some("34"),
+        ),
+        ("select ('[1,2]'::jsonb)[true]", "subscript type boolean is not supported", Some("25")),
+        (
+            "select ('[1, \"2\", null]'::jsonb)[1:2]",
+            "jsonb subscript does not support slices",
+            Some("36"),
+        ),
+        ("select ('[1, \"2\", null]'::jsonb)[:]", "jsonb subscript does not support slices", None),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some("42804"), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// The row description of a message.
 fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
     let bytes = message.decoded();
