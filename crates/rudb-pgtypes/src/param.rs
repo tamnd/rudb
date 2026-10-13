@@ -27,15 +27,18 @@ use crate::reg::{RegInput, RegKind, reg_in};
 use crate::scalar::{bool_in, bytea_in, char_in, name_in, uuid_in};
 use crate::string::{bpchar_in, varchar_in};
 use crate::types::{Oid, PgType, TypeInfo, format_type};
-use crate::{float4_in, float8_in, json_in, jsonb_in, jsonb_recv};
+use crate::{StackDepth, float4_in, float8_in, json_in, jsonb_in, jsonb_recv};
 
-/// What the text input of a parameter depends on: `DateStyle`, `TimeZone` and `IntervalStyle`.
+/// What the input of a parameter depends on: `DateStyle`, `TimeZone`, `IntervalStyle` and
+/// `max_stack_depth`.
 #[derive(Debug)]
 pub struct InputSettings<'a> {
     /// The date and time settings.
     pub datetime: DateTimeInput<'a>,
     /// `IntervalStyle`.
     pub interval_style: IntervalStyle,
+    /// `max_stack_depth`, which limits how deep a `json` or a `jsonb` value can be nested.
+    pub stack_depth: StackDepth,
 }
 
 /// The rudb type that a parameter of the PostgreSQL type `oid` binds as, or `None` for 0, for
@@ -117,7 +120,7 @@ pub fn param_value(
 ) -> Result<Value, TypeError> {
     if binary {
         let mut recv = Recv::new(data);
-        let value = binary_value(oid, &mut recv)?;
+        let value = binary_value(oid, &mut recv, settings.stack_depth)?;
         recv.finish(number)?;
         Ok(value)
     } else {
@@ -151,7 +154,7 @@ pub fn column_value(
                 Value::Varchar(varchar_in(recv.text()?, typmod)?.to_owned())
             }
             oids::BPCHAR if typmod >= 0 => bpchar_value(recv.text()?, typmod)?,
-            _ => binary_value(oid, &mut recv)?,
+            _ => binary_value(oid, &mut recv, settings.stack_depth)?,
         };
         if recv.remaining() > 0 {
             return Err(TypeError::new(
@@ -204,7 +207,15 @@ pub fn soft_input_error(
     match column_value(ty, false, text.as_bytes(), settings) {
         Ok(_) => Ok(None),
         // A name of another kind than a type needs the catalog, which is not an error of the text.
-        Err(error) if error.sqlstate == SqlState::FEATURE_NOT_SUPPORTED => Err(error),
+        // A value nested too deep stops the stack, which no input catches.
+        Err(error)
+            if matches!(
+                error.sqlstate,
+                SqlState::FEATURE_NOT_SUPPORTED | SqlState::STATEMENT_TOO_COMPLEX
+            ) =>
+        {
+            Err(error)
+        }
         Err(error) => Ok(Some(error)),
     }
 }
@@ -235,8 +246,7 @@ fn text_value(oid: Oid, text: &str, settings: &InputSettings<'_>) -> Result<Valu
         }
         oids::NAME => Value::Varchar(name_in(text).to_owned()),
         oids::NUMERIC => Value::Numeric(numeric_in(text, -1)?.to_bytes()),
-        oids::JSON => Value::Varchar(json_in(text)?.to_owned()),
-        oids::JSONB => Value::Varchar(jsonb_in(text)?),
+        oids::JSON | oids::JSONB => return json_text_value(oid, text, settings.stack_depth),
         oids::DATE => date(date_in(text, cx)?),
         oids::TIME => Value::Time(time_in(text, -1, cx)?),
         oids::TIMETZ => time_tz(timetz_in(text, -1, cx)?),
@@ -292,6 +302,19 @@ pub fn plain_text_value(oid: Oid, text: &str) -> Option<Result<Value, TypeError>
     })
 }
 
+/// The value that the input function of `json` reads from `text` when `oid` is `json`, and that
+/// of `jsonb` when it is not. `depth` limits how deep the value can be nested.
+///
+/// # Errors
+///
+/// The error of the input function, with the SQLSTATE and the text of PostgreSQL.
+pub fn json_text_value(oid: Oid, text: &str, depth: StackDepth) -> Result<Value, TypeError> {
+    Ok(Value::Varchar(match oid {
+        oids::JSON => json_in(text, depth)?.to_owned(),
+        _ => jsonb_in(text, depth)?,
+    }))
+}
+
 /// The text input of an OID alias type. A number needs no lookup. A `regtype` name is read as a
 /// type name is read in a cast, which finds every built-in type. A name of another kind needs the
 /// catalog of PG3.
@@ -309,7 +332,7 @@ fn reg_value(kind: RegKind, text: &str) -> Result<u32, TypeError> {
     ))
 }
 
-fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
+fn binary_value(oid: Oid, recv: &mut Recv<'_>, depth: StackDepth) -> Result<Value, TypeError> {
     Ok(match oid {
         oids::BOOL => Value::Boolean(recv.bool()?),
         oids::INT2 => Value::SmallInt(recv.i16()?),
@@ -333,7 +356,7 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::TEXT | oids::VARCHAR | oids::BPCHAR | oids::NAME | oids::UNKNOWN | oids::JSON => {
             Value::Varchar(recv.text()?.to_owned())
         }
-        oids::JSONB => Value::Varchar(jsonb_recv(recv.rest())?),
+        oids::JSONB => Value::Varchar(jsonb_recv(recv.rest(), depth)?),
         oids::UUID => Value::Uuid(uuid::from_bytes(recv.uuid()?)),
         oids::DATE => date(date_recv(recv)?),
         oids::TIME => Value::Time(time_recv(recv, -1)?),
@@ -343,7 +366,7 @@ fn binary_value(oid: Oid, recv: &mut Recv<'_>) -> Result<Value, TypeError> {
         oids::INTERVAL => interval(interval_recv(recv, -1)?),
         _ => {
             if let Some((element, _)) = element(oid) {
-                let array = array_recv(recv, element, |recv| binary_value(element, recv))?;
+                let array = array_recv(recv, element, |recv| binary_value(element, recv, depth))?;
                 list(element, array, |value| value)?
             } else {
                 let name =
@@ -424,6 +447,7 @@ mod tests {
                 now: 0,
             },
             interval_style: IntervalStyle::Postgres,
+            stack_depth: StackDepth::default(),
         };
         let soft = |text, name| {
             soft_input_error(text, name, &settings)
@@ -484,6 +508,7 @@ mod tests {
                 now: 0,
             },
             interval_style: IntervalStyle::Postgres,
+            stack_depth: StackDepth::default(),
         };
         param_value(oid, binary, data, 1, &settings)
     }
@@ -500,6 +525,7 @@ mod tests {
                 now: 0,
             },
             interval_style: IntervalStyle::Postgres,
+            stack_depth: StackDepth::default(),
         };
         let ty = PgType { oid: oids::BPCHAR, typmod: 8 };
         for binary in [false, true] {

@@ -99,8 +99,10 @@
 //! the vector to write a repeated value once.
 //!
 //! PostgreSQL parses `json` by recursion and stops a deep value with `stack depth limit exceeded`
-//! when it reaches `max_stack_depth`. [`json_in`] uses no recursion and takes a value at any
-//! depth.
+//! when it reaches `max_stack_depth`. [`json_in`] uses no recursion, and [`StackDepth`] counts
+//! the stack that PostgreSQL would use, so the same value is too deep. The counts are those of a
+//! cast in a 64-bit build. The stack below the parse changes with the statement and the platform,
+//! so PostgreSQL can take a value a few levels deeper or less deep.
 
 mod array;
 mod binary;
@@ -158,7 +160,7 @@ pub use declared::{declared_type, session_type, type_name};
 pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
-pub use json::json_in;
+pub use json::{StackDepth, json_in};
 pub use jsonb::{jsonb_in, jsonb_recv, jsonb_send};
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
 pub use number_format::{
@@ -175,8 +177,8 @@ pub use opclasses::{
 };
 pub use operators::{Operator, hashable, operators, operators_of};
 pub use param::{
-    InputSettings, column_value, has_plain_input, logical_type, param_value, plain_text_value,
-    soft_input_error,
+    InputSettings, column_value, has_plain_input, json_text_value, logical_type, param_value,
+    plain_text_value, soft_input_error,
 };
 pub use polymorphic::{Generic, enforce_generic_types};
 pub use procs::{Proc, builtin_procs, func_name_as_type, procs};

@@ -1385,8 +1385,8 @@ impl Binder<'_> {
     }
 
     /// `pg_input_is_valid(text, type)` when `valid`, and `pg_input_error_info(text, type)`. The
-    /// kernel reads the text with the input function of the type, which reads `DateStyle` and
-    /// `IntervalStyle`, so they are given to it as two constants. A new value of a setting makes a
+    /// kernel reads the text with the input function of the type, which reads `DateStyle`,
+    /// `IntervalStyle` and `max_stack_depth`, so they are given to it as three constants. A new value of a setting makes a
     /// new plan.
     fn input_check(
         &mut self,
@@ -1408,12 +1408,15 @@ impl Binder<'_> {
         let interval_style = setting("IntervalStyle", "postgres");
         let date_style = self.add_constant(date_style);
         let interval_style = self.add_constant(interval_style);
+        let stack_depth = Value::Integer(self.stack_depth());
+        let stack_depth = self.add_constant(stack_depth);
         let (kernel, returns) = match valid {
             true => ("__rudb_pg_input_valid", LogicalType::Boolean),
             false => ("__rudb_pg_input_error", rudb_kernels::pginput::error_type()),
         };
         let name = self.plan_mut().intern(kernel);
-        let args = self.plan_mut().add_expr_list(&[text, type_name, date_style, interval_style]);
+        let args = [text, type_name, date_style, interval_style, stack_depth];
+        let args = self.plan_mut().add_expr_list(&args);
         Ok(self.add_expr(Expr::Function { name, args }, returns))
     }
 

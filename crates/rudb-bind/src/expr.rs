@@ -1016,7 +1016,8 @@ impl Binder<'_> {
     /// function of the type reads it, as `__rudb_pg_input` over the string and the OID. `None`
     /// when the session casts with the engine, when `expr` is not a string, or when the input of
     /// the type reads a setting or the catalog. An array of strings is read element by element,
-    /// so `'{a}'::text[]::int[]` is the error of the input of `integer`.
+    /// so `'{a}'::text[]::int[]` is the error of the input of `integer`. The input of `json` and
+    /// `jsonb` reads `max_stack_depth`, which is given to the call as a third argument.
     fn read_string(
         &mut self,
         expr: ExprRef,
@@ -1029,7 +1030,7 @@ impl Binder<'_> {
         {
             let info = rudb_pgtypes::TypeInfo::get(declared.oid)?;
             let element = DeclaredType { oid: info.elem, typmod: declared.typmod };
-            if info.elem == 0 || !rudb_pgtypes::has_plain_input(element.oid) {
+            if info.elem == 0 || !reads_string(element.oid) {
                 return None;
             }
             let table = self.fresh_index();
@@ -1046,14 +1047,26 @@ impl Binder<'_> {
         if self.semantics.cast_input() != CastInput::Postgres
             || *self.plan().expr_type(expr) != LogicalType::Varchar
             || rudb_pgtypes::logical_type(declared.oid).as_ref() != Some(target)
-            || !rudb_pgtypes::has_plain_input(declared.oid)
+            || !reads_string(declared.oid)
         {
             return None;
         }
         let oid = self.add_constant(Value::BigInt(i64::from(declared.oid)));
+        let mut args = vec![expr, oid];
+        if !rudb_pgtypes::has_plain_input(declared.oid) {
+            let depth = self.stack_depth();
+            args.push(self.add_constant(Value::Integer(depth)));
+        }
         let name = self.plan_mut().intern("__rudb_pg_input");
-        let args = self.plan_mut().add_expr_list(&[expr, oid]);
+        let args = self.plan_mut().add_expr_list(&args);
         Some(self.add_expr(Expr::Function { name, args }, target.clone()))
+    }
+
+    /// `max_stack_depth` of the session in kilobytes, which limits how deep the input of `json`
+    /// and `jsonb` lets a value be nested.
+    pub(crate) fn stack_depth(&self) -> i32 {
+        let setting = self.session.postgres().and_then(|pg| pg.settings.int("max_stack_depth"));
+        setting.unwrap_or(rudb_pgtypes::StackDepth::default().0)
     }
 
     /// The value of a number literal. PostgreSQL reads a number with an exponent, an integer past
@@ -6516,6 +6529,13 @@ pub(crate) fn postgres_oid(ty: &LogicalType) -> Option<u32> {
         }
         ty => Some(rudb_pgtypes::pg_type(ty).oid).filter(|&oid| oid != rudb_pgtypes::oid::TEXT),
     }
+}
+
+/// Whether `__rudb_pg_input` reads a string as the type `oid`: a type whose input reads no
+/// setting, or `json` and `jsonb`, whose input reads `max_stack_depth`.
+fn reads_string(oid: u32) -> bool {
+    rudb_pgtypes::has_plain_input(oid)
+        || matches!(oid, rudb_pgtypes::oid::JSON | rudb_pgtypes::oid::JSONB)
 }
 
 #[cfg(test)]

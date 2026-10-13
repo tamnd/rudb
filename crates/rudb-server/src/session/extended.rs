@@ -412,6 +412,7 @@ impl Extended {
                 now: now + UNIX_TO_POSTGRES_USECS,
             },
             interval_style: runner.format.interval_style,
+            stack_depth: runner.format.stack_depth,
         };
         let formats = params.formats;
         let mut values = Vec::with_capacity(statement.types.len());

@@ -1,8 +1,8 @@
 //! `pg_input_is_valid` and `pg_input_error_info` of a PostgreSQL session, which read a string with
 //! the input function of a type and catch its error.
 //!
-//! The binder gives each call the `DateStyle` and the `IntervalStyle` of the session as two more
-//! arguments. The zone is UTC, since the zone changes the value that a `timestamptz` reads and not
+//! The binder gives each call the `DateStyle`, the `IntervalStyle` and the `max_stack_depth` of the
+//! session as three more arguments. The zone is UTC, since the zone changes the value that a `timestamptz` reads and not
 //! whether the text is one.
 
 use rudb_common::{Error, LogicalType, Result, Value};
@@ -22,7 +22,7 @@ pub fn error_type() -> LogicalType {
     LogicalType::Struct(fields.collect())
 }
 
-/// `__rudb_pg_input_valid(text, type, DateStyle, IntervalStyle)` and
+/// `__rudb_pg_input_valid(text, type, DateStyle, IntervalStyle, max_stack_depth)` and
 /// `__rudb_pg_input_error` with the same arguments, or `None` for another function.
 pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     let valid = match name {
@@ -30,8 +30,8 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
         "__rudb_pg_input_error" => false,
         _ => return Ok(None),
     };
-    let [text, type_name, date_style, interval_style] = args else {
-        return Err(Error::internal(format!("{name} takes 4 arguments")));
+    let [text, type_name, date_style, interval_style, stack_depth] = args else {
+        return Err(Error::internal(format!("{name} takes 5 arguments")));
     };
     let (Value::Varchar(text), Value::Varchar(type_name)) = (text, type_name) else {
         // Both functions are strict.
@@ -51,6 +51,7 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
             now: 0,
         },
         interval_style: IntervalStyle::of_setting(&setting(interval_style)),
+        stack_depth: crate::text::stack_depth(stack_depth)?,
     };
     let error = rudb_pgtypes::soft_input_error(text, type_name, &settings)
         .map_err(|error| Error::from(error).unplaced())?;
@@ -80,7 +81,13 @@ mod tests {
 
     fn call_with(name: &str, text: &str, type_name: &str, date_style: &str) -> Result<Value> {
         let string = |text: &str| Value::Varchar(text.to_owned());
-        let args = [string(text), string(type_name), string(date_style), string("postgres")];
+        let args = [
+            string(text),
+            string(type_name),
+            string(date_style),
+            string("postgres"),
+            Value::Integer(2048),
+        ];
         Ok(call(name, &args)?.unwrap())
     }
 
@@ -102,7 +109,8 @@ mod tests {
         );
         assert_eq!((&fields[1].1, &fields[2].1), (&Value::Null, &Value::Null));
         assert_eq!(fields[3].1, Value::Varchar("22P02".into()));
-        let args = [Value::Null, Value::Varchar("int4".into()), Value::Null, Value::Null];
+        let args =
+            [Value::Null, Value::Varchar("int4".into()), Value::Null, Value::Null, Value::Null];
         assert_eq!(call("__rudb_pg_input_valid", &args).unwrap(), Some(Value::Null));
     }
 }

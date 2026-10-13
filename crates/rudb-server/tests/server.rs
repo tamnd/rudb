@@ -2412,6 +2412,53 @@ fn a_qualified_star_in_an_expression_is_the_whole_row() {
     server.stop().unwrap();
 }
 
+/// The input of `json` and `jsonb` stops a value nested deeper than `max_stack_depth` lets the
+/// stack of PostgreSQL go, in a literal, in a cast as the query runs and in `pg_input_is_valid`,
+/// and a cast of text to `json` gives the errors of the input of PostgreSQL.
+#[test]
+fn the_json_input_stops_a_value_nested_too_deep() {
+    let dirs = Dirs::new("pgjdeep");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let error = |client: &mut Client, sql: &str| {
+        let messages = client.query(sql);
+        let error = messages.iter().find(|m| m.tag == b'E').expect(sql);
+        (error.field(b'C').unwrap(), error.field(b'D'), error.field(b'H'))
+    };
+    let deep = format!("'{}'", "[".repeat(2000));
+    let hint = |kilobytes| {
+        format!(
+            "Increase the configuration parameter \"max_stack_depth\" (currently {kilobytes}kB), \
+             after ensuring the platform's stack depth limit is adequate."
+        )
+    };
+    let messages = client.query("set max_stack_depth = '100kB'");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for sql in [
+        "select repeat('[', 10000)::json".to_owned(),
+        "select repeat('{\"a\":', 10000)::jsonb".to_owned(),
+        format!("select {deep}::json"),
+        format!("select pg_input_is_valid({deep}, 'jsonb')"),
+    ] {
+        let want = ("54001".to_owned(), None, Some(hint(100)));
+        assert_eq!(error(&mut client, &sql), want, "{sql}");
+    }
+    let nested = "(repeat('[', 900) || repeat(']', 900))";
+    assert_eq!(scalar(&mut client, &format!("select length({nested}::json::text)")), "1800");
+    let messages = client.query("reset max_stack_depth");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    let nested = "(repeat('[', 20000) || repeat(']', 20000))";
+    assert_eq!(scalar(&mut client, &format!("select length({nested}::jsonb::text)")), "40000");
+    let nested = "repeat('[', 30000)";
+    let want = ("54001".to_owned(), None, Some(hint(2048)));
+    assert_eq!(error(&mut client, &format!("select {nested}::json")), want);
+    let want = ("22P02".to_owned(), Some("Token \"nul\" is invalid.".to_owned()), None);
+    assert_eq!(error(&mut client, "select ('nul' || '')::json"), want);
+    assert_eq!(scalar(&mut client, "select (' [1, 2] ' || '')::json::text"), " [1, 2] ");
+    server.stop().unwrap();
+}
+
 /// A column read from a data changing `WITH` definition, or from a query around a `LATERAL` one,
 /// is the table column that it reads, and a scalar query or an `ARRAY(SELECT ...)` keeps the
 /// declared type of its column, all as `markTargetListOrigins` and `exprTypmod` of PostgreSQL

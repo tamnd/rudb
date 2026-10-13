@@ -718,6 +718,16 @@ impl Settings {
         }
     }
 
+    /// The current value of an `integer` parameter in its base unit, or `None` if there is no
+    /// such parameter or it is not an integer.
+    #[must_use]
+    pub fn int(&self, name: &str) -> Option<i32> {
+        match self.setting(find(name)?) {
+            Setting::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// The current value of a parameter in its base unit.
     #[must_use]
     pub fn setting(&self, parameter: &'static Parameter) -> Setting {

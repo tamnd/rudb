@@ -167,7 +167,7 @@ fn string_in(type_name: &str, typmod: i32, input: &str) -> Option<Result<String,
         "text" => Ok(input.to_string()),
         "varchar" => varchar_in(input, typmod).map(str::to_string),
         "bpchar" => bpchar_in(input, typmod).map(|v| v.into_owned()),
-        "json" => json_in(input).map(str::to_string),
+        "json" => json_in(input, StackDepth::default()).map(str::to_string),
         _ => return None,
     };
     Some(result.map(|v| {
