@@ -2260,6 +2260,59 @@ fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
     shape.collect()
 }
 
+/// `SET (a, b) = (SELECT ...)` takes the columns of the one row of the query, or nulls when it
+/// has no row, in an `UPDATE` and in an `ON CONFLICT DO UPDATE`, and `SET (a, b) = ROW(t.*)`
+/// takes the fields of `t`. A query of another width is error 42601 at the query and a query of
+/// two rows is error 21000, as in PostgreSQL.
+#[test]
+fn a_list_of_columns_is_set_from_the_row_of_a_query() {
+    let dirs = Dirs::new("pgmulti");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages = client.query(
+        "create temp table pairs (k int primary key, v text); insert into pairs values (1, 'a'), (2, 'b')",
+    );
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for sql in [
+        "update pairs set (k, v) = (select k + 10, v || 'x' from pairs p where p.k = pairs.k)",
+        "update pairs set (v) = (select 'z' where false) where k = 11",
+        "insert into pairs values (12, 'c') on conflict (k) do update set (k, v) = (select excluded.k + 1, pairs.v || excluded.v)",
+        "update pairs set (v, k) = row(s.*) from (values ('d', 14)) s(j, i) where v = 'bxc'",
+    ] {
+        let messages = client.query(sql);
+        assert!(messages.iter().all(|message| message.tag != b'E'), "{sql}: {messages:?}");
+    }
+    assert_eq!(
+        scalar(
+            &mut client,
+            "select string_agg(k || ':' || coalesce(v, 'null'), ',' order by k) from pairs"
+        ),
+        "11:null,14:d"
+    );
+    for (sql, state, message, position) in [
+        (
+            "update pairs set (k, v) = (select 1)",
+            "42601",
+            "number of columns does not match number of values",
+            "27",
+        ),
+        (
+            "update pairs set (v) = (select v from pairs)",
+            "21000",
+            "more than one row returned by a subquery used as an expression",
+            "",
+        ),
+    ] {
+        let messages = client.query(sql);
+        let error = messages.iter().find(|message| message.tag == b'E').unwrap();
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(error.field(b'P').unwrap_or_default(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// A column read from a data changing `WITH` definition, or from a query around a `LATERAL` one,
 /// is the table column that it reads, and a scalar query or an `ARRAY(SELECT ...)` keeps the
 /// declared type of its column, all as `markTargetListOrigins` and `exprTypmod` of PostgreSQL

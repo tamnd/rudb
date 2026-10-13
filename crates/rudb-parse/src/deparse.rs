@@ -615,6 +615,7 @@ fn expr(ast: &Ast, index: ExprRef) -> String {
             let exists = format!("EXISTS({})", query(ast, inner));
             if negated { format!("(NOT {exists})") } else { exists }
         }
+        Expr::MultiAssign { source, .. } => expr(ast, source),
     }
 }
 

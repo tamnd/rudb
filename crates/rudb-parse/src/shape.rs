@@ -282,6 +282,9 @@ impl Shape<'_> {
             Expr::Exists { query, negated } => {
                 format!("exists{{{}, negated: {negated}}}", self.query(query))
             }
+            Expr::MultiAssign { source, column, columns } => {
+                format!("multiassign{{{}, {column} of {columns}}}", self.expr(source))
+            }
         }
     }
 

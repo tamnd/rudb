@@ -1665,6 +1665,18 @@ pub enum Expr {
         /// Whether `NOT` was written before `EXISTS`.
         negated: bool,
     },
+    /// One column of `SET (a, b) = (SELECT ...)` in PostgreSQL, which is the value at `column` of
+    /// the one row of the query. The columns of the list all have the same `source`, so the
+    /// query runs one time for each row and not one time for each column. A `ROW` whose width
+    /// only the binder knows, as `ROW(t.*)`, is a source as well.
+    MultiAssign {
+        /// The query, as an [`Expr::Subquery`], or the [`Expr::Row`].
+        source: ExprRef,
+        /// The place of the column in the list, from zero.
+        column: u32,
+        /// How many columns the list has, which is how many the query must give.
+        columns: u32,
+    },
 }
 
 /// One `WHEN a THEN b`.
@@ -2137,6 +2149,7 @@ impl Ast {
             | Expr::Exists { .. } => Vec::new(),
             Expr::Columns { inner, .. } => vec![inner],
             Expr::Fields { record } => vec![record],
+            Expr::MultiAssign { source, .. } => vec![source],
             Expr::Unary { operand, .. }
             | Expr::Cast { operand, .. }
             | Expr::InSubquery { operand, .. }

@@ -393,6 +393,9 @@ impl Binder<'_> {
             ast::Expr::Exists { query, negated } => {
                 self.bind_exists_subquery(ast, query, negated, scope)
             }
+            ast::Expr::MultiAssign { source, column, columns } => {
+                self.bind_multi_assign(ast, source, column, columns, scope)
+            }
         }
     }
 
@@ -548,6 +551,66 @@ impl Binder<'_> {
             self.subquery_types.push((expr, declared));
         }
         Ok(expr)
+    }
+
+    /// One column of `SET (a, b) = source`, as `transformMultiAssignRef` of PostgreSQL binds it.
+    /// The first column of the list to get here binds the source, and each column takes its own
+    /// value of it. A query is joined in the way a scalar query is, so its one row gives the
+    /// values, and a `ROW` gives a value for each field after `t.*` is taken apart. A source with
+    /// another number of values than the list has columns is error 42601 at the source.
+    fn bind_multi_assign(
+        &mut self,
+        ast: &Ast,
+        source: ast::ExprRef,
+        column: u32,
+        columns: u32,
+        outer: &Scope,
+    ) -> Result<ExprRef> {
+        if let Some((_, values)) = self.multi_assigned.iter().find(|(at, _)| *at == source) {
+            return values.get(column as usize).copied().ok_or_else(|| {
+                Error::internal(format!("column {column} of a multiple assignment"))
+            });
+        }
+        let values = match ast.expr(source) {
+            ast::Expr::Subquery { query, array: false } => {
+                let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
+                if let Some(first) = scope.columns.first() {
+                    self.scalar_subqueries.push(PendingSubquery {
+                        node,
+                        kind: rudb_plan::JoinKind::Single,
+                        conditions: Vec::new(),
+                        dependent: !correlations.is_empty(),
+                        reads: correlations,
+                        index: first.binding.table,
+                        inside_aggregate: self.in_aggregate,
+                    });
+                }
+                let values = scope.columns.iter();
+                values
+                    .map(|column| self.add_expr(Expr::Column(column.binding), column.ty.clone()))
+                    .collect()
+            }
+            ast::Expr::Row { items } => {
+                let mut values = Vec::new();
+                for &item in ast.expr_list(items) {
+                    match ast.expr(item) {
+                        ast::Expr::Fields { record } => values.extend(
+                            self.bind_fields(ast, record, outer)?.into_iter().map(|(expr, _)| expr),
+                        ),
+                        _ => values.push(self.bind_expr(ast, item, outer)?),
+                    }
+                }
+                values
+            }
+            _ => return Err(Error::internal("a multiple assignment from something not a query")),
+        };
+        if values.len() != columns as usize {
+            return Err(Error::binder("number of columns does not match number of values")
+                .state(SqlState::SYNTAX_ERROR)
+                .placed_at(Some(ast.expr_span(source))));
+        }
+        self.multi_assigned.push((source, values));
+        self.bind_multi_assign(ast, source, column, columns, outer)
     }
 
     /// The input of the sort at the top of a query, the expression the query's one column is over
@@ -5061,7 +5124,9 @@ pub(crate) fn first_aggregate(
                 .or_else(|| ast.order_list(held.order).iter().find_map(|item| first(item.expr)))
         }
         // A subquery has its own aggregation and does not make the outer block aggregate.
-        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } => None,
+        ast::Expr::Subquery { .. } | ast::Expr::Exists { .. } | ast::Expr::MultiAssign { .. } => {
+            None
+        }
     }
 }
 
@@ -5450,6 +5515,7 @@ pub(crate) fn describe(ast: &Ast, expr: ast::ExprRef, semantics: Semantics) -> S
             let exists = format!("EXISTS({})", rudb_parse::deparse::query(ast, query));
             if negated { format!("(NOT {exists})") } else { exists }
         }
+        ast::Expr::MultiAssign { .. } => "subquery".to_string(),
     }
 }
 
