@@ -658,8 +658,11 @@ fn format_type_names_a_type_by_its_oid() {
     ] {
         assert_eq!(scalar(&mut client, sql), name, "{sql}");
     }
+    // `format_type` is stable, so its error comes from the executor, after the columns.
     let messages = client.query("select format_type(1186, 0)");
-    assert_eq!(messages[0].field(b'M').as_deref(), Some("invalid INTERVAL typmod: 0x0"));
+    assert_eq!(tags(&messages), "TEZ");
+    assert_eq!(messages[1].field(b'M').as_deref(), Some("invalid INTERVAL typmod: 0x0"));
+    assert_eq!(messages[1].field(b'P'), None);
     server.stop().unwrap();
 }
 
@@ -4572,6 +4575,19 @@ fn the_rows_before_an_error_go_before_the_error() {
     client.execute("", 0);
     assert_eq!(tags(&client.sync()), "1EZ");
     assert_eq!(tags(&client.query("select 1")), "TDCZ");
+    // The planner does not fold a stable function or one that returns a set, so its error comes
+    // from the executor, after the columns. The arguments of the call still fold.
+    for sql in [
+        "select to_number('viv', 'RN')",
+        "select json_build_object(null, 'a')",
+        "select format('Hello %s')",
+        "select * from generate_series(1, 2, 0)",
+        "select regexp_matches('abc', '(b')",
+    ] {
+        assert_eq!(tags(&client.query(sql)), "TEZ", "{sql}");
+    }
+    assert_eq!(tags(&client.query("select * from generate_series(1, 1 / 0)")), "EZ");
+    assert_eq!(tags(&client.query("select format('%s', 1 / 0)")), "EZ");
     server.stop().unwrap();
 }
 
