@@ -175,7 +175,7 @@ impl Transform<'_> {
         Ok(self.made_call(name, args, location))
     }
 
-    fn made_call(&mut self, name: &str, args: Slice, location: i32) -> ExprRef {
+    pub(super) fn made_call(&mut self, name: &str, args: Slice, location: i32) -> ExprRef {
         let part = self.intern(name);
         let name = self.ast.part_slice([part]);
         self.push(Expr::Function { name, args, distinct: false, filter: NONE }, location)
@@ -482,9 +482,14 @@ impl Transform<'_> {
         let Some(arg) = &indirection.arg else {
             return clause("A_Indirection");
         };
-        let mut target = self.expr(arg)?;
+        let target = self.expr(arg)?;
+        self.indirect(target, &indirection.indirection)
+    }
+
+    /// The subscripts and the field selections of `list` after `target`.
+    pub(super) fn indirect(&mut self, mut target: ExprRef, list: &List) -> Made<ExprRef> {
         let span = self.ast.expr_span(target);
-        for node in indirection.indirection.iter().flatten() {
+        for node in list.iter().flatten() {
             let mut selected = NONE;
             let (name, args) = match node {
                 Node::A_Star(_) => {

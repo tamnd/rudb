@@ -439,6 +439,124 @@ pub fn jsonb_set_lax(
     }
 }
 
+/// `jsonb_set_element`, the assignment to a subscript, `SET value['a'][0] = new`: the value with
+/// `new` at the end of `path`, as `setPath` makes it with `JB_PATH_CREATE`, `JB_PATH_FILL_GAPS`
+/// and `JB_PATH_CONSISTENT_POSITION`.
+///
+/// A missing key or index is added, and so is the rest of the path after it, as an object for a
+/// step that is not an integer and as an array for one that is. An index past the end of an array
+/// adds nulls before the new element, and a negative index counts from the end.
+///
+/// # Errors
+///
+/// A step into a scalar, a step into an array that is not an integer, and a negative index before
+/// the start of an array.
+pub fn jsonb_set_element(text: &str, path: &[&str], new: &str) -> Result<String, TypeError> {
+    let doc = Doc::read(text)?;
+    let mut node = doc.root;
+    for (level, &step) in path.iter().enumerate() {
+        let position = level + 1;
+        let rest = &path[position..];
+        let mut out = String::new();
+        match doc.shape(node) {
+            Shape::Scalar(..) => {
+                let mut error = invalid("cannot replace existing key".into());
+                error.detail = Some(
+                    "The path assumes key is a composite object, but it is a scalar value.".into(),
+                );
+                return Err(error);
+            }
+            Shape::Object(fields) => {
+                let found = fields.iter().position(|(key, _)| key == step);
+                if let Some(at) = found
+                    && !rest.is_empty()
+                {
+                    node = fields[at].1;
+                    continue;
+                }
+                let mut kept: Vec<(&str, &str)> =
+                    fields.iter().map(|(key, value)| (key.as_str(), doc.span(*value))).collect();
+                let added = new_path(rest, new);
+                match found {
+                    Some(at) => kept[at].1 = new,
+                    None => {
+                        let at = kept.partition_point(|(key, _)| key_order(key, step).is_lt());
+                        kept.insert(at, (step, &added));
+                    }
+                }
+                write_object(&kept, &mut out);
+            }
+            Shape::Array(items) => {
+                let index = index_of(step).ok_or_else(|| {
+                    TypeError::new(
+                        SqlState::INVALID_TEXT_REPRESENTATION,
+                        format!(
+                            "path element at position {position} is not an integer: \"{step}\""
+                        ),
+                    )
+                })?;
+                let len = i64::try_from(items.len()).unwrap_or(i64::MAX);
+                if index < 0 && -index > len {
+                    return Err(invalid(format!(
+                        "path element at position {position} is out of range: {index}"
+                    )));
+                }
+                let at = if index < 0 { len + index } else { index };
+                let found = usize::try_from(at).ok().filter(|&at| at < items.len());
+                if let Some(at) = found
+                    && !rest.is_empty()
+                {
+                    node = items[at];
+                    continue;
+                }
+                let mut kept: Vec<&str> = items.iter().map(|&item| doc.span(item)).collect();
+                let added = new_path(rest, new);
+                match found {
+                    Some(at) => kept[at] = new,
+                    None => {
+                        let gap = usize::try_from(at - len).unwrap_or_default();
+                        kept.extend(std::iter::repeat_n("null", gap));
+                        kept.push(&added);
+                    }
+                }
+                write_array(&kept, &mut out);
+            }
+        }
+        let (start, end) = doc.bounds(node);
+        return Ok([&text[..start], &out, &text[end..]].concat());
+    }
+    Ok(text.to_owned())
+}
+
+/// `push_path`: `new` at the end of `path` in new objects and arrays, an object for a step that
+/// is not an integer and an array for one that is. An array has as many nulls before the next
+/// step as the step says.
+fn new_path(path: &[&str], new: &str) -> String {
+    let mut out = new.to_owned();
+    for &step in path.iter().rev() {
+        let mut outer = String::with_capacity(out.len() + step.len() + 4);
+        match index_of(step) {
+            Some(index) => {
+                outer.push('[');
+                for _ in 0..index.max(0) {
+                    outer.push_str("null, ");
+                }
+                outer.push_str(&out);
+                outer.push(']');
+            }
+            None => {
+                outer.push('{');
+                escape_json(step, &mut outer);
+                outer.push_str(": ");
+                outer.push_str(&out);
+                outer.push('}');
+            }
+        }
+        out = outer;
+    }
+    out
+}
+
 /// `setPath`: the value with `change` at the end of `path`. Each step reads the key of an object
 /// or the index of an array, which `strtoint` reads. The text of the one array or object that
 /// changes is written again, and the text around it is copied.
@@ -773,6 +891,39 @@ mod tests {
         assert_eq!(jsonb_pretty(&doc).unwrap(), want);
         assert_eq!(jsonb_pretty("[]").unwrap(), "[\n]");
         assert_eq!(jsonb_pretty("1").unwrap(), "1");
+    }
+
+    #[test]
+    fn a_subscript_assignment_fills_the_path_it_takes() {
+        let set = |doc: &str, path: &[&str], new: &str| jsonb_set_element(doc, path, new);
+        assert_eq!(set("{}", &["a"], "1").unwrap(), r#"{"a": 1}"#);
+        assert_eq!(set("[]", &["0"], "1").unwrap(), "[1]");
+        assert_eq!(set("[1]", &["5"], "2").unwrap(), "[1, null, null, null, null, 2]");
+        assert_eq!(
+            set("[1, null, null, null, null, 2]", &["-4"], "3").unwrap(),
+            "[1, null, 3, null, null, 2]"
+        );
+        let error = set("[1, 2]", &["-8"], "1").unwrap_err();
+        assert_eq!(error.message, "path element at position 1 is out of range: -8");
+        let deep = set("{}", &["a", "0", "b", "0", "c"], "1").unwrap();
+        assert_eq!(deep, r#"{"a": [{"b": [{"c": 1}]}]}"#);
+        assert_eq!(
+            set(&deep, &["a", "2", "b", "2", "c", "2"], "1").unwrap(),
+            r#"{"a": [{"b": [{"c": 1}]}, null, {"b": [null, null, {"c": [null, null, 1]}]}]}"#
+        );
+        let doc = r#"{"a": [1, {"b": 2}]}"#;
+        assert_eq!(
+            set(doc, &["a", "1", "c"], r#""x""#).unwrap(),
+            r#"{"a": [1, {"b": 2, "c": "x"}]}"#
+        );
+        assert_eq!(set(doc, &["a", "3"], "null").unwrap(), r#"{"a": [1, {"b": 2}, null, null]}"#);
+        for (doc, path) in [(r#"{"a": 1}"#, &["a", "b"][..]), ("null", &["0"][..])] {
+            let error = set(doc, path, "1").unwrap_err();
+            assert_eq!(error.message, "cannot replace existing key");
+            assert!(error.detail.unwrap().starts_with("The path assumes key is a composite"));
+        }
+        let error = set("[1]", &["x"], "1").unwrap_err();
+        assert_eq!(error.message, "path element at position 1 is not an integer: \"x\"");
     }
 
     #[test]

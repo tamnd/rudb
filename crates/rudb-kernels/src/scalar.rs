@@ -4547,6 +4547,9 @@ pub fn call_values(
     if let Some(value) = crate::pgjson::call(name, args)? {
         return Ok(value);
     }
+    if let Some(value) = crate::pgjsonbsubs::call(name, args)? {
+        return Ok(value);
+    }
     if let Some(value) = crate::pgjsonbuild::writer(name, args)? {
         return Ok(value);
     }

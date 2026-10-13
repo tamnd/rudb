@@ -16,6 +16,7 @@ use rudb_common::{
 };
 use rudb_kernels::pgarray;
 use rudb_kernels::pgjson::JsonSet;
+use rudb_kernels::pgjsonbsubs;
 use rudb_kernels::pgregexp::{self, Function};
 use rudb_parse::ast::{BinaryOp, LiteralKind, UnaryOp};
 use rudb_parse::{Ast, ast, deparse};
@@ -1317,7 +1318,7 @@ impl Binder<'_> {
             return Ok(None);
         }
         if target == LogicalType::Jsonb {
-            return self.jsonb_subscript(ast, name, arguments, bound).map(Some);
+            return self.jsonb_subscript(ast, arguments, bound).map(Some);
         }
         let LogicalType::List(element) = &target else {
             return Ok(None);
@@ -1350,17 +1351,27 @@ impl Binder<'_> {
     fn jsonb_subscript(
         &mut self,
         ast: &Ast,
-        name: &str,
         arguments: &[ast::ExprRef],
         bound: &[ExprRef],
     ) -> Result<ExprRef> {
-        if name == pgarray::ARRAY_SLICE {
-            // A bound that the parser filled in for an omitted one spans the brackets, and so the
-            // other bound too.
+        let (key, _) = self.jsonb_key(ast, arguments, bound)?;
+        let path = self.call("list_value", vec![key])?;
+        Ok(self.pgproc_kernel("jsonb_extract_path", &[bound[0], path], LogicalType::Jsonb))
+    }
+
+    /// The key of a subscript of a `jsonb` value as text, and whether it is an `integer`. The
+    /// arguments are those of `array_extract` or `array_slice` from the transform, and a slice is
+    /// the error of PostgreSQL at the bound that is written last.
+    fn jsonb_key(
+        &mut self,
+        ast: &Ast,
+        arguments: &[ast::ExprRef],
+        bound: &[ExprRef],
+    ) -> Result<(ExprRef, bool)> {
+        if arguments.len() == 3 {
             let omitted = |at: usize| {
-                let (outer, inner) =
-                    (ast.expr_span(arguments[at]), ast.expr_span(arguments[3 - at]));
-                outer.start <= inner.start && inner.end <= outer.end
+                matches!(ast.expr(arguments[at]), ast::Expr::List { items }
+                    if ast.expr_list(items).is_empty())
             };
             let error = Error::binder("jsonb subscript does not support slices")
                 .state(SqlState::DATATYPE_MISMATCH);
@@ -1370,32 +1381,121 @@ impl Binder<'_> {
         let ty = self.plan().expr_type(bound[1]).clone();
         let source = operand_oids(ast, &arguments[1..2], std::slice::from_ref(&ty))
             .and_then(|oids| oids.first().copied());
-        let key = match source {
-            Some(rudb_pgtypes::oid::UNKNOWN) => self.cast_to(bound[1], &LogicalType::Varchar),
+        match source {
+            Some(rudb_pgtypes::oid::UNKNOWN) => {
+                Ok((self.cast_to(bound[1], &LogicalType::Varchar), false))
+            }
             Some(source)
                 if rudb_pgtypes::can_coerce_implicitly(source, rudb_pgtypes::oid::INT4) =>
             {
                 let index = self.checked_cast_to(bound[1], &LogicalType::Integer, false)?;
-                self.cast_to(index, &LogicalType::Varchar)
+                Ok((self.cast_to(index, &LogicalType::Varchar), true))
             }
             Some(source)
                 if rudb_pgtypes::can_coerce_implicitly(source, rudb_pgtypes::oid::TEXT) =>
             {
-                self.checked_cast_to(bound[1], &LogicalType::Varchar, false)?
+                Ok((self.checked_cast_to(bound[1], &LogicalType::Varchar, false)?, false))
             }
             _ => {
                 let shown = match source {
                     Some(source) => rudb_pgtypes::format_type(source).into_owned(),
                     None => ty.to_string(),
                 };
-                return Err(Error::binder(format!("subscript type {shown} is not supported"))
+                Err(Error::binder(format!("subscript type {shown} is not supported"))
                     .state(SqlState::DATATYPE_MISMATCH)
                     .hint("jsonb subscript must be coercible to either integer or text.")
-                    .with_span(ast.leftmost_span(arguments[1])));
+                    .with_span(ast.leftmost_span(arguments[1])))
+            }
+        }
+    }
+
+    /// An assignment to a subscript of a column, `SET j['a'][0] = v`, which the transform writes
+    /// as a call with the read `j['a'][0]` and the new value, see [`ast::Ast::assignments`]. The
+    /// column is read again at the bottom of the read, or is the value of an earlier assignment
+    /// to it in the same list. The subscripts are keys as a read takes them, and the new value is
+    /// coerced to `jsonb` by an assignment cast, as `transformAssignmentIndirection` does it.
+    pub(crate) fn pg_assignment(
+        &mut self,
+        ast: &Ast,
+        call: ast::ExprRef,
+        scope: &Scope,
+    ) -> Result<ExprRef> {
+        let ast::Expr::Function { args, .. } = ast.expr(call) else {
+            return Err(Error::internal("an assignment to a subscript that is not a call"));
+        };
+        let &[read, written] = ast.expr_list(args) else {
+            return Err(Error::internal("an assignment to a subscript without two arguments"));
+        };
+        let mut steps = Vec::new();
+        let mut base = read;
+        while ast.indirection(base).is_some()
+            && let ast::Expr::Function { args, .. } = ast.expr(base)
+        {
+            let args = ast.expr_list(args);
+            steps.push(args);
+            base = args[0];
+        }
+        steps.reverse();
+        let mut column = base;
+        while let ast::Expr::Function { args, .. } = ast.expr(column) {
+            column = ast.expr_list(args)[0];
+        }
+        let column = match ast.expr(column) {
+            ast::Expr::Column { name } => ast.name(name).last().unwrap_or_default(),
+            _ => "",
+        };
+        let value = self.bind_expr(ast, written, scope)?;
+        let container = self.bind_expr(ast, base, scope)?;
+        let span = ast.expr_span(call);
+        match self.plan().expr_type(container) {
+            LogicalType::Jsonb => {}
+            LogicalType::List(_) | LogicalType::Array(..) => {
+                return Err(Error::not_implemented("an assignment to a subscript of an array")
+                    .with_span(span));
+            }
+            ty => {
+                let shown = rudb_pgtypes::format_type(rudb_pgtypes::pg_type(ty).oid);
+                return Err(Error::binder(format!(
+                    "cannot subscript type {shown} because it does not support subscripting"
+                ))
+                .state(SqlState::DATATYPE_MISMATCH)
+                .with_span(span));
+            }
+        }
+        let mut keys = Vec::with_capacity(steps.len());
+        let mut array = false;
+        for (at, arguments) in steps.into_iter().enumerate() {
+            let mut bound = vec![container];
+            for &argument in &arguments[1..] {
+                bound.push(self.bind_expr(ast, argument, scope)?);
+            }
+            let (key, integer) = self.jsonb_key(ast, arguments, &bound)?;
+            array |= at == 0 && integer;
+            keys.push(key);
+        }
+        let value = match self.read_literal(ast, written, rudb_pgtypes::oid::JSONB) {
+            Some(value) => value?,
+            None => {
+                let ty = self.plan().expr_type(value).clone();
+                if let Some(oid) = crate::expr::written_oid(ast, written, &ty)
+                    && !rudb_pgtypes::can_coerce_assigned(oid, rudb_pgtypes::oid::JSONB)
+                {
+                    let shown = rudb_pgtypes::format_type(oid);
+                    return Err(Error::binder(format!(
+                        "subscripted assignment to \"{column}\" requires type jsonb but expression is of type {shown}"
+                    ))
+                    .state(SqlState::DATATYPE_MISMATCH)
+                    .hint("You will need to rewrite or cast the expression.")
+                    .with_span(span));
+                }
+                self.checked_cast_to(value, &LogicalType::Jsonb, false)?
             }
         };
-        let path = self.call("list_value", vec![key])?;
-        Ok(self.pgproc_kernel("jsonb_extract_path", &[bound[0], path], LogicalType::Jsonb))
+        let path = self.call("list_value", keys)?;
+        let array = self.add_constant(Value::Boolean(array));
+        let name = self.plan_mut().intern(pgjsonbsubs::KERNEL);
+        let args = self.plan_mut().add_expr_list(&[container, path, value, array]);
+        Ok(self.add_expr(Expr::Function { name, args }, LogicalType::Jsonb))
     }
 
     /// One subscript as an `integer`. A string literal is read by the input function of `integer`,

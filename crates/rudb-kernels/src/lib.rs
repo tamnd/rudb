@@ -98,6 +98,7 @@ mod pgformat;
 mod pgformattype;
 pub mod pginput;
 pub mod pgjson;
+pub mod pgjsonbsubs;
 pub mod pgjsonbuild;
 mod pgjsonfuncs;
 mod pgmath;

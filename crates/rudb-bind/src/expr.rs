@@ -179,6 +179,9 @@ impl Binder<'_> {
                     false => self.bind_unnest(ast, expr, &[expr], scope),
                 }
             }
+            ast::Expr::Function { .. } if ast.assignment(expr) => {
+                self.pg_assignment(ast, expr, scope)
+            }
             ast::Expr::Function { name, args, distinct, filter }
                 if name.len == 1
                     && rudb_catalog::same_name(

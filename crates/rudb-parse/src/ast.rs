@@ -2014,6 +2014,10 @@ pub struct Ast {
     /// with the field it selects, or [`NONE`] for a subscript. `(x).a` names its column `a`, and
     /// a call of `struct_extract` written by hand names it for the function.
     pub indirections: Vec<(ExprRef, StrRef)>,
+    /// The calls that the PostgreSQL transform makes of an assignment to a subscript of a column,
+    /// `SET j['a'][0] = v`. The first argument is the read of the subscript, `j['a'][0]`, and the
+    /// second is the new value. The call is the new value of the whole column.
+    pub assignments: Vec<ExprRef>,
     /// The function sources written `WITH ORDINALITY`, which have one more column that numbers
     /// their rows from 1. Kept to one side because few sources have it.
     pub ordinal_sources: Vec<SourceRef>,
@@ -2340,6 +2344,11 @@ impl Ast {
     /// subscript, and `None` for any other call.
     pub fn indirection(&self, call: ExprRef) -> Option<StrRef> {
         self.indirections.iter().find(|(held, _)| *held == call).map(|&(_, field)| field)
+    }
+
+    /// Whether a call is an assignment to a subscript, see [`Ast::assignments`].
+    pub fn assignment(&self, call: ExprRef) -> bool {
+        self.assignments.contains(&call)
     }
 
     /// The `ORDER BY` written inside a call, empty when it has none.
