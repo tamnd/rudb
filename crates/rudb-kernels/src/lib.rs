@@ -99,6 +99,7 @@ mod pgformattype;
 pub mod pginput;
 pub mod pgjson;
 pub mod pgjsonbuild;
+mod pgjsonfuncs;
 mod pgmath;
 mod pgnormalize;
 mod pgorderedset;

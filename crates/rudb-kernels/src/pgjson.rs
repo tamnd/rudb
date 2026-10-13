@@ -3,13 +3,13 @@
 //! of each.
 //!
 //! The binder makes each call an `unnest` of the list that `__rudb_pg_json_set` gives for the
-//! document, so the same call is a set of rows in a select list and in `FROM`. The kernel reads
-//! the text of the document and not a parsed tree, because a `json` value keeps the text it was
-//! written with, spaces and repeated keys too, and each value it gives is a piece of that text. A
-//! `jsonb` value is in its normal form, which has the keys sorted and once each, so the same walk
-//! gives what PostgreSQL gives for it.
+//! document, so the same call is a set of rows in a select list and in `FROM`. The reader of
+//! `rudb_pgtypes::json_each` and the others keeps the place of each value in the text, because a
+//! `json` value keeps the text it was written with, spaces and repeated keys too, and each value
+//! it gives is a piece of that text. A `jsonb` value is in its normal form, which has the keys
+//! sorted and once each, so the same reader gives what PostgreSQL gives for it.
 
-use rudb_common::{Error, Field, LogicalType, Result, SqlState, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Value};
 
 /// The name the plan records for the call.
 pub const KERNEL: &str = "__rudb_pg_json_set";
@@ -100,83 +100,41 @@ impl JsonSet {
         matches!(self.gives, Gives::Elements | Gives::ElementsText).then_some("value")
     }
 
-    /// The error for a document that is not what the function takes apart.
-    fn refused(self, kind: Kind) -> Error {
-        let name = self.name();
-        let message = match (self.gives, self.binary, kind) {
-            (Gives::Each | Gives::EachText, false, Kind::Array) => {
-                "cannot deconstruct an array as an object".to_owned()
-            }
-            (Gives::Each | Gives::EachText, false, _) => "cannot deconstruct a scalar".to_owned(),
-            (Gives::Each | Gives::EachText, true, _) => {
-                format!("cannot call {name} on a non-object")
-            }
-            (Gives::Elements | Gives::ElementsText, false, Kind::Object) => {
-                format!("cannot call {name} on a non-array")
-            }
-            (Gives::Elements | Gives::ElementsText, false, _) => {
-                format!("cannot call {name} on a scalar")
-            }
-            (Gives::Elements | Gives::ElementsText, true, Kind::Object) => {
-                "cannot extract elements from an object".to_owned()
-            }
-            (Gives::Elements | Gives::ElementsText, true, _) => {
-                "cannot extract elements from a scalar".to_owned()
-            }
-            (Gives::Keys, _, Kind::Array) => format!("cannot call {name} on an array"),
-            (Gives::Keys, _, _) => format!("cannot call {name} on a scalar"),
-        };
-        Error::invalid_input(message).state(SqlState::INVALID_PARAMETER_VALUE).unplaced()
-    }
-
-    /// The list for one document.
+    /// The list for one document, from the reader of `rudb_pgtypes`, which gives the errors of
+    /// PostgreSQL for a document that is not what the function takes apart.
     fn list(self, text: &str) -> Result<Value> {
-        let bytes = text.as_bytes();
-        let start = skip_space(bytes, 0);
-        let kind = match bytes.get(start) {
-            Some(b'{') => Kind::Object,
-            Some(b'[') => Kind::Array,
-            _ => Kind::Scalar,
+        let name = self.name();
+        let as_text = matches!(self.gives, Gives::EachText | Gives::ElementsText);
+        let failed = |error: rudb_pgtypes::TypeError| Error::from(error).unplaced();
+        let text_of = |value: Option<String>| value.map_or(Value::Null, Value::Varchar);
+        let values = match self.gives {
+            Gives::Each | Gives::EachText => {
+                rudb_pgtypes::json_each(text, name, as_text, self.binary)
+                    .map_err(failed)?
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Value::Struct(vec![
+                            ("key".to_owned(), Value::Varchar(key)),
+                            ("value".to_owned(), text_of(value)),
+                        ])
+                    })
+                    .collect()
+            }
+            Gives::Elements | Gives::ElementsText => {
+                rudb_pgtypes::json_array_elements(text, name, as_text, self.binary)
+                    .map_err(failed)?
+                    .into_iter()
+                    .map(text_of)
+                    .collect()
+            }
+            Gives::Keys => rudb_pgtypes::json_object_keys(text, name)
+                .map_err(failed)?
+                .into_iter()
+                .map(Value::Varchar)
+                .collect(),
         };
-        let wanted = match self.gives {
-            Gives::Elements | Gives::ElementsText => Kind::Array,
-            Gives::Each | Gives::EachText | Gives::Keys => Kind::Object,
-        };
-        if kind != wanted {
-            return Err(self.refused(kind));
-        }
-        let mut values = Vec::new();
-        for (key, value) in members(text, start, kind == Kind::Object) {
-            let value_text = || match value.as_bytes().first() {
-                Some(b'"') => Value::Varchar(unescape(value)),
-                _ if value == "null" => Value::Null,
-                _ => Value::Varchar(value.to_owned()),
-            };
-            let key = || Value::Varchar(unescape(key));
-            values.push(match self.gives {
-                Gives::Each => Value::Struct(vec![
-                    ("key".to_owned(), key()),
-                    ("value".to_owned(), Value::Varchar(value.to_owned())),
-                ]),
-                Gives::EachText => Value::Struct(vec![
-                    ("key".to_owned(), key()),
-                    ("value".to_owned(), value_text()),
-                ]),
-                Gives::Elements => Value::Varchar(value.to_owned()),
-                Gives::ElementsText => value_text(),
-                Gives::Keys => key(),
-            });
-        }
         Ok(Value::List { element: self.element(), values })
     }
-}
-
-/// What a document is at its top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Object,
-    Array,
-    Scalar,
 }
 
 /// `__rudb_pg_json_set(document, function)`, or `None` for another function.
@@ -199,149 +157,10 @@ pub(crate) fn call(name: &str, args: &[Value]) -> Result<Option<Value>> {
     }
 }
 
-/// The first byte at or after `at` that is not a space of JSON.
-fn skip_space(bytes: &[u8], mut at: usize) -> usize {
-    while matches!(bytes.get(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-        at += 1;
-    }
-    at
-}
-
-/// The byte just after the value that starts at `at`.
-fn value_end(bytes: &[u8], at: usize) -> usize {
-    match bytes.get(at) {
-        Some(b'"') => string_end(bytes, at),
-        Some(b'{' | b'[') => {
-            let mut depth = 0usize;
-            let mut here = at;
-            while let Some(&byte) = bytes.get(here) {
-                match byte {
-                    b'"' => {
-                        here = string_end(bytes, here);
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return here + 1;
-                        }
-                    }
-                    _ => {}
-                }
-                here += 1;
-            }
-            here
-        }
-        _ => {
-            let mut here = at;
-            while let Some(byte) = bytes.get(here) {
-                if matches!(byte, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') {
-                    break;
-                }
-                here += 1;
-            }
-            here
-        }
-    }
-}
-
-/// The byte just after the string that starts with the quote at `at`.
-fn string_end(bytes: &[u8], at: usize) -> usize {
-    let mut here = at + 1;
-    while let Some(&byte) = bytes.get(here) {
-        match byte {
-            b'\\' => here += 2,
-            b'"' => return here + 1,
-            _ => here += 1,
-        }
-    }
-    here
-}
-
-/// The members of the object or the array that starts at `start`, each as the text of its key and
-/// the text of its value. An element of an array has an empty key.
-fn members(text: &str, start: usize, object: bool) -> Vec<(&str, &str)> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut at = skip_space(bytes, start + 1);
-    while let Some(&byte) = bytes.get(at) {
-        if matches!(byte, b'}' | b']') {
-            break;
-        }
-        let mut key = "";
-        if object {
-            let end = string_end(bytes, at);
-            key = &text[at..end];
-            at = skip_space(bytes, end);
-            // The colon.
-            at = skip_space(bytes, at + 1);
-        }
-        let end = value_end(bytes, at);
-        out.push((key, &text[at..end]));
-        at = skip_space(bytes, end);
-        if bytes.get(at) == Some(&b',') {
-            at = skip_space(bytes, at + 1);
-        }
-    }
-    out
-}
-
-/// The text a JSON string stands for, given with its quotes.
-fn unescape(quoted: &str) -> String {
-    let inner = quoted.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')).unwrap_or(quoted);
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('b') => out.push('\u{8}'),
-            Some('f') => out.push('\u{c}'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('u') => {
-                let unit = hex4(&mut chars);
-                let code = match unit {
-                    Some(high @ 0xD800..=0xDBFF) => {
-                        let mut ahead = chars.clone();
-                        let low = match (ahead.next(), ahead.next()) {
-                            (Some('\\'), Some('u')) => hex4(&mut ahead),
-                            _ => None,
-                        };
-                        match low {
-                            Some(low @ 0xDC00..=0xDFFF) => {
-                                chars = ahead;
-                                Some(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
-                            }
-                            _ => None,
-                        }
-                    }
-                    other => other,
-                };
-                out.push(code.and_then(char::from_u32).unwrap_or('\u{FFFD}'));
-            }
-            Some(other) => out.push(other),
-            None => {}
-        }
-    }
-    out
-}
-
-/// Four hex digits as a number.
-fn hex4(chars: &mut std::str::Chars<'_>) -> Option<u32> {
-    let mut code = 0;
-    for _ in 0..4 {
-        code = code * 16 + chars.next()?.to_digit(16)?;
-    }
-    Some(code)
-}
-
 #[cfg(test)]
 mod tests {
+    use rudb_common::SqlState;
+
     use super::*;
 
     fn run(function: &str, document: &str) -> Result<Vec<Value>> {

@@ -370,18 +370,25 @@ fn unexpected(token: Token, error: Error) -> Fail {
 /// it reads the next one, as in `pg_parse_json`, so an error of an action comes before an error
 /// of a later token.
 pub(crate) trait Sink {
-    /// The start of an array or an object.
-    fn open(&mut self, open: Open);
-    /// The end of the array or the object that was opened last.
-    fn close(&mut self);
+    /// The start of an array or an object, at the byte `start` of the input.
+    fn open(&mut self, open: Open, start: usize);
+    /// The end of the array or the object that was opened last, before the byte `end`.
+    fn close(&mut self, end: usize);
     /// The key of the next field of an object, decoded.
     fn key(&mut self, key: &str);
-    /// A scalar: its kind, its bytes in the input and, for a string, its decoded text.
+    /// A scalar: its kind, the place of its first byte, its bytes in the input and, for a
+    /// string, its decoded text.
     ///
     /// # Errors
     ///
     /// The error of the action, which stops the parse.
-    fn scalar(&mut self, kind: Kind, token: &str, text: &str) -> Result<(), TypeError>;
+    fn scalar(
+        &mut self,
+        kind: Kind,
+        start: usize,
+        token: &str,
+        text: &str,
+    ) -> Result<(), TypeError>;
 }
 
 /// Why a parse stopped.
@@ -400,10 +407,10 @@ impl From<Fail> for Stop {
 struct Check;
 
 impl Sink for Check {
-    fn open(&mut self, _: Open) {}
-    fn close(&mut self) {}
+    fn open(&mut self, _: Open, _: usize) {}
+    fn close(&mut self, _: usize) {}
     fn key(&mut self, _: &str) {}
-    fn scalar(&mut self, _: Kind, _: &str, _: &str) -> Result<(), TypeError> {
+    fn scalar(&mut self, _: Kind, _: usize, _: &str, _: &str) -> Result<(), TypeError> {
         Ok(())
     }
 }
@@ -432,14 +439,14 @@ pub(crate) fn parse(
                     depth.check(used, OBJECT_FRAME)?;
                     used += OBJECT_FRAME;
                     stack.push(Open::Object);
-                    sink.open(Open::Object);
+                    sink.open(Open::Object, token.start);
                     token = lexer.next()?;
                     match token.kind {
                         Kind::String => Step::Field,
                         Kind::ObjectEnd => {
                             stack.pop();
                             used -= OBJECT_FRAME;
-                            sink.close();
+                            sink.close(token.end);
                             token = lexer.next()?;
                             Step::After
                         }
@@ -448,10 +455,10 @@ pub(crate) fn parse(
                 }
                 Kind::ArrayStart => {
                     depth.check(used, ARRAY_FRAME)?;
-                    sink.open(Open::Array);
+                    sink.open(Open::Array, token.start);
                     token = lexer.next()?;
                     if token.kind == Kind::ArrayEnd {
-                        sink.close();
+                        sink.close(token.end);
                         token = lexer.next()?;
                         Step::After
                     } else {
@@ -461,7 +468,8 @@ pub(crate) fn parse(
                     }
                 }
                 Kind::String | Kind::Number | Kind::True | Kind::False | Kind::Null => {
-                    sink.scalar(token.kind, text(token), &lexer.text).map_err(Stop::Action)?;
+                    sink.scalar(token.kind, token.start, text(token), &lexer.text)
+                        .map_err(Stop::Action)?;
                     token = lexer.next()?;
                     Step::After
                 }
@@ -496,7 +504,7 @@ pub(crate) fn parse(
                 } else if token.kind == close {
                     stack.pop();
                     used -= frame(open);
-                    sink.close();
+                    sink.close(token.end);
                     token = lexer.next()?;
                     Step::After
                 } else {

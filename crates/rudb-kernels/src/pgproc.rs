@@ -9,15 +9,15 @@
 use rudb_common::{LogicalType, Result, Value};
 
 use crate::{
-    pgarray, pgdatetime, pgformattype, pgjsonbuild, pgmath, pgnormalize, pgregression, pgseries,
-    pgstring, pgunicode, pgvariance, pgwindow,
+    pgarray, pgdatetime, pgformattype, pgjsonbuild, pgjsonfuncs, pgmath, pgnormalize,
+    pgregression, pgseries, pgstring, pgunicode, pgvariance, pgwindow,
 };
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// The C functions of each module of kernels, sorted.
-const SOURCES: [&[&str]; 12] = [
+const SOURCES: [&[&str]; 13] = [
     pgmath::SOURCES,
     pgvariance::SOURCES,
     pgregression::SOURCES,
@@ -30,6 +30,7 @@ const SOURCES: [&[&str]; 12] = [
     pgseries::SOURCES,
     pgwindow::SOURCES,
     pgjsonbuild::SOURCES,
+    pgjsonfuncs::SOURCES,
 ];
 
 /// The C functions of each module that are not strict, as `proisstrict` has them.
@@ -57,7 +58,7 @@ pub fn collated(src: &str) -> bool {
 /// Whether an operator whose function is the C function `src` is the kernel of the function,
 /// because the operator of the engine with the same name answers in another way.
 pub fn operator(src: &str) -> bool {
-    pgmath::OPERATORS.contains(&src)
+    pgmath::OPERATORS.contains(&src) || pgjsonfuncs::OPERATORS.contains(&src)
 }
 
 /// Whether the C function `src` has a kernel.
@@ -126,6 +127,9 @@ pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<
         return Ok(Some(value));
     }
     if let Some(value) = pgjsonbuild::call(src, args)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = pgjsonfuncs::call(src, args)? {
         return Ok(Some(value));
     }
     pgarray::proc_call(src, args, returns)

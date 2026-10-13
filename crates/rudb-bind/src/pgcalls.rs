@@ -620,10 +620,18 @@ impl Binder<'_> {
         let proc = candidate.proc;
         if candidate.variadic != 0 {
             // A kernel of a variadic `any` takes its values as text, by the output function of
-            // the type of each value, as `format()` writes them.
+            // the type of each value, as `format()` writes them. A kernel of a variadic of one
+            // type, such as the `text` of `json_extract_path`, takes them as an array of it.
             let fixed = bound.len() - candidate.variadic;
-            if proc.variadic != oid::ANY
-                || !how.names.is_empty()
+            let any = proc.variadic == oid::ANY;
+            let element = match any {
+                true => None,
+                false => match rudb_pgtypes::logical_type(proc.variadic) {
+                    Some(ty) if !rudb_pgtypes::is_polymorphic(proc.variadic) => Some(ty),
+                    _ => return Ok(None),
+                },
+            };
+            if !how.names.is_empty()
                 || !rudb_kernels::pgproc::has(proc.src)
                 || !matches!(proc.lang, b'i' | b'c')
             {
@@ -640,14 +648,15 @@ impl Binder<'_> {
             let keys = datums && proc.src.ends_with("_build_object");
             let mut texts = Vec::with_capacity(candidate.variadic);
             for (at, &value) in bound[fixed..].iter().enumerate() {
-                texts.push(match datums {
-                    true => {
+                texts.push(match (datums, &element) {
+                    (true, _) => {
                         if keys && at.is_multiple_of(2) {
                             self.json_key(value)?;
                         }
                         self.json_datum(value)?
                     }
-                    false => self.output_text(value)?,
+                    (false, Some(ty)) => self.argument_as(ast, arguments[fixed + at], value, ty)?,
+                    (false, None) => self.output_text(value)?,
                 });
             }
             let values = self.call("list_value", texts)?;

@@ -116,6 +116,7 @@ mod generated;
 mod json;
 mod jsonb;
 mod jsonbuild;
+mod jsonfuncs;
 pub mod keywords;
 mod number;
 mod number_format;
@@ -166,6 +167,10 @@ pub use jsonb::{escape_json, jsonb_in, jsonb_recv, jsonb_send};
 pub use jsonbuild::{
     build_array, build_object, object_of_texts, object_shape_error, pretty_outer, to_jsonb,
     valid_json_number,
+};
+pub use jsonfuncs::{
+    Fields, json_array_element, json_array_elements, json_array_length, json_each,
+    json_extract_path, json_object_field, json_object_keys, json_strip_nulls, json_typeof,
 };
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
 pub use number_format::{
