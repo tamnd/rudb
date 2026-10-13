@@ -67,6 +67,12 @@ pub fn operator(src: &str) -> bool {
     pgmath::OPERATORS.contains(&src) || pgjsonfuncs::OPERATORS.contains(&src)
 }
 
+/// Whether a cast whose function is the C function `src` is the kernel of the function, because
+/// the cast of the engine answers in another way.
+pub fn cast(src: &str) -> bool {
+    pgjsonfuncs::CASTS.binary_search(&src).is_ok()
+}
+
 /// Whether the C function `src` has a kernel.
 pub fn has(src: &str) -> bool {
     SOURCES.iter().any(|sources| sources.binary_search(&src).is_ok())

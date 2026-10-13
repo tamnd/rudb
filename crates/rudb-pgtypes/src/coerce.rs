@@ -3,6 +3,7 @@
 
 use crate::generated::casts::{CASTS, PREFERRED};
 use crate::oid;
+use crate::procs::{Proc, procs};
 use crate::types::{Oid, TypeInfo};
 
 /// A row of `pg_cast`: a cast from `source` to `target`, the place it is allowed in and the way
@@ -58,6 +59,15 @@ pub enum CoercionPath {
 pub fn find_cast(source: Oid, target: Oid) -> Option<&'static Cast> {
     let at = CASTS.binary_search_by_key(&(source, target), |cast| (cast.source, cast.target));
     at.ok().map(|at| &CASTS[at])
+}
+
+/// The function of the cast of `pg_cast` from `source` to `target`, for a cast that is done by a
+/// function. `castfunc` of a built-in cast is the function with the name of the target type that
+/// takes the source type and gives the target type, such as `int4(jsonb)`.
+pub fn cast_function(source: Oid, target: Oid) -> Option<&'static Proc> {
+    find_cast(source, target).filter(|cast| cast.method == b'f')?;
+    let name = TypeInfo::get(target)?.name;
+    procs(name).iter().find(|proc| proc.args.first() == Some(&source) && proc.result == target)
 }
 
 /// How a value of type `source` becomes a value of type `target` in `context`, for two built-in
@@ -162,6 +172,16 @@ pub fn common_type(types: &[Option<Oid>]) -> Result<Oid, Mismatch> {
 mod tests {
     use super::*;
     use crate::oid;
+
+    #[test]
+    fn a_cast_by_a_function_finds_its_function() {
+        let src = |source, target| cast_function(source, target).map(|proc| proc.src);
+        assert_eq!(src(oid::JSONB, oid::INT4), Some("jsonb_int4"));
+        assert_eq!(src(oid::JSONB, oid::BOOL), Some("jsonb_bool"));
+        assert_eq!(src(oid::INT4, oid::INT8), Some("int48"));
+        assert_eq!(src(oid::JSON, oid::INT4), None);
+        assert_eq!(src(oid::JSON, oid::JSONB), None);
+    }
 
     #[test]
     fn an_assignment_takes_the_casts_of_assignment_and_the_output_to_a_string() {
