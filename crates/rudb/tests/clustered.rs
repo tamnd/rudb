@@ -445,6 +445,7 @@ fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
             .expect("loads the lines");
         database.execute("CHECKPOINT").expect("commits");
     }
+    let written = std::fs::read(&path).expect("the file reads");
     let reopened = Database::open(name).expect("the file opens again");
     reopened.execute("SET threads = 1").expect("sets the thread count");
     let stored = rows(&reopened, "SELECT l_orderkey, l_linenumber FROM lineitem");
@@ -459,5 +460,10 @@ fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
     // The declaration came back out of the file, parent and all.
     let setting = reopened.setting("cluster_by").expect("a setting");
     assert!(setting.contains(through), "{setting}");
+    // A session that only read leaves the file as it was. The reclusterer measured `lineitem` on
+    // `l_orderkey`, found it as far out of that order as a table can be, and every close sorted it
+    // by the key and wrote the whole file again in the parent's order.
+    drop(reopened);
+    assert!(std::fs::read(&path).expect("the file reads") == written, "a read wrote the file");
     let _ = std::fs::remove_file(path);
 }
