@@ -6976,6 +6976,69 @@ fn the_json_operators_read_a_part_of_a_value() {
 }
 
 #[test]
+fn the_jsonb_operators_test_and_change_a_value() {
+    let dirs = Dirs::new("jsonb-ops");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut value = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            return format!("{code} {}", error.field(b'M').unwrap_or_default());
+        }
+        let row = messages.iter().find(|m| m.tag == b'D').unwrap();
+        let values = data_row(row).into_iter().map(|value| {
+            value.map_or_else(|| "NULL".to_string(), |value| String::from_utf8(value).unwrap())
+        });
+        values.collect::<Vec<_>>().join("|")
+    };
+    // The values of the PostgreSQL 19 oracle.
+    for (sql, expected) in [
+        (r#"select '{"a":1}'::jsonb ? 'a', '[["a"]]'::jsonb ? 'a', '"a"'::jsonb ? 'a'"#, "t|f|t"),
+        (r#"select '{"a":1}'::jsonb ?| '{}', '{"a":1}'::jsonb ?& array['a', null]"#, "f|t"),
+        (r#"select '[1.0, [2]]'::jsonb @> '[[2], 1]', '1'::jsonb @> '[1]'"#, "t|f"),
+        (r#"select '{"a":[1,2]}'::jsonb <@ '{"a":[2,1,3],"b":0}'"#, "t"),
+        (
+            r#"select '{"a":1}'::jsonb || '{"a":2,"b":3}', '{"a":1}'::jsonb || '1'"#,
+            r#"{"a": 2, "b": 3}|[{"a": 1}, 1]"#,
+        ),
+        (r#"select '["a","b","a"]'::jsonb - 'a', '[1,2,3]'::jsonb - -1"#, r#"["b"]|[1, 2]"#),
+        (r#"select '{"a":1,"b":2}'::jsonb - '{a,b}'::text[]"#, "{}"),
+        ("select '1'::jsonb - 'a'", "22023 cannot delete from scalar"),
+        (r#"select '{"a":[1,{"b":2}]}'::jsonb #- '{a,1,b}'"#, r#"{"a": [1, {}]}"#),
+        (
+            r#"select jsonb_set('{"a":[1,2]}', '{a,-5}', '"x"'), jsonb_set('{"a":1}', '{b}', '2', false)"#,
+            r#"{"a": ["x", 1, 2]}|{"a": 1}"#,
+        ),
+        (
+            r#"select jsonb_set('{"a":[1]}', '{a,x}', '2')"#,
+            r#"22P02 path element at position 2 is not an integer: "x""#,
+        ),
+        (r#"select jsonb_insert('{"a":[1,2]}', '{a,1}', '"x"', true)"#, r#"{"a": [1, 2, "x"]}"#),
+        (
+            r#"select jsonb_insert('{"a":{"b":1}}', '{a,b}', '2')"#,
+            "22023 cannot replace existing key",
+        ),
+        (
+            r#"select jsonb_set_lax('{"a":1}', '{a}', null), jsonb_set_lax('{"a":1}', '{a}', null, true, 'delete_key')"#,
+            r#"{"a": null}|{}"#,
+        ),
+        (
+            r#"select jsonb_set_lax('{"a":1}', '{a}', null, true, 'raise_exception')"#,
+            "22004 JSON value must not be null",
+        ),
+        (
+            r#"select jsonb_pretty('{"a":[1,{}]}')"#,
+            "{\n    \"a\": [\n        1,\n        {\n        }\n    ]\n}",
+        ),
+    ] {
+        assert_eq!(value(sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
     let dirs = Dirs::new("pg-regexp");
     let server = Server::start(dirs.config()).unwrap();
