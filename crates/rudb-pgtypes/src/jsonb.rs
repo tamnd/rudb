@@ -134,12 +134,11 @@ impl Sink for Tree {
     }
 }
 
-/// `uniqueifyJsonbObject`: the fields in the order of their keys, shorter keys first and keys of
-/// one length in the order of their bytes. Of the fields with one key, the last one stays.
+/// `uniqueifyJsonbObject`: the fields in the [`key_order`] of their keys. Of the fields with one
+/// key, the last one stays.
 fn unique(fields: &mut Vec<(String, usize)>) {
-    let order = |a: &str, b: &str| a.len().cmp(&b.len()).then_with(|| a.cmp(b));
     // A stable sort keeps the fields of one key in the order of the input.
-    fields.sort_by(|a, b| order(&a.0, &b.0));
+    fields.sort_by(|a, b| key_order(&a.0, &b.0));
     let mut kept: Vec<(String, usize)> = Vec::with_capacity(fields.len());
     for field in fields.drain(..) {
         match kept.last_mut() {
@@ -148,6 +147,12 @@ fn unique(fields: &mut Vec<(String, usize)>) {
         }
     }
     *fields = kept;
+}
+
+/// The order of the keys of an object of `jsonb`: shorter keys first, and keys of one length in the
+/// order of their bytes.
+pub(crate) fn key_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
 /// `escape_json`: a string in quotes, with the escapes that PostgreSQL writes.

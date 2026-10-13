@@ -34,8 +34,14 @@ const SOURCES: [&[&str]; 13] = [
 ];
 
 /// The C functions of each module that are not strict, as `proisstrict` has them.
-const NULLS: [&[&str]; 5] =
-    [pgstring::NULLS, pgarray::NULLS, pgformattype::NULLS, pgwindow::NULLS, pgjsonbuild::NULLS];
+const NULLS: [&[&str]; 6] = [
+    pgstring::NULLS,
+    pgarray::NULLS,
+    pgformattype::NULLS,
+    pgwindow::NULLS,
+    pgjsonbuild::NULLS,
+    pgjsonfuncs::NULLS,
+];
 
 /// Whether the kernel of the C function `src` writes the elements of its first argument, an
 /// array, which it then takes with each element as text by the output function of its type.

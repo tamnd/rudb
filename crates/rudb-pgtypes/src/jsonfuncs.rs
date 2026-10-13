@@ -17,7 +17,7 @@ use crate::error::TypeError;
 use crate::json::{self, Kind, Open, Sink, StackDepth, Stop};
 use crate::jsonb::escape_json;
 
-enum Shape {
+pub(crate) enum Shape {
     /// A scalar, with the decoded text of a string.
     Scalar(Kind, Option<String>),
     Array(Vec<usize>),
@@ -34,10 +34,10 @@ struct Node {
 }
 
 /// A `json` or a `jsonb` value, read into one vector of nodes that refer to each other by index.
-struct Doc<'a> {
-    text: &'a str,
+pub(crate) struct Doc<'a> {
+    pub(crate) text: &'a str,
     nodes: Vec<Node>,
-    root: usize,
+    pub(crate) root: usize,
 }
 
 #[derive(Default)]
@@ -107,7 +107,7 @@ impl Sink for Builder {
 
 impl<'a> Doc<'a> {
     /// Reads `text`, with the strings decoded, as `makeJsonLexContext` with `need_escapes` set.
-    fn read(text: &'a str) -> Result<Doc<'a>, TypeError> {
+    pub(crate) fn read(text: &'a str) -> Result<Doc<'a>, TypeError> {
         let mut builder = Builder::default();
         match json::parse(text, true, StackDepth::default(), &mut builder) {
             Ok(()) => {}
@@ -118,19 +118,25 @@ impl<'a> Doc<'a> {
         Ok(Doc { text, nodes: builder.nodes, root })
     }
 
-    fn shape(&self, node: usize) -> &Shape {
+    pub(crate) fn shape(&self, node: usize) -> &Shape {
         &self.nodes[node].shape
     }
 
-    /// The text of the value of `node` in the input.
-    fn span(&self, node: usize) -> &'a str {
+    /// The bytes of the value of `node` in the input.
+    pub(crate) fn bounds(&self, node: usize) -> (usize, usize) {
         let node = &self.nodes[node];
-        &self.text[node.start..node.end]
+        (node.start, node.end)
+    }
+
+    /// The text of the value of `node` in the input.
+    pub(crate) fn span(&self, node: usize) -> &'a str {
+        let (start, end) = self.bounds(node);
+        &self.text[start..end]
     }
 
     /// The value of the field `key` of the object `node`. Of two fields with one key, the last
     /// one is the value, as the parse of `get_worker` keeps the last match.
-    fn field(&self, node: usize, key: &str) -> Option<usize> {
+    pub(crate) fn field(&self, node: usize, key: &str) -> Option<usize> {
         let Shape::Object(fields) = self.shape(node) else { return None };
         fields.iter().rev().find(|(name, _)| name == key).map(|&(_, value)| value)
     }
@@ -212,7 +218,7 @@ impl<'a> Doc<'a> {
 }
 
 /// An error of a function here, all of which PostgreSQL gives as an invalid parameter value.
-fn invalid(message: String) -> TypeError {
+pub(crate) fn invalid(message: String) -> TypeError {
     TypeError::new(SqlState::INVALID_PARAMETER_VALUE, message)
 }
 
@@ -278,7 +284,7 @@ pub fn json_extract_path(
 
 /// `strtoint` of a step of a path: an integer after any white space, with an optional sign and no
 /// other byte after it.
-fn index_of(step: &str) -> Option<i64> {
+pub(crate) fn index_of(step: &str) -> Option<i64> {
     let trimmed = step.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
     trimmed.parse::<i32>().ok().map(i64::from)
 }
