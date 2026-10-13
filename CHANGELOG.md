@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.16
+
+In the PostgreSQL dialect, #3085 reads jsonb subscripts as PostgreSQL does, and #3088 takes assignments to jsonb subscripts the same way.
+
+On the engine side, a clustered load whose sort spills no longer encodes the table on one thread. #3086 cuts every spilled run where its leading key changes and merges the runs in pieces of about a million rows, one morsel a piece, so the encode after the sort runs on every thread. A 30M row clustered load at `memory_limit = '1GB'` on a 6 core machine went from 42 to 65 s to 22 to 24 s. #3087 reads a sort that fitted on every thread rather than four when a load asks for runs of chunks, and #3089 writes what each spilled instance has left as a run on its own thread rather than leaving it for one thread at the end.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.15
 
 In the PostgreSQL dialect, #3075 builds json and jsonb values from any type as PostgreSQL does, with to_json, row_to_json, json_build_object and the jsonb forms of each. #3076 reads t.* in a row or a call as the row of the relation t. #3080 adds the json and jsonb operators and functions that read a value, and #3081 adds the jsonb operators that test and change a value. #3082 compares jsonb values in the order of PostgreSQL, casts a jsonb value to the scalar types, and refuses a cast that pg_cast does not allow with error 42846. #3083 folds only the immutable functions at plan time, so the error of a stable call or of a call that returns a set comes after the RowDescription, as in PostgreSQL.
