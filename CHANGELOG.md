@@ -10,6 +10,14 @@ There is now a third handover. The C series is the query compiler plan in `spec/
 
 There is now a fourth handover. The PG series is the PostgreSQL compatibility plan in `notes/Spec/2140/compat/postgres`, and it takes the minor version over at 0.9.0, which is the release where PG1 closed. From here the minor version counts PG milestones, and C series work ships in whatever release it lands in.
 
+## 0.10.14
+
+In the PostgreSQL dialect, #3071 reads a qualified star in an expression, such as `t.*` in a function argument or a comparison, as the whole row of the table. #3073 refuses a json or a jsonb value that is nested deeper than max_stack_depth allows, with the stack depth error of PostgreSQL, in a literal, a parameter, COPY and a cast at run time.
+
+In the protocol, #3072 runs COPY to and from a file on the server, and to and from a program, in the text, the csv and the binary formats of PostgreSQL.
+
+The native directory format number stays at 31 and the storage format version at 9.
+
 ## 0.10.13
 
 In the PostgreSQL dialect, #3063 lets an array of rows take a row with the concatenation operator. #3066 refuses a comparison of two types that PostgreSQL has no operator for, with error 42883, in a comparison, an IN list, a quantified comparison and a subquery. #3067 keeps the table columns and the declared types of the columns of a data changing WITH definition, of a column read from a query around a LATERAL one, and of a scalar query and ARRAY(SELECT ...) in the row description. #3069 sets a list of columns from the row of a query, or from ROW(t.*), in UPDATE and in ON CONFLICT DO UPDATE.
