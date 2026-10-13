@@ -3351,6 +3351,27 @@ impl Writer {
         self
     }
 
+    /// Leaves the tables of `names` out of the generation this writer commits, for tables the file
+    /// holds that were dropped since it was committed.
+    ///
+    /// Their runs go on the free list the way the runs of a table written again do, and a commit two
+    /// generations on writes into them. Before this, a file that held a dropped table could not be
+    /// appended to and the checkpoint wrote the whole database again. A load that sorts each table
+    /// through a staging table it drops after is a drop between every two tables, and on the JOB
+    /// clustered load those rewrites were more than half of the time.
+    #[must_use]
+    pub fn dropping(mut self, names: &[String]) -> Self {
+        let size = self.space.end();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.closed)
+            .into_iter()
+            .partition(|held| names.contains(&held.name));
+        self.closed = kept;
+        for entry in &gone {
+            give_entry(&*self.file, &mut self.space, entry, false, size);
+        }
+        self
+    }
+
     /// Sets the log anchor the next commit writes down, which says how much of the log the file
     /// holds once it is published.
     #[must_use]
@@ -4915,12 +4936,34 @@ impl Writer {
         anchor: Option<&LogAnchor>,
         marks: &[(String, GoneRows)],
     ) -> Result<()> {
+        Self::restate_dropping(path, views, anchor, marks, &[])
+    }
+
+    /// [`Writer::restate_marking`] that also leaves the tables of `dropped` out, the way
+    /// [`Writer::dropping`] has [`Writer::finish`] do it. A checkpoint after a `DROP TABLE` and
+    /// nothing else costs a catalog.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::restate_marking`].
+    pub fn restate_dropping(
+        path: impl AsRef<Path>,
+        views: &[ViewEntry],
+        anchor: Option<&LogAnchor>,
+        marks: &[(String, GoneRows)],
+        dropped: &[String],
+    ) -> Result<()> {
         let path = path.as_ref();
         let file = RealFilesystem::new().open(path, OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (mut closed, _, card, held, free) = decode_catalog(&bytes, size)?;
+        let (closed, _, card, held, free) = decode_catalog(&bytes, size)?;
         let mut out = Out::new(path, &*file, size, slot, free)?;
+        let (gone, mut closed): (Vec<_>, Vec<_>) =
+            closed.into_iter().partition(|held| dropped.contains(&held.name));
+        for entry in &gone {
+            give_entry(&*file, &mut out.space, entry, false, size);
+        }
         for (name, gone) in marks {
             let held = closed.iter_mut().find(|held| held.name == *name).ok_or_else(|| {
                 invalid(&format!("rows gone from {name}, which the file does not hold"))
@@ -5162,7 +5205,7 @@ fn give_entry(
 }
 
 /// The runs the directory of `entry` says its table owns.
-fn owned_by(file: &dyn rudb_io::File, entry: &Entry, size: u64) -> Result<Vec<(u64, u64)>> {
+fn owned_by<F: Positional + ?Sized>(file: &F, entry: &Entry, size: u64) -> Result<Vec<(u64, u64)>> {
     let mut directory = vec![0; entry.directory.length as usize];
     read_at(file, entry.directory.offset, &mut directory)?;
     if checksum(&directory) != entry.directory.hash {
@@ -8056,6 +8099,24 @@ impl Catalog {
     /// generation would have to carry, so the count has to come out of the catalog beside the name.
     pub fn rows(&self) -> impl ExactSizeIterator<Item = (&str, usize)> {
         self.entries.iter().map(|entry| (entry.name.as_str(), entry.rows))
+    }
+
+    /// The bytes the table called `name` takes in the file: the runs its directory says it owns and
+    /// the directory itself. Nothing for a name the file does not hold.
+    ///
+    /// A checkpoint after a drop weighs this against what the tables it keeps hold, to tell a
+    /// staging table that was a small share of the file from a drop that leaves it mostly dead.
+    ///
+    /// # Errors
+    ///
+    /// If the table's directory cannot be read or does not checksum.
+    pub fn held_bytes(&self, name: &str) -> Result<u64> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.name == name) else {
+            return Ok(0);
+        };
+        let owned = owned_by(&*self.file, entry, self.size)?;
+        let runs = owned.iter().map(|(_, length)| *length).sum::<u64>();
+        Ok(runs.saturating_add(u64::from(entry.directory.length)))
     }
 
     /// The views in the file, in the order they were written.
