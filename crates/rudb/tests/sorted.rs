@@ -94,6 +94,41 @@ fn a_sort_that_does_not_fit_spills_and_answers_the_same_thing() {
     );
 }
 
+/// The same spilled sort on four threads, where every instance spills and has rows left when its
+/// input runs out, and writes those as a run of its own rather than leaving them to be sorted
+/// together at the end.
+#[test]
+fn a_sort_spilled_on_four_threads_answers_the_same_thing() {
+    let scrambled = "SELECT r AS a, (r * 7919) % 1000003 AS b FROM range(2000000) AS t(r)";
+    let ordered = format!("SELECT a, b FROM ({scrambled}) ORDER BY b, a");
+
+    let spilling = Database::new();
+    spilling.execute("SET threads=4").expect("sets the thread count");
+    spilling.execute("SET memory_limit='100MB'").expect("sets the limit");
+    spilling
+        .execute(&format!("CREATE TABLE s AS {ordered}"))
+        .expect("two million rows sort by spilling on four threads");
+    assert_eq!(
+        spilling.value("SELECT count(*) FROM s").expect("counts").to_string(),
+        "2000000",
+        "every row came through"
+    );
+
+    let roomy = Database::new();
+    roomy.execute("SET threads=1").expect("sets the thread count");
+    roomy.execute("SET memory_limit='2GB'").expect("sets the limit");
+    roomy.execute(&format!("CREATE TABLE s AS {ordered}")).expect("and again without spilling");
+
+    spilling.execute("SET memory_limit='2GB'").expect("raises the limit for the read");
+    let digest = "SELECT sum(pos * (a * 1000003 + b)) \
+                  FROM (SELECT a, b, row_number() OVER () AS pos FROM s)";
+    assert_eq!(
+        spilling.value(digest).expect("reads").to_string(),
+        roomy.value(digest).expect("reads").to_string(),
+        "the sort spilled on four threads is in the same order as the one that fitted"
+    );
+}
+
 /// A long string column sorted on several threads, where it is laid in ranges of rows a thread
 /// each, answers what it answers laid whole on one thread.
 ///
