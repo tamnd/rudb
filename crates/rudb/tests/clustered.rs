@@ -485,6 +485,68 @@ fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The order declaration builds the link it orders by, and the link is what tells the planner each
+/// order's lines are one run.
+///
+/// Without it a table in its parent's order is in no order of its own key that the planner can see,
+/// and TPC-H q18's `GROUP BY l_orderkey` went from closing each order as the key moved past it on the
+/// plain file to hashing all of them on the ordered one. Nothing here sets `graph_links`.
+#[test]
+fn a_table_ordered_through_its_parent_keeps_a_link_that_closes_its_groups_by_run() {
+    let path = std::env::temp_dir()
+        .join(format!("rudb-clustered-through-link-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database
+            .execute("CREATE TABLE orders (o_orderkey BIGINT, o_orderdate DATE)")
+            .expect("creates");
+        database
+            .execute("CREATE TABLE lineitem (l_orderkey BIGINT, l_quantity INTEGER)")
+            .expect("creates");
+        database
+            .execute(
+                "SET cluster_by = 'orders(exact(o_orderdate), o_orderkey), \
+                 lineitem(l_orderkey) -> orders(o_orderkey)'",
+            )
+            .expect("declares both");
+        database
+            .execute(
+                "INSERT INTO orders SELECT r::BIGINT, \
+                 (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE FROM range(75000) AS s(r)",
+            )
+            .expect("loads the orders");
+        database
+            .execute(
+                "INSERT INTO lineitem SELECT (r // 4)::BIGINT, (r % 50)::INTEGER \
+                 FROM range(300000) AS s(r)",
+            )
+            .expect("loads the lines");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    let listed = rows(&reopened, "SELECT name, link FROM rudb_links()");
+    assert_eq!(
+        listed,
+        vec![vec![
+            Value::Varchar("lineitem(l_orderkey) -> orders(o_orderkey)".into()),
+            Value::Varchar("monotone".into()),
+        ]],
+        "the declaration did not build the link it orders by"
+    );
+    let query = "SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey";
+    let explained = reopened.query(&format!("EXPLAIN {query}")).expect("the explain ran");
+    let Value::Varchar(plan) = explained.value_at(0, 1) else { panic!("no plan") };
+    assert!(plan.contains("groups closed by run"), "{plan}");
+    let summed = rows(&reopened, &format!("SELECT count(*), sum(q)::BIGINT FROM ({query})"));
+    assert_eq!(summed, vec![vec![Value::BigInt(75_000), Value::BigInt(7_350_000)]]);
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}
+
 /// The same through a text key, which is matched by comparing values rather than integers.
 ///
 /// Two orders share a key here, and a line with that key goes with the one written first, which
