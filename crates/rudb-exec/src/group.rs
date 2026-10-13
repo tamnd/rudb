@@ -6910,6 +6910,11 @@ impl Sink for Aggregate<'_> {
             own,
             folded,
         } = local;
+        // A scan sends an empty chunk built from constant vectors for a part it kept no rows of,
+        // and those vectors carry none of the codes a coded exchange plans its shape from.
+        if chunk.is_empty() {
+            return Ok(Progress::More);
+        }
         let rows = self.read(chunk, expressions)?;
         if self.ranged_counts() {
             return self.count_ranged(&rows, ranged);
