@@ -401,6 +401,21 @@ fn a_load_into_a_table_that_declared_nothing_is_left_in_the_order_it_arrived() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Which file is at `path`, so a file written again and renamed over it is told apart from the
+/// same file with a catalog added at the end. Nothing on a system without inode numbers.
+fn identity(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(path).expect("the file is there").ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// A table ordered through its parent comes out of the checkpoint in the parent's order.
 ///
 /// `orders` is declared in date order and `lineitem` through it, which is the layout section 12.2
@@ -445,7 +460,7 @@ fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
             .expect("loads the lines");
         database.execute("CHECKPOINT").expect("commits");
     }
-    let written = std::fs::read(&path).expect("the file reads");
+    let written = identity(&path);
     let reopened = Database::open(name).expect("the file opens again");
     reopened.execute("SET threads = 1").expect("sets the thread count");
     let stored = rows(&reopened, "SELECT l_orderkey, l_linenumber FROM lineitem");
@@ -460,11 +475,13 @@ fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
     // The declaration came back out of the file, parent and all.
     let setting = reopened.setting("cluster_by").expect("a setting");
     assert!(setting.contains(through), "{setting}");
-    // A session that only read leaves the file as it was. The reclusterer measured `lineitem` on
-    // `l_orderkey`, found it as far out of that order as a table can be, and every close sorted it
-    // by the key and wrote the whole file again in the parent's order.
+    // A session that only read does not write the file again. The reclusterer measured `lineitem`
+    // on `l_orderkey`, found it as far out of that order as a table can be, and every close sorted
+    // it by the key and wrote the whole file again in the parent's order. A close may still put a
+    // new catalog at the end of the file, so what is compared is which file it is, since a file
+    // written again is a new one renamed over the old.
     drop(reopened);
-    assert!(std::fs::read(&path).expect("the file reads") == written, "a read wrote the file");
+    assert_eq!(identity(&path), written, "a read wrote the whole file again");
     let _ = std::fs::remove_file(path);
 }
 
