@@ -89,6 +89,23 @@ const SHARE_DIVISOR: usize = 20;
 /// kilobytes is about where a 32 KiB window has enough behind it to find anything.
 const LZ_FLOOR: usize = 4096;
 
+/// How many bytes more than the smallest encoding a coded one may cost and still be kept instead.
+///
+/// A scan filters a part held as a dictionary or as FSST on its codes and one held plain, front
+/// coded or as LZ on every string, so a column whose parts are all coded but one runs the slow kernel for that one. The
+/// part that ends up plain is nearly always the short one at the end of a load: on the JOB load
+/// sorted by `movie_id`, the last eight rows of `movie_info` came out plain beside 1,811 coded
+/// parts. A dictionary of eight values costs a few bytes of codes over plain, and the slack stops
+/// the choice from turning on those bytes. On a part of a few thousand rows the codes alone are
+/// more than this, so the rule leaves every part that size could matter on alone.
+const CODED_SLACK: usize = 64;
+
+/// How few values a chunk can hold and still be offered a dictionary when no value repeats.
+///
+/// A dictionary of values that are all different is plain with codes on top, which only ever wins
+/// through [`CODED_SLACK`], and that it can only do while the codes are a few bytes.
+const SMALL_DICT_VALUES: usize = 64;
+
 /// How many bytes of a column the symbol table is trained on.
 ///
 /// The paper trains on about 16 KB. This is four times that, because training happens once per
@@ -946,6 +963,7 @@ fn encode_at(values: &[&[u8]], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u
         tally::chose(Family::String, started);
     }
     let mut best: Option<(Kind, Vec<u8>)> = None;
+    let mut coded: Option<(Kind, Vec<u8>)> = None;
     for kind in narrowed {
         let encoded = if counted {
             tally::offer(Family::String, kind.tag(), || encode_as(kind, values, depth, chooser))?
@@ -955,9 +973,23 @@ fn encode_at(values: &[&[u8]], depth: u8, chooser: &dyn Chooser) -> Result<Vec<u
         let Some(bytes) = encoded else {
             continue;
         };
+        if matches!(kind, Kind::Dict | Kind::Fsst)
+            && coded.as_ref().is_none_or(|(_, current)| bytes.len() < current.len())
+        {
+            coded = Some((kind, bytes.clone()));
+        }
         if best.as_ref().is_none_or(|(_, current)| bytes.len() < current.len()) {
             best = Some((kind, bytes));
         }
+    }
+    // A chunk at the top level that would be held off codes, plain, front coded or compressed with
+    // LZ, gives way to a coded one that costs at most a few bytes more.
+    if depth == 0
+        && let (Some((kind, smallest)), Some((_, codes))) = (&best, &coded)
+        && matches!(kind, Kind::Plain | Kind::Front | Kind::Lz)
+        && codes.len() <= smallest.len() + CODED_SLACK
+    {
+        best = coded;
     }
     let (kind, bytes) =
         best.ok_or_else(|| Error::internal("no string encoding applied to the chunk"))?;
@@ -976,7 +1008,9 @@ fn candidates(values: &[&[u8]], depth: u8) -> Vec<Kind> {
         return vec![Kind::Constant];
     }
     kinds.push(Kind::Fsst);
-    if depth < MAX_DEPTH && has_duplicates(values) {
+    if depth < MAX_DEPTH
+        && ((depth == 0 && values.len() <= SMALL_DICT_VALUES) || has_duplicates(values))
+    {
         kinds.push(Kind::Dict);
     }
     if depth < MAX_DEPTH && sharing_of(values) >= total_len(values) / SHARE_DIVISOR {
@@ -2182,6 +2216,32 @@ mod tests {
         let mut short = vec![1, 2, 3, 0];
         assert!(copy_back(&mut short, 0, 3, 1, 2).is_err(), "past the end of the buffer");
         assert!(copy_back(&mut short, 0, 3, 4, 1).is_err(), "further back than the output");
+    }
+
+    #[test]
+    fn a_short_chunk_of_distinct_values_is_coded() {
+        // The tail of a load: eight values that all differ, which plain held a few bytes smaller.
+        let values: Vec<Vec<u8>> =
+            (0..8).map(|at| format!("West Germany {}", at * 7919).into_bytes()).collect();
+        let bytes = round_trip(&values);
+        let kind = kind_of(&bytes);
+        assert!(matches!(kind, Kind::Dict | Kind::Fsst), "{}", describe(&bytes).unwrap());
+        let plain = encode_only(Kind::Plain, &borrow(&values)).unwrap().unwrap();
+        assert!(bytes.len() <= plain.len() + CODED_SLACK);
+        // Values that share a prefix, which front coding held smallest.
+        let shared: Vec<Vec<u8>> =
+            (0..8).map(|at| format!("West Germany {at}").into_bytes()).collect();
+        let bytes = round_trip(&shared);
+        let kind = kind_of(&bytes);
+        assert!(matches!(kind, Kind::Dict | Kind::Fsst), "{}", describe(&bytes).unwrap());
+    }
+
+    #[test]
+    fn a_long_chunk_of_distinct_values_is_not_given_a_dictionary() {
+        let values: Vec<Vec<u8>> =
+            (0..5000).map(|at| format!("{:x}", at * 2_654_435_761_u64).into_bytes()).collect();
+        let bytes = round_trip(&values);
+        assert_ne!(kind_of(&bytes), Kind::Dict, "{}", describe(&bytes).unwrap());
     }
 
     #[test]
