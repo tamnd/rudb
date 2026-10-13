@@ -115,6 +115,7 @@ mod float;
 mod generated;
 mod json;
 mod jsonb;
+mod jsonbuild;
 pub mod keywords;
 mod number;
 mod number_format;
@@ -161,7 +162,11 @@ pub use error::TypeError;
 pub use float::{float4_in, float4_out, float8_in, float8_out};
 pub use generated::oids as oid;
 pub use json::{StackDepth, json_in};
-pub use jsonb::{jsonb_in, jsonb_recv, jsonb_send};
+pub use jsonb::{escape_json, jsonb_in, jsonb_recv, jsonb_send};
+pub use jsonbuild::{
+    build_array, build_object, object_of_texts, object_shape_error, pretty_outer, to_jsonb,
+    valid_json_number,
+};
 pub use number::{int_out, int2_in, int4_in, int8_in, oid_in, oid_out, u64_out};
 pub use number_format::{
     NumberTemplate, float4_to_char, float8_to_char, int4_to_char, int8_to_char, numeric_to_char,

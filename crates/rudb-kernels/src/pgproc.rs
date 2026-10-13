@@ -9,15 +9,15 @@
 use rudb_common::{LogicalType, Result, Value};
 
 use crate::{
-    pgarray, pgdatetime, pgformattype, pgmath, pgnormalize, pgregression, pgseries, pgstring,
-    pgunicode, pgvariance, pgwindow,
+    pgarray, pgdatetime, pgformattype, pgjsonbuild, pgmath, pgnormalize, pgregression, pgseries,
+    pgstring, pgunicode, pgvariance, pgwindow,
 };
 
 /// The prefix of the name of a kernel of a C function.
 pub const PREFIX: &str = "__rudb_pgproc_";
 
 /// The C functions of each module of kernels, sorted.
-const SOURCES: [&[&str]; 11] = [
+const SOURCES: [&[&str]; 12] = [
     pgmath::SOURCES,
     pgvariance::SOURCES,
     pgregression::SOURCES,
@@ -29,15 +29,23 @@ const SOURCES: [&[&str]; 11] = [
     pgformattype::SOURCES,
     pgseries::SOURCES,
     pgwindow::SOURCES,
+    pgjsonbuild::SOURCES,
 ];
 
 /// The C functions of each module that are not strict, as `proisstrict` has them.
-const NULLS: [&[&str]; 4] = [pgstring::NULLS, pgarray::NULLS, pgformattype::NULLS, pgwindow::NULLS];
+const NULLS: [&[&str]; 5] =
+    [pgstring::NULLS, pgarray::NULLS, pgformattype::NULLS, pgwindow::NULLS, pgjsonbuild::NULLS];
 
 /// Whether the kernel of the C function `src` writes the elements of its first argument, an
 /// array, which it then takes with each element as text by the output function of its type.
 pub fn outputs(src: &str) -> bool {
     pgarray::OUTPUTS.contains(&src)
+}
+
+/// Whether the kernel of the C function `src` takes each argument of a polymorphic type, `record`
+/// or `any` as its JSON text, which the binder writes by the rules of `datum_to_json_internal`.
+pub fn datums(src: &str) -> bool {
+    pgjsonbuild::DATUMS.contains(&src)
 }
 
 /// Whether the kernel of the C function `src` takes the OID of the collation of the call as one
@@ -117,6 +125,9 @@ pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<
     if let Some(value) = pgwindow::call(src, args)? {
         return Ok(Some(value));
     }
+    if let Some(value) = pgjsonbuild::call(src, args)? {
+        return Ok(Some(value));
+    }
     pgarray::proc_call(src, args, returns)
 }
 
@@ -133,6 +144,13 @@ mod tests {
     fn the_sources_are_sorted() {
         for sources in SOURCES {
             assert!(sources.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn a_function_that_takes_json_text_has_a_kernel() {
+        for src in pgjsonbuild::DATUMS {
+            assert!(has(src), "{src}");
         }
     }
 

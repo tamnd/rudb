@@ -30,6 +30,7 @@ mod explain;
 mod expr;
 mod figure;
 pub mod fold;
+mod jsondatum;
 mod kept;
 mod lambda;
 mod listaggr;

@@ -81,7 +81,7 @@ impl Tree {
                     if at > 0 {
                         out.push_str(", ");
                     }
-                    escape(key, out);
+                    escape_json(key, out);
                     out.push_str(": ");
                     *child
                 }
@@ -119,7 +119,7 @@ impl Sink for Tree {
     fn scalar(&mut self, kind: Kind, token: &str, text: &str) -> Result<(), TypeError> {
         let mut out = String::new();
         match kind {
-            Kind::String => escape(text, &mut out),
+            Kind::String => escape_json(text, &mut out),
             Kind::Number => {
                 let mut bytes = Vec::new();
                 numeric_out(&numeric_in(token, -1)?, &mut bytes);
@@ -151,7 +151,7 @@ fn unique(fields: &mut Vec<(String, usize)>) {
 }
 
 /// `escape_json`: a string in quotes, with the escapes that PostgreSQL writes.
-fn escape(text: &str, out: &mut String) {
+pub fn escape_json(text: &str, out: &mut String) {
     out.push('"');
     for c in text.chars() {
         match c {

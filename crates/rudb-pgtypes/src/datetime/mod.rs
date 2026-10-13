@@ -79,6 +79,9 @@ pub enum DateStyle {
     Sql,
     Postgres,
     German,
+    /// `USE_XSD_DATES`, which no setting gives: the form of ISO 8601 that `to_json` writes, with a
+    /// `T` between the date and the time and the minutes of each zone offset.
+    Xsd,
 }
 
 /// The field order part of `DateStyle`. The output uses it only to put the day before the month.
@@ -397,12 +400,13 @@ fn seconds(sec: i64, usec: i64, fill: bool, out: &mut Vec<u8>) {
 }
 
 /// `EncodeTimezone`: the offset east of UTC, with minutes and seconds only when they are not zero.
-fn zone_offset(offset: i32, out: &mut Vec<u8>) {
+/// The XSD style has the minutes always.
+fn zone_offset(offset: i32, minutes: bool, out: &mut Vec<u8>) {
     out.push(if offset >= 0 { b'+' } else { b'-' });
     let total = offset.unsigned_abs();
     let (hour, min, sec) = (total / 3600, total / 60 % 60, total % 60);
     zeropad(u64::from(hour), 2, out);
-    if min != 0 || sec != 0 {
+    if min != 0 || sec != 0 || minutes {
         out.push(b':');
         two(min, out);
     }
@@ -415,7 +419,7 @@ fn zone_offset(offset: i32, out: &mut Vec<u8>) {
 /// The date part in the order and with the separator of the style.
 fn date_part(f: &Fields, format: DateFormat, out: &mut Vec<u8>) {
     let (first, second, sep) = match (format.style, format.day_first()) {
-        (DateStyle::Iso, _) => {
+        (DateStyle::Iso | DateStyle::Xsd, _) => {
             year(f.year, out);
             out.push(b'-');
             two(f.month, out);
@@ -483,7 +487,7 @@ pub fn time_out(time: i64, out: &mut Vec<u8>) {
 /// The text output of `timetz`. The zone is in seconds west of UTC, as PostgreSQL stores it.
 pub fn timetz_out(time: i64, zone: i32, out: &mut Vec<u8>) {
     time_out(time, out);
-    zone_offset(-zone, out);
+    zone_offset(-zone, false, out);
 }
 
 /// `AdjustTimeForTypmod` and the rounding of `AdjustTimestampForTypmod`: rounds half away from
@@ -531,12 +535,13 @@ fn date_time(f: &Fields, zone: Option<(i32, &str)>, format: DateFormat, out: &mu
         out.extend_from_slice(&abbrev.as_bytes()[..abbrev.len().min(MAX_TZ_LEN)]);
     };
     match format.style {
-        DateStyle::Iso => {
+        DateStyle::Iso | DateStyle::Xsd => {
+            let xsd = format.style == DateStyle::Xsd;
             date_part(f, format, out);
-            out.push(b' ');
+            out.push(if xsd { b'T' } else { b' ' });
             clock_out(f.hour, f.minute, f.second, f.usec, out);
             if let Some((offset, _)) = zone {
-                zone_offset(offset, out);
+                zone_offset(offset, xsd, out);
             }
         }
         DateStyle::Sql | DateStyle::German => {
@@ -946,6 +951,14 @@ mod tests {
         };
         assert_eq!(tz(DateStyle::Iso), "2026-10-05 18:04:56.789+05:30");
         assert_eq!(tz(DateStyle::Postgres), "Mon Oct 05 18:04:56.789 2026 IST");
+        assert_eq!(tz(DateStyle::Xsd), "2026-10-05T18:04:56.789+05:30");
+        assert_eq!(at(DateStyle::Xsd, DateOrder::Dmy), "2026-10-05T12:34:56.789");
+        let utc = FixedZone::utc();
+        let xsd = DateFormat { style: DateStyle::Xsd, order: DateOrder::Mdy };
+        assert_eq!(
+            text(|out| timestamptz_out(ts, xsd, &utc, out).unwrap()),
+            "2026-10-05T12:34:56.789+00:00"
+        );
         let bc = (date2j(-43, 3, 15) - POSTGRES_EPOCH_JDATE) as i64 * USECS_PER_DAY;
         assert_eq!(
             text(|out| timestamp_out(bc, DateFormat::ISO_MDY, out).unwrap()),

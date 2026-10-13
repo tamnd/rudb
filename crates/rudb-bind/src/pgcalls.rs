@@ -635,9 +635,20 @@ impl Binder<'_> {
                 let Some(ty) = rudb_pgtypes::logical_type(oid) else { return Ok(None) };
                 args.push(self.argument_as(ast, arguments[index], bound[index], &ty)?);
             }
+            // A kernel that builds a `json` value takes the JSON text of each value instead.
+            let datums = rudb_kernels::pgproc::datums(proc.src);
+            let keys = datums && proc.src.ends_with("_build_object");
             let mut texts = Vec::with_capacity(candidate.variadic);
-            for &value in &bound[fixed..] {
-                texts.push(self.output_text(value)?);
+            for (at, &value) in bound[fixed..].iter().enumerate() {
+                texts.push(match datums {
+                    true => {
+                        if keys && at.is_multiple_of(2) {
+                            self.json_key(value)?;
+                        }
+                        self.json_datum(value)?
+                    }
+                    false => self.output_text(value)?,
+                });
             }
             let values = self.call("list_value", texts)?;
             args.push(values);
@@ -667,6 +678,19 @@ impl Binder<'_> {
                 .map_err(|error| Error::from(error).unplaced())?
         };
         let Some(returns) = rudb_pgtypes::logical_type(generic.result) else { return Ok(None) };
+        // A kernel that builds a `json` value takes the JSON text of each argument that can be of
+        // any type.
+        if rudb_kernels::pgproc::datums(proc.src) && candidate.args.len() == bound.len() {
+            let mut args = Vec::with_capacity(bound.len());
+            for (at, &declared) in candidate.args.iter().enumerate() {
+                let any = rudb_pgtypes::is_polymorphic(declared) || declared == oid::RECORD;
+                args.push(match rudb_pgtypes::logical_type(declared) {
+                    Some(ty) if !any => self.argument_as(ast, arguments[at], bound[at], &ty)?,
+                    _ => self.json_datum(bound[at])?,
+                });
+            }
+            return Ok(Some(self.pgproc_kernel(proc.src, &args, returns)));
+        }
         // A function that returns a set is the unnest of the array of its kernel, or of the list
         // of the series of the engine, so it binds only as the argument of the unnest of a select
         // list or of `FROM`.
@@ -790,7 +814,7 @@ impl Binder<'_> {
             };
             let oid = match untyped || ty == LogicalType::Null {
                 true => oid::UNKNOWN,
-                false => match exact_oid(typed) {
+                false => match exact_oid(typed).or_else(|| record_oid(typed)) {
                     Some(oid) => oid,
                     None => return Ok(None),
                 },
