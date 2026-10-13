@@ -400,3 +400,64 @@ fn a_load_into_a_table_that_declared_nothing_is_left_in_the_order_it_arrived() {
     assert_eq!(first, wanted, "an undeclared load was reordered");
     let _ = std::fs::remove_file(path);
 }
+
+/// A table ordered through its parent comes out of the checkpoint in the parent's order.
+///
+/// `orders` is declared in date order and `lineitem` through it, which is the layout section 12.2
+/// of the order spec measures. Neither table is loaded in that order: the order dates are scrambled
+/// the way `ROWS` scrambles ship dates, and the lines arrive grouped by order but in key order. So
+/// the order the lines are read back in, one thread and a plain scan, is the order the checkpoint
+/// put them in, and it has to be every order's lines together, the orders by date, and a line with
+/// no order at the end. There are enough lines that the write gathers them in three windows, so the
+/// edges of a window and of a chunk are both crossed.
+#[test]
+fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
+    let path =
+        std::env::temp_dir().join(format!("rudb-clustered-through-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let through = "lineitem(l_orderkey) -> orders(o_orderkey)";
+    {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database
+            .execute("CREATE TABLE orders (o_orderkey BIGINT, o_orderdate DATE)")
+            .expect("creates");
+        database
+            .execute("CREATE TABLE lineitem (l_orderkey BIGINT, l_linenumber INTEGER)")
+            .expect("creates");
+        database
+            .execute(&format!(
+                "SET cluster_by = 'orders(exact(o_orderdate), o_orderkey), {through}'"
+            ))
+            .expect("declares both");
+        database
+            .execute(
+                "INSERT INTO orders SELECT r::BIGINT, \
+                 (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE FROM range(75000) AS s(r)",
+            )
+            .expect("loads the orders");
+        database
+            .execute(
+                "INSERT INTO lineitem SELECT (r // 4)::BIGINT, (r % 4 + 1)::INTEGER \
+                 FROM range(300000) AS s(r) UNION ALL SELECT 999999, 1",
+            )
+            .expect("loads the lines");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    let stored = rows(&reopened, "SELECT l_orderkey, l_linenumber FROM lineitem");
+    let mut wanted = rows(
+        &reopened,
+        "SELECT l_orderkey, l_linenumber FROM lineitem JOIN orders ON l_orderkey = o_orderkey \
+         ORDER BY o_orderdate, o_orderkey, l_linenumber",
+    );
+    wanted.push(vec![Value::BigInt(999999), Value::Integer(1)]);
+    assert_eq!(stored.len(), 300_001, "every line is still there");
+    assert!(stored == wanted, "the lines are not in the order of their orders");
+    // The declaration came back out of the file, parent and all.
+    let setting = reopened.setting("cluster_by").expect("a setting");
+    assert!(setting.contains(through), "{setting}");
+    let _ = std::fs::remove_file(path);
+}

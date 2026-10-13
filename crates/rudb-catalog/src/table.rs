@@ -2029,9 +2029,7 @@ impl Table {
             None => None,
             // Rebuilt against this table's columns rather than trusted, since the caller built it
             // from a name list and a stale one would store a column index off the end.
-            Some(asked) => {
-                Some(Clustering::new(asked.columns().to_vec(), asked.width(), &self.columns)?)
-            }
+            Some(asked) => Some(asked.checked(&self.columns)?),
         };
         Ok(())
     }

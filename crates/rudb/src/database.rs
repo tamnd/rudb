@@ -2864,6 +2864,7 @@ fn persist_anchored(
     }
     let temporary = scratch(path)?;
     let mut writer: Option<rudb_native::Writer> = None;
+    let mut orders = crate::ordered::Orders::default();
     for name in &names {
         let table = catalog.table(name)?;
         let fields = table.columns().to_vec();
@@ -2878,7 +2879,10 @@ fn persist_anchored(
         if !constraints.is_empty() {
             open = open.constrain(constraints)?;
         }
-        write_parts(&mut open, table.rows(), 0, &fields)?;
+        match orders.of(catalog, name, &|_| true)? {
+            Some(order) => crate::ordered::write(&mut open, table.rows(), &order, &fields)?,
+            None => write_parts(&mut open, table.rows(), 0, &fields)?,
+        }
         writer = Some(open);
     }
     let mut writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
@@ -3893,6 +3897,10 @@ fn appended(
         return Ok(None);
     }
     let mut writer: Option<rudb_native::Writer> = None;
+    let mut orders = crate::ordered::Orders::default();
+    let whole = |name: &QualifiedName| {
+        dirty.iter().any(|d| d == name) && !extended.contains_key(&name.table)
+    };
     for name in &dirty {
         let table = catalog.table(name)?;
         let fields = table.columns().to_vec();
@@ -3916,7 +3924,11 @@ fn appended(
         // Said even when there is nothing, because a table extended in place starts from what
         // its old directory held, and an index dropped since is still in that.
         open = open.constrain(table.stored_constraints()?)?;
-        write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?;
+        let order = if kept.is_none() { orders.of(catalog, name, &whole)? } else { None };
+        match order {
+            Some(order) => crate::ordered::write(&mut open, table.rows(), &order, &fields)?,
+            None => write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?,
+        }
         writer = Some(open);
     }
     let Some(mut writer) = writer else { return Ok(None) };
@@ -8510,7 +8522,11 @@ impl Shared {
                     // the first two are a `stat` and a count.
                     let alone = !path.exists() && catalog.stored_tables().count() == 1;
                     let empty = target.rows().is_empty();
-                    if empty && (alone || appendable(path, &catalog, &insert.name)?) {
+                    // A table ordered through its parent is put in order by the checkpoint, which
+                    // needs the rows in memory and the parent beside them, so it loads the slow way.
+                    let ordered =
+                        target.clustering().is_none_or(|clustering| clustering.parent().is_none());
+                    if empty && ordered && (alone || appendable(path, &catalog, &insert.name)?) {
                         let table = target.name().table.clone();
                         let fields = target.columns().to_vec();
                         // The declaration the target already carries, which is the one the binder

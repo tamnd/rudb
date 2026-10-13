@@ -183,10 +183,43 @@ impl fmt::Display for Width {
 /// list beside this and a name here would be a second copy that a rename could put out of step. The
 /// cost is that this has to be validated against a column count wherever it is built, which
 /// [`Clustering::new`] does.
+///
+/// A declaration can also order a table through its parent, which is [`Clustering::through`]. The
+/// columns are then the child's half of the relationship, and the rows are ordered by where the
+/// parent row each one points at is stored, and then by their own row id. That is the layout of
+/// section 12.2 of `spec/graph/12-the-order-the-suite-asks-for.md`: `lineitem` through `orders`
+/// with `orders` in date order keeps every order's lines together and puts them in date order,
+/// which no list of `lineitem`'s own columns can say.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Clustering {
     columns: Vec<u32>,
     width: Width,
+    parent: Option<Parent>,
+}
+
+/// The parent a table is ordered through, by name, and the parent's half of the relationship.
+///
+/// Names and not indexes, unlike the child's columns, because the parent is another table and this
+/// is stored with the child. A parent dropped or renamed since leaves a declaration that orders
+/// nothing, and a checkpoint writes such a child in the order it already has.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Parent {
+    table: String,
+    columns: Vec<String>,
+}
+
+impl Parent {
+    /// The parent table's name, without a schema, since the two live in one database.
+    #[must_use]
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// The parent's columns, one for each of the child's, in the same order.
+    #[must_use]
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
 }
 
 impl Clustering {
@@ -228,7 +261,66 @@ impl Clustering {
                 leading.name
             )));
         }
-        Ok(Self { columns, width })
+        Ok(Self { columns, width, parent: None })
+    }
+
+    /// A declaration that orders the table through its parent `table`, where the child's `columns`
+    /// equal the parent's `parent_columns` one for one.
+    ///
+    /// # Errors
+    ///
+    /// The ones [`Clustering::new`] gives for the child's columns, and if the parent's list is not
+    /// as long as the child's or names a column twice.
+    pub fn through(
+        columns: Vec<u32>,
+        table: String,
+        parent_columns: Vec<String>,
+        fields: &[Field],
+    ) -> Result<Self> {
+        let mut clustering = Self::new(columns, Width::Exact, fields)?;
+        if parent_columns.len() != clustering.columns.len() {
+            return Err(Error::invalid_input(format!(
+                "a clustering declaration through {table} names {} columns on one side and {} on \
+                 the other",
+                clustering.columns.len(),
+                parent_columns.len()
+            )));
+        }
+        for (at, column) in parent_columns.iter().enumerate() {
+            if parent_columns[..at].iter().any(|seen| seen.eq_ignore_ascii_case(column)) {
+                return Err(Error::invalid_input(format!(
+                    "a clustering declaration names {table}.{column} twice"
+                )));
+            }
+        }
+        clustering.parent = Some(Parent { table, columns: parent_columns });
+        Ok(clustering)
+    }
+
+    /// This declaration checked again against `fields`, the columns of the table it is put on.
+    ///
+    /// What a catalog entry or a writer calls with a declaration somebody else built, since the two
+    /// could have drifted and a stale one would store a column index off the end.
+    ///
+    /// # Errors
+    ///
+    /// The ones [`Clustering::new`] and [`Clustering::through`] give.
+    pub fn checked(&self, fields: &[Field]) -> Result<Self> {
+        match &self.parent {
+            None => Self::new(self.columns.clone(), self.width, fields),
+            Some(parent) => Self::through(
+                self.columns.clone(),
+                parent.table.clone(),
+                parent.columns.clone(),
+                fields,
+            ),
+        }
+    }
+
+    /// The parent the rows are ordered through, when they are.
+    #[must_use]
+    pub fn parent(&self) -> Option<&Parent> {
+        self.parent.as_ref()
     }
 
     /// A declaration over `columns` that leaves the width to the leading column's type.
@@ -278,9 +370,11 @@ impl Clustering {
     #[must_use]
     pub fn fitted(&self, rows: u64, days: u64) -> Self {
         match self.width {
-            Width::Auto => {
-                Self { columns: self.columns.clone(), width: Width::for_span(rows, days) }
-            }
+            Width::Auto => Self {
+                columns: self.columns.clone(),
+                width: Width::for_span(rows, days),
+                parent: self.parent.clone(),
+            },
             _ => self.clone(),
         }
     }
@@ -315,6 +409,16 @@ impl Clustering {
         let rest = self.columns[1..].iter().map(|&at| named(at)).collect::<Vec<_>>();
         std::iter::once(leading).chain(rest).collect::<Vec<_>>().join(", ")
     }
+
+    /// The whole declaration for `table` as the setting takes it, parent and all.
+    #[must_use]
+    pub fn written(&self, table: &str, names: &[String]) -> String {
+        let own = format!("{table}({})", self.describe(names));
+        match &self.parent {
+            None => own,
+            Some(parent) => format!("{own} -> {}({})", parent.table, parent.columns.join(", ")),
+        }
+    }
 }
 
 /// A declaration as somebody wrote it, before a catalog turned the names into column indexes.
@@ -328,6 +432,7 @@ pub struct Declared {
     table: String,
     width: Option<Width>,
     columns: Vec<String>,
+    parent: Option<Parent>,
 }
 
 impl Declared {
@@ -347,6 +452,12 @@ impl Declared {
     #[must_use]
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    /// The parent the table is ordered through, when the declaration names one after `->`.
+    #[must_use]
+    pub fn parent(&self) -> Option<&Parent> {
+        self.parent.as_ref()
     }
 }
 
@@ -379,6 +490,16 @@ pub fn is_clustering_setting(name: &str) -> bool {
 /// ```text
 /// lineitem(quarter(l_shipdate), l_orderkey, l_linenumber),
 /// orders(quarter(o_orderdate), o_orderkey)
+/// ```
+///
+/// An entry can instead order a table through its parent, with an arrow from the child's columns
+/// to the parent's, which is [`Clustering::through`]. No width goes on either side, since the
+/// order comes from where the parent's rows are and not from a value. The layout section 12.2 of
+/// the order spec measures is these two:
+///
+/// ```text
+/// orders(o_orderdate, o_orderkey),
+/// lineitem(l_orderkey) -> orders(o_orderkey)
 /// ```
 ///
 /// # Errors
@@ -426,6 +547,31 @@ fn entries(setting: &str) -> Vec<String> {
 }
 
 fn parse_entry(entry: &str) -> Result<Declared> {
+    let Some((own, parent)) = entry.split_once("->") else {
+        return parse_list(entry);
+    };
+    let own = parse_list(own.trim())?;
+    let parent = parse_list(parent.trim())?;
+    if own.width.is_some() || parent.width.is_some() || parent.parent.is_some() {
+        return Err(malformed(format!(
+            "`{entry}` orders through a parent, which takes plain columns on both sides"
+        )));
+    }
+    if own.columns.len() != parent.columns.len() {
+        return Err(malformed(format!(
+            "`{entry}` names {} columns on one side of the arrow and {} on the other",
+            own.columns.len(),
+            parent.columns.len()
+        )));
+    }
+    if own.table.eq_ignore_ascii_case(&parent.table) {
+        return Err(malformed(format!("`{entry}` orders a table through itself")));
+    }
+    Ok(Declared { parent: Some(Parent { table: parent.table, columns: parent.columns }), ..own })
+}
+
+/// One `table(column, ...)`, the whole of an entry that names no parent.
+fn parse_list(entry: &str) -> Result<Declared> {
     let Some((table, rest)) = entry.split_once('(') else {
         return Err(malformed(format!("expected `table(column, ...)` and found `{entry}`")));
     };
@@ -454,7 +600,7 @@ fn parse_entry(entry: &str) -> Result<Declared> {
         }
     }
     columns[0] = leading;
-    Ok(Declared { table: table.to_owned(), width, columns })
+    Ok(Declared { table: table.to_owned(), width, columns, parent: None })
 }
 
 /// A leading column as the width it was wrapped in, if it was wrapped, and the column itself.
@@ -686,5 +832,43 @@ mod tests {
         assert_eq!(stage_zero.describe(&names), "month(l_shipdate), l_orderkey, l_linenumber");
         let plain = Clustering::new(vec![0], Width::Exact, &fields).expect("valid");
         assert_eq!(plain.describe(&names), "l_orderkey");
+    }
+
+    #[test]
+    fn a_table_ordered_through_its_parent_parses_checks_and_reads_back() {
+        let setting = "orders(o_orderdate, o_orderkey), lineitem(l_orderkey) -> orders(o_orderkey)";
+        let declared = parse_clustering(setting).expect("parse");
+        assert_eq!(declared.len(), 2, "the arrow is not a separator");
+        assert!(declared[0].parent().is_none());
+        let parent = declared[1].parent().expect("lineitem goes through orders");
+        assert_eq!(declared[1].table(), "lineitem");
+        assert_eq!(declared[1].columns(), ["l_orderkey"]);
+        assert_eq!((parent.table(), parent.columns()), ("orders", &["o_orderkey".to_owned()][..]));
+        // What it reads back as is what was typed, so it pastes straight back into the setting.
+        let fields = lineitem();
+        let names = fields.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+        let through =
+            Clustering::through(vec![0], "orders".into(), vec!["o_orderkey".into()], &fields)
+                .expect("valid");
+        assert_eq!(
+            through.written("lineitem", &names),
+            "lineitem(l_orderkey) -> orders(o_orderkey)"
+        );
+        assert_eq!(through.checked(&fields).expect("still valid"), through, "the parent stays");
+        assert_eq!(through.fitted(10, 10).parent(), through.parent(), "and through a fit too");
+        assert!(
+            Clustering::through(vec![0, 1], "orders".into(), vec!["o_orderkey".into()], &fields)
+                .is_err(),
+            "two columns against one"
+        );
+        for bad in [
+            "lineitem(l_orderkey) -> orders(o_orderkey, o_custkey)",
+            "lineitem(month(l_shipdate)) -> orders(o_orderdate)",
+            "lineitem(l_orderkey) -> lineitem(l_orderkey)",
+            "lineitem(l_orderkey) -> orders",
+        ] {
+            let complaint = parse_clustering(bad).expect_err(bad).message().to_owned();
+            assert!(complaint.contains("clustering"), "{bad}: {complaint}");
+        }
     }
 }

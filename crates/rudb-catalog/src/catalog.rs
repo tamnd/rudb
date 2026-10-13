@@ -2212,7 +2212,7 @@ impl Catalog {
                 let clustering = table.clustering()?;
                 let names =
                     table.columns().iter().map(|field| field.name.clone()).collect::<Vec<_>>();
-                Some(format!("{}({})", table.name().table, clustering.describe(&names)))
+                Some(clustering.written(&table.name().table, &names))
             })
             .collect::<Vec<_>>()
             .join(", ")

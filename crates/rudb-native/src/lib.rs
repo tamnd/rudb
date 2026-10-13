@@ -226,6 +226,13 @@ const QUANTILE_BUCKETS: u64 = 64;
 /// format instead would have made every file this build writes unreadable to an older one, whether
 /// it has a declaration in it or not, to warn about a case that only arises when it does.
 const CLUSTERING: &[u8; 8] = b"RUDBCL1\0";
+/// The parent a clustered table is ordered through, when its declaration names one.
+///
+/// Written straight after [`CLUSTERING`] and only for a declaration with a parent, so every file
+/// without one is the bytes it was and the format number stays. A build that predates it refuses a
+/// file that has one, at the unknown magic, which is right: it would read the child's columns as an
+/// order by their own values, and the rows are not in that order.
+const CLUSTERING_PARENT: &[u8; 8] = b"RUDBCP1\0";
 /// The string columns whose global dictionary stopped taking values partway through the load.
 ///
 /// Section 5.5 of the encoding spec: a column whose stripes are nearly all new values, or the
@@ -3417,11 +3424,7 @@ impl Writer {
     pub fn declare(mut self, clustering: Clustering) -> Result<Self> {
         // Rebuilt against this table's own column count rather than trusted, because the caller
         // built it against a catalog entry and the two could have drifted.
-        self.table.clustering = Some(Clustering::new(
-            clustering.columns().to_vec(),
-            clustering.width(),
-            &self.table.fields,
-        )?);
+        self.table.clustering = Some(clustering.checked(&self.table.fields)?);
         Ok(self)
     }
 
@@ -12022,6 +12025,19 @@ fn encode_directory(table: &Table) -> Result<Vec<u8>> {
                 u16::try_from(column).map_err(|_| invalid("clustering column index overflow"))?,
             );
         }
+        if let Some(parent) = clustering.parent() {
+            out.extend_from_slice(CLUSTERING_PARENT);
+            let mut name = |text: &str| -> Result<()> {
+                let length = u32::try_from(text.len()).map_err(|_| invalid("name is too long"))?;
+                put_u32(&mut out, length);
+                out.extend_from_slice(text.as_bytes());
+                Ok(())
+            };
+            name(parent.table())?;
+            for column in parent.columns() {
+                name(column)?;
+            }
+        }
     }
     let demoted = (0..table.fields.len())
         .filter(|&column| table.demoted.get(column).copied().unwrap_or(false))
@@ -14176,6 +14192,26 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             clustering = Some(Clustering::new(columns, bucket, &fields).map_err(|_| {
                 invalid("stored clustering declaration does not match the table it is on")
             })?);
+        } else if &tag == CLUSTERING_PARENT {
+            let Some(own) = clustering.as_ref().filter(|own| own.parent().is_none()) else {
+                return Err(invalid("a clustering parent with no declaration before it"));
+            };
+            let mut name = || -> Result<String> {
+                let length = cur.u32()? as usize;
+                std::str::from_utf8(cur.take(length)?)
+                    .map(str::to_owned)
+                    .map_err(|_| invalid("clustering parent name is not UTF-8"))
+            };
+            let table = name()?;
+            let mut columns = Vec::with_capacity(own.columns().len());
+            for _ in own.columns() {
+                columns.push(name()?);
+            }
+            clustering = Some(
+                Clustering::through(own.columns().to_vec(), table, columns, &fields).map_err(
+                    |_| invalid("stored clustering parent does not match the table it is on"),
+                )?,
+            );
         } else if &tag == DEMOTED {
             if !demoted.is_empty() {
                 return Err(invalid("directory names two demoted column blocks"));
