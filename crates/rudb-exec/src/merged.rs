@@ -273,9 +273,14 @@ impl Source for Sorted {
         match &*stage {
             Stage::Held(chunks) => {
                 let rows = chunks.iter().map(Chunk::len).sum::<usize>();
-                let useful = rows.div_ceil(50_000).clamp(1, 4);
-                let morsels =
-                    chunks.len().div_ceil(per_morsel(chunks, self.asked.load(Ordering::Relaxed)));
+                let asked = self.asked.load(Ordering::Relaxed);
+                // Four instances at most for whatever reads a sorted answer, unless the sink asked
+                // for runs of chunks. That is a load into a native file, which encodes every row it
+                // takes and is the slowest thing in its pipeline, and at four instances the encode
+                // of a clustered load ran on four of six cores on `server2` after the sort was done.
+                let most = if asked > 0 { usize::MAX } else { 4 };
+                let useful = rows.div_ceil(50_000).clamp(1, most);
+                let morsels = chunks.len().div_ceil(per_morsel(chunks, asked));
                 Some(morsels.min(threads).min(useful))
             }
             Stage::Waiting => Some(0),
@@ -784,6 +789,35 @@ mod tests {
             seen,
             vec![vec![bigint(0), bigint(1)], vec![bigint(2), bigint(3)], vec![bigint(4)]]
         );
+    }
+
+    /// A large answer is read by four instances at most, and by as many as there are threads when
+    /// the sink asked for runs of chunks.
+    #[test]
+    fn a_sink_that_asks_for_runs_of_a_large_sort_gets_every_thread() {
+        let held = || {
+            let sorted = Sorted::new();
+            let chunks = (0..200)
+                .map(|at| {
+                    let column =
+                        Vector::flat(LogicalType::BigInt, Data::Int64(vec![at; 2048].into()))
+                            .expect("bigints are an i64 layout");
+                    Chunk::new(vec![column]).expect("one column")
+                })
+                .collect();
+            sorted.hold(chunks).expect("held");
+            sorted
+        };
+        assert_eq!(held().morsels(16, 1), Some(4), "a query reads it on four");
+        let asking = held();
+        asking.gather(8192);
+        assert_eq!(asking.morsels(16, 1), Some(9), "409,600 rows are nine of 50,000");
+        let asking = held();
+        asking.gather(8192);
+        assert_eq!(asking.morsels(6, 1), Some(6), "and no more than there are threads");
+        let small = held();
+        small.gather(1 << 20);
+        assert_eq!(small.morsels(16, 1), Some(1), "and no more than there are morsels");
     }
 
     #[test]
