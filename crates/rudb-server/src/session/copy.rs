@@ -1647,6 +1647,7 @@ impl Runner {
                 now: now + UNIX_TO_POSTGRES_USECS,
             },
             interval_style: self.format.interval_style,
+            stack_depth: self.format.stack_depth,
         }
     }
 

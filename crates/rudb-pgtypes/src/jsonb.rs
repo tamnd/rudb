@@ -10,7 +10,7 @@
 //! takes no recursion to build, to print or to drop.
 
 use crate::error::TypeError;
-use crate::json::{self, Kind, Open, Sink, Stop};
+use crate::json::{self, Kind, Open, Sink, StackDepth, Stop};
 use crate::numeric::{numeric_in, numeric_out};
 
 /// The version byte at the start of the binary format, the only one that PostgreSQL knows.
@@ -169,10 +169,11 @@ fn escape(text: &str, out: &mut String) {
     out.push('"');
 }
 
-/// The text input of `jsonb`: the text of the value in the one form that PostgreSQL prints.
-pub fn jsonb_in(s: &str) -> Result<String, TypeError> {
+/// The text input of `jsonb`: the text of the value in the one form that PostgreSQL prints. A value
+/// nested deeper than `depth` lets the stack of PostgreSQL go is an error.
+pub fn jsonb_in(s: &str, depth: StackDepth) -> Result<String, TypeError> {
     let mut tree = Tree::default();
-    match json::parse(s, true, &mut tree) {
+    match json::parse(s, true, depth, &mut tree) {
         Ok(()) => {}
         Err(Stop::Syntax(fail)) => return Err(json::syntax(s, fail)),
         Err(Stop::Action(error)) => return Err(error),
@@ -183,10 +184,10 @@ pub fn jsonb_in(s: &str) -> Result<String, TypeError> {
 }
 
 /// The binary input of `jsonb`: the version byte and then the text.
-pub fn jsonb_recv(bytes: &[u8]) -> Result<String, TypeError> {
+pub fn jsonb_recv(bytes: &[u8], depth: StackDepth) -> Result<String, TypeError> {
     match bytes.split_first() {
         Some((&VERSION, text)) => match std::str::from_utf8(text) {
-            Ok(text) => jsonb_in(text),
+            Ok(text) => jsonb_in(text, depth),
             Err(_) => Err(TypeError::new(
                 rudb_common::SqlState::CHARACTER_NOT_IN_REPERTOIRE,
                 "invalid byte sequence for encoding \"UTF8\"".to_string(),
@@ -214,11 +215,11 @@ mod tests {
     use super::*;
 
     fn out(s: &str) -> String {
-        jsonb_in(s).unwrap()
+        jsonb_in(s, StackDepth::default()).unwrap()
     }
 
     fn fails(s: &str) -> (String, String, String) {
-        let error = jsonb_in(s).unwrap_err();
+        let error = jsonb_in(s, StackDepth::default()).unwrap_err();
         (error.sqlstate.as_str().to_owned(), error.message, error.detail.unwrap_or_default())
     }
 
@@ -268,13 +269,24 @@ mod tests {
         );
         // The lexer decodes a string before the parser looks at where it is.
         assert_eq!(fails(r#"{"a": 1 "\u0000"}"#).0, "22P05");
-        assert!(json::json_in(r#"["\u0000", "\ud800"]"#).is_ok());
+        assert!(json::json_in(r#"["\u0000", "\ud800"]"#, StackDepth::default()).is_ok());
     }
 
     #[test]
     fn deep_nesting_needs_no_recursion() {
         let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
-        assert_eq!(out(&deep), deep);
+        assert_eq!(jsonb_in(&deep, StackDepth(16_384)).unwrap(), deep);
+        assert_eq!(fails(&deep).0, "54001");
+    }
+
+    #[test]
+    fn the_depth_is_the_depth_that_the_stack_of_postgres_takes() {
+        let nested = |open: &str, close: &str, n| format!("{}1{}", open.repeat(n), close.repeat(n));
+        let small = StackDepth(100);
+        assert!(jsonb_in(&nested("[", "]", 984), small).is_ok());
+        assert!(jsonb_in(&nested("[", "]", 985), small).is_err());
+        assert!(jsonb_in(&nested(r#"{"a":"#, "}", 843), small).is_ok());
+        assert!(jsonb_in(&nested(r#"{"a":"#, "}", 844), small).is_err());
     }
 
     #[test]
@@ -282,12 +294,15 @@ mod tests {
         let mut bytes = Vec::new();
         jsonb_send(r#"{"a": 1}"#, &mut bytes);
         assert_eq!(bytes, b"\x01{\"a\": 1}");
-        assert_eq!(jsonb_recv(b"\x01{\"b\":1,\"a\":2}").unwrap(), r#"{"a": 2, "b": 1}"#);
         assert_eq!(
-            jsonb_recv(b"\x02{}").unwrap_err().message,
+            jsonb_recv(b"\x01{\"b\":1,\"a\":2}", StackDepth::default()).unwrap(),
+            r#"{"a": 2, "b": 1}"#
+        );
+        assert_eq!(
+            jsonb_recv(b"\x02{}", StackDepth::default()).unwrap_err().message,
             "unsupported jsonb version number 2"
         );
-        let empty = jsonb_recv(b"").unwrap_err();
+        let empty = jsonb_recv(b"", StackDepth::default()).unwrap_err();
         assert_eq!(empty.sqlstate, rudb_common::SqlState::PROTOCOL_VIOLATION);
     }
 }

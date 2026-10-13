@@ -8,18 +8,20 @@ use rudb_common::session::LiteralInput;
 use rudb_common::value::Value;
 use rudb_common::{Error, Result};
 use rudb_pgtypes::{
-    DateOrder, DateTimeInput, InputSettings, IntervalStyle, RegKind, SessionZones, TypeInfo,
-    UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, json_in, jsonb_in, numeric_in, oid, param_value,
+    DateOrder, DateTimeInput, InputSettings, IntervalStyle, RegKind, SessionZones, StackDepth,
+    TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, json_text_value, numeric_in, oid, param_value,
 };
 
 use super::zone;
 
-/// The settings that the input functions read: `DateStyle`, `TimeZone` and `IntervalStyle`.
+/// The settings that the input functions read: `DateStyle`, `TimeZone`, `IntervalStyle` and
+/// `max_stack_depth`.
 #[derive(Debug)]
 pub(super) struct Literals {
     pub(super) order: DateOrder,
     pub(super) zone: String,
     pub(super) interval_style: IntervalStyle,
+    pub(super) stack_depth: StackDepth,
 }
 
 impl LiteralInput for Literals {
@@ -28,8 +30,7 @@ impl LiteralInput for Literals {
         // digits is a double. A `json` is kept as it was written, and a `jsonb` in its normal form.
         let read = match oid {
             oid::NUMERIC => numeric_in(text, -1).map(|value| Value::Numeric(value.to_bytes())),
-            oid::JSON => json_in(text).map(|text| Value::Varchar(text.to_owned())),
-            oid::JSONB => jsonb_in(text).map(Value::Varchar),
+            oid::JSON | oid::JSONB => json_text_value(oid, text, self.stack_depth),
             _ => return self.read_known(oid, text),
         };
         Some(read.map_err(Error::from))
@@ -82,6 +83,7 @@ impl Literals {
                 now: now + UNIX_TO_POSTGRES_USECS,
             },
             interval_style: self.interval_style,
+            stack_depth: self.stack_depth,
         };
         Some(param_value(oid, false, text.as_bytes(), 0, &settings).map_err(Error::from))
     }

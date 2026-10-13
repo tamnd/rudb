@@ -33,7 +33,7 @@ use rudb_common::guc::{self, Action, Origin, Settings};
 use rudb_common::session::Postgres;
 use rudb_pgtypes::{
     ByteaOutput, DateFormat, DateTimeInput, IntervalStyle, OutputSettings, RowEncoder,
-    SessionZones, TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
+    SessionZones, StackDepth, TypeInfo, UNIX_TO_POSTGRES_USECS, ZoneAbbrevs, pg_type,
 };
 use rudb_pgwire::{
     CommandTag, Field, Frontend, Handshake, Level, OutBuf, QUERY_CANCELED, Replication, Session,
@@ -971,13 +971,15 @@ fn wire_flush(stream: &mut Stream) -> impl FnMut(&mut OutBuf) -> io::Result<()> 
     }
 }
 
-/// The settings of the text output that come from the parameters of the session.
+/// The settings of the text output that come from the parameters of the session, and
+/// `max_stack_depth`, which the input of `json` and `jsonb` reads.
 #[derive(Debug, Clone, Copy)]
 struct Format {
     date_format: DateFormat,
     interval_style: IntervalStyle,
     extra_float_digits: i32,
     bytea_output: ByteaOutput,
+    stack_depth: StackDepth,
 }
 
 impl Default for Format {
@@ -987,6 +989,7 @@ impl Default for Format {
             interval_style: IntervalStyle::Postgres,
             extra_float_digits: 1,
             bytea_output: ByteaOutput::Hex,
+            stack_depth: StackDepth::default(),
         }
     }
 }
@@ -1244,6 +1247,8 @@ impl Runner {
         self.format.extra_float_digits = text("extra_float_digits").parse().unwrap_or(1);
         self.format.bytea_output =
             if text("bytea_output") == "escape" { ByteaOutput::Escape } else { ByteaOutput::Hex };
+        let stack_depth = self.guc.int("max_stack_depth");
+        self.format.stack_depth = stack_depth.map_or_else(StackDepth::default, StackDepth);
         self.utf8 = text("client_encoding") != "SQL_ASCII";
         self.least = match text("client_min_messages").as_str() {
             "warning" => Severity::Warning,
@@ -1259,6 +1264,7 @@ impl Runner {
             order: self.format.date_format.order,
             zone: self.zone_name.clone(),
             interval_style: self.format.interval_style,
+            stack_depth: self.format.stack_depth,
         };
         let postgres = Postgres {
             settings: self.guc.clone(),

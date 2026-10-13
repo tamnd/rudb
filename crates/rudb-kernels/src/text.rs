@@ -278,7 +278,7 @@ pub(crate) fn chr(code: &Value) -> Result<Value> {
 ///
 /// `__rudb_pg_input` is the explicit cast of a string in a PostgreSQL session to a type whose
 /// input reads no setting, which the input function of the type reads. Its second argument is
-/// the OID of the type.
+/// the OID of the type. For `json` and `jsonb`, a third argument is `max_stack_depth`.
 pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
     // Each of these is strict, which is not true of every kernel whose name starts the same way.
     const NAMES: [&str; 6] = [
@@ -307,6 +307,11 @@ pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
                 None => Err(Error::internal(format!("no input function for the type {oid}"))),
             };
         }
+        ("__rudb_pg_input", [_, oid, depth]) => {
+            let oid = u32::try_from(whole(oid)?).unwrap_or_default();
+            let value = rudb_pgtypes::json_text_value(oid, string(text)?, stack_depth(depth)?);
+            return Ok(Some(value.map_err(|error| Error::from(error).unplaced())?));
+        }
         ("__rudb_pg_name", [_]) => rudb_pgtypes::name_in(string(text)?),
         ("__rudb_pg_varchar", [_, typmod]) => {
             rudb_pgtypes::varchar_coerce(string(text)?, whole(typmod)? as i32, false)?
@@ -323,6 +328,12 @@ pub(crate) fn postgres(name: &str, args: &[Value]) -> Result<Option<Value>> {
         _ => return Ok(None),
     };
     Ok(Some(Value::Varchar(kept.to_owned())))
+}
+
+/// `max_stack_depth` in kilobytes, which the binder gives as a constant.
+pub(crate) fn stack_depth(value: &Value) -> Result<rudb_pgtypes::StackDepth> {
+    let kilobytes = i32::try_from(whole(value)?).unwrap_or(i32::MAX);
+    Ok(rudb_pgtypes::StackDepth(kilobytes))
 }
 
 /// The string an argument is, which the binder has already cast to a VARCHAR.

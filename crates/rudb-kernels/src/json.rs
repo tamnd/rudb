@@ -1103,7 +1103,7 @@ pub fn cast_to_jsonb(
             other => return Ok(other),
         },
     };
-    match rudb_pgtypes::jsonb_in(&text) {
+    match rudb_pgtypes::jsonb_in(&text, rudb_pgtypes::StackDepth::default()) {
         Ok(normal) => Ok(Value::Varchar(normal)),
         Err(_) if try_cast => Ok(Value::Null),
         Err(error) => Err(error.into()),

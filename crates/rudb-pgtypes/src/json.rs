@@ -6,6 +6,11 @@
 //! recursive descent. This one keeps a stack of the open arrays and objects instead, so it takes
 //! the tokens in the same order and finds the same first error.
 //!
+//! The parser of PostgreSQL calls `check_stack_depth` as it goes into each array and object, and
+//! stops a value that is nested too deep with `stack depth limit exceeded` when the stack passes
+//! `max_stack_depth`. [`StackDepth`] counts the bytes that the stack of PostgreSQL would have, so
+//! the same value is too deep here.
+//!
 //! `json_in` does not decode the escapes, so it takes `\u0000` and a lone surrogate such as
 //! `\ud800`. Only `jsonb` refuses them: its lexer decodes each string as it reads it, which is
 //! `need_escapes` in `jsonapi.c`, and gives the events of the parse to [`Sink`].
@@ -303,6 +308,47 @@ pub(crate) enum Open {
     Object,
 }
 
+/// `max_stack_depth` in kilobytes, which limits how deep a value can be nested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackDepth(pub i32);
+
+impl Default for StackDepth {
+    /// The default of `max_stack_depth`, `2MB`.
+    fn default() -> StackDepth {
+        StackDepth(2048)
+    }
+}
+
+/// The bytes of the stack of PostgreSQL that the parse of a nested array and of a nested object
+/// take, and that a parse takes before its first value when it is in `json_in` and in `jsonb_in`.
+/// These are measured on a 64-bit PostgreSQL 19, with the deepest value that `100kB` and `2MB` let
+/// each input read in a cast. The stack below the parse is not the same in each statement, so
+/// PostgreSQL can stop a value one or two levels before or after this does.
+const ARRAY_FRAME: i64 = 96;
+const OBJECT_FRAME: i64 = 112;
+const JSON_BASE: i64 = 7776;
+const JSONB_BASE: i64 = 7904;
+
+impl StackDepth {
+    /// `check_stack_depth`: the error when an array or an object of `frame` bytes more does not
+    /// fit in the `used` bytes of the stack.
+    fn check(self, used: i64, frame: i64) -> Result<(), Stop> {
+        if used + frame <= i64::from(self.0) * 1024 {
+            return Ok(());
+        }
+        let mut error = TypeError::new(
+            SqlState::STATEMENT_TOO_COMPLEX,
+            "stack depth limit exceeded".to_string(),
+        );
+        error.hint = Some(format!(
+            "Increase the configuration parameter \"max_stack_depth\" (currently {}kB), after \
+             ensuring the platform's stack depth limit is adequate.",
+            self.0
+        ));
+        Err(Stop::Action(error))
+    }
+}
+
 /// What the parser reads next.
 enum Step {
     /// A value: `parse_object`, `parse_array` or `parse_scalar`.
@@ -363,18 +409,28 @@ impl Sink for Check {
 }
 
 /// `pg_parse_json`, which gives each event to `sink`. With `escapes` set, the lexer decodes the
-/// strings and refuses the escapes that do not make text.
-pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<(), Stop> {
+/// strings and refuses the escapes that do not make text, as for `jsonb`. A value nested deeper
+/// than `depth` lets the stack of PostgreSQL go is an error.
+pub(crate) fn parse(
+    input: &str,
+    escapes: bool,
+    depth: StackDepth,
+    sink: &mut impl Sink,
+) -> Result<(), Stop> {
     let text = |token: Token| &input[token.start..token.end];
     let input = input.as_bytes();
     let mut lexer = Lexer { input, at: 0, escapes, text: String::new() };
     let mut stack = Vec::new();
+    let mut used = if escapes { JSONB_BASE } else { JSON_BASE };
+    let frame = |open| if open == Open::Array { ARRAY_FRAME } else { OBJECT_FRAME };
     let mut token = lexer.next()?;
     let mut step = Step::Value;
     loop {
         step = match step {
             Step::Value => match token.kind {
                 Kind::ObjectStart => {
+                    depth.check(used, OBJECT_FRAME)?;
+                    used += OBJECT_FRAME;
                     stack.push(Open::Object);
                     sink.open(Open::Object);
                     token = lexer.next()?;
@@ -382,6 +438,7 @@ pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<
                         Kind::String => Step::Field,
                         Kind::ObjectEnd => {
                             stack.pop();
+                            used -= OBJECT_FRAME;
                             sink.close();
                             token = lexer.next()?;
                             Step::After
@@ -390,6 +447,7 @@ pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<
                     }
                 }
                 Kind::ArrayStart => {
+                    depth.check(used, ARRAY_FRAME)?;
                     sink.open(Open::Array);
                     token = lexer.next()?;
                     if token.kind == Kind::ArrayEnd {
@@ -397,6 +455,7 @@ pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<
                         token = lexer.next()?;
                         Step::After
                     } else {
+                        used += ARRAY_FRAME;
                         stack.push(Open::Array);
                         Step::Value
                     }
@@ -436,6 +495,7 @@ pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<
                     next
                 } else if token.kind == close {
                     stack.pop();
+                    used -= frame(open);
                     sink.close();
                     token = lexer.next()?;
                     Step::After
@@ -447,9 +507,9 @@ pub(crate) fn parse(input: &str, escapes: bool, sink: &mut impl Sink) -> Result<
     }
 }
 
-/// The text input of `json`: the string, after a check of the syntax.
-pub fn json_in(s: &str) -> Result<&str, TypeError> {
-    match parse(s, false, &mut Check) {
+/// The text input of `json`: the string, after a check of the syntax and of the depth.
+pub fn json_in(s: &str, depth: StackDepth) -> Result<&str, TypeError> {
+    match parse(s, false, depth, &mut Check) {
         Ok(()) => Ok(s),
         Err(Stop::Syntax(fail)) => Err(syntax(s, fail)),
         Err(Stop::Action(error)) => Err(error),
@@ -523,11 +583,12 @@ mod tests {
     use super::*;
 
     fn detail(s: &str) -> String {
-        json_in(s).unwrap_err().detail.unwrap()
+        json_in(s, StackDepth::default()).unwrap_err().detail.unwrap()
     }
 
     #[test]
     fn the_first_error_is_the_error_of_postgres() {
+        let json_in = |s: &'static str| json_in(s, StackDepth::default());
         assert!(json_in(r#" {"a": [1, -2.5e+3, true, null, "\u00e9\n", {}, []]} "#).is_ok());
         assert_eq!(detail("[1 2]"), r#"Expected "," or "]", but found "2"."#);
         assert_eq!(detail("[1, 2x]"), r#"Token "2x" is invalid."#);
@@ -537,7 +598,8 @@ mod tests {
         assert_eq!(detail(r#""\é""#), r#"Escape sequence "\é" is invalid."#);
         assert_eq!(detail("\"a\tb\""), "Character with value 0x09 must be escaped.");
         assert_eq!(detail(r#""abc"#), r#"Token ""abc" is invalid."#);
-        let context = |s: &str| json_in(s).unwrap_err().context.unwrap();
+        let context =
+            |s: &str| super::json_in(s, StackDepth::default()).unwrap_err().context.unwrap();
         assert_eq!(context("[1 2]"), "JSON data, line 1: [1 2...");
         assert_eq!(context("[1,"), "JSON data, line 1: [1,");
         assert_eq!(context("[1,\n 2,\n x]"), "JSON data, line 3:  x...");
@@ -546,8 +608,19 @@ mod tests {
     }
 
     #[test]
-    fn deep_nesting_needs_no_recursion() {
-        let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
-        assert!(json_in(&deep).is_ok());
+    fn the_depth_is_the_depth_that_the_stack_of_postgres_takes() {
+        let nested = |open: &str, close: &str, n| format!("{}1{}", open.repeat(n), close.repeat(n));
+        let small = StackDepth(100);
+        assert!(json_in(&nested("[", "]", 985), small).is_ok());
+        let error = json_in(&nested("[", "]", 986), small).unwrap_err();
+        assert_eq!(error.sqlstate, SqlState::STATEMENT_TOO_COMPLEX);
+        assert!(error.hint.unwrap().contains("(currently 100kB)"));
+        assert!(json_in(&nested(r#"{"a":"#, "}", 844), small).is_ok());
+        assert!(json_in(&nested(r#"{"a":"#, "}", 845), small).is_err());
+        assert!(json_in(&nested("[", "]", 21764), StackDepth::default()).is_ok());
+        assert!(json_in(&nested("[", "]", 21765), StackDepth::default()).is_err());
+        // An array that is closed gives its bytes back.
+        let wide = format!("[{}1]", "[[]], ".repeat(10_000));
+        assert!(json_in(&wide, small).is_ok());
     }
 }
