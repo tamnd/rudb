@@ -1007,6 +1007,14 @@ impl Sink for Sort {
         // sorts its own at once as the scan runs out, rather than one sort of all of them after
         // the last instance is done. `finalize` merges the runs. The valued arm is left for
         // `finalize`, which sorts it the way it always has.
+        //
+        // An instance that has spilled writes what it has left as a run of its own, here, for the
+        // same reason. Left for `finalize`, the rows every instance had left were sorted again
+        // together and written as one run on one thread: three seconds of a 22 second clustered
+        // load on `server2`, with the other five cores idle.
+        if !local.runs.is_empty() && local.held.rows.len() > 0 {
+            self.spill(&mut local)?;
+        }
         if let Keyed::Normal(rows) = &mut local.held.rows {
             in_order(rows);
         }
