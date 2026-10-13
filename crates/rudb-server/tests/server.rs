@@ -6920,6 +6920,62 @@ fn the_json_set_functions_give_the_rows_and_columns_of_postgresql() {
 }
 
 #[test]
+fn the_json_operators_read_a_part_of_a_value() {
+    let dirs = Dirs::new("json-ops");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let mut value = |sql: &str| {
+        let messages = client.query(sql);
+        if let Some(error) = messages.iter().find(|m| m.tag == b'E') {
+            let code = error.field(b'C').unwrap_or_default();
+            return format!("{code} {}", error.field(b'M').unwrap_or_default());
+        }
+        let row = messages.iter().find(|m| m.tag == b'D').unwrap();
+        let values = data_row(row).into_iter().map(|value| {
+            value.map_or_else(|| "NULL".to_string(), |value| String::from_utf8(value).unwrap())
+        });
+        values.collect::<Vec<_>>().join("|")
+    };
+    // The values of the PostgreSQL 19 oracle. A part of a `json` value keeps its text, and a part
+    // of a `jsonb` value is in the normal form.
+    let doc = r#"'{"a": [1, {"b" : "x\"é"}], "a" : 2, "c": null}'"#;
+    for (sql, expected) in [
+        (
+            format!("select {doc}::json -> 'a', {doc}::json -> 'c', {doc}::json ->> 'c'"),
+            "2|null|NULL",
+        ),
+        (format!("select {doc}::json -> 0, {doc}::json -> null::text"), "NULL|NULL"),
+        (
+            r#"select '[1, {"b" : "x"}]'::json -> -1, '[1, {"b" : "x"}]'::json ->> -1"#.into(),
+            r#"{"b" : "x"}|{"b" : "x"}"#,
+        ),
+        (r#"select '{"a": [1, {"b" : "x\"y"}]}'::json #>> '{a,1,b}'"#.into(), r#"x"y"#),
+        (
+            r#"select '{"a": [1, {"b" : 2}]}'::jsonb #> '{a,-1}', '[1]'::jsonb #> '{x}'"#.into(),
+            r#"{"b": 2}|NULL"#,
+        ),
+        (r#"select json_extract_path('{"a":{"b":[1,2]}}', 'a', 'b', '1')"#.into(), "2"),
+        (r#"select json_extract_path_text('{"a":"x"}', variadic array['a'])"#.into(), "x"),
+        (r#"select json_array_length('[1, [2, 3]]'), jsonb_typeof('{"a":1}')"#.into(), "2|object"),
+        ("select json_array_length('{}')".into(), "22023 cannot get array length of a non-array"),
+        ("select jsonb_array_length('1')".into(), "22023 cannot get array length of a scalar"),
+        (r#"select json_strip_nulls('{"a" : null, "b" : [1, null]}')"#.into(), r#"{"b":[1,null]}"#),
+        (
+            r#"select jsonb_strip_nulls('{"a" : null, "b" : [1, null]}', true)"#.into(),
+            r#"{"b": [1]}"#,
+        ),
+        (
+            r#"select '{"a":"\u0000"}'::json -> 'a'"#.into(),
+            "22P05 unsupported Unicode escape sequence",
+        ),
+    ] {
+        assert_eq!(value(&sql), expected, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
 fn the_regular_expressions_of_postgresql_give_its_matches_and_its_rows() {
     let dirs = Dirs::new("pg-regexp");
     let server = Server::start(dirs.config()).unwrap();
