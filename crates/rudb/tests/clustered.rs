@@ -467,3 +467,54 @@ fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
     assert!(std::fs::read(&path).expect("the file reads") == written, "a read wrote the file");
     let _ = std::fs::remove_file(path);
 }
+
+/// The same through a text key, which is matched by comparing values rather than integers.
+///
+/// Two orders share a key here, and a line with that key goes with the one written first, which
+/// is the earlier of the two dates.
+#[test]
+fn a_table_ordered_through_its_parent_by_a_text_key_is_stored_in_the_parent_order() {
+    let path = std::env::temp_dir()
+        .join(format!("rudb-clustered-through-text-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database.execute("CREATE TABLE orders (o_key VARCHAR, o_day DATE)").expect("creates");
+        database.execute("CREATE TABLE lines (l_key VARCHAR, l_at INTEGER)").expect("creates");
+        database
+            .execute(
+                "SET cluster_by = 'orders(exact(o_day), o_key), lines(l_key) -> orders(o_key)'",
+            )
+            .expect("declares both");
+        database
+            .execute(
+                "INSERT INTO orders SELECT 'k' || r, \
+                 (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE FROM range(20000) AS s(r) \
+                 UNION ALL SELECT 'k7', DATE '1991-06-01'",
+            )
+            .expect("loads the orders");
+        database
+            .execute(
+                "INSERT INTO lines SELECT 'k' || (r // 3), r::INTEGER FROM range(60000) AS s(r) \
+                 UNION ALL SELECT NULL, 60000",
+            )
+            .expect("loads the lines");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    let stored = rows(&reopened, "SELECT l_at FROM lines");
+    let mut wanted = rows(
+        &reopened,
+        "SELECT l_at FROM lines JOIN (SELECT o_key, min(o_day) AS o_day FROM orders GROUP BY o_key) \
+         ON l_key = o_key ORDER BY o_day, o_key, l_at",
+    );
+    wanted.push(vec![Value::Integer(60000)]);
+    assert_eq!(stored.len(), 60_001, "every line is still there");
+    assert!(stored == wanted, "the lines are not in the order of their orders");
+    assert_eq!(stored[0], vec![Value::Integer(21)], "the order dated first is the second k7");
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}

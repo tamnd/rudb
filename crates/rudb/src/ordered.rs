@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use rudb_catalog::{Catalog, QualifiedName, Rows};
 use rudb_common::value::{civil_from_days, days_from_civil};
-use rudb_common::{Clustering, Error, Field, Result, Value, Width};
+use rudb_common::{Clustering, Error, Field, LogicalType, Result, Value, Width};
 use rudb_vector::{Chunk, Vector};
 
 /// Rows a part holds, the same number the plain write cuts at.
@@ -135,36 +135,32 @@ impl Orders {
 /// The rows ordered by the table's own columns: the leading one bucketed at the declared width, nulls
 /// last, and ties left in the order they came in.
 fn by_own(rows: &Rows, clustering: &Clustering) -> Result<Vec<u32>> {
-    let columns = clustering.columns().iter().map(|&at| at as usize).collect::<Vec<_>>();
-    let mut keys = keys(rows, &columns)?;
+    let mut keys = clustering
+        .columns()
+        .iter()
+        .map(|&at| Key::read(rows, at as usize))
+        .collect::<Result<Vec<_>>>()?;
     let width = match clustering.width() {
-        Width::Auto => {
-            let days = keys.iter().filter_map(|key| day(&key[0])).fold(None, |span, day| {
-                let (low, high) = span.unwrap_or((day, day));
-                Some((low.min(day), high.max(day)))
-            });
-            let days = days.map_or(0, |(low, high)| u64::try_from(high - low).unwrap_or(0));
-            clustering.fitted(keys.len() as u64, days).width()
-        }
+        Width::Auto => clustering.fitted(rows.len() as u64, keys[0].span()).width(),
         width => width,
     };
     if width != Width::Exact {
-        for key in &mut keys {
-            if let Some(day) = day(&key[0]) {
-                key[0] = Value::Date(bucket(day, width));
-            }
-        }
+        keys[0].bucket(width);
     }
-    let mut order = numbered(keys.len())?;
-    order.sort_by(|&left, &right| compare(&keys[left as usize], &keys[right as usize]));
+    let mut order = numbered(rows.len())?;
+    order.sort_by(|&left, &right| compare(&keys, left as usize, &keys, right as usize));
     Ok(order)
 }
 
 /// The rows ordered by where the parent row each one matches will be stored, then by their own
-/// place. A row that matches no parent row goes after every row that does.
+/// place. A row that matches no parent row goes after every row that does, and a row whose key more
+/// than one parent row holds goes with the one written first.
 ///
-/// The parent's keys are sorted once and each child row finds its parent by a binary search, which
-/// needs nothing of a value beyond the ordering every type already has.
+/// One integer column on each side is a foreign key nearly always, and it is matched through the
+/// parent's keys sorted beside where each is written, a plain array a search runs down. Any other
+/// key sorts the parent's row numbers by the key and searches those, which needs nothing of a value
+/// beyond the ordering every type already has. Either way the rows are then dealt out by where
+/// their parents are written, which is a count and not a sort, since a place is a row number.
 fn through(
     rows: &Rows,
     own: &[usize],
@@ -172,33 +168,102 @@ fn through(
     theirs: &[usize],
     moved: Option<&[u32]>,
 ) -> Result<Vec<u32>> {
-    let parents = keys(parent, theirs)?;
+    let mut parents = theirs.iter().map(|&at| Key::read(parent, at)).collect::<Result<Vec<_>>>()?;
+    let mut children = own.iter().map(|&at| Key::read(rows, at)).collect::<Result<Vec<_>>>()?;
+    // The two sides have one type, but a side can still come back as values where the other came
+    // back as integers, from a chunk held in a form that has no block, and the two are compared in
+    // one form.
+    for (index, (child, parent_key)) in children.iter_mut().zip(&mut parents).enumerate() {
+        if child.is_signed() != parent_key.is_signed() {
+            *child = Key::values(rows, own[index])?;
+            *parent_key = Key::values(parent, theirs[index])?;
+        }
+    }
     // Where each parent row is written. With no new order that is where it is now.
-    let mut placed = numbered(parents.len())?;
+    let mut placed = numbered(parent.len())?;
     if let Some(moved) = moved {
         for (to, &from) in moved.iter().enumerate() {
             placed[from as usize] = to as u32;
         }
     }
-    let mut sorted = numbered(parents.len())?;
-    sorted.sort_by(|&left, &right| compare(&parents[left as usize], &parents[right as usize]));
-    let children = keys(rows, own)?;
     let unmatched = u32::MAX;
-    // row at a time: once per row of a checkpoint that is putting the table in a new order, and the
-    // search compares values the sort above already has in hand.
-    let at = children
-        .iter()
-        .map(|key| {
-            if key.iter().any(Value::is_null) {
-                return unmatched;
-            }
-            sorted
-                .binary_search_by(|&probe| compare(&parents[probe as usize], key))
-                .map_or(unmatched, |found| placed[sorted[found] as usize])
-        })
-        .collect::<Vec<_>>();
-    let mut order = numbered(children.len())?;
-    order.sort_by_key(|&row| at[row as usize]);
+    let at = match (parents.as_slice(), children.as_slice()) {
+        (
+            [Key::Signed { values: keys, nulls: gone, .. }],
+            [Key::Signed { values: wanted, nulls: missing, .. }],
+        ) => {
+            let mut sorted = keys
+                .iter()
+                .zip(gone)
+                .zip(&placed)
+                .filter(|((_, null), _)| !**null)
+                .map(|((&key, _), &place)| (key, place))
+                .collect::<Vec<_>>();
+            sorted.sort_unstable();
+            sorted.dedup_by_key(|(key, _)| *key);
+            wanted
+                .iter()
+                .zip(missing)
+                .map(|(key, &null)| {
+                    if null {
+                        return unmatched;
+                    }
+                    sorted
+                        .binary_search_by_key(key, |&(key, _)| key)
+                        .map_or(unmatched, |found| sorted[found].1)
+                })
+                .collect::<Vec<_>>()
+        }
+        _ => {
+            let mut sorted = numbered(parent.len())?;
+            // Ties by where the row is written, so a key more than one parent row holds is found
+            // at the one written first, the same one the integer match finds.
+            sorted.sort_by(|&left, &right| {
+                compare(&parents, left as usize, &parents, right as usize)
+                    .then(placed[left as usize].cmp(&placed[right as usize]))
+            });
+            (0..rows.len())
+                .map(|row| {
+                    if children.iter().any(|key| key.is_null(row)) {
+                        return unmatched;
+                    }
+                    let first = sorted.partition_point(|&probe| {
+                        compare(&parents, probe as usize, &children, row) == Ordering::Less
+                    });
+                    match sorted.get(first) {
+                        Some(&found)
+                            if compare(&parents, found as usize, &children, row)
+                                == Ordering::Equal =>
+                        {
+                            placed[found as usize]
+                        }
+                        _ => unmatched,
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    dealt(&at, parent.len())
+}
+
+/// Row numbers in the order of the places `at` gives them, a place past `places` last, and rows
+/// with one place in the order they came in.
+fn dealt(at: &[u32], places: usize) -> Result<Vec<u32>> {
+    u32::try_from(at.len()).map_err(|_| Error::internal("a table past four billion rows"))?;
+    let slot = |place: u32| (place as usize).min(places);
+    let mut starts = vec![0_usize; places + 2];
+    for &place in at {
+        starts[slot(place) + 1] += 1;
+    }
+    for index in 1..starts.len() {
+        starts[index] += starts[index - 1];
+    }
+    let mut order = vec![0_u32; at.len()];
+    for (row, &place) in at.iter().enumerate() {
+        let next = &mut starts[slot(place)];
+        order[*next] = row as u32;
+        *next += 1;
+    }
     Ok(order)
 }
 
@@ -209,34 +274,144 @@ fn numbered(rows: usize) -> Result<Vec<u32>> {
     Ok((0..rows).collect())
 }
 
-/// The values of `columns` for every row, in the order the table reads them.
-fn keys(rows: &Rows, columns: &[usize]) -> Result<Vec<Vec<Value>>> {
-    let mut keys = Vec::with_capacity(rows.len());
-    for at in 0..rows.chunk_count() {
-        let chunk = rows.read(at, columns)?;
-        let vectors =
-            (0..columns.len()).map(|index| chunk.column(index)).collect::<Result<Vec<_>>>()?;
-        // row at a time: a sort key per row, built once per checkpoint that reorders the table,
-        // because the sort compares rows across chunks and a chunk's vectors go when it does.
-        for row in 0..chunk.len() {
-            keys.push(
-                vectors.iter().map(|vector| vector.try_value_at(row)).collect::<Result<_>>()?,
-            );
-        }
-    }
-    Ok(keys)
+/// One column of a sort key, the whole table of it, in the order the table reads its rows.
+///
+/// A key is compared a column at a time by row number, so a row's key is never put together in one
+/// place, and an integer, date or timestamp column is held as the integers it is stored as. Any
+/// other column is held as values.
+enum Key {
+    Signed { values: Vec<i64>, nulls: Vec<bool>, ty: LogicalType },
+    Values(Vec<Value>),
 }
 
-/// Two keys in ascending order with nulls last, the way the declaration's sort puts them.
-fn compare(left: &[Value], right: &[Value]) -> Ordering {
-    for (left, right) in left.iter().zip(right) {
-        let ordering = match (left.is_null(), right.is_null()) {
+impl Key {
+    /// Column `column` of `rows`, as integers when every chunk of it hands its rows over as a
+    /// block and as values when one does not.
+    fn read(rows: &Rows, column: usize) -> Result<Self> {
+        let mut values = Vec::with_capacity(rows.len());
+        let mut nulls = Vec::with_capacity(rows.len());
+        let mut block = Vec::new();
+        let mut ty = None;
+        for at in 0..rows.chunk_count() {
+            let chunk = rows.read(at, &[column])?;
+            let vector = chunk.column(0)?;
+            if !vector.signed_block(&mut block) {
+                return Self::values(rows, column);
+            }
+            ty.get_or_insert_with(|| vector.logical_type().clone());
+            let len = vector.len();
+            if vector.validity().has_nulls(len) {
+                nulls.extend((0..len).map(|row| vector.is_null_at(row)));
+            } else {
+                nulls.resize(nulls.len() + len, false);
+            }
+            values.extend_from_slice(&block);
+        }
+        Ok(Self::Signed { values, nulls, ty: ty.unwrap_or(LogicalType::BigInt) })
+    }
+
+    /// Column `column` of `rows` as values.
+    fn values(rows: &Rows, column: usize) -> Result<Self> {
+        let mut values = Vec::with_capacity(rows.len());
+        for at in 0..rows.chunk_count() {
+            let chunk = rows.read(at, &[column])?;
+            let vector = chunk.column(0)?;
+            // row at a time: the key of a column with no integer form, a string or a float, read
+            // once per checkpoint that reorders the table, because the sort compares rows across
+            // chunks and a chunk's vectors go when it does.
+            for row in 0..vector.len() {
+                values.push(vector.try_value_at(row)?);
+            }
+        }
+        Ok(Self::Values(values))
+    }
+
+    fn is_signed(&self) -> bool {
+        matches!(self, Self::Signed { .. })
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Signed { nulls, .. } => nulls[row],
+            Self::Values(values) => values[row].is_null(),
+        }
+    }
+
+    /// The day row `row` falls on, for a date or a timestamp that is not null.
+    fn day(&self, row: usize) -> Option<i32> {
+        match self {
+            Self::Signed { values, nulls, ty } if !nulls[row] => match ty {
+                LogicalType::Date => i32::try_from(values[row]).ok(),
+                LogicalType::Timestamp => i32::try_from(values[row].div_euclid(DAY_MICROS)).ok(),
+                _ => None,
+            },
+            Self::Signed { .. } => None,
+            Self::Values(values) => day(&values[row]),
+        }
+    }
+
+    /// The days between the first and the last the column falls on.
+    fn span(&self) -> u64 {
+        let rows = match self {
+            Self::Signed { values, .. } => values.len(),
+            Self::Values(values) => values.len(),
+        };
+        let days = (0..rows).filter_map(|row| self.day(row)).fold(None, |span, day| {
+            let (low, high) = span.unwrap_or((day, day));
+            Some((low.min(day), high.max(day)))
+        });
+        days.map_or(0, |(low, high)| u64::try_from(high - low).unwrap_or(0))
+    }
+
+    /// Every date or timestamp in the column put on the first day of its bucket at `width`.
+    fn bucket(&mut self, width: Width) {
+        match self {
+            Self::Signed { values, nulls, ty } => {
+                let date = *ty == LogicalType::Date;
+                if !date && *ty != LogicalType::Timestamp {
+                    return;
+                }
+                for (value, &null) in values.iter_mut().zip(nulls.iter()) {
+                    let day = if date { *value } else { value.div_euclid(DAY_MICROS) };
+                    if let (false, Ok(day)) = (null, i32::try_from(day)) {
+                        *value = i64::from(bucket(day, width));
+                    }
+                }
+                *ty = LogicalType::Date;
+            }
+            Self::Values(values) => {
+                // row at a time: the bucket of a key held as values, which a date or a timestamp
+                // column is only when one of its chunks had no integer form.
+                for value in values.iter_mut() {
+                    if let Some(day) = day(value) {
+                        *value = Value::Date(bucket(day, width));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Row `left` of the key `lefts` against row `right` of the key `rights`, in ascending order with
+/// nulls last, the way the declaration's sort puts them. The two are one key or a child's key and
+/// its parent's, whose columns are of one type and held in one form.
+fn compare(lefts: &[Key], left: usize, rights: &[Key], right: usize) -> Ordering {
+    for (one, other) in lefts.iter().zip(rights) {
+        let ordering = match (one.is_null(left), other.is_null(right)) {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
-            // Two values of one column always compare, so an error here is a column of two types,
-            // and calling them equal leaves the rows in the order they came in.
-            (false, false) => rudb_kernels::order(left, right).unwrap_or(Ordering::Equal),
+            (false, false) => match (one, other) {
+                (Key::Signed { values: ones, .. }, Key::Signed { values: others, .. }) => {
+                    ones[left].cmp(&others[right])
+                }
+                // Two values of one column always compare, so an error here is a column of two
+                // types, and calling them equal leaves the rows in the order they came in.
+                (Key::Values(ones), Key::Values(others)) => {
+                    rudb_kernels::order(&ones[left], &others[right]).unwrap_or(Ordering::Equal)
+                }
+                _ => Ordering::Equal,
+            },
         };
         if ordering != Ordering::Equal {
             return ordering;
@@ -348,7 +523,7 @@ fn laid(field: &Field, pieces: &[&Vector]) -> Result<Vector> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Width, bucket};
+    use super::{Width, bucket, dealt};
     use rudb_common::value::days_from_civil;
 
     #[test]
@@ -358,5 +533,12 @@ mod tests {
         assert_eq!(bucket(day, Width::Quarter), days_from_civil(1995, 7, 1));
         assert_eq!(bucket(day, Width::Year), days_from_civil(1995, 1, 1));
         assert_eq!(bucket(day, Width::Exact), day);
+    }
+
+    #[test]
+    fn rows_are_dealt_by_place_with_ties_in_the_order_they_came_and_no_place_last() {
+        let unmatched = u32::MAX;
+        let order = dealt(&[2, unmatched, 0, 2, 1, unmatched, 0], 3).expect("deals");
+        assert_eq!(order, [2, 6, 4, 0, 3, 1, 5]);
     }
 }
