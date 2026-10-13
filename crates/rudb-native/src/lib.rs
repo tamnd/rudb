@@ -3351,6 +3351,27 @@ impl Writer {
         self
     }
 
+    /// Leaves the tables of `names` out of the generation this writer commits, for tables the file
+    /// holds that were dropped since it was committed.
+    ///
+    /// Their runs go on the free list the way the runs of a table written again do, and a commit two
+    /// generations on writes into them. Before this, a file that held a dropped table could not be
+    /// appended to and the checkpoint wrote the whole database again. A load that sorts each table
+    /// through a staging table it drops after is a drop between every two tables, and on the JOB
+    /// clustered load those rewrites were more than half of the time.
+    #[must_use]
+    pub fn dropping(mut self, names: &[String]) -> Self {
+        let size = self.space.end();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.closed)
+            .into_iter()
+            .partition(|held| names.contains(&held.name));
+        self.closed = kept;
+        for entry in &gone {
+            give_entry(&*self.file, &mut self.space, entry, false, size);
+        }
+        self
+    }
+
     /// Sets the log anchor the next commit writes down, which says how much of the log the file
     /// holds once it is published.
     #[must_use]
@@ -4915,12 +4936,34 @@ impl Writer {
         anchor: Option<&LogAnchor>,
         marks: &[(String, GoneRows)],
     ) -> Result<()> {
+        Self::restate_dropping(path, views, anchor, marks, &[])
+    }
+
+    /// [`Writer::restate_marking`] that also leaves the tables of `dropped` out, the way
+    /// [`Writer::dropping`] has [`Writer::finish`] do it. A checkpoint after a `DROP TABLE` and
+    /// nothing else costs a catalog.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Writer::restate_marking`].
+    pub fn restate_dropping(
+        path: impl AsRef<Path>,
+        views: &[ViewEntry],
+        anchor: Option<&LogAnchor>,
+        marks: &[(String, GoneRows)],
+        dropped: &[String],
+    ) -> Result<()> {
         let path = path.as_ref();
         let file = RealFilesystem::new().open(path, OpenMode::ReadWrite)?;
         let size = file.len()?;
         let (slot, bytes, _) = committed_slot(&*file, size)?;
-        let (mut closed, _, card, held, free) = decode_catalog(&bytes, size)?;
+        let (closed, _, card, held, free) = decode_catalog(&bytes, size)?;
         let mut out = Out::new(path, &*file, size, slot, free)?;
+        let (gone, mut closed): (Vec<_>, Vec<_>) =
+            closed.into_iter().partition(|held| dropped.contains(&held.name));
+        for entry in &gone {
+            give_entry(&*file, &mut out.space, entry, false, size);
+        }
         for (name, gone) in marks {
             let held = closed.iter_mut().find(|held| held.name == *name).ok_or_else(|| {
                 invalid(&format!("rows gone from {name}, which the file does not hold"))

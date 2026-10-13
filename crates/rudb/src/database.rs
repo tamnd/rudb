@@ -2843,8 +2843,16 @@ fn persist_anchored(
             && (table.rows().is_stored() || table.rows().markable())
             && table.clustering_is_stored()
     });
-    if restated && marked && held.is_some_and(|held| held.tables == wanted(&names)) {
-        rudb_native::Writer::restate_marking(path, &views, anchor, &marks)?;
+    // A table dropped since the file was committed is left out of the new catalog and its runs go
+    // on the free list, which keeps a drop from costing the whole file written again. That is only
+    // done while what is left holds most of the file, for the reason [`mostly_live`] gives.
+    let dropped = held.as_ref().map(|held| dropped(&held.tables, &names)).unwrap_or_default();
+    if restated
+        && marked
+        && held.as_ref().is_some_and(|held| wanted(&names).is_subset(&held.tables))
+        && (dropped.is_empty() || mostly_live(path, catalog, &names, &BTreeMap::new())?)
+    {
+        rudb_native::Writer::restate_dropping(path, &views, anchor, &marks, &dropped)?;
         rebind(path, catalog, &names, pages)?;
         return settle(catalog, &names, &changes, |_| false);
     }
@@ -3066,6 +3074,13 @@ fn held_rows(path: &Path) -> Result<Option<BTreeMap<String, usize>>> {
 /// The same set of names, taken from the catalog instead.
 fn wanted(names: &[QualifiedName]) -> BTreeSet<String> {
     names.iter().map(|name| name.table.clone()).collect()
+}
+
+/// The tables of `held`, the ones a committed file holds, that are not in the catalog's `names`
+/// any more because they were dropped since.
+fn dropped<'a>(held: impl IntoIterator<Item = &'a String>, names: &[QualifiedName]) -> Vec<String> {
+    let wanted = wanted(names);
+    held.into_iter().filter(|name| !wanted.contains(*name)).cloned().collect()
 }
 
 /// The views a file written from this catalog now would hold.
@@ -3857,15 +3872,20 @@ fn appended(
     // written again, which is what gives the space back.
     let again = |name: &String| held.contains_key(name) && !extended.contains_key(name);
     let rewritten = dirty.iter().any(|d| again(&d.table) && held[&d.table] > 0);
+    // A table the file holds that the catalog dropped is left out of this generation, and the
+    // space it held is dead the same way a table written again leaves its old stripes dead.
+    let dropped = dropped(held.keys(), names);
+    let emptied = dropped.iter().any(|name| held[name] > 0);
     let carried = held.keys().all(|name| {
         native.contains(name)
             || extended.contains_key(name)
             || dirty.iter().any(|d| &d.table == name)
+            || dropped.contains(name)
     });
     if !carried || !native.iter().all(|name| held.contains_key(name)) {
         return Ok(None);
     }
-    if rewritten && !mostly_live(path, catalog, names, &extended)? {
+    if (rewritten || emptied) && !mostly_live(path, catalog, names, &extended)? {
         return Ok(None);
     }
     let mut writer: Option<rudb_native::Writer> = None;
@@ -3896,7 +3916,7 @@ fn appended(
         writer = Some(open);
     }
     let Some(mut writer) = writer else { return Ok(None) };
-    writer = writer.with_marks(marks);
+    writer = writer.dropping(&dropped).with_marks(marks);
     if let Some(anchor) = anchor {
         writer = writer.with_log_anchor(anchor.clone());
     }
