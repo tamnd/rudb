@@ -316,7 +316,8 @@ fn key_tag(fields: &[rudb_common::Field], key: usize) -> Option<u8> {
 }
 
 /// Whether a column of this type can be a key at all.
-fn mappable(ty: &LogicalType) -> bool {
+#[must_use]
+pub fn mappable(ty: &LogicalType) -> bool {
     matches!(
         ty,
         LogicalType::TinyInt

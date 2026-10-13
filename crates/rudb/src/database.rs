@@ -3548,6 +3548,11 @@ fn index(
             continue;
         };
         let Some(at) = table.column_index(column) else { continue };
+        // A key no form can map is passed over like the rest, and not refused at the build, which
+        // would fail the checkpoint over a relationship that only ever made a query faster.
+        if !rudb_native::graph::mappable(&table.columns()[at].ty) {
+            continue;
+        }
         let name = table.name().clone();
         if only.is_some_and(|only| !only.contains(&name.table)) {
             continue;
@@ -3710,9 +3715,13 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
 ///
 /// One column is its index and two are a pair, which is `rudb_native::graph::key_of`. The columns
 /// have to be of the same count on both sides of a relationship, and the parser already refuses one
-/// whose sides differ, so this does not check it again.
+/// whose sides differ, so this does not check it again. A column of a type with no integer key form
+/// has no number, so a relationship over text is passed over rather than failing the build.
 fn key_in(table: &rudb_catalog::Table, columns: &[String]) -> Option<usize> {
     let at = columns.iter().map(|column| table.column_index(column)).collect::<Option<Vec<_>>>()?;
+    if !at.iter().all(|&at| rudb_native::graph::mappable(&table.columns()[at].ty)) {
+        return None;
+    }
     rudb_native::graph::key_of(&at)
 }
 
