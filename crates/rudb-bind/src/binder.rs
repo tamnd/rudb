@@ -512,9 +512,9 @@ pub(crate) struct Binder<'a> {
     /// whose column declares one, by the expression it binds to, so a target that is the query
     /// keeps it.
     pub(crate) subquery_types: Vec<(ExprRef, DeclaredType)>,
-    /// The columns of each query of `SET (a, b) = (SELECT ...)` that is joined in already, by the
-    /// query as it was written, so the other columns of the list read the same row.
-    pub(crate) multi_assigned: Vec<(ast::ExprRef, Vec<(ColumnBinding, LogicalType)>)>,
+    /// The values of each source of `SET (a, b) = (SELECT ...)` that is bound already, by the
+    /// source as it was written, so the other columns of the list read the same row.
+    pub(crate) multi_assigned: Vec<(ast::ExprRef, Vec<ExprRef>)>,
     /// Table indices of the queries this block will join in above its grouping, not below it.
     ///
     /// Only ever set while a `HAVING` is being rewritten over the aggregate. A column from one of

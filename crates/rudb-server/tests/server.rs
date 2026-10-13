@@ -2260,8 +2260,9 @@ fn typed_shape(message: &Message) -> Vec<(String, u32, i32)> {
 }
 
 /// `SET (a, b) = (SELECT ...)` takes the columns of the one row of the query, or nulls when it
-/// has no row, in an `UPDATE` and in an `ON CONFLICT DO UPDATE`. A query of another width is
-/// error 42601 at the query and a query of two rows is error 21000, as in PostgreSQL.
+/// has no row, in an `UPDATE` and in an `ON CONFLICT DO UPDATE`, and `SET (a, b) = ROW(t.*)`
+/// takes the fields of `t`. A query of another width is error 42601 at the query and a query of
+/// two rows is error 21000, as in PostgreSQL.
 #[test]
 fn a_list_of_columns_is_set_from_the_row_of_a_query() {
     let dirs = Dirs::new("pgmulti");
@@ -2276,6 +2277,7 @@ fn a_list_of_columns_is_set_from_the_row_of_a_query() {
         "update pairs set (k, v) = (select k + 10, v || 'x' from pairs p where p.k = pairs.k)",
         "update pairs set (v) = (select 'z' where false) where k = 11",
         "insert into pairs values (12, 'c') on conflict (k) do update set (k, v) = (select excluded.k + 1, pairs.v || excluded.v)",
+        "update pairs set (v, k) = row(s.*) from (values ('d', 14)) s(j, i) where v = 'bxc'",
     ] {
         let messages = client.query(sql);
         assert!(messages.iter().all(|message| message.tag != b'E'), "{sql}: {messages:?}");
@@ -2285,7 +2287,7 @@ fn a_list_of_columns_is_set_from_the_row_of_a_query() {
             &mut client,
             "select string_agg(k || ':' || coalesce(v, 'null'), ',' order by k) from pairs"
         ),
-        "11:null,13:bxc"
+        "11:null,14:d"
     );
     for (sql, state, message, position) in [
         (

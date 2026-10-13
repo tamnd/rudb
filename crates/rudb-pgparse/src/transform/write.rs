@@ -406,30 +406,42 @@ impl Transform<'_> {
     }
 
     /// The values of `(a, b) = source`, one for each column. The source is a `ROW` with one value
-    /// for each column, or a sub-select whose one row gives them, which the binder checks has a
-    /// column for each. Any other source is the error of PostgreSQL.
+    /// for each column, or a sub-select whose one row gives them. The binder checks the width of a
+    /// sub-select, and of a `ROW` with a `t.*` in it, since only the binder knows how many fields
+    /// those give. Any other source is the error of PostgreSQL.
+    /// A value for each column of `(a, b) = source` that the binder takes from `source`.
+    fn multi_assign(
+        &mut self,
+        source: ExprRef,
+        assign: &MultiAssignRef,
+        location: i32,
+    ) -> Vec<ExprRef> {
+        let columns = u32::try_from(assign.ncolumns).unwrap_or_default();
+        let values = (0..columns)
+            .map(|column| self.push(Expr::MultiAssign { source, column, columns }, location));
+        values.collect()
+    }
+
     fn row_source(&mut self, assign: &MultiAssignRef) -> Made<Vec<ExprRef>> {
         match &assign.source {
-            Some(Node::RowExpr(row)) => {
-                if i32::try_from(row.args.len()).ok() != Some(assign.ncolumns) {
+            Some(source @ Node::RowExpr(row)) => {
+                let built = self.expr(source)?;
+                let Expr::Row { items } = self.ast.expr(built) else { return clause("RowExpr") };
+                let values = self.ast.expr_list(items).to_vec();
+                if values.iter().any(|&value| matches!(self.ast.expr(value), Expr::Fields { .. })) {
+                    return Ok(self.multi_assign(built, assign, row.location));
+                }
+                if i32::try_from(values.len()).ok() != Some(assign.ncolumns) {
                     return Err(Error::parser("number of columns does not match number of values")
                         .state(SqlState::SYNTAX_ERROR)
                         .with_span(self.at(row.location))
                         .into());
                 }
-                let mut values = Vec::with_capacity(row.args.len());
-                for arg in row.args.iter().flatten() {
-                    values.push(self.expr(arg)?);
-                }
                 Ok(values)
             }
             Some(source @ Node::SubLink(link)) if link.subLinkType == SubLinkType::EXPR_SUBLINK => {
                 let query = self.expr(source)?;
-                let columns = u32::try_from(assign.ncolumns).unwrap_or_default();
-                let values = (0..columns).map(|column| {
-                    self.push(Expr::MultiAssign { source: query, column, columns }, link.location)
-                });
-                Ok(values.collect())
+                Ok(self.multi_assign(query, assign, link.location))
             }
             source => {
                 let location = crate::actions::exprLocation(source.as_ref());

@@ -553,10 +553,11 @@ impl Binder<'_> {
         Ok(expr)
     }
 
-    /// One column of `SET (a, b) = (SELECT ...)`, as `transformMultiAssignRef` of PostgreSQL
-    /// binds it. The first column of the list to get here binds the query and joins it in the way
-    /// a scalar query is joined, and each column reads its own column of the one row. A query
-    /// with another number of columns than the list is error 42601 at the query.
+    /// One column of `SET (a, b) = source`, as `transformMultiAssignRef` of PostgreSQL binds it.
+    /// The first column of the list to get here binds the source, and each column takes its own
+    /// value of it. A query is joined in the way a scalar query is, so its one row gives the
+    /// values, and a `ROW` gives a value for each field after `t.*` is taken apart. A source with
+    /// another number of values than the list has columns is error 42601 at the source.
     fn bind_multi_assign(
         &mut self,
         ast: &Ast,
@@ -566,34 +567,48 @@ impl Binder<'_> {
         outer: &Scope,
     ) -> Result<ExprRef> {
         if let Some((_, values)) = self.multi_assigned.iter().find(|(at, _)| *at == source) {
-            let Some((binding, ty)) = values.get(column as usize).cloned() else {
-                return Err(Error::internal(format!("column {column} of a multiple assignment")));
-            };
-            return Ok(self.add_expr(Expr::Column(binding), ty));
+            return values.get(column as usize).copied().ok_or_else(|| {
+                Error::internal(format!("column {column} of a multiple assignment"))
+            });
         }
-        let ast::Expr::Subquery { query, array: false } = ast.expr(source) else {
-            return Err(Error::internal("a multiple assignment from something not a query"));
+        let values = match ast.expr(source) {
+            ast::Expr::Subquery { query, array: false } => {
+                let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
+                if let Some(first) = scope.columns.first() {
+                    self.scalar_subqueries.push(PendingSubquery {
+                        node,
+                        kind: rudb_plan::JoinKind::Single,
+                        conditions: Vec::new(),
+                        dependent: !correlations.is_empty(),
+                        reads: correlations,
+                        index: first.binding.table,
+                        inside_aggregate: self.in_aggregate,
+                    });
+                }
+                let values = scope.columns.iter();
+                values
+                    .map(|column| self.add_expr(Expr::Column(column.binding), column.ty.clone()))
+                    .collect()
+            }
+            ast::Expr::Row { items } => {
+                let mut values = Vec::new();
+                for &item in ast.expr_list(items) {
+                    match ast.expr(item) {
+                        ast::Expr::Fields { record } => values.extend(
+                            self.bind_fields(ast, record, outer)?.into_iter().map(|(expr, _)| expr),
+                        ),
+                        _ => values.push(self.bind_expr(ast, item, outer)?),
+                    }
+                }
+                values
+            }
+            _ => return Err(Error::internal("a multiple assignment from something not a query")),
         };
-        let (node, scope, correlations) = self.bind_isolated_subquery(ast, query, outer)?;
-        if scope.len() != columns as usize {
+        if values.len() != columns as usize {
             return Err(Error::binder("number of columns does not match number of values")
                 .state(SqlState::SYNTAX_ERROR)
                 .placed_at(Some(ast.expr_span(source))));
         }
-        let values: Vec<_> =
-            scope.columns.iter().map(|column| (column.binding, column.ty.clone())).collect();
-        let Some(&(first, _)) = values.first() else {
-            return Err(Error::internal("a multiple assignment of no columns"));
-        };
-        self.scalar_subqueries.push(PendingSubquery {
-            node,
-            kind: rudb_plan::JoinKind::Single,
-            conditions: Vec::new(),
-            dependent: !correlations.is_empty(),
-            reads: correlations,
-            index: first.table,
-            inside_aggregate: self.in_aggregate,
-        });
         self.multi_assigned.push((source, values));
         self.bind_multi_assign(ast, source, column, columns, outer)
     }

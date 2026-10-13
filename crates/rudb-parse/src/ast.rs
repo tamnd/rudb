@@ -1667,9 +1667,10 @@ pub enum Expr {
     },
     /// One column of `SET (a, b) = (SELECT ...)` in PostgreSQL, which is the value at `column` of
     /// the one row of the query. The columns of the list all have the same `source`, so the
-    /// query runs one time for each row and not one time for each column.
+    /// query runs one time for each row and not one time for each column. A `ROW` whose width
+    /// only the binder knows, as `ROW(t.*)`, is a source as well.
     MultiAssign {
-        /// The query, as an [`Expr::Subquery`].
+        /// The query, as an [`Expr::Subquery`], or the [`Expr::Row`].
         source: ExprRef,
         /// The place of the column in the list, from zero.
         column: u32,
