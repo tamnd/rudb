@@ -1,11 +1,13 @@
-//! `COPY ... FROM STDIN` and `COPY ... TO STDOUT`, the copy sub-protocol of PostgreSQL.
+//! `COPY`, with the copy sub-protocol of PostgreSQL, a file of the server or a program.
 //!
-//! The server runs these two forms itself, because the data goes over the connection and not into
-//! a file. `COPY TO STDOUT` runs the query, or a `SELECT` of the table, and sends the rows in
-//! `CopyData` messages in the formats of `copyto.c`. `COPY FROM STDIN` sends `CopyInResponse`, and
-//! the main loop gives each `CopyData` to [`Load`]. It reads the rows as `copyfromparse.c` reads
-//! them, into one list of values for each column, and writes them through the bulk path of the
-//! engine. A `COPY` of a file or of a program goes to the engine.
+//! The server runs `COPY` itself. `COPY TO STDOUT` runs the query, or a `SELECT` of the table, and
+//! sends the rows in `CopyData` messages in the formats of `copyto.c`. `COPY FROM STDIN` sends
+//! `CopyInResponse`, and the main loop gives each `CopyData` to [`Load`]. It reads the rows as
+//! `copyfromparse.c` reads them, into one list of values for each column, and writes them through
+//! the bulk path of the engine. A copy of a file or of a program has the same formats, and
+//! [`server`] reads or writes its data in place of the connection.
+
+mod server;
 
 use std::ops::Range;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,13 +35,25 @@ const DISPLAY: usize = 100;
 /// The signature of the binary format, the first 11 bytes of the data.
 const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 
-/// A `COPY` statement with `STDIN` or `STDOUT`.
+/// A `COPY` statement.
 #[derive(Debug, Clone)]
 pub(super) struct Copy {
     source: Source,
     /// `FROM`, else `TO`. PostgreSQL takes `STDIN` and `STDOUT` in both directions.
     pub(super) from: bool,
+    endpoint: Endpoint,
     options: Options,
+}
+
+/// Where the data of a copy comes from or goes to.
+#[derive(Debug, Clone)]
+enum Endpoint {
+    /// `STDIN` or `STDOUT`, the connection.
+    Client,
+    /// A file of the server. A relative path is in the data directory.
+    File(String),
+    /// `PROGRAM`, a command for the shell.
+    Program(String),
 }
 
 #[derive(Debug, Clone)]
@@ -175,9 +189,9 @@ fn type_failure(error: TypeError) -> Failure {
     failure
 }
 
-/// Reads a `COPY` with `STDIN` or `STDOUT`, or gives `None` for another statement and for a copy
-/// of a file or a program, which the engine runs. A position in an error is a byte offset in
-/// `sql`.
+/// Reads a `COPY`, or gives `None` for another statement and for a `COPY` that does not read
+/// up to its options, which the engine parses for the syntax error. A position in an error is a
+/// byte offset in `sql`.
 pub(super) fn parse(sql: &str) -> Option<Result<Copy, Failure>> {
     let head = sql.trim_start().as_bytes();
     if !head.get(..4).is_some_and(|word| word.eq_ignore_ascii_case(b"copy")) {
@@ -224,11 +238,18 @@ pub(super) fn parse(sql: &str) -> Option<Result<Copy, Failure>> {
     } else {
         return None;
     };
-    if !(p.eat("stdin") || p.eat("stdout")) {
+    let endpoint = if p.eat("stdin") || p.eat("stdout") {
+        Endpoint::Client
+    } else if let Some(name) = p.string() {
+        Endpoint::File(name)
+    } else if p.peek_is("program") && matches!(tokens.get(p.at + 1), Some(Token::String(_))) {
+        p.at += 1;
+        Endpoint::Program(p.string()?)
+    } else {
         return None;
-    }
+    };
     // From here the statement is the server's, so what does not read is a syntax error.
-    Some(p.rest(source, from, items))
+    Some(p.rest(source, from, endpoint, items))
 }
 
 struct Reader<'a> {
@@ -340,7 +361,13 @@ impl Reader<'_> {
     }
 
     /// The options and the end of the statement.
-    fn rest(&mut self, source: Source, from: bool, mut items: Vec<Item>) -> Result<Copy, Failure> {
+    fn rest(
+        &mut self,
+        source: Source,
+        from: bool,
+        endpoint: Endpoint,
+        mut items: Vec<Item>,
+    ) -> Result<Copy, Failure> {
         if matches!(source, Source::Query(_)) && from {
             self.at -= 2;
             return Err(self.syntax_error());
@@ -381,7 +408,7 @@ impl Reader<'_> {
             return Err(self.syntax_error());
         }
         let options = options(&items, from)?;
-        Ok(Copy { source, from, options })
+        Ok(Copy { source, from, endpoint, options })
     }
 
     /// `copy_generic_opt_arg`.
@@ -943,7 +970,7 @@ enum Eol {
     CrNl,
 }
 
-/// A `COPY FROM STDIN` that reads data.
+/// A `COPY FROM` that reads data.
 pub(super) struct Load {
     target: LoadTarget,
     /// The place in the table of each column of the copy.
@@ -1340,6 +1367,10 @@ impl Load {
         let mut at = 0;
         let result = (|| {
             if self.signature {
+                // The signature is checked as soon as it is there, before the rest of the header.
+                if self.pending.get(..11).is_some_and(|signature| signature != SIGNATURE) {
+                    return Err(failure("22P04", "COPY file signature not recognized"));
+                }
                 let Some(head) = self.pending.get(..19) else {
                     return if done && self.pending.len() < 11 {
                         Err(failure("22P04", "COPY file signature not recognized"))
@@ -1349,9 +1380,6 @@ impl Load {
                         Ok(())
                     };
                 };
-                if &head[..11] != SIGNATURE {
-                    return Err(failure("22P04", "COPY file signature not recognized"));
-                }
                 let flags = u32::from_be_bytes([head[11], head[12], head[13], head[14]]);
                 if flags & (1 << 16) != 0 {
                     return Err(failure("22P04", "invalid COPY file header (WITH OIDS)"));
@@ -1676,9 +1704,9 @@ impl Runner {
         Ok((given, names))
     }
 
-    /// Runs `COPY ... TO STDOUT`: the `CopyOutResponse`, the rows in `CopyData` messages and the
-    /// `CopyDone`. Gives the number of rows, and the caller sends the `CommandComplete`.
-    /// `offset` is the place of the statement in `sql`.
+    /// Runs `COPY ... TO`: for `STDOUT` the `CopyOutResponse`, the rows in `CopyData` messages and
+    /// the `CopyDone`, and for a file or a program the rows in it. Gives the number of rows, and
+    /// the caller sends the `CommandComplete`. `offset` is the place of the statement in `sql`.
     pub(super) fn copy_to(
         &mut self,
         copy: &Copy,
@@ -1744,8 +1772,17 @@ impl Runner {
             Err(error) => return Ok(Err(type_failure(error))),
         };
         let width = columns.len();
-        let code = i16::from(binary);
-        out.copy_out_response(i8::from(binary), &vec![code; width]);
+        let mut sink = match &copy.endpoint {
+            Endpoint::Client => {
+                let code = i16::from(binary);
+                out.copy_out_response(i8::from(binary), &vec![code; width]);
+                None
+            }
+            endpoint => match server::Sink::open(endpoint) {
+                Ok(sink) => Some(sink),
+                Err(failure) => return Ok(Err(failure)),
+            },
+        };
         let mut data = Vec::with_capacity(MESSAGE);
         if binary {
             data.extend_from_slice(SIGNATURE);
@@ -1792,11 +1829,17 @@ impl Runner {
                     copy_row(options, body, &force_quote, &mut data);
                 }
                 if data.len() >= MESSAGE {
-                    out.copy_data(&data);
-                    data.clear();
-                    if out.len() >= FLUSH_AT {
-                        flush(out)?;
+                    if let Some(sink) = &mut sink {
+                        if let Err(failure) = sink.write(&data) {
+                            return Ok(Err(failure));
+                        }
+                    } else {
+                        out.copy_data(&data);
+                        if out.len() >= FLUSH_AT {
+                            flush(out)?;
+                        }
                     }
+                    data.clear();
                 }
             }
             rows += n as u64;
@@ -1804,22 +1847,28 @@ impl Runner {
         if binary {
             data.extend_from_slice(&(-1i16).to_be_bytes());
         }
-        if !data.is_empty() {
-            out.copy_data(&data);
-        }
-        out.copy_done();
-        Ok(Ok(rows))
+        let Some(mut sink) = sink else {
+            if !data.is_empty() {
+                out.copy_data(&data);
+            }
+            out.copy_done();
+            return Ok(Ok(rows));
+        };
+        let written = if data.is_empty() { Ok(()) } else { sink.write(&data) };
+        Ok(written.and_then(|()| sink.close()).map(|()| rows))
     }
 
     /// Starts `COPY ... FROM STDIN`: checks the table and the columns and sends the
-    /// `CopyInResponse`. The main loop then gives the data to [`Runner::copy_data`].
+    /// `CopyInResponse`. The main loop then gives the data to [`Runner::copy_data`]. A copy from a
+    /// file or a program reads all of its data here and sends the `CommandComplete`.
     pub(super) fn copy_from(
         &mut self,
         copy: Copy,
         rest: Option<Rest>,
         out: &mut OutBuf,
     ) -> Result<(), Failure> {
-        let Source::Table { name, columns } = &copy.source else {
+        let Copy { source, endpoint, options, .. } = copy;
+        let Source::Table { name, columns } = &source else {
             return Err(failure("42601", "COPY FROM needs a table"));
         };
         let target = self.copy_table(name, true)?;
@@ -1837,21 +1886,18 @@ impl Runner {
             .enumerate()
             .map(|(at, ty)| column_type(ty, shape.origin(at)))
             .collect();
-        let options = copy.options;
         let all: Vec<String> = fields.iter().map(|field| field.name.clone()).collect();
         let table = Some(target.table().to_owned());
         let force_not_null =
             force_flags(&options.force_not_null, "FORCE_NOT_NULL", &names, &all, &table)?;
         let force_null = force_flags(&options.force_null, "FORCE_NULL", &names, &all, &table)?;
         let binary = options.format == Format::Binary;
-        let code = i16::from(binary);
-        out.copy_in_response(i8::from(binary), &vec![code; names.len()]);
         let heading = match options.header {
             Header::Lines(lines) => lines,
             Header::Match => 1,
         };
         let count = names.len();
-        self.load = Some(Box::new(Load {
+        let load = Box::new(Load {
             table: target.table().to_owned(),
             target,
             given,
@@ -1874,8 +1920,50 @@ impl Runner {
             rest,
             fields: Vec::new(),
             scratch: Vec::new(),
-        }));
+        });
+        if let Endpoint::Client = endpoint {
+            let code = i16::from(binary);
+            out.copy_in_response(i8::from(binary), &vec![code; count]);
+            self.load = Some(load);
+            return Ok(());
+        }
+        let rows = self.copy_from_server(load, &endpoint, out)?;
+        out.command_tag(CommandTag::Copy, rows);
         Ok(())
+    }
+
+    /// Reads all the data of `COPY FROM` a file or a program, and gives the number of rows. The
+    /// text formats stop at the end-of-copy marker, and the rest of the data is not read.
+    fn copy_from_server(
+        &mut self,
+        mut load: Box<Load>,
+        endpoint: &Endpoint,
+        out: &mut OutBuf,
+    ) -> Result<u64, Failure> {
+        let data = self.guc.get("data_directory").unwrap_or_default();
+        let mut source = server::Source::open(endpoint, &data)?;
+        let mut buf = vec![0; MESSAGE];
+        let reached_end = loop {
+            if load.ended && load.options.format != Format::Binary {
+                break false;
+            }
+            let n = source.read(&mut buf)?;
+            if n == 0 {
+                break true;
+            }
+            let read = self.copy_read(&mut load, &buf[..n], false);
+            self.copy_notices(&mut load, out);
+            read?;
+        };
+        let read = self.copy_read(&mut load, &[], true);
+        self.copy_notices(&mut load, out);
+        read?;
+        source.close(reached_end)?;
+        if let Some(summary) = load.summary() {
+            load.notices.push((summary, false));
+            self.copy_notices(&mut load, out);
+        }
+        Ok(load.total)
     }
 
     /// Reads one `CopyData` of `COPY FROM STDIN`. An error ends the copy.
@@ -1972,10 +2060,10 @@ impl Runner {
         }
     }
 
-    /// Runs a `COPY` with `STDIN` or `STDOUT` that starts at byte `offset` of `sql`. For `COPY
-    /// TO` it sends the rows and the `CommandComplete`. For `COPY FROM` it sends the
-    /// `CopyInResponse` and gives with [`Runner::load`] set, and the main loop reads the data.
-    /// `rest` is the rest of a `Query`, or `None` on the extended flow.
+    /// Runs a `COPY` that starts at byte `offset` of `sql`. For `COPY TO` and for `COPY FROM` a
+    /// file or a program it sends the rows and the `CommandComplete`. For `COPY FROM STDIN` it
+    /// sends the `CopyInResponse` and gives with [`Runner::load`] set, and the main loop reads the
+    /// data. `rest` is the rest of a `Query`, or `None` on the extended flow.
     pub(super) fn copy(
         &mut self,
         copy: Copy,
@@ -1987,6 +2075,11 @@ impl Runner {
     ) -> std::io::Result<Result<(), Failure>> {
         if self.connection.transaction() == rudb::Transaction::Aborted {
             return Ok(Err(aborted_failure()));
+        }
+        let roles = self.roles.snapshot();
+        let role = self.current_oid(&roles);
+        if let Err(failure) = server::privileges(&copy.endpoint, copy.from, &roles, role) {
+            return Ok(Err(failure));
         }
         let done = if copy.from {
             // The rows of the copy go in one transaction, so an error writes none of them.
@@ -2119,10 +2212,17 @@ mod tests {
     }
 
     #[test]
-    fn statements_that_are_not_stdin_or_stdout_are_not_copies() {
+    fn a_copy_reads_the_client_a_file_or_a_program() {
         assert!(parse("select 1").is_none());
-        assert!(parse("copy t from '/tmp/x'").is_none());
-        assert!(parse("copy t to program 'cat'").is_none());
+        let copy = parsed("copy t from stdin");
+        assert!(matches!(copy.endpoint, Endpoint::Client));
+        let copy = parsed("copy t from '/tmp/x' (format csv)");
+        assert!(matches!(&copy.endpoint, Endpoint::File(name) if name == "/tmp/x"));
+        let copy = parsed("copy (select 1) to program 'cat'");
+        assert!(matches!(&copy.endpoint, Endpoint::Program(command) if command == "cat"));
+        // What does not read up to the options is the engine's, for its syntax error.
+        assert!(parse("copy t from program").is_none());
+        assert!(parse("copy t from").is_none());
     }
 
     #[test]

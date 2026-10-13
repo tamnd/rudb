@@ -135,7 +135,7 @@ pub(super) struct Statement {
     cursor: Option<Cursor>,
     /// The query of a `DECLARE`, which has the parameters.
     query: Option<Arc<Statement>>,
-    /// The `COPY` with `STDIN` or `STDOUT` that the server runs itself, from [`copy::parse`].
+    /// The `COPY` that the server runs itself, from [`copy::parse`].
     copy: Option<Copy>,
     /// The statement on the prepared statements that the server runs itself, from
     /// [`prepare::parse`].

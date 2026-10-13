@@ -2313,6 +2313,69 @@ fn a_list_of_columns_is_set_from_the_row_of_a_query() {
     server.stop().unwrap();
 }
 
+/// `COPY` reads and writes a file of the server or the pipe of a program in the formats of the
+/// connection, with the errors of PostgreSQL for a relative path, a missing file, a directory and a
+/// program that fails.
+#[test]
+fn copy_reads_and_writes_files_and_programs_of_the_server() {
+    let dirs = Dirs::new("pgcopyf");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let root = dirs.root.display().to_string();
+    std::fs::write(dirs.root.join("in.txt"), "1\ta\n2\t\\N\n\\.\n3\tc\n").unwrap();
+    let messages = client.query("create temp table ct (k int, v text)");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for (sql, tag) in [
+        (format!("copy ct from '{root}/in.txt'"), "COPY 2"),
+        ("copy ct from program 'printf \"7\\tz\\n\"'".to_owned(), "COPY 1"),
+        (format!("copy ct to '{root}/out.csv' (format csv, header)"), "COPY 3"),
+        (format!("copy (select k from ct where k > 1) to program 'cat > {root}/k.txt'"), "COPY 2"),
+    ] {
+        let messages = client.query(&sql);
+        assert_eq!(tags(&messages), "CZ", "{sql}: {messages:?}");
+        assert_eq!(text(&messages[0]), tag, "{sql}");
+    }
+    let csv = std::fs::read_to_string(dirs.root.join("out.csv")).unwrap();
+    assert_eq!(csv, "k,v\n1,a\n2,\n7,z\n");
+    assert_eq!(std::fs::read_to_string(dirs.root.join("k.txt")).unwrap(), "2\n7\n");
+    for (sql, state, message, more) in [
+        (
+            "copy ct to 'out.txt'".to_owned(),
+            "42602",
+            "relative path not allowed for COPY to file".to_owned(),
+            None,
+        ),
+        (
+            format!("copy ct from '{root}/none.txt'"),
+            "58P01",
+            format!(
+                "could not open file \"{root}/none.txt\" for reading: No such file or directory"
+            ),
+            Some((
+                b'H',
+                "COPY FROM instructs the PostgreSQL server process to read a file. You may want a client-side facility such as psql's \\copy.",
+            )),
+        ),
+        (format!("copy ct from '{root}'"), "42809", format!("\"{root}\" is a directory"), None),
+        (
+            "copy ct from program 'exit 3'".to_owned(),
+            "38000",
+            "program \"exit 3\" failed".to_owned(),
+            Some((b'D', "child process exited with exit code 3")),
+        ),
+    ] {
+        let messages = client.query(&sql);
+        let error = messages.iter().find(|message| message.tag == b'E').unwrap();
+        assert_eq!(error.field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(error.field(b'M'), Some(message), "{sql}");
+        if let Some((field, want)) = more {
+            assert_eq!(error.field(field).as_deref(), Some(want), "{sql}");
+        }
+    }
+    server.stop().unwrap();
+}
+
 /// `t.*` in an expression is the whole row of `t`, so a cast, a comparison, `IS NULL`, a field
 /// read and a function call take it as one value, while a target list and `ROW(...)` still take
 /// it apart into its columns, as in PostgreSQL.
