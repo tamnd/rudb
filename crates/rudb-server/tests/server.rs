@@ -2313,6 +2313,42 @@ fn a_list_of_columns_is_set_from_the_row_of_a_query() {
     server.stop().unwrap();
 }
 
+/// `t.*` in an expression is the whole row of `t`, so a cast, a comparison, `IS NULL`, a field
+/// read and a function call take it as one value, while a target list and `ROW(...)` still take
+/// it apart into its columns, as in PostgreSQL.
+#[test]
+fn a_qualified_star_in_an_expression_is_the_whole_row() {
+    let dirs = Dirs::new("pgwhole");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    let messages =
+        client.query("create temp table wz (k int, v text); insert into wz values (1, 'a')");
+    assert!(messages.iter().all(|message| message.tag != b'E'));
+    for (sql, want) in [
+        ("select wz.*::text from wz", "(1,a)"),
+        ("select (wz.*)::text from wz", "(1,a)"),
+        ("select (wz.* = wz.*)::text from wz", "true"),
+        ("select (wz.* is null)::text from wz", "false"),
+        ("select 'x' || wz.* from wz", "x(1,a)"),
+        ("select (wz.*).k::text from wz", "1"),
+        ("select coalesce(wz.*)::text from wz", "(1,a)"),
+        ("select count(wz.*)::text from wz", "1"),
+        ("select v from wz where wz.* is not null", "a"),
+        ("select row(wz.*, 2)::text from wz", "(1,a,2)"),
+        ("select s.*::text from (select k, v from wz) s", "(1,a)"),
+    ] {
+        assert_eq!(scalar(&mut client, sql), want, "{sql}");
+    }
+    let messages = client.query("select wz.*, 3 from wz");
+    let row = messages.iter().find(|m| m.tag == b'D').unwrap();
+    assert_eq!(data_row(row).len(), 3);
+    let messages = client.query("insert into wz values (2, 'b') returning wz.*");
+    let row = messages.iter().find(|m| m.tag == b'D').unwrap();
+    assert_eq!(data_row(row).len(), 2);
+    server.stop().unwrap();
+}
+
 /// A column read from a data changing `WITH` definition, or from a query around a `LATERAL` one,
 /// is the table column that it reads, and a scalar query or an `ARRAY(SELECT ...)` keeps the
 /// declared type of its column, all as `markTargetListOrigins` and `exprTypmod` of PostgreSQL

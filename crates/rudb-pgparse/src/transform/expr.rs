@@ -234,14 +234,28 @@ impl Transform<'_> {
     }
 
     /// A column, or a star with the names before it.
+    ///
+    /// `t.*` in an expression is the whole row of `t`, as `transformColumnRef` reads it, so
+    /// `t.*::text` and `t.* is null` take the row as one value. Only a target list and a row
+    /// constructor take it apart into its columns, and they read it with [`Self::star`].
     fn column(&mut self, fields: &List, location: i32) -> Made<ExprRef> {
-        if let Some(Some(Node::A_Star(_))) = fields.last() {
-            let qualifier = self.names(&fields[..fields.len() - 1])?;
-            let star = Expr::Star { qualifier, replacements: Slice::default() };
-            return Ok(self.push(star, location));
+        if let (Some(Some(Node::A_Star(_))), 2..) = (fields.last(), fields.len()) {
+            let name = self.names(&fields[..fields.len() - 1])?;
+            return Ok(self.push(Expr::Column { name }, location));
+        }
+        if let Some(star) = self.star(fields, location)? {
+            return Ok(star);
         }
         let name = self.names(fields)?;
         Ok(self.push(Expr::Column { name }, location))
+    }
+
+    /// `*` or `t.*` as the columns that it stands for, or nothing when `fields` is not a star.
+    pub(super) fn star(&mut self, fields: &List, location: i32) -> Made<Option<ExprRef>> {
+        let Some(Some(Node::A_Star(_))) = fields.last() else { return Ok(None) };
+        let qualifier = self.names(&fields[..fields.len() - 1])?;
+        let star = Expr::Star { qualifier, replacements: Slice::default() };
+        Ok(Some(self.push(star, location)))
     }
 
     /// The symbol of an operator name. A name with a schema is valid only when the schema is

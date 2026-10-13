@@ -227,7 +227,14 @@ impl Transform<'_> {
             let Some(value) = &target.val else {
                 return clause("ResTarget");
             };
-            let expr = self.expr(value)?;
+            let star = match value {
+                Node::ColumnRef(column) => self.star(&column.fields, column.location)?,
+                _ => None,
+            };
+            let expr = match star {
+                Some(star) => star,
+                None => self.expr(value)?,
+            };
             let alias = match &target.name {
                 Some(name) => self.intern(name),
                 None => NONE,
