@@ -169,7 +169,8 @@ pub use jsonb::{escape_json, jsonb_in, jsonb_recv, jsonb_send};
 pub use jsonbcmp::{jsonb_bool, jsonb_cmp, jsonb_float, jsonb_integer, jsonb_numeric};
 pub use jsonbops::{
     jsonb_concat, jsonb_contains, jsonb_delete, jsonb_delete_index, jsonb_delete_path,
-    jsonb_exists, jsonb_exists_keys, jsonb_insert, jsonb_pretty, jsonb_set, jsonb_set_lax,
+    jsonb_exists, jsonb_exists_keys, jsonb_insert, jsonb_pretty, jsonb_set, jsonb_set_element,
+    jsonb_set_lax,
 };
 pub use jsonbuild::{
     build_array, build_object, object_of_texts, object_shape_error, pretty_outer, to_jsonb,

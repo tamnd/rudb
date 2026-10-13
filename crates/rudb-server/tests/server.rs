@@ -710,6 +710,84 @@ fn the_jsonb_subscripts_read_as_postgresql_does() {
     server.stop().unwrap();
 }
 
+#[test]
+fn the_jsonb_subscripts_take_assignments_as_postgresql_does() {
+    let dirs = Dirs::new("jsonb-set");
+    let server = Server::start(dirs.config()).unwrap();
+    let mut client = Client::unix(&server);
+    connect(&mut client, PROTOCOL_3_0);
+    for sql in [
+        "create table t (id int primary key, j jsonb)",
+        "insert into t values (1, '[1]'), (2, null), (3, '{\"a\": 1}')",
+    ] {
+        assert_eq!(tags(&client.query(sql)), "CZ", "{sql}");
+    }
+    // A gap in an array is filled with nulls, a null value is the container that the first
+    // subscript asks for, and a second subscript of the same column is put into the first.
+    for (sql, value) in [
+        ("update t set j[3] = '2' where id = 1 returning j", "[1, null, null, 2]"),
+        (
+            "update t set j[0]['b'][1] = '\"x\"' where id = 2 returning j",
+            "[{\"b\": [null, \"x\"]}]",
+        ),
+        (
+            "update t as x set j['b'] = j['a'], j['c']['d'] = null where id = 3 returning j",
+            "{\"a\": 1, \"b\": 1, \"c\": {\"d\": null}}",
+        ),
+        (
+            "insert into t values (3, '5') on conflict (id) do update set j['e'] = excluded.j returning j['e']",
+            "5",
+        ),
+    ] {
+        assert_eq!(scalar(&mut client, sql), value, "{sql}");
+    }
+    for (sql, state, message, position) in [
+        (
+            "update t set j['k'] = 2 where id = 1",
+            "42804",
+            "subscripted assignment to \"j\" requires type jsonb but expression is of type integer",
+            Some("14"),
+        ),
+        (
+            "update t set j[null] = '1' where id = 3",
+            "22004",
+            "jsonb subscript in assignment must not be null",
+            None,
+        ),
+        (
+            "update t set j['a']['b'] = '1' where id = 3",
+            "22023",
+            "cannot replace existing key",
+            None,
+        ),
+        (
+            "update t set j[-9] = '1' where id = 1",
+            "22023",
+            "path element at position 1 is out of range: -9",
+            None,
+        ),
+        (
+            "update t set id[1] = 1",
+            "42804",
+            "cannot subscript type integer because it does not support subscripting",
+            Some("14"),
+        ),
+        (
+            "update t set j[1] = '1', j = '1'",
+            "42601",
+            "multiple assignments to same column \"j\"",
+            None,
+        ),
+    ] {
+        let messages = client.query(sql);
+        assert_eq!(tags(&messages), "EZ", "{sql}");
+        assert_eq!(messages[0].field(b'C').as_deref(), Some(state), "{sql}");
+        assert_eq!(messages[0].field(b'M').as_deref(), Some(message), "{sql}");
+        assert_eq!(messages[0].field(b'P').as_deref(), position, "{sql}");
+    }
+    server.stop().unwrap();
+}
+
 /// The row description of a message.
 fn row_shape(message: &Message) -> Vec<(String, u32, i16)> {
     let bytes = message.decoded();

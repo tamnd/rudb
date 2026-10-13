@@ -149,7 +149,7 @@ impl Transform<'_> {
     pub(super) fn update(&mut self, update: &UpdateStmt) -> Made<Statement> {
         self.written_with(update.withClause.as_deref(), |this| {
             let (name, alias) = this.written_table(update.relation.as_deref())?;
-            let sets = this.sets(&update.targetList)?;
+            let sets = this.sets(&update.targetList, name, alias)?;
             let returning = this.returning(update.returningClause.as_deref(), name, alias)?;
             let using = this.using(&update.fromClause)?;
             let filter = this.optional(update.whereClause.as_ref())?;
@@ -361,7 +361,7 @@ impl Transform<'_> {
                     .with_span(self.at(conflict.location))
                     .into());
                 }
-                let sets = self.sets(&conflict.targetList)?;
+                let sets = self.sets(&conflict.targetList, name, alias)?;
                 let condition = self.optional(conflict.whereClause.as_ref())?;
                 let span = self.span;
                 self.ast.conflict_update(&mut self.interned, name, alias, sets, condition, span)
@@ -375,14 +375,18 @@ impl Transform<'_> {
     ///
     /// The grammar gives `(a, b) = source` as one target for each column, each with the same
     /// source and the place of its column in the list.
-    fn sets(&mut self, list: &List) -> Made<Vec<Assignment>> {
+    ///
+    /// `j['a'][0] = v` sets the whole column `j` to a call that the binder reads as the column with
+    /// `v` put at that subscript. A second subscript of the same column is put into the value of
+    /// the first, as `process_matched_tle` merges them, so `SET j['a'] = 1, j['b'] = 2` sets both.
+    fn sets(&mut self, list: &List, name: Slice, alias: StrRef) -> Made<Vec<Assignment>> {
         let mut sets = Vec::with_capacity(list.len());
         let mut row = Vec::new();
         for node in list.iter().flatten() {
             let Node::ResTarget(target) = node else {
                 return Err(not_yet(node));
             };
-            if !target.indirection.is_empty() {
+            if !target.indirection.iter().flatten().all(|node| matches!(node, Node::A_Indices(_))) {
                 return clause("SetIndirection");
             }
             let column = self.intern(target.name.as_deref().unwrap_or_default());
@@ -400,7 +404,38 @@ impl Transform<'_> {
                 Some(node) => self.expr(node)?,
                 None => return clause("ResTarget"),
             };
-            sets.push(Assignment { column, span: Some(self.at(target.location)), value });
+            if target.indirection.is_empty() {
+                sets.push(Assignment { column, span: Some(self.at(target.location)), value });
+                continue;
+            }
+            let earlier = sets.iter().rposition(|set: &Assignment| {
+                set.column == column && self.ast.assignment(set.value)
+            });
+            let base = match earlier {
+                Some(at) => sets[at].value,
+                None => {
+                    let table = if alias == NONE {
+                        let last = self.ast.name(name).last().unwrap_or_default().to_owned();
+                        self.intern(&last)
+                    } else {
+                        alias
+                    };
+                    let name = self.ast.part_slice([table, column]);
+                    self.push(Expr::Column { name }, target.location)
+                }
+            };
+            let read = self.indirect(base, &target.indirection)?;
+            let args = self.ast.expr_slice([read, value]);
+            let call = self.made_call("subscript_assign", args, target.location);
+            self.ast.assignments.push(call);
+            match earlier {
+                Some(at) => sets[at].value = call,
+                None => sets.push(Assignment {
+                    column,
+                    span: Some(self.at(target.location)),
+                    value: call,
+                }),
+            }
         }
         Ok(sets)
     }
