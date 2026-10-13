@@ -4630,7 +4630,7 @@ impl Binder<'_> {
     /// The cast of `expr` to text with the output function of the PostgreSQL type `oid`, as
     /// `__rudb_pg_output` with the settings that the output reads. A new value of a setting makes
     /// a new PostgreSQL session value, so a plan that read the old value is not used again.
-    fn pg_output(&mut self, expr: ExprRef, oid: u32) -> ExprRef {
+    pub(crate) fn pg_output(&mut self, expr: ExprRef, oid: u32) -> ExprRef {
         let setting = |name: &str| self.session.postgres().and_then(|pg| pg.settings.get(name));
         let digits =
             setting("extra_float_digits").and_then(|digits| digits.parse().ok()).unwrap_or(1);

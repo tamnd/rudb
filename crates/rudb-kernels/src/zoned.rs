@@ -50,6 +50,10 @@ pub fn call_in_time_zone<V: AsRef<Vector>>(
     if crate::pgformat::formats(name) {
         return Some(crate::pgformat::call_vectors(name, &args, returns, zone));
     }
+    // A `timestamptz` in a `json` value is in the session zone.
+    if name == crate::pgjsonbuild::TIME {
+        return Some(rows(&args, returns, |row| crate::pgjsonbuild::time(row, zone)));
+    }
     // The kernels of `pg_proc` that read the wall clock of an instant, in any zone.
     if let Some(src) = name.strip_prefix(crate::pgproc::PREFIX)
         && crate::pgdatetime::ZONED.contains(&src)

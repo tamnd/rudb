@@ -507,6 +507,13 @@ pub(crate) fn parse(
     }
 }
 
+/// `IsValidJsonNumber`: whether the whole of `text` is one number of JSON, so that `to_json` can
+/// write the output of a number as it is, and must quote `NaN` and `Infinity`.
+pub(crate) fn is_number(text: &str) -> bool {
+    let mut lexer = Lexer { input: text.as_bytes(), at: 0, escapes: false, text: String::new() };
+    matches!(lexer.next(), Ok(token) if token.kind == Kind::Number && token.start == 0 && token.end == text.len())
+}
+
 /// The text input of `json`: the string, after a check of the syntax and of the depth.
 pub fn json_in(s: &str, depth: StackDepth) -> Result<&str, TypeError> {
     match parse(s, false, depth, &mut Check) {

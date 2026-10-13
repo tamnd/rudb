@@ -4487,6 +4487,29 @@ fn made_timestamp_value(millis: &Value) -> Result<Value> {
     micros_of_millis(millis).map(Value::Timestamp)
 }
 
+/// Whether a call of `name` with no argument is given the row count of the chunk by the executor,
+/// since a kernel takes its row count from its first argument. [`crate::draws`] says which draw
+/// a value for each row, and a kernel of `pg_proc` that is not volatile, such as the one of
+/// `json_build_array()`, has one value for all of them.
+#[must_use]
+pub fn needs_rows(name: &str) -> bool {
+    crate::draws(name)
+        || (name.starts_with(crate::pgproc::PREFIX) && !crate::pgproc::volatile(name))
+}
+
+/// `rows` answers for one call of `name` with no argument, which [`needs_rows`] said yes to.
+///
+/// # Errors
+///
+/// If the call fails.
+pub fn call_rows(name: &str, returns: &LogicalType, rows: usize) -> Result<Vector> {
+    if crate::draws(name) {
+        return crate::drawn(name, rows);
+    }
+    let value = call_values(name, &[], returns, None)?;
+    Ok(Vector::constant(returns.clone(), value, rows))
+}
+
 /// Calls a scalar function on one row.
 ///
 /// # Errors
@@ -4523,6 +4546,12 @@ pub fn call_values(
     }
     if let Some(value) = crate::pgjson::call(name, args)? {
         return Ok(value);
+    }
+    if let Some(value) = crate::pgjsonbuild::writer(name, args)? {
+        return Ok(value);
+    }
+    if name == crate::pgjsonbuild::TIME {
+        return crate::pgjsonbuild::time(args, rudb_common::SessionTimeZone::default());
     }
     if let Some(value) = crate::pgregexp::call(name, args)? {
         return Ok(value);
