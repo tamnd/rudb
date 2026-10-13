@@ -31,7 +31,7 @@
 use rudb_common::{ErrorCode, LogicalType, Result, Value};
 use rudb_kernels::cast::reads_time_zone;
 use rudb_kernels::{Comparison, Connective, call_values, cast_value, combine, compare_values};
-use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Plan, Slice};
+use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Node, Plan, Slice};
 use rudb_vector::Vector;
 
 /// The functions whose value is not decided by their arguments.
@@ -81,15 +81,50 @@ pub fn volatile_function(name: &str) -> bool {
     VOLATILE.contains(&name) || rudb_kernels::pgproc::volatile(name)
 }
 
+/// The prefix of the name of a kernel that the binder writes by hand for a function of a
+/// PostgreSQL session, such as `__rudb_pg_to_char` for `to_char`.
+const PG_KERNEL: &str = "__rudb_pg_";
+
+/// Whether the planner of PostgreSQL folds a call of the function `name` with `count` arguments,
+/// as `eval_const_expressions` decides it: only a function that is immutable and does not return
+/// a set.
+///
+/// The kernel of a C function of `pg_proc` is found by its `prosrc`, and any other name by its
+/// `proname` and the number of its arguments. A call of the engine that `pg_proc` does not have,
+/// such as an operator, folds.
+fn planner_folds(name: &str, count: usize) -> bool {
+    static SOURCES: std::sync::OnceLock<std::collections::HashMap<&str, bool>> =
+        std::sync::OnceLock::new();
+    let folds = |proc: &rudb_pgtypes::Proc| proc.volatility == b'i' && !proc.retset;
+    if let Some(src) = name.strip_prefix(rudb_kernels::pgproc::PREFIX) {
+        let sources = SOURCES.get_or_init(|| {
+            let mut sources = std::collections::HashMap::new();
+            for proc in rudb_pgtypes::builtin_procs().iter().filter(|proc| proc.kind == b'f') {
+                *sources.entry(proc.src).or_insert(false) |= folds(proc);
+            }
+            sources
+        });
+        return sources.get(src).copied().unwrap_or(true);
+    }
+    let name = name.strip_prefix(PG_KERNEL).unwrap_or(name);
+    let mut called = rudb_pgtypes::procs(name)
+        .iter()
+        .filter(|proc| proc.kind == b'f' && proc.takes(count))
+        .peekable();
+    called.peek().is_none() || called.any(folds)
+}
+
 /// Raises the first error of a part of the plan that PostgreSQL works out when it plans the query.
 ///
-/// The planner of PostgreSQL folds each call whose arguments are all constants, in every expression
-/// of the plan, and an error there fails the statement before it makes a row. So
-/// `SELECT 1/0 + x FROM t WHERE false` is a division by zero there, and on the extended protocol the
-/// error comes at `Bind` and not at `Execute`. It does not fold an arm of a `CASE` after a condition
-/// that is a constant true or in place of one that is a constant false or null, nor an operand of
-/// `AND` after a constant false, of `OR` after a constant true or of `COALESCE` after a constant
-/// that is not null. This does the same.
+/// The planner of PostgreSQL folds each call of an immutable function whose arguments are all
+/// constants, in every expression of the plan, and an error there fails the statement before it
+/// makes a row. So `SELECT 1/0 + x FROM t WHERE false` is a division by zero there, and on the
+/// extended protocol the error comes at `Bind` and not at `Execute`. It does not fold an arm of a
+/// `CASE` after a condition that is a constant true or in place of one that is a constant false or
+/// null, nor an operand of `AND` after a constant false, of `OR` after a constant true or of
+/// `COALESCE` after a constant that is not null. A call of a stable function, such as `to_char` or
+/// `json_build_object`, and of a function that returns a set, such as `generate_series`, waits for
+/// the executor, and only its arguments fold. This does the same.
 ///
 /// # Errors
 ///
@@ -103,12 +138,32 @@ pub fn planned(plan: &Plan) -> Result<()> {
             continue;
         }
         let held = plan.node(node);
+        // The list of an unnest is the call of a function that returns a set.
+        let sets = match *held {
+            Node::LateralFunction { function, args, .. } if plan.string(function) == "unnest" => {
+                plan.expr_list(args)
+            }
+            _ => &[],
+        };
         for (expr, _, _) in plan.top_level_exprs(held) {
-            constant_parts(plan, expr)?;
+            match *plan.expr(expr) {
+                Expr::Function { args, .. } if sets.contains(&expr) => {
+                    for &arg in plan.expr_list(args) {
+                        constant_parts(plan, arg)?;
+                    }
+                }
+                _ => constant_parts(plan, expr)?,
+            }
         }
         stack.extend(held.children().into_iter().flatten());
     }
     Ok(())
+}
+
+/// What an expression comes to when PostgreSQL plans it, which is [`value_of`] without the calls
+/// that its planner does not fold.
+fn planned_value(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
+    evaluate(plan, expr, &mut Lambdas { enabled: false, planning: true, frames: Vec::new() })
 }
 
 /// Folds the constant parts of one expression for [`planned`], the whole of it if it is constant.
@@ -120,7 +175,7 @@ fn constant_parts(plan: &Plan, expr: ExprRef) -> Result<()> {
         Expr::Function { name, .. } => plan.string(name) == "coalesce",
         _ => false,
     };
-    if !stops && value_of(plan, expr)?.is_some() {
+    if !stops && planned_value(plan, expr)?.is_some() {
         return Ok(());
     }
     match *plan.expr(expr) {
@@ -134,7 +189,7 @@ fn constant_parts(plan: &Plan, expr: ExprRef) -> Result<()> {
             let decides = Value::Boolean(op == ConjunctionOp::Or);
             for &child in plan.expr_list(children) {
                 constant_parts(plan, child)?;
-                if value_of(plan, child)? == Some(decides.clone()) {
+                if planned_value(plan, child)? == Some(decides.clone()) {
                     break;
                 }
             }
@@ -144,7 +199,7 @@ fn constant_parts(plan: &Plan, expr: ExprRef) -> Result<()> {
             let coalesce = plan.string(name) == "coalesce";
             for &arg in plan.expr_list(args) {
                 constant_parts(plan, arg)?;
-                if coalesce && value_of(plan, arg)?.is_some_and(|value| !value.is_null()) {
+                if coalesce && planned_value(plan, arg)?.is_some_and(|value| !value.is_null()) {
                     break;
                 }
             }
@@ -168,7 +223,7 @@ fn constant_parts(plan: &Plan, expr: ExprRef) -> Result<()> {
         Expr::Case { arms, otherwise } => {
             for arm in plan.arm_list(arms) {
                 constant_parts(plan, arm.when)?;
-                match value_of(plan, arm.when)? {
+                match planned_value(plan, arm.when)? {
                     Some(when) if when.as_bool() == Some(true) => {
                         return constant_parts(plan, arm.then);
                     }
@@ -188,7 +243,7 @@ fn constant_parts(plan: &Plan, expr: ExprRef) -> Result<()> {
 /// If evaluating it raises. A caller that would rather have the expression than the error throws
 /// this away, which is what the folding pass does and what the module documentation explains.
 pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
-    evaluate(plan, expr, &mut Lambdas { enabled: false, frames: Vec::new() })
+    evaluate(plan, expr, &mut Lambdas { enabled: false, planning: false, frames: Vec::new() })
 }
 
 /// What an expression comes to, the way [`value_of`] works it out, except that a `list_filter` or a
@@ -202,12 +257,14 @@ pub fn value_of(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
 ///
 /// If evaluating it raises.
 pub fn value_with_lambdas(plan: &Plan, expr: ExprRef) -> Result<Option<Value>> {
-    evaluate(plan, expr, &mut Lambdas { enabled: true, frames: Vec::new() })
+    evaluate(plan, expr, &mut Lambdas { enabled: true, planning: false, frames: Vec::new() })
 }
 
-/// Whether lambdas are run at all, and the parameter values of the ones being run, innermost last.
+/// Whether lambdas are run at all, whether the calls that the planner of PostgreSQL does not fold
+/// are left alone, and the parameter values of the lambdas being run, innermost last.
 struct Lambdas {
     enabled: bool,
+    planning: bool,
     frames: Vec<(u32, [Value; 2])>,
 }
 
@@ -257,7 +314,9 @@ fn evaluate(plan: &Plan, expr: ExprRef, lambdas: &mut Lambdas) -> Result<Option<
         }
         Expr::Function { name, args } => {
             let name = plan.string(name);
-            if volatile_function(name) {
+            if volatile_function(name)
+                || (lambdas.planning && !planner_folds(name, plan.expr_list(args).len()))
+            {
                 return Ok(None);
             }
             // A call on a `TIMESTAMPTZ`, or one that makes one, reads the session zone the same way

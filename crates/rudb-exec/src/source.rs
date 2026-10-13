@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rudb_catalog::Table;
 use rudb_common::stage::{self, Stage};
-use rudb_common::{Error, Field, LogicalType, Result, Session, SessionTimeZone, SqlState, Value};
+use rudb_common::{
+    Error, Field, LogicalType, PlanErrors, Result, Session, SessionTimeZone, SqlState, Value,
+};
 use rudb_csv::{Part, Reader as CsvReader, Split};
 use rudb_encoding::sequence::Sequence;
 use rudb_functions::{
@@ -3349,6 +3351,8 @@ pub(crate) struct Series {
     listed: Option<Arc<[i64]>>,
     /// Whether a second column numbers the values from 1, which is `WITH ORDINALITY`.
     ordinality: bool,
+    /// The error of the arguments, which the first read raises in place of rows.
+    refused: Option<Error>,
     morsels: AtomicU64,
 }
 
@@ -3364,7 +3368,10 @@ impl Series {
     ///
     /// # Errors
     ///
-    /// Whatever evaluating an argument reports, and a step of zero.
+    /// Whatever evaluating an argument reports, and a step of zero. With the plan errors of
+    /// PostgreSQL, an error of the step and of the bounds comes from the first read, as the
+    /// function scan of PostgreSQL calls the function at its first fetch, after the
+    /// `RowDescription`.
     pub(crate) fn new(
         plan: &Plan,
         index: u32,
@@ -3372,8 +3379,10 @@ impl Series {
         args: Slice,
         time_zone: SessionTimeZone,
         ordinality: bool,
+        plan_errors: PlanErrors,
     ) -> Result<Self> {
-        let mut series = Self::counted(plan, index, function, args, time_zone)?;
+        let late = plan_errors == PlanErrors::Postgres;
+        let mut series = Self::counted(plan, index, function, args, time_zone, late)?;
         if ordinality {
             let mut fields = series.schema.fields().to_vec();
             fields.push(Field::new("ordinality", LogicalType::BigInt));
@@ -3390,6 +3399,7 @@ impl Series {
         function: &str,
         args: Slice,
         time_zone: SessionTimeZone,
+        late: bool,
     ) -> Result<Self> {
         let Some(function) = TableFunction::lookup(function) else {
             return Err(Error::internal(format!("a plan with a table function called {function}")));
@@ -3405,10 +3415,11 @@ impl Series {
             let schema = Schema::numbered(vec![Field::new(function.name(), ty.clone())], index);
             let empty = Self { ty, ..Self::empty(schema.clone()) };
             let values = (start.value_at(0), stop.value_at(0), step.value_at(0));
-            let Some(stepping) = moments(function, &values.0, &values.1, &values.2, time_zone)?
-            else {
-                return Ok(empty);
+            let stepping = match moments(function, &values.0, &values.1, &values.2, time_zone) {
+                Err(error) if late => return Ok(empty.refusing(error)),
+                stepping => stepping?,
             };
+            let Some(stepping) = stepping else { return Ok(empty) };
             let rows = u64::try_from(stepping.len()).unwrap_or(u64::MAX);
             return Ok(match stepping {
                 Stepping::Even { start, step, .. } => Self { start, step, rows, ..empty },
@@ -3441,8 +3452,16 @@ impl Series {
                 )));
             }
         };
-        let rows = u64::try_from(series_length(function, start, stop, step)?).unwrap_or(u64::MAX);
+        let rows = match series_length(function, start, stop, step) {
+            Err(error) if late => return Ok(Self::empty(schema).refusing(error)),
+            rows => u64::try_from(rows?).unwrap_or(u64::MAX),
+        };
         Ok(Self { start, step, rows, ..Self::empty(schema) })
+    }
+
+    /// The series whose one read raises `error`.
+    fn refusing(self, error: Error) -> Self {
+        Self { rows: 1, refused: Some(error), ..self }
     }
 
     fn empty(schema: Schema) -> Self {
@@ -3454,6 +3473,7 @@ impl Series {
             ty: LogicalType::BigInt,
             listed: None,
             ordinality: false,
+            refused: None,
             morsels: AtomicU64::new(0),
         }
     }
@@ -3488,6 +3508,9 @@ impl Source for Series {
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
+        if let Some(error) = &self.refused {
+            return Err(error.clone());
+        }
         let count = usize::try_from(morsel.remaining()).unwrap_or(usize::MAX).min(VECTOR_SIZE);
         if count == 0 {
             *out = Chunk::empty(&self.schema.types());

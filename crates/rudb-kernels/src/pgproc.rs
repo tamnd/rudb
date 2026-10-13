@@ -102,12 +102,19 @@ pub fn rows_of(src: &str) -> Option<&'static str> {
 
 /// The value of a call of a kernel of a C function, or `None` for any other name. A null
 /// argument of a strict function gives a null. The functions that are not strict, as
-/// `proisstrict` has them, see the null.
+/// `proisstrict` has them, see the null. An error of a kernel has no position in the query, as an
+/// error that a function of PostgreSQL raises has none.
 pub(crate) fn call(name: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
     let Some(src) = name.strip_prefix(PREFIX) else { return Ok(None) };
     if args.iter().any(Value::is_null) && !sees_nulls(src) {
         return Ok(Some(Value::Null));
     }
+    kernel(src, args, returns).map_err(rudb_common::Error::unplaced)
+}
+
+/// The value of the kernel of the C function `src` over `args`, which are not null where the
+/// function is strict.
+fn kernel(src: &str, args: &[Value], returns: &LogicalType) -> Result<Option<Value>> {
     if let Some(value) = pgmath::call(src, args)? {
         return Ok(Some(value));
     }

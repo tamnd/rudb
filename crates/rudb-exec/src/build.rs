@@ -2720,7 +2720,9 @@ impl<'a> Building<'a, '_> {
             }
             _ => {
                 let time_zone = self.session.session_time_zone();
-                let series = Series::new(plan, index, name, args, time_zone, ordinality)?;
+                let plan_errors = self.session.semantics().plan_errors();
+                let series =
+                    Series::new(plan, index, name, args, time_zone, ordinality, plan_errors)?;
                 let schema = series.schema().clone();
                 let counters = self.watch(reference, id, pipeline, "Series", Some(name));
                 Segment::new(Arc::new(Watched::new(series, counters)), schema)
