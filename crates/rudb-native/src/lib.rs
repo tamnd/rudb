@@ -2878,7 +2878,7 @@ impl Writer {
     /// This is a checkpoint of a table that rows were deleted from or changed in costing that
     /// table, and not every other table in the file as well. The runs the old stripes held go on
     /// the free list, and a commit two generations on writes into them once no reader of the old
-    /// table is left, see [`free`]. A table from a file older than that list gives back nothing,
+    /// table is left, see `free`. A table from a file older than that list gives back nothing,
     /// and only a rewrite of the whole file gets its space back.
     ///
     /// # Errors
@@ -5682,7 +5682,7 @@ pub struct Reader {
 /// Where a table's directory and its record of gone rows sit in a file, which tells one version of
 /// a table in a file from another: a commit that writes the table again or marks more of its rows
 /// gone writes a new one somewhere else, and the old one cannot be written over while a reader of
-/// it is open, see [`free`].
+/// it is open, see `free`.
 pub type Filed = (u64, Option<u64>);
 
 /// What [`Reader::open`] read before it returned.
