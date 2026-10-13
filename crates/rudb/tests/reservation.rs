@@ -27,7 +27,9 @@ fn database(name: &str) -> (Database, std::path::PathBuf) {
             .as_nanos()
     ));
     let database = Database::open(path.to_str().expect("a UTF-8 temporary path")).expect("opens");
-    database.execute("SET threads = 4").expect("sets the thread count");
+    // Two threads, since each thread's table can end up with every group, and four of them grew to
+    // within a few kilobytes of the limit below and failed on a CI machine.
+    database.execute("SET threads = 2").expect("sets the thread count");
     database.execute("CREATE TABLE t (k INTEGER, c INTEGER, v INTEGER)").expect("creates");
     database
         .execute("INSERT INTO t SELECT i % 390000, 7, i FROM range(0, 2000000) AS r(i)")
