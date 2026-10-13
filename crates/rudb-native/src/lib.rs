@@ -5205,7 +5205,7 @@ fn give_entry(
 }
 
 /// The runs the directory of `entry` says its table owns.
-fn owned_by(file: &dyn rudb_io::File, entry: &Entry, size: u64) -> Result<Vec<(u64, u64)>> {
+fn owned_by<F: Positional + ?Sized>(file: &F, entry: &Entry, size: u64) -> Result<Vec<(u64, u64)>> {
     let mut directory = vec![0; entry.directory.length as usize];
     read_at(file, entry.directory.offset, &mut directory)?;
     if checksum(&directory) != entry.directory.hash {
@@ -8099,6 +8099,24 @@ impl Catalog {
     /// generation would have to carry, so the count has to come out of the catalog beside the name.
     pub fn rows(&self) -> impl ExactSizeIterator<Item = (&str, usize)> {
         self.entries.iter().map(|entry| (entry.name.as_str(), entry.rows))
+    }
+
+    /// The bytes the table called `name` takes in the file: the runs its directory says it owns and
+    /// the directory itself. Nothing for a name the file does not hold.
+    ///
+    /// A checkpoint after a drop weighs this against what the tables it keeps hold, to tell a
+    /// staging table that was a small share of the file from a drop that leaves it mostly dead.
+    ///
+    /// # Errors
+    ///
+    /// If the table's directory cannot be read or does not checksum.
+    pub fn held_bytes(&self, name: &str) -> Result<u64> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.name == name) else {
+            return Ok(0);
+        };
+        let owned = owned_by(&*self.file, entry, self.size)?;
+        let runs = owned.iter().map(|(_, length)| *length).sum::<u64>();
+        Ok(runs.saturating_add(u64::from(entry.directory.length)))
     }
 
     /// The views in the file, in the order they were written.

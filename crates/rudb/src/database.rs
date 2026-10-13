@@ -2040,11 +2040,11 @@ impl Database {
 /// makes the whole of it atomic. A checkpoint over a catalog where nothing changed still does
 /// nothing.
 ///
-/// The rewrite below it is still there for the cases the append cannot answer. Carrying a table
-/// forward means carrying forward what the committed generation says, so a generation that names a
-/// table the catalog no longer has, or does not name one the catalog says is native, is one where
-/// the file and the catalog disagree about which tables exist, and the honest answer is to write
-/// all of them again.
+/// The rewrite below it is still there for the cases the append cannot answer. A generation that
+/// names a table the catalog dropped since leaves it out and gives its space to the free list, as
+/// long as the tables kept hold more than it did. One that does not name a table the catalog says
+/// is native is one where the file and the catalog disagree about which tables exist, and the
+/// honest answer is to write all of them again.
 ///
 /// The tables are rebound afterwards. Without that the catalog would go on reading the generation
 /// before this one, which still answers correctly because its bytes are unchanged, but which would
@@ -2845,12 +2845,13 @@ fn persist_anchored(
     });
     // A table dropped since the file was committed is left out of the new catalog and its runs go
     // on the free list, which keeps a drop from costing the whole file written again. That is only
-    // done while what is left holds most of the file, for the reason [`mostly_live`] gives.
+    // done while what is left holds more than the dropped tables did, see [`outweighs_dropped`].
     let dropped = held.as_ref().map(|held| dropped(&held.tables, &names)).unwrap_or_default();
     if restated
         && marked
         && held.as_ref().is_some_and(|held| wanted(&names).is_subset(&held.tables))
-        && (dropped.is_empty() || mostly_live(path, catalog, &names, &BTreeMap::new())?)
+        && (dropped.is_empty()
+            || outweighs_dropped(path, catalog, &names, &BTreeMap::new(), &dropped)?)
     {
         rudb_native::Writer::restate_dropping(path, &views, anchor, &marks, &dropped)?;
         rebind(path, catalog, &names, pages)?;
@@ -3885,7 +3886,10 @@ fn appended(
     if !carried || !native.iter().all(|name| held.contains_key(name)) {
         return Ok(None);
     }
-    if (rewritten || emptied) && !mostly_live(path, catalog, names, &extended)? {
+    if rewritten && !mostly_live(path, catalog, names, &extended)? {
+        return Ok(None);
+    }
+    if emptied && !outweighs_dropped(path, catalog, names, &extended, &dropped)? {
         return Ok(None);
     }
     let mut writer: Option<rudb_native::Writer> = None;
@@ -3960,6 +3964,41 @@ fn mostly_live(
     extended: &BTreeMap<String, usize>,
 ) -> Result<bool> {
     let size = std::fs::metadata(path)?.len();
+    Ok(live_bytes(catalog, names, extended)?.saturating_mul(2) >= size)
+}
+
+/// Whether the tables a checkpoint keeps hold at least as much of the file as the tables of
+/// `dropped` held before they were dropped, so leaving those out leaves a file at least half live
+/// as far as tables go.
+///
+/// This is not [`mostly_live`], which weighs the tables kept against the whole file, because a
+/// small file is mostly statistics, sketches and catalogs, and those count as dead there. A load
+/// that sorts each table through a staging table drops one the size of the table it just filled,
+/// and weighed against the file that was a rewrite of the database for a table that was a small
+/// share of it. The space a drop gives back goes on the free list and the next tables are written into
+/// it, so what has to stay bounded is how much a single drop leaves dead, not the file's overhead.
+fn outweighs_dropped(
+    path: &Path,
+    catalog: &Catalog,
+    names: &[QualifiedName],
+    extended: &BTreeMap<String, usize>,
+    dropped: &[String],
+) -> Result<bool> {
+    let held = rudb_native::Catalog::open(path)?;
+    let mut dead = 0u64;
+    for name in dropped {
+        dead = dead.saturating_add(held.held_bytes(name)?);
+    }
+    Ok(live_bytes(catalog, names, extended)? >= dead)
+}
+
+/// The bytes the tables a checkpoint keeps where they are take in the file, the share of each a
+/// table with rows gone from it still reads, see [`mostly_live`].
+fn live_bytes(
+    catalog: &Catalog,
+    names: &[QualifiedName],
+    extended: &BTreeMap<String, usize>,
+) -> Result<u64> {
     let mut live = 0u64;
     for name in names {
         let reader = match catalog.table(name)?.rows() {
@@ -3982,7 +4021,7 @@ fn mostly_live(
         }
         live = live.saturating_add(held).saturating_add(layout.directory);
     }
-    Ok(live.saturating_mul(2) >= size)
+    Ok(live)
 }
 
 /// How many rows a checkpoint gathers small chunks into before writing them as one part.
