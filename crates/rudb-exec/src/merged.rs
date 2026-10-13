@@ -29,7 +29,9 @@
 //! the last thing compared, so no two rows are ever equal and the answer does not depend on how
 //! many threads ran or, now, on where the spills happened to fall.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -37,13 +39,39 @@ use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_pipeline::{Morsel, Progress, Source};
 use rudb_vector::{Assembly, Chunk, Data, StringColumn, VECTOR_SIZE, Vector};
 
-use crate::runs::Runs;
+use crate::runs::{Reader, Runs};
 
 /// How many bytes of a run's ordering column are the normalized key.
 pub(crate) const KEY: usize = crate::normal::WIDTH;
 
 /// How wide a run's ordering column is: the key and then the arrival.
 pub(crate) const ORDER: usize = KEY + 16;
+
+/// How many rows a piece of a merge holds before the next key starts a new one.
+///
+/// A piece is a morsel, and the load under a clustered sort never lets a stripe span two of them,
+/// so a piece is at least two full stripes wherever the keys allow it. Past that a bigger piece
+/// only means fewer of them to spread over the threads.
+const PIECE_ROWS: usize = 1 << 20;
+
+/// One sorted run, and where in it each value of the leading key starts.
+#[derive(Debug)]
+pub(crate) struct Run {
+    pub(crate) file: Runs,
+    /// The run's stretches in key order, or `None` for a run whose leading key changes too often
+    /// for its stretches to be worth listing.
+    pub(crate) stretches: Option<Vec<Stretch>>,
+}
+
+/// The rows of one run that share a value of the leading sort key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stretch {
+    /// The normalized bytes of that value, which order the way the values do.
+    pub(crate) key: Vec<u8>,
+    /// The run's blocks those rows are in, which hold no other rows.
+    pub(crate) blocks: Range<usize>,
+    pub(crate) rows: usize,
+}
 
 /// The rows of a finished sort, however they ended up being held.
 ///
@@ -65,8 +93,33 @@ enum Stage {
     Waiting,
     /// It all fitted, so this is the answer.
     Held(Vec<Chunk>),
-    /// It did not, so this is the runs it went to and how far the merge has got.
+    /// It did not, so this is the runs it went to, cut into pieces that merge on their own.
+    Merging(Arc<Pieces>),
+}
+
+/// A merge cut where the leading key changes, so that each piece is a merge of its own over one
+/// stretch of every run and the pieces can run at once.
+///
+/// A run is sorted, so its rows for one value of the leading key are one stretch of it, and a
+/// spilled run is cut into blocks at those places. A piece covering a range of values is then a
+/// merge over a range of blocks of each run, and the pieces in key order are the whole answer in
+/// order. That is what a clustered load needs, since its leading key is the partition and has a
+/// few hundred values at most: one merge of every run was one thread encoding the whole table.
+#[derive(Debug)]
+struct Pieces {
+    files: Vec<Arc<Runs>>,
+    pieces: Vec<Mutex<Piece>>,
+    types: Vec<LogicalType>,
+}
+
+/// How far one piece of a merge has got.
+#[derive(Debug)]
+enum Piece {
+    /// Nothing read yet: the blocks of each run the piece covers, by the run's place in
+    /// [`Pieces::files`].
+    Waiting(Vec<(usize, Range<usize>)>),
     Merging(Merge),
+    Spent,
 }
 
 impl Default for Sorted {
@@ -101,14 +154,81 @@ impl Sorted {
     /// # Errors
     ///
     /// The same as [`Sorted::hold`], and whatever reading the first chunk of each run reports.
-    pub(crate) fn merge(&self, files: Vec<Runs>, types: Vec<LogicalType>) -> Result<()> {
-        let mut heads = Vec::with_capacity(files.len());
-        for file in files {
-            heads.push(Head::opening(file)?);
+    pub(crate) fn merge(&self, files: Vec<Run>, types: Vec<LogicalType>) -> Result<()> {
+        self.merge_in(files, types, PIECE_ROWS)
+    }
+
+    /// [`Sorted::merge`] with pieces of `rows` rows.
+    fn merge_in(&self, files: Vec<Run>, types: Vec<LogicalType>, rows: usize) -> Result<()> {
+        let mut finished = Vec::with_capacity(files.len());
+        let mut stretches = Vec::with_capacity(files.len());
+        for Run { mut file, stretches: listed } in files {
+            file.finish()?;
+            finished.push(Arc::new(file));
+            stretches.push(listed);
         }
-        *self.stage.lock().map_err(poisoned)? = Stage::Merging(Merge { heads, types });
+        let pieces = cut(&finished, &stretches, rows)
+            .into_iter()
+            .map(|blocks| Mutex::new(Piece::Waiting(blocks)))
+            .collect();
+        *self.stage.lock().map_err(poisoned)? =
+            Stage::Merging(Arc::new(Pieces { files: finished, pieces, types }));
         Ok(())
     }
+}
+
+/// The pieces a merge of `files` is cut into, each as the blocks of every run it covers, in key
+/// order.
+///
+/// One piece of everything unless every run listed its stretches. Otherwise the values of the
+/// leading key are taken in order and a piece closes at the first value that takes it to `rows`
+/// rows, so a value is never split between two pieces and a piece holds whole stripes.
+fn cut(
+    files: &[Arc<Runs>],
+    stretches: &[Option<Vec<Stretch>>],
+    rows: usize,
+) -> Vec<Vec<(usize, Range<usize>)>> {
+    let whole = || {
+        files
+            .iter()
+            .enumerate()
+            .map(|(at, file)| (at, 0..usize::try_from(file.chunks()).unwrap_or(usize::MAX)))
+            .collect::<Vec<_>>()
+    };
+    let Some(listed) = stretches.iter().map(Option::as_deref).collect::<Option<Vec<_>>>() else {
+        return vec![whole()];
+    };
+    let mut counts: BTreeMap<&[u8], usize> = BTreeMap::new();
+    for stretch in listed.iter().flat_map(|stretches| stretches.iter()) {
+        *counts.entry(stretch.key.as_slice()).or_default() += stretch.rows;
+    }
+    // Where each piece after the first starts, as the first value it holds.
+    let mut starts: Vec<&[u8]> = Vec::new();
+    let mut held = 0;
+    for (key, count) in counts {
+        if held >= rows {
+            starts.push(key);
+            held = 0;
+        }
+        held += count;
+    }
+    if starts.is_empty() {
+        return vec![whole()];
+    }
+    let mut pieces = vec![Vec::new(); starts.len() + 1];
+    for (at, stretches) in listed.iter().enumerate() {
+        let mut from = 0;
+        for (piece, blocks) in pieces.iter_mut().enumerate() {
+            let to = starts.get(piece).map_or(stretches.len(), |start| {
+                from + stretches[from..].partition_point(|stretch| stretch.key.as_slice() < *start)
+            });
+            if from < to {
+                blocks.push((at, stretches[from].blocks.start..stretches[to - 1].blocks.end));
+            }
+            from = to;
+        }
+    }
+    pieces
 }
 
 /// How many of a fitted sort's `chunks` go in one morsel, for a sink that asked for `asked` rows in
@@ -138,10 +258,13 @@ impl Source for Sorted {
                 let end = start.saturating_add(per).min(chunks.len() as u64);
                 (start < end).then(|| Morsel::new(index, start, end))
             }
-            // One morsel ever. A merge is a single pass over every run at once and a second thread
-            // taking a morsel of it would be a second pass, which is a different answer and not a
-            // faster one.
-            Stage::Waiting | Stage::Merging(_) => (index == 0).then(|| Morsel::new(0, 0, 1)),
+            // A morsel a piece. A piece is a single pass over its stretch of every run and a second
+            // thread taking a morsel of it would be a second pass, which is a different answer and
+            // not a faster one.
+            Stage::Merging(pieces) => {
+                (index < pieces.pieces.len() as u64).then(|| Morsel::new(index, 0, 1))
+            }
+            Stage::Waiting => (index == 0).then(|| Morsel::new(0, 0, 1)),
         }
     }
 
@@ -156,7 +279,7 @@ impl Source for Sorted {
                 Some(morsels.min(threads).min(useful))
             }
             Stage::Waiting => Some(0),
-            Stage::Merging(_) => Some(1),
+            Stage::Merging(pieces) => Some(pieces.pieces.len()),
         }
     }
 
@@ -167,8 +290,8 @@ impl Source for Sorted {
     }
 
     fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
-        let mut stage = self.stage.lock().map_err(poisoned)?;
-        match &mut *stage {
+        let stage = self.stage.lock().map_err(poisoned)?;
+        match &*stage {
             Stage::Held(chunks) => {
                 let index = morsel.cursor() as usize;
                 let Some(chunk) = chunks.get(index) else {
@@ -179,23 +302,57 @@ impl Source for Sorted {
                 Ok(if morsel.is_drained() { Progress::Done } else { Progress::More })
             }
             Stage::Waiting => Err(Error::internal("a sort was read before it finished")),
-            Stage::Merging(merge) => match merge.next()? {
-                Some(chunk) => {
-                    *out = chunk;
-                    // Done only when the runs are empty, because a morsel that drains on its first
-                    // chunk would take the rest of the merge with it.
-                    if merge.spent() {
-                        morsel.advance(1);
-                        return Ok(Progress::Done);
-                    }
-                    Ok(Progress::More)
-                }
-                None => {
-                    *out = Chunk::empty(&merge.types);
-                    morsel.advance(1);
-                    Ok(Progress::Done)
-                }
-            },
+            Stage::Merging(pieces) => {
+                // Let go of the stage before the merge, which is what lets the pieces run at once.
+                let pieces = Arc::clone(pieces);
+                drop(stage);
+                pieces.read(morsel, out)
+            }
+        }
+    }
+}
+
+impl Pieces {
+    /// The next chunk of the piece `morsel` is, opening the piece on its first read.
+    fn read(&self, morsel: &mut Morsel, out: &mut Chunk) -> Result<Progress> {
+        let Some(piece) = usize::try_from(morsel.index()).ok().and_then(|at| self.pieces.get(at))
+        else {
+            return Err(Error::internal(format!("{morsel} asks for a piece nobody cut")));
+        };
+        let mut piece = piece.lock().map_err(poisoned)?;
+        if let Piece::Waiting(blocks) = &*piece {
+            let mut heads = Vec::with_capacity(blocks.len());
+            for (file, blocks) in blocks {
+                let Some(file) = self.files.get(*file) else {
+                    return Err(Error::internal("a piece of a merge names a run it does not have"));
+                };
+                heads.push(Head::opening(file.reader(blocks.clone())?)?);
+            }
+            *piece = Piece::Merging(Merge { heads, types: self.types.clone() });
+        }
+        let next = match &mut *piece {
+            Piece::Merging(merge) => merge.next()?.map(|chunk| (chunk, merge.spent())),
+            Piece::Waiting(_) | Piece::Spent => None,
+        };
+        match next {
+            // Done only when the runs are empty, because a morsel that drains on its first chunk
+            // would take the rest of the piece with it.
+            Some((chunk, false)) => {
+                *out = chunk;
+                Ok(Progress::More)
+            }
+            Some((chunk, true)) => {
+                *out = chunk;
+                *piece = Piece::Spent;
+                morsel.advance(1);
+                Ok(Progress::Done)
+            }
+            None => {
+                *out = Chunk::empty(&self.types);
+                *piece = Piece::Spent;
+                morsel.advance(1);
+                Ok(Progress::Done)
+            }
         }
     }
 }
@@ -285,7 +442,7 @@ fn laid(types: &[LogicalType], pieces: &[Chunk], rows: usize) -> Result<Chunk> {
 /// One sorted run, with the chunk of it the merge is currently looking at.
 #[derive(Debug)]
 struct Head {
-    file: Runs,
+    file: Reader,
     /// The payload of the chunk being read, with the ordering column taken off.
     chunk: Chunk,
     /// The ordering column of that chunk, which is what the merge compares.
@@ -295,7 +452,7 @@ struct Head {
 
 impl Head {
     /// A run with its first chunk read.
-    fn opening(file: Runs) -> Result<Self> {
+    fn opening(file: Reader) -> Result<Self> {
         let empty = Vector::constant(LogicalType::Blob, Value::Null, 0);
         let mut head = Self { file, chunk: Chunk::empty(&[]), order: empty, at: 0 };
         head.refill()?;
@@ -383,14 +540,16 @@ impl fmt::Display for Sorted {
             Ok(stage) => match &*stage {
                 Stage::Held(chunks) => write!(f, "{} sorted chunks", chunks.len()),
                 Stage::Waiting => write!(f, "a sort that has not finished"),
-                Stage::Merging(merge) => {
-                    let rows: u64 = merge.heads.iter().map(|head| head.file.rows()).sum();
-                    let bytes: u64 = merge.heads.iter().map(|head| head.file.bytes()).sum();
-                    let chunks: u64 = merge.heads.iter().map(|head| head.file.chunks()).sum();
+                Stage::Merging(pieces) => {
+                    let rows: u64 = pieces.files.iter().map(|file| file.rows()).sum();
+                    let bytes: u64 = pieces.files.iter().map(|file| file.bytes()).sum();
+                    let chunks: u64 = pieces.files.iter().map(|file| file.chunks()).sum();
                     write!(
                         f,
-                        "a merge of {} runs, {rows} rows in {chunks} chunks and {bytes} bytes",
-                        merge.heads.len()
+                        "a merge of {} runs in {} pieces, {rows} rows in {chunks} chunks and \
+                         {bytes} bytes",
+                        pieces.files.len(),
+                        pieces.pieces.len()
                     )
                 }
             },
@@ -405,7 +564,8 @@ mod tests {
     use rudb_vector::{Data, Vector};
 
     use super::{
-        Chunk, KEY, ORDER, Progress, Runs, Sorted, Source, VECTOR_SIZE, order_of, ordering,
+        Chunk, KEY, ORDER, Progress, Run, Runs, Sorted, Source, Stretch, VECTOR_SIZE, order_of,
+        ordering,
     };
 
     /// A run of the given keys, each one a row whose payload is the key as a `BIGINT`.
@@ -413,9 +573,14 @@ mod tests {
     /// The arrival is the run's number and the row's place in it, which is what a real spill would
     /// have written and is what settles a tie between two runs.
     fn run(number: u64, keys: &[i64]) -> Runs {
+        cut_at(number, keys, &[]).0
+    }
+
+    /// [`run`] cut into blocks at `starts` as well, with the blocks of each stretch.
+    fn cut_at(number: u64, keys: &[i64], starts: &[usize]) -> (Runs, Vec<std::ops::Range<usize>>) {
         let types = vec![LogicalType::BigInt, LogicalType::Blob];
         let mut file = Runs::new("test", types).expect("a run file");
-        file.begin(keys.len()).expect("the row count");
+        let stretches = file.begin_at(keys.len(), starts).expect("the row count");
         let payload = Vector::flat(LogicalType::BigInt, Data::Int64(keys.to_vec().into()))
             .expect("bigints are an i64 layout");
         file.column(&payload).expect("the payload column");
@@ -430,24 +595,44 @@ mod tests {
                 order_of(&bytes, (number, at as u64))
             })
             .collect();
-        for block in orders.chunks(VECTOR_SIZE) {
-            file.part(&ordering(block).expect("blobs")).expect("the ordering column");
+        let blocks: Vec<_> = file.blocks().collect();
+        for block in blocks {
+            file.part(&ordering(&orders[block]).expect("blobs")).expect("the ordering column");
         }
-        file
+        (file, stretches)
     }
 
-    /// Everything a merge of these runs gives back, in the order it gives it.
-    fn merged(files: Vec<Runs>) -> Vec<i64> {
-        let sorted = Sorted::new();
-        sorted.merge(files, vec![LogicalType::BigInt]).expect("the runs open");
+    /// A run cut wherever its key changes, with its stretches listed, which is what a sort that
+    /// spilled writes when the key is the leading one.
+    fn listed(number: u64, keys: &[i64]) -> Run {
+        let starts: Vec<usize> =
+            (0..keys.len()).filter(|&row| row == 0 || keys[row] != keys[row - 1]).collect();
+        let (file, blocks) = cut_at(number, keys, &starts);
+        let stretches = starts
+            .iter()
+            .zip(blocks.into_iter().skip(1))
+            .enumerate()
+            .map(|(at, (&start, blocks))| Stretch {
+                key: (keys[start] as u64 ^ (1 << 63)).to_be_bytes().to_vec(),
+                blocks,
+                rows: starts.get(at + 1).copied().unwrap_or(keys.len()) - start,
+            })
+            .collect();
+        Run { file, stretches: Some(stretches) }
+    }
+
+    /// Everything that comes out of `sorted`, a morsel at a time, with the morsels in the order
+    /// they were handed out.
+    fn drained(sorted: &Sorted) -> Vec<Vec<i64>> {
         let mut out = Vec::new();
         while let Some(mut morsel) = sorted.morsel() {
+            let mut values = Vec::new();
             loop {
                 let mut chunk = Chunk::empty(&[]);
                 let progress = sorted.read(&mut morsel, &mut chunk).expect("a chunk");
                 for row in 0..chunk.len() {
                     match chunk.value_at(row, 0) {
-                        Value::BigInt(value) => out.push(value),
+                        Value::BigInt(value) => values.push(value),
                         other => panic!("a {other} came out of a BIGINT column"),
                     }
                 }
@@ -455,8 +640,53 @@ mod tests {
                     break;
                 }
             }
+            out.push(values);
         }
         out
+    }
+
+    /// Everything a merge of these runs gives back, in the order it gives it.
+    fn merged(files: Vec<Runs>) -> Vec<i64> {
+        let sorted = Sorted::new();
+        let files = files.into_iter().map(|file| Run { file, stretches: None }).collect();
+        sorted.merge(files, vec![LogicalType::BigInt]).expect("the runs open");
+        drained(&sorted).concat()
+    }
+
+    /// Runs that list their stretches merge as pieces, each piece a run of whole keys, and the
+    /// pieces in the order they are handed out are the whole answer in order.
+    #[test]
+    fn runs_cut_by_key_merge_as_pieces_in_key_order() {
+        let first: Vec<i64> = (0..VECTOR_SIZE as i64 + 30).map(|row| row / 100).collect();
+        let second: Vec<i64> = (0..500).map(|row| row / 50 + 3).collect();
+        let mut want: Vec<i64> = first.iter().chain(second.iter()).copied().collect();
+        want.sort_unstable();
+        let sorted = Sorted::new();
+        let files = vec![listed(0, &first), listed(1, &second)];
+        sorted.merge_in(files, vec![LogicalType::BigInt], 300).expect("the runs open");
+        let pieces = sorted.morsels(16, 1).expect("merging");
+        assert!(pieces > 3, "{pieces} pieces");
+        let answer = drained(&sorted);
+        assert_eq!(answer.len(), pieces);
+        for pair in answer.windows(2) {
+            let (Some(last), Some(next)) = (pair[0].last(), pair[1].first()) else {
+                panic!("an empty piece");
+            };
+            assert!(last < next, "a key split between two pieces");
+        }
+        assert_eq!(answer.concat(), want);
+    }
+
+    /// One run that did not list its stretches is enough to merge everything as one piece, since
+    /// nothing says where its keys are.
+    #[test]
+    fn a_run_without_stretches_merges_as_one_piece() {
+        let sorted = Sorted::new();
+        let files =
+            vec![listed(0, &[1, 1, 2, 3]), Run { file: run(1, &[1, 2, 2, 4]), stretches: None }];
+        sorted.merge_in(files, vec![LogicalType::BigInt], 1).expect("the runs open");
+        assert_eq!(sorted.morsels(16, 1), Some(1));
+        assert_eq!(drained(&sorted).concat(), vec![1, 1, 1, 2, 2, 2, 3, 4]);
     }
 
     #[test]

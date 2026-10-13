@@ -64,7 +64,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rudb_common::{Error, LogicalType, Result, Value};
 use rudb_vector::{Buffer, Chunk, Data, StringColumn, VECTOR_SIZE, Validity, Vector};
@@ -97,6 +99,9 @@ pub(crate) struct Runs {
     begun: bool,
     rows: usize,
     blocks: usize,
+    /// The row each block starts at, and then the row count, so block `n` is the rows from
+    /// `cuts[n]` to `cuts[n + 1]`.
+    cuts: Vec<usize>,
     /// Where each column's stretch of the file starts, one per column once it has been written.
     starts: Vec<u64>,
     /// How many bytes each block of each column takes, by column and then by block.
@@ -104,10 +109,12 @@ pub(crate) struct Runs {
     /// The column being written, and how many of its blocks have gone out.
     column: usize,
     block: usize,
-    /// How many blocks the reader has handed back.
+    /// How many blocks [`Runs::next_chunk`] has handed back.
+    #[cfg(test)]
     read: usize,
-    /// Where each column's cursor has got to, which is only meaningful once reading has started.
-    cursors: Vec<u64>,
+    /// Where each block of each column starts in the file, by column and then by block, which is
+    /// only filled in once the writing is finished.
+    offsets: Vec<Vec<u64>>,
     bytes: u64,
 }
 
@@ -144,12 +151,14 @@ impl Runs {
             begun: false,
             rows: 0,
             blocks: 0,
+            cuts: vec![0],
             starts: Vec::new(),
             spans: Vec::new(),
             column: 0,
             block: 0,
+            #[cfg(test)]
             read: 0,
-            cursors: Vec::new(),
+            offsets: Vec::new(),
             bytes: 0,
         })
     }
@@ -177,14 +186,61 @@ impl Runs {
     /// # Errors
     ///
     /// If the file has already been begun.
+    #[cfg(test)]
     pub(crate) fn begin(&mut self, rows: usize) -> Result<()> {
+        self.begin_at(rows, &[]).map(drop)
+    }
+
+    /// Says how many rows the run holds, and that a block has to start at each of `starts` as well
+    /// as every [`VECTOR_SIZE`] rows after one.
+    ///
+    /// What comes back is the blocks each stretch covers, one range for the rows before the first
+    /// start and one for each start, so that a reader can be handed a stretch and read nothing
+    /// either side of it. A sort that spills cuts its run where its leading key changes, and a
+    /// merge of one key's rows then reads only that key's blocks of every run.
+    ///
+    /// # Errors
+    ///
+    /// If the file has already been begun, or if the starts are not in order and inside the rows.
+    pub(crate) fn begin_at(&mut self, rows: usize, starts: &[usize]) -> Result<Vec<Range<usize>>> {
         if self.begun {
             return Err(Error::internal("a run file was begun twice"));
         }
+        if starts.windows(2).any(|pair| pair[0] >= pair[1]) || starts.last() > Some(&rows) {
+            return Err(Error::internal("a run file was cut out of order"));
+        }
         self.begun = true;
         self.rows = rows;
-        self.blocks = rows.div_ceil(VECTOR_SIZE);
-        Ok(())
+        let mut cuts = Vec::with_capacity(rows.div_ceil(VECTOR_SIZE) + starts.len() + 1);
+        let mut stretches = Vec::with_capacity(starts.len() + 1);
+        let mut from = 0;
+        for &end in starts.iter().chain(std::iter::once(&rows)) {
+            let first = cuts.len();
+            let mut at = from;
+            while at < end {
+                cuts.push(at);
+                at = (at + VECTOR_SIZE).min(end);
+            }
+            stretches.push(first..cuts.len());
+            from = end;
+        }
+        self.blocks = cuts.len();
+        cuts.push(rows);
+        self.cuts = cuts;
+        Ok(stretches)
+    }
+
+    /// The rows each block holds, in order, once the file is begun.
+    pub(crate) fn blocks(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.cuts.windows(2).map(|pair| pair[0]..pair[1])
+    }
+
+    /// The rows block `block` starts at, and how many it holds.
+    fn cut(&self, block: usize) -> Result<(usize, usize)> {
+        match (self.cuts.get(block), self.cuts.get(block + 1)) {
+            (Some(&from), Some(&to)) => Ok((from, to - from)),
+            _ => Err(Error::internal("a run file block past the last one")),
+        }
     }
 
     /// Writes a whole column, which is the ordinary way in.
@@ -204,8 +260,8 @@ impl Runs {
             )));
         }
         for block in 0..self.blocks {
-            let at = block * VECTOR_SIZE;
-            self.part(&whole.slice(at, (self.rows - at).min(VECTOR_SIZE))?)?;
+            let (at, rows) = self.cut(block)?;
+            self.part(&whole.slice(at, rows)?)?;
         }
         Ok(())
     }
@@ -232,8 +288,7 @@ impl Runs {
                 self.types.len()
             )));
         };
-        let at = self.block * VECTOR_SIZE;
-        let rows = (self.rows - at).min(VECTOR_SIZE);
+        let (_, rows) = self.cut(self.block)?;
         if values.len() != rows {
             return Err(Error::internal(format!(
                 "a run file block of {rows} rows was given {}",
@@ -276,62 +331,134 @@ impl Runs {
 
     /// The next chunk, or `None` once they have all come back.
     ///
-    /// The first call finishes the writing and sets each column's cursor to where its stretch of
-    /// the file begins, so there is no separate step for it and no reader borrowing this. That
-    /// matters because the thing that reads these holds a stack of them at once, one per run, and a
-    /// reader that borrowed its file would make that self referential.
+    /// The first call finishes the writing, see [`Runs::finish`]. Only the tests read a run this
+    /// way: a merge takes a [`Runs::reader`] for each stretch it reads, even when that is the whole
+    /// run.
     ///
     /// # Errors
     ///
     /// If the buffered writes cannot be flushed, if fewer columns were written than the file was
     /// opened with, if the read fails, or if the file says a layout the column's type does not
     /// allow, which is a bug in this file rather than anything a query can cause.
+    #[cfg(test)]
     pub(crate) fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        if let Some(mut writer) = self.writer.take() {
-            writer.flush().map_err(|e| Error::io(format!("could not finish a run file: {e}")))?;
-            let file = writer
-                .into_inner()
-                .map_err(|e| Error::io(format!("could not finish a run file: {e}")))?;
-            if self.blocks > 0 && self.starts.len() != self.types.len() {
-                return Err(Error::internal(format!(
-                    "a run file of {} columns was read with {} of them written",
-                    self.types.len(),
-                    self.starts.len()
-                )));
-            }
-            self.cursors.clone_from(&self.starts);
-            self.reader = Some(file);
-        }
+        self.finish()?;
         if self.read >= self.blocks {
             return Ok(None);
         }
-        let block = self.read;
-        let at = block * VECTOR_SIZE;
-        let rows = (self.rows - at).min(VECTOR_SIZE);
+        let Some(mut file) = self.reader.take() else {
+            return Err(Error::internal("a run file was read before it was written"));
+        };
+        let chunk = self.read_block(&mut file, self.read, &mut Vec::new());
+        self.reader = Some(file);
+        self.read += 1;
+        chunk.map(Some)
+    }
+
+    /// Finishes the writing, so that the file can be read, and does nothing the second time.
+    ///
+    /// # Errors
+    ///
+    /// If the buffered writes cannot be flushed, or if fewer columns were written than the file was
+    /// opened with.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        let Some(mut writer) = self.writer.take() else { return Ok(()) };
+        writer.flush().map_err(|e| Error::io(format!("could not finish a run file: {e}")))?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| Error::io(format!("could not finish a run file: {e}")))?;
+        if self.blocks > 0 && self.starts.len() != self.types.len() {
+            return Err(Error::internal(format!(
+                "a run file of {} columns was read with {} of them written",
+                self.types.len(),
+                self.starts.len()
+            )));
+        }
+        self.offsets = self
+            .starts
+            .iter()
+            .zip(&self.spans)
+            .map(|(&start, spans)| {
+                let mut at = start;
+                spans
+                    .iter()
+                    .map(|span| {
+                        let here = at;
+                        at += span;
+                        here
+                    })
+                    .collect()
+            })
+            .collect();
+        self.reader = Some(file);
+        Ok(())
+    }
+
+    /// A reader of `blocks` with a file handle of its own, so that several can read one run at
+    /// once, each from a different place in it.
+    ///
+    /// # Errors
+    ///
+    /// If the run was not finished, if the blocks are not the run's, or if the file cannot be
+    /// opened again.
+    pub(crate) fn reader(self: &Arc<Self>, blocks: Range<usize>) -> Result<Reader> {
+        if self.writer.is_some() || blocks.end > self.blocks {
+            return Err(Error::internal("a run file was read before it was finished"));
+        }
+        let file = File::open(&self.path).map_err(|e| {
+            Error::io(format!("could not open a run file at {}: {e}", self.path.display()))
+        })?;
+        Ok(Reader { runs: Arc::clone(self), file, next: blocks.start, end: blocks.end })
+    }
+
+    /// Reads block `block` of every column through `file`, with `bytes` as the buffer.
+    fn read_block(&self, file: &mut File, block: usize, bytes: &mut Vec<u8>) -> Result<Chunk> {
+        let (_, rows) = self.cut(block)?;
         let mut columns = Vec::with_capacity(self.types.len());
-        let mut bytes = Vec::new();
         for (position, ty) in self.types.iter().enumerate() {
-            let (Some(file), Some(span), Some(cursor)) = (
-                self.reader.as_mut(),
+            let (Some(span), Some(offset)) = (
                 self.spans.get(position).and_then(|spans| spans.get(block)),
-                self.cursors.get_mut(position),
+                self.offsets.get(position).and_then(|offsets| offsets.get(block)),
             ) else {
                 return Err(Error::internal("a run file was read before it was written"));
             };
-            file.seek(SeekFrom::Start(*cursor))
+            file.seek(SeekFrom::Start(*offset))
                 .map_err(|e| Error::io(format!("could not seek in a run file: {e}")))?;
             bytes.clear();
             bytes.resize(usize::try_from(*span).unwrap_or(usize::MAX), 0);
-            file.read_exact(&mut bytes)
+            file.read_exact(bytes)
                 .map_err(|e| Error::io(format!("could not read a run file: {e}")))?;
-            *cursor += *span;
-            let mut src: &[u8] = &bytes;
+            let mut src: &[u8] = bytes;
             let validity = take_validity(&mut src, rows)?;
             let column = take_payload(&mut src, ty, rows)?;
             columns.push(column.with_validity(validity));
         }
-        self.read += 1;
-        Ok(Some(Chunk::with_rows(columns, rows)?))
+        Chunk::with_rows(columns, rows)
+    }
+}
+
+/// Some of the blocks of a finished run, read in order through a file handle of its own.
+#[derive(Debug)]
+pub(crate) struct Reader {
+    runs: Arc<Runs>,
+    file: File,
+    next: usize,
+    end: usize,
+}
+
+impl Reader {
+    /// The next block, or `None` once the stretch is read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runs::next_chunk`].
+    pub(crate) fn next_chunk(&mut self) -> Result<Option<Chunk>> {
+        if self.next >= self.end {
+            return Ok(None);
+        }
+        let chunk = self.runs.read_block(&mut self.file, self.next, &mut Vec::new())?;
+        self.next += 1;
+        Ok(Some(chunk))
     }
 }
 
@@ -635,6 +762,36 @@ mod tests {
     /// Every row of a chunk, as values, for comparing against what a run gave back.
     fn rows_in(chunk: &Chunk) -> Vec<Vec<Value>> {
         (0..chunk.len()).map(|row| chunk.row(row).collect()).collect()
+    }
+
+    /// A run cut at given rows has blocks that start there, and a reader of one stretch of it reads
+    /// that stretch and nothing either side.
+    #[test]
+    fn a_run_cut_at_given_rows_reads_back_a_stretch_at_a_time() {
+        let rows = VECTOR_SIZE + 10;
+        let numbers: Vec<i32> = (0..rows as i32).collect();
+        let mut runs = Runs::new("test-cut", vec![LogicalType::Integer]).expect("a temporary file");
+        assert_eq!(runs.begin_at(rows, &[3, 5]).expect("in order"), vec![0..1, 1..2, 2..4]);
+        runs.column(&ints(&numbers)).expect("a column");
+        runs.finish().expect("finished");
+        let runs = std::sync::Arc::new(runs);
+        let mut reader = runs.reader(2..4).expect("a reader");
+        let mut back = Vec::new();
+        while let Some(chunk) = reader.next_chunk().expect("readable") {
+            back.extend(rows_in(&chunk).into_iter().map(|mut row| row.remove(0)));
+        }
+        assert_eq!(back, (5..rows as i32).map(Value::Integer).collect::<Vec<_>>());
+        let mut first = runs.reader(0..1).expect("a reader");
+        assert_eq!(first.next_chunk().expect("readable").map(|chunk| chunk.len()), Some(3));
+        assert!(first.next_chunk().expect("readable").is_none());
+    }
+
+    #[test]
+    fn a_run_cut_out_of_order_is_refused() {
+        let mut runs = Runs::new("test-cut-order", vec![LogicalType::Integer]).expect("a file");
+        assert!(runs.begin_at(10, &[5, 3]).is_err());
+        let mut runs = Runs::new("test-cut-past", vec![LogicalType::Integer]).expect("a file");
+        assert!(runs.begin_at(10, &[11]).is_err());
     }
 
     /// The whole point: rows written a column at a time come back as rows, in order.
