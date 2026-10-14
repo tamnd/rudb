@@ -1352,3 +1352,72 @@ fn field_ids_go_in_the_schema_and_are_refused_as_the_pin_refuses_them() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn parquet_version_two_writes_the_pins_encodings_and_is_refused_as_the_pin_refuses_it() {
+    let db = Database::new();
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-version-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("makes the directory");
+    let path = root.join("v.parquet");
+    let text = |value: &str| rudb_common::Value::Varchar(value.into());
+    let query = concat!(
+        "SELECT i AS a, i::VARCHAR AS s, i / 2 AS d, i % 2 AS k, i % 2 = 0 AS b ",
+        "FROM range(20) r(i)"
+    );
+    // The encodings are the pin's for the same statements.
+    for (version, encodings) in [
+        ("v1", ["PLAIN", "PLAIN", "PLAIN", "PLAIN_DICTIONARY", "PLAIN"]),
+        (
+            "'V2'",
+            [
+                "DELTA_BINARY_PACKED",
+                "DELTA_LENGTH_BYTE_ARRAY",
+                "BYTE_STREAM_SPLIT",
+                "RLE_DICTIONARY",
+                "PLAIN",
+            ],
+        ),
+    ] {
+        let sql = format!("COPY ({query}) TO '{}' (PARQUET_VERSION {version})", path.display());
+        db.execute(&sql).expect(&sql);
+        let sql = format!("SELECT encodings FROM parquet_metadata('{}')", path.display());
+        let expected: Vec<_> = encodings.iter().map(|encoding| vec![text(encoding)]).collect();
+        assert_eq!(values(&db, &sql), expected, "{version}");
+        let sql = format!("SELECT format_version FROM parquet_file_metadata('{}')", path.display());
+        let format = if version == "v1" { 1 } else { 2 };
+        assert_eq!(values(&db, &sql), vec![vec![rudb_common::Value::BigInt(format)]]);
+        let sql = format!("SELECT sum(a), count(s), sum(d), sum(k) FROM '{}'", path.display());
+        assert_eq!(
+            values(&db, &sql),
+            vec![vec![
+                rudb_common::Value::HugeInt(190),
+                rudb_common::Value::BigInt(20),
+                rudb_common::Value::Double(95.0),
+                rudb_common::Value::HugeInt(10),
+            ]]
+        );
+    }
+    for (version, message) in [
+        ("v3", "Binder Error: Expected parquet_version 'V1' or 'V2'"),
+        (
+            "2",
+            "Invalid Input Error: Copy option \"parquet_version\" expected an argument of type \
+             VARCHAR - the argument \"2\" of type INTEGER could not be cast as this type",
+        ),
+        (
+            "",
+            "Invalid Input Error: Copy option \"parquet_version\" requires an argument of type \
+             VARCHAR",
+        ),
+        (
+            "NULL",
+            "Binder Error: NULL is not supported as a valid option for COPY option \
+             \"parquet_version\"",
+        ),
+    ] {
+        let sql =
+            format!("COPY (SELECT 1 AS a) TO '{}' (PARQUET_VERSION {version})", path.display());
+        assert_eq!(db.query(&sql).expect_err(&sql).to_string(), message);
+    }
+    std::fs::remove_dir_all(&root).ok();
+}

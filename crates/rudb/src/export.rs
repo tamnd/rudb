@@ -602,6 +602,7 @@ impl<'a> Sink<'a> {
                 bloom: copy.bloom_filter_false_positive_ratio,
             });
             writer.set_field_ids(&copy.field_ids);
+            writer.set_version(copy.parquet_version);
             Body::Parquet { writer: Box::new(writer), stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
             let moments = Moments {

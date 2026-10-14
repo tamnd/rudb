@@ -168,6 +168,8 @@ pub struct CopyTo {
     pub kv_metadata: Vec<(String, Vec<u8>)>,
     /// For Parquet, the field ids `FIELD_IDS` gives the columns, where it was written.
     pub field_ids: Vec<rudb_parquet::FieldId>,
+    /// For Parquet, the format version `PARQUET_VERSION` gives, which is one or two.
+    pub parquet_version: i32,
     /// For Parquet, `DICTIONARY_SIZE_LIMIT`, where `None` leaves it to the size of the row group.
     pub dictionary_size_limit: Option<u64>,
     /// For Parquet, `STRING_DICTIONARY_PAGE_SIZE_LIMIT`.
@@ -999,7 +1001,8 @@ fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -
         let Some(written) = written else { continue };
         if !written.null()
             && written.ty != LogicalType::Varchar
-            && matches!(name, "filename_pattern" | "compression")
+            && (matches!(name, "filename_pattern" | "compression")
+                || (name == "parquet_version" && format == "parquet"))
         {
             let value = written.value.as_ref().map(Value::to_string).unwrap_or_default();
             return Err(Error::invalid_input(format!(
@@ -1238,6 +1241,7 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         timestamp_format: None,
         kv_metadata: Vec::new(),
         field_ids: Vec::new(),
+        parquet_version: 1,
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
@@ -1328,6 +1332,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         timestamp_format: None,
         kv_metadata: Vec::new(),
         field_ids: Vec::new(),
+        parquet_version: 1,
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
@@ -1419,6 +1424,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         timestamp_format: None,
         kv_metadata: Vec::new(),
         field_ids: Vec::new(),
+        parquet_version: 1,
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
@@ -1466,9 +1472,20 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                 })?;
                 out.row_group_size = out.row_group_size.max(1);
             }
+            "parquet_version" => {
+                if value.is_none() {
+                    return Err(Error::invalid_input(
+                        "Copy option \"parquet_version\" requires an argument of type VARCHAR",
+                    ));
+                }
+                out.parquet_version = match written.to_ascii_uppercase().as_str() {
+                    "V1" => 1,
+                    "V2" => 2,
+                    _ => return Err(Error::binder("Expected parquet_version 'V1' or 'V2'")),
+                };
+            }
             "row_group_size_bytes"
             | "compression_level"
-            | "parquet_version"
             | "geoparquet_version"
             | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
