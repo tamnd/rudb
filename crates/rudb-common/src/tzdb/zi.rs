@@ -4,11 +4,13 @@
 //! continuation of the zone above it, or a link. The pin's data has no leap second lines, so they
 //! are not read.
 //!
-//! The file is read in two steps. [`read`] tells the lines apart and keeps where each zone starts
-//! and which lines hold the rules of each name, and [`Data::zone`] reads the eras of a zone and the
-//! rules they follow when the zone is compiled. A session compiles one or two of the six hundred
-//! zones of a release, and reading them all took 20 million instructions a release, more than
-//! answering `SELECT COUNT(*)` over ten million rows.
+//! The file is read in two steps. [`find`] finds the line a name's zone starts on, and [`zone`]
+//! reads the eras of the zone and the rules they follow when the zone is compiled. A session
+//! compiles one or two of the six hundred zones of a release, and reading them all took 20 million
+//! instructions a release, more than answering `SELECT COUNT(*)` over ten million rows. Keeping
+//! where every zone and rule starts took a fifth of a megabyte of every process, so a lookup reads
+//! the lines again instead, which is a few hundred microseconds once for each name. Only a listing
+//! of every zone, which [`read`] gives, keeps them all.
 
 use std::ops::Range;
 
@@ -70,7 +72,7 @@ pub(super) struct Era {
     pub specifier: Option<u8>,
     /// The time the era ends and how it is written, for an era that is not the last.
     pub until: Option<(Rule, i64)>,
-    /// The rules the era follows, a range of the rules [`Data::zone`] reads with the eras.
+    /// The rules the era follows, a range of the rules [`zone`] reads with the eras.
     pub rules: Range<usize>,
     /// The saved time and the daylight saving flag of an era that names no rules.
     pub save: i64,
@@ -85,7 +87,7 @@ pub(super) struct Data {
     /// The links: the target and the name of the link.
     pub links: Vec<(&'static str, &'static str)>,
     /// The name of each rule and its line, in the order of the file.
-    rules: Vec<(&'static str, &'static str)>,
+    pub rules: Vec<(&'static str, &'static str)>,
 }
 
 const MONTHS: [&str; 12] = [
@@ -371,100 +373,194 @@ impl Iterator for Fields {
             .map_or(bytes.len(), |length| start + length);
         let field = &self.0[start..end];
         self.0 = &self.0[end..];
-        Some(if field == "-" { "" } else { field.trim_matches('"') })
+        Some(match field.as_bytes() {
+            b"-" => "",
+            [b'"', ..] | [.., b'"'] => field.trim_matches('"'),
+            _ => field,
+        })
     }
 }
 
-/// `infile`, as far as telling the lines apart: the zones, the links and the rules of the file.
+/// A line of the file that is a rule, a zone or a link.
+enum Line {
+    /// The fields of a rule after its word, which start with its name, and its line. A scan that
+    /// wants no rules splits no more of the line.
+    Rule(Fields, &'static str),
+    /// The name of a zone and the text of the file from the zone's line on.
+    Zone(&'static str, &'static str),
+    /// The target and the name of a link.
+    Link(&'static str, &'static str),
+}
+
+/// `infile`, as far as telling the lines apart: the rules, the zones and the links of the file, in
+/// its order.
 ///
 /// A line is told by its first word alone. `infile` reads the line after an era with an end as
 /// the era's continuation whatever its first word is, but `zic` refuses one that is a rule, a zone
 /// or a link, so in data that compiles the word says the same. The fields of a rule are counted
 /// when a zone reads the rule.
+fn lines(text: &'static str) -> impl Iterator<Item = Line> {
+    text.lines().filter_map(move |line| {
+        // Only a word that starts one of the three, or is quoted, can be one of them, and most of
+        // the file is the continuation lines of zones. Telling those by their first byte, before
+        // any fields are split, is what makes reading the file again for a lookup cheap.
+        let first = line.bytes().find(|byte| !byte.is_ascii_whitespace())?;
+        if !matches!(first.to_ascii_lowercase(), b'r' | b'z' | b'l' | b'"') {
+            return None;
+        }
+        let mut fields = Fields(line);
+        // The file writes the words as their first letters, which `byword` takes as well.
+        let word = match fields.next()? {
+            "R" => 0,
+            "Z" => 1,
+            "L" => 2,
+            word => byword(word, &["Rule", "Zone", "Link"])?,
+        };
+        match word {
+            0 => Some(Line::Rule(fields, line)),
+            1 => {
+                let name = fields.next().unwrap_or_default();
+                (fields.count() >= 3).then(|| {
+                    let at = line.as_ptr() as usize - text.as_ptr() as usize;
+                    Line::Zone(name, &text[at..])
+                })
+            }
+            _ => match (fields.next(), fields.next(), fields.next()) {
+                (Some(target), Some(name), None) => Some(Line::Link(target, name)),
+                _ => None,
+            },
+        }
+    })
+}
+
+/// The name of a rule and its line. `inrule` refuses a rule without a name, which no zone could
+/// follow.
+fn rule(mut fields: Fields, line: &'static str) -> Option<(&'static str, &'static str)> {
+    fields.next().filter(|name| !name.is_empty()).map(|name| (name, line))
+}
+
+/// Every zone, link and rule of the file, for a listing of every zone.
 pub(super) fn read(text: &'static str) -> Data {
     let mut zones = Vec::new();
     let mut links = Vec::new();
     let mut rules = Vec::new();
-    for line in text.lines() {
-        let mut fields = Fields(line);
-        // The file writes the words as their first letters, which `byword` takes as well.
-        let word = match fields.next() {
-            None => continue,
-            Some("R") => Some(0),
-            Some("Z") => Some(1),
-            Some("L") => Some(2),
-            Some(word) => byword(word, &["Rule", "Zone", "Link"]),
-        };
-        match word {
-            Some(0) => rules.push((fields.next().unwrap_or_default(), line)),
-            Some(1) => {
-                let name = fields.next().unwrap_or_default();
-                if fields.count() >= 3 {
-                    let at = line.as_ptr() as usize - text.as_ptr() as usize;
-                    zones.push((name, &text[at..]));
-                }
-            }
-            Some(2) => {
-                if let (Some(target), Some(name), None) =
-                    (fields.next(), fields.next(), fields.next())
-                {
-                    links.push((target, name));
-                }
-            }
-            _ => {}
+    for line in lines(text) {
+        match line {
+            Line::Zone(name, at) => zones.push((name, at)),
+            Line::Link(target, name) => links.push((target, name)),
+            Line::Rule(fields, line) => rules.extend(rule(fields, line)),
         }
     }
     Data { zones, links, rules }
 }
 
-impl Data {
-    /// `inzone`, `inzcont` and `associate` for the zone at `index` of [`Data::zones`]: its eras,
-    /// and the rules they follow, sorted by name as `associate` sorts them.
-    pub(super) fn zone(&self, index: usize) -> (Vec<Era>, Vec<Rule>) {
-        let mut lines = self.zones[index].1.lines();
-        let mut eras = Vec::new();
-        let first = getfields(lines.next().unwrap_or_default());
-        let mut wantcont = era(&first[2..], &mut eras);
-        for line in lines {
-            if !wantcont {
-                break;
-            }
-            let fields = getfields(line);
-            if !fields.is_empty() {
-                wantcont = era(&fields, &mut eras);
-            }
-        }
-        let mut rules = Vec::new();
-        let mut read: Vec<(&str, Range<usize>)> = Vec::new();
-        for era in &mut eras {
-            let range = match read.iter().find(|(name, _)| *name == era.rule) {
-                Some((_, range)) => range.clone(),
-                None => {
-                    let start = rules.len();
-                    // `qsort` with `rcomp` keeps no order among the rules of one name, and the
-                    // order of the file is the one the pin's build gets from the sort of glibc,
-                    // which is stable.
-                    for &(_, line) in self.rules.iter().filter(|(name, _)| *name == era.rule) {
-                        let fields = getfields(line);
-                        if fields.len() != 10 {
-                            continue;
-                        }
-                        let Some(save) = getsave(fields[8]) else { continue };
-                        rules.extend(rulesub(
-                            fields[2], fields[3], fields[5], fields[6], fields[7], save, fields[9],
-                        ));
-                    }
-                    read.push((era.rule, start..rules.len()));
-                    start..rules.len()
+/// The zone file a name finds without regard to case, as `pg_open_tzfile` finds it among a file
+/// for each zone and each link: the name of the file and the text of its zone from the zone's line
+/// on.
+///
+/// The files are listed in the order of their names, a zone before a link of the same name, and
+/// the last that matches is the one found. That is the name last in byte order, and of the zones
+/// and links that share it the last link of the file and then the last zone. A link is to the last
+/// zone of its target, and a link to no zone is no file.
+pub(super) fn find(text: &'static str, name: &str) -> Option<(&'static str, &'static str)> {
+    // Every zone, so that a link finds its target without reading the file again.
+    let mut zones = Vec::new();
+    let mut matches = Vec::new();
+    for (at, line) in lines(text).enumerate() {
+        match line {
+            Line::Zone(zone, from) => {
+                zones.push((zone, from));
+                if zone.eq_ignore_ascii_case(name) {
+                    matches.push((zone, false, at, from));
                 }
-            };
-            if range.is_empty() {
-                (era.save, era.isdst) = getsave(era.rule).unwrap_or((0, false));
             }
-            era.rules = range;
+            Line::Link(target, link) if link.eq_ignore_ascii_case(name) => {
+                matches.push((link, true, at, target));
+            }
+            _ => {}
         }
-        (eras, rules)
     }
+    matches.sort_unstable_by_key(|&(name, link, at, _)| (name, link, at));
+    matches.into_iter().rev().find_map(|(name, link, _, found)| {
+        if !link {
+            return Some((name, found));
+        }
+        let &(_, zone) = zones.iter().rev().find(|&&(zone, _)| zone == found)?;
+        Some((name, zone))
+    })
+}
+
+/// `inzone`, `inzcont` and `associate` for the zone whose line starts `at`, a part of `text`: its
+/// eras, and the rules they follow, sorted by name as `associate` sorts them.
+///
+/// The rules are read from `rules_of` when a listing of every zone has them, and from the lines of
+/// `text` otherwise. A listing compiles every zone, and each one reading the file again took a
+/// second.
+pub(super) fn zone(
+    text: &'static str,
+    at: &'static str,
+    rules_of: Option<&[(&'static str, &'static str)]>,
+) -> (Vec<Era>, Vec<Rule>) {
+    let mut lines_at = at.lines();
+    let mut eras = Vec::new();
+    let first = getfields(lines_at.next().unwrap_or_default());
+    let mut wantcont = era(&first[2..], &mut eras);
+    for line in lines_at {
+        if !wantcont {
+            break;
+        }
+        let fields = getfields(line);
+        if !fields.is_empty() {
+            wantcont = era(&fields, &mut eras);
+        }
+    }
+    // The lines of each name of rules the eras follow, read in one pass over the file when no
+    // listing has them. `qsort` with `rcomp` keeps no order among the rules of one name, and the
+    // order of the file is the one the pin's build gets from the sort of glibc, which is stable.
+    let mut named: Vec<(&str, Vec<&'static str>)> = Vec::new();
+    for era in &eras {
+        if !named.iter().any(|(name, _)| *name == era.rule) {
+            named.push((era.rule, Vec::new()));
+        }
+    }
+    let listed = rules_of.map(|listed| listed.iter().copied());
+    // A rule has a name, so an era that follows none reads no lines.
+    let wanted = named.iter().any(|(name, _)| !name.is_empty());
+    let scanned = (rules_of.is_none() && wanted).then(|| {
+        lines(text).filter_map(|line| match line {
+            Line::Rule(fields, line) => rule(fields, line),
+            _ => None,
+        })
+    });
+    for (name, line) in listed.into_iter().flatten().chain(scanned.into_iter().flatten()) {
+        if let Some((_, lines)) = named.iter_mut().find(|(rule, _)| *rule == name) {
+            lines.push(line);
+        }
+    }
+    let mut rules = Vec::new();
+    let mut read = Vec::with_capacity(named.len());
+    for (name, lines) in named {
+        let start = rules.len();
+        for line in lines {
+            let fields = getfields(line);
+            if fields.len() != 10 {
+                continue;
+            }
+            let Some(save) = getsave(fields[8]) else { continue };
+            rules.extend(rulesub(
+                fields[2], fields[3], fields[5], fields[6], fields[7], save, fields[9],
+            ));
+        }
+        read.push((name, start..rules.len()));
+    }
+    for era in &mut eras {
+        let (_, range) = read.iter().find(|(name, _)| *name == era.rule).unwrap_or(&("", 0..0));
+        if range.is_empty() {
+            (era.save, era.isdst) = getsave(era.rule).unwrap_or((0, false));
+        }
+        era.rules = range.clone();
+    }
+    (eras, rules)
 }
 
 /// `inzsub`: an era of a zone, from the fields after the name. Whether a continuation line
