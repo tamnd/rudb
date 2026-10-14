@@ -903,10 +903,10 @@ impl<W: Write> Writer<W> {
     ///
     /// # Errors
     ///
-    /// For a codec other than `UNCOMPRESSED` and `SNAPPY`, for a column of a type [`storage`]
-    /// refuses, or if the magic cannot be written.
+    /// For a codec [`Codec::compress`] cannot write, for a column of a type [`storage`] refuses,
+    /// or if the magic cannot be written.
     pub fn new(out: W, fields: &[Field], codec: Codec, created_by: &str) -> Result<Self> {
-        if !matches!(codec, Codec::Uncompressed | Codec::Snappy) {
+        if codec.compress(&[]).is_none() {
             return Err(Error::not_implemented(format!(
                 "COPY TO a Parquet file with the {codec:?} codec is not supported yet"
             )));
@@ -1260,10 +1260,7 @@ impl<W: Write> Writer<W> {
         inner: (i16, thrift::Writer),
         written: &mut Written,
     ) -> Result<()> {
-        let stored = match self.codec {
-            Codec::Snappy => Cow::Owned(rudb_compress::snappy::compress(body)),
-            _ => Cow::Borrowed(body),
-        };
+        let stored = self.codec.compress(body).unwrap_or(Cow::Borrowed(body));
         let mut header = thrift::Writer::default();
         header.i32(1, kind);
         header.i32(2, i32::try_from(body.len()).map_err(|_| too_big())?);
@@ -1295,7 +1292,7 @@ impl<W: Write> Writer<W> {
         meta.list_of_ints(2, &[i64::from(encoding)]);
         let path: Vec<&str> = column.path.iter().map(String::as_str).collect();
         meta.list_of_strings(3, &path);
-        meta.i32(4, if self.codec == Codec::Snappy { 1 } else { 0 });
+        meta.i32(4, self.codec.to_parquet());
         meta.int(5, written.values);
         meta.int(6, written.uncompressed);
         meta.int(7, written.compressed);
@@ -2444,6 +2441,50 @@ mod tests {
                 .map(|value| value.map_or(Value::Null, |v| Value::Timestamp(micros(v))));
             assert_eq!(read_back(pin, at), values.collect::<Vec<_>>(), "{at} reads back");
         }
+    }
+
+    #[test]
+    fn lz4_pages_come_out_as_the_pins_bytes() {
+        // SET TimeZone = 'UTC'; COPY (SELECT (i // 50)::BIGINT AS a, 'value ' || (i % 7) AS s,
+        // (i // 100)::INTEGER AS c, (CASE WHEN i < 300 THEN i * 2654435761 % 4294967291 ELSE i //
+        // 1000 END)::BIGINT AS d FROM range(9000) r(i)) TO 'lz4.parquet' (CODEC 'lz4',
+        // DICTIONARY_SIZE_LIMIT 0), in the pin. The pages of a, s and d are past 64 KiB and the one
+        // of c is not, which are the two sizes of hash table the pin's LZ4 picks between.
+        let rows = 0..9000_i64;
+        let a = rows.clone().map(|i| Value::BigInt(i / 50)).collect::<Vec<_>>();
+        let s =
+            rows.clone().map(|i| Value::Varchar(format!("value {}", i % 7))).collect::<Vec<_>>();
+        let c = rows.clone().map(|i| Value::Integer((i / 100) as i32)).collect::<Vec<_>>();
+        let d = rows
+            .map(|i| {
+                Value::BigInt(if i < 300 { i * 2_654_435_761 % 4_294_967_291 } else { i / 1000 })
+            })
+            .collect::<Vec<_>>();
+        let fields = [
+            Field::new("a", LogicalType::BigInt),
+            Field::new("s", LogicalType::Varchar),
+            Field::new("c", LogicalType::Integer),
+            Field::new("d", LogicalType::BigInt),
+        ];
+        // A chunk holds at most 8192 rows, so the group is written as two.
+        let chunk = |rows: std::ops::Range<usize>| {
+            Chunk::new(vec![
+                column(LogicalType::BigInt, &a[rows.clone()]),
+                column(LogicalType::Varchar, &s[rows.clone()]),
+                column(LogicalType::Integer, &c[rows.clone()]),
+                column(LogicalType::BigInt, &d[rows]),
+            ])
+            .expect("a chunk")
+        };
+        let mut writer = Writer::new(Vec::new(), &fields, Codec::Lz4Raw, PIN).expect("starts");
+        writer.set_limits(Limits { dictionary: Some(0), ..Limits::default() });
+        writer.write_group(&[chunk(0..8192), chunk(8192..9000)]).expect("writes");
+        let bytes = writer.finish().expect("finishes");
+        let pin = include_bytes!("../testdata/lz4.parquet");
+        assert!(bytes == pin, "differs from the pin's file");
+        assert_eq!(read_back(pin, 0), a);
+        assert_eq!(read_back(pin, 2), c);
+        assert_eq!(read_back(pin, 3), d);
     }
 
     fn interval(months: i32, days: i32, micros: i64) -> Value {

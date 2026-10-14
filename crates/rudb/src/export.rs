@@ -648,8 +648,11 @@ impl<'a> Sink<'a> {
                 fields.push(Field::new(name.clone(), ty.clone()));
                 stored.push(rudb_parquet::storage(ty)?);
             }
-            let codec =
-                if copy.compression == "snappy" { Codec::Snappy } else { Codec::Uncompressed };
+            let codec = match copy.compression.as_str() {
+                "snappy" => Codec::Snappy,
+                "lz4_raw" => Codec::Lz4Raw,
+                _ => Codec::Uncompressed,
+            };
             let mut writer = rudb_parquet::Writer::new(out, &fields, codec, CREATED_BY)?;
             writer.set_key_values(copy.kv_metadata.clone());
             writer.set_limits(rudb_parquet::Limits {

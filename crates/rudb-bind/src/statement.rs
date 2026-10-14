@@ -160,8 +160,11 @@ pub struct CopyTo {
     pub array: bool,
     /// Whether the file is Parquet, in which case only the two options below apply.
     pub parquet: bool,
-    /// For Parquet, the codec the pages are compressed with, in lower case.
+    /// For Parquet, the codec the pages are compressed with, in lower case, where `lz4` is written
+    /// as `lz4_raw` since that is the one the pin writes for it.
     pub compression: String,
+    /// For Parquet, `COMPRESSION_LEVEL`, which only the ZSTD codec takes.
+    pub compression_level: Option<i64>,
     /// For Parquet, how many rows go in a row group.
     pub row_group_size: u64,
     /// For Parquet, the key value pairs `KV_METADATA` puts in the footer, in the order written.
@@ -1002,7 +1005,7 @@ fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -
         if !written.null()
             && written.ty != LogicalType::Varchar
             && (matches!(name, "filename_pattern" | "compression")
-                || (name == "parquet_version" && format == "parquet"))
+                || (matches!(name, "parquet_version" | "codec") && format == "parquet"))
         {
             let value = written.value.as_ref().map(Value::to_string).unwrap_or_default();
             return Err(Error::invalid_input(format!(
@@ -1100,6 +1103,10 @@ const MOST_STRING_DICTIONARY: u64 = 1 << 30;
 /// The largest `DATA_PAGE_SIZE_LIMIT` the pin takes, which is also its default.
 const MOST_DATA_PAGE: u64 = 100 << 20;
 
+/// The range of `COMPRESSION_LEVEL` the pin takes, which is the range of levels zstd has.
+const LEAST_LEVEL: i64 = -131_072;
+const MOST_LEVEL: i64 = 22;
+
 /// The Parquet dictionary, page and bloom filter options, each cast to the type the pin casts it
 /// to and checked the way the pin checks it.
 fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyTo) -> Result<()> {
@@ -1110,6 +1117,7 @@ fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyT
             "string_dictionary_page_size_limit" | "data_page_size_limit" => LogicalType::UBigInt,
             "write_bloom_filter" => LogicalType::Boolean,
             "bloom_filter_false_positive_ratio" => LogicalType::Double,
+            "compression_level" => LogicalType::BigInt,
             _ => continue,
         };
         // A boolean option may be written bare, and the Parquet writer is the one to refuse it.
@@ -1152,6 +1160,14 @@ fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyT
             }
         };
         match name.as_str() {
+            "compression_level" => {
+                if !(i128::from(LEAST_LEVEL)..=i128::from(MOST_LEVEL)).contains(&number) {
+                    return Err(Error::binder(format!(
+                        "Compression level must be between {LEAST_LEVEL} and {MOST_LEVEL}"
+                    )));
+                }
+                out.compression_level = Some(number as i64);
+            }
             "dictionary_size_limit" => {
                 if number < 0 {
                     return Err(Error::binder(
@@ -1181,6 +1197,11 @@ fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyT
         }
     }
     out.bloom_filter_false_positive_ratio = bloom.then_some(ratio);
+    if out.compression_level.is_some() && out.compression != "zstd" {
+        return Err(Error::binder(
+            "Compression level is only supported for the ZSTD compression codec",
+        ));
+    }
     Ok(())
 }
 
@@ -1246,6 +1267,7 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
         bloom_filter_false_positive_ratio: Some(0.01),
+        compression_level: None,
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1337,6 +1359,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
         bloom_filter_false_positive_ratio: Some(0.01),
+        compression_level: None,
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1429,6 +1452,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
         bloom_filter_false_positive_ratio: Some(0.01),
+        compression_level: None,
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1445,21 +1469,28 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             | "data_page_size_limit"
             | "write_bloom_filter"
             | "bloom_filter_false_positive_ratio"
+            | "compression_level"
             | "dictionary_compression_ratio_threshold" => {}
             "compression" | "codec" => {
+                if value.is_none() {
+                    return Err(Error::invalid_input(format!(
+                        "Copy option \"{name}\" requires an argument of type VARCHAR"
+                    )));
+                }
                 let codec = written.to_ascii_lowercase();
                 match codec.as_str() {
-                    "uncompressed" | "snappy" => out.compression = codec,
-                    "brotli" | "gzip" | "lz4" | "lz4_raw" | "zstd" => {
+                    "uncompressed" | "snappy" | "lz4_raw" => out.compression = codec,
+                    "lz4" => out.compression = "lz4_raw".to_string(),
+                    "brotli" | "gzip" | "zstd" => {
                         return Err(Error::not_implemented(format!(
                             "COPY TO a Parquet file with the {codec} codec is not supported yet"
                         )));
                     }
                     _ => {
-                        return Err(Error::binder(
-                            "Expected \"compression\" argument to be any of [uncompressed, brotli, \
-                             gzip, snappy, lz4, lz4_raw or zstd]",
-                        ));
+                        return Err(Error::binder(format!(
+                            "Expected \"{name}\" argument to be any of [uncompressed, brotli, \
+                             gzip, snappy, lz4, lz4_raw or zstd]"
+                        )));
                     }
                 }
             }
@@ -1484,10 +1515,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     _ => return Err(Error::binder("Expected parquet_version 'V1' or 'V2'")),
                 };
             }
-            "row_group_size_bytes"
-            | "compression_level"
-            | "geoparquet_version"
-            | "preserve_order" => {
+            "row_group_size_bytes" | "geoparquet_version" | "preserve_order" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
                 )));
