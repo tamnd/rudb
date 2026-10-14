@@ -373,11 +373,12 @@ fn sample_size_is_counted_in_chunks_and_minus_one_reads_the_whole_file() {
         .map(|n| if n == 150_000 { format!("{n},x\n") } else { format!("{n},{n}\n") })
         .collect();
     let file = written("sample-whole.csv", &format!("a,b\n{rows}"));
-    let sql =
-        format!("SELECT typeof(b), count(*) FROM read_csv({file}, sample_size=-1) GROUP BY 1");
-    let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
-    assert_eq!(result.value_at(0, 0), Value::Varchar("VARCHAR".into()));
-    assert_eq!(result.value_at(0, 1), Value::BigInt(200_000));
+    let sql = format!("SELECT typeof(b) FROM read_csv({file}, sample_size=-1) LIMIT 1");
+    let result = database.value(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result, Value::Varchar("VARCHAR".into()));
+    let sql = format!("SELECT count(*) FROM read_csv({file}, sample_size=-1)");
+    let result = database.value(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result, Value::BigInt(200_000));
 }
 
 #[test]
