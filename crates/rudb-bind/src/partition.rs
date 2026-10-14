@@ -44,6 +44,10 @@ pub struct Partitioned {
     pub per_thread: bool,
     /// Whether no file at all is written for no rows, which is `WRITE_EMPTY_FILE false`.
     pub skip_empty: bool,
+    /// Whether the one file is written beside its path and moved there at the end, which is
+    /// `USE_TMP_FILE`, and `None` when the option is not written, which does that only over a file
+    /// that is there already.
+    pub use_tmp_file: Option<bool>,
     /// What the statement answers with.
     pub returns: Returns,
 }
@@ -176,7 +180,7 @@ pub(crate) fn partitioning(
             "hive_file_pattern" => out.flat = !boolean(name, value.as_deref())?,
             // Written at all, even off, is what the pin checks against the options below.
             "use_tmp_file" => {
-                boolean(name, value.as_deref())?;
+                out.use_tmp_file = Some(boolean(name, value.as_deref())?);
                 tmp = true;
             }
             "per_thread_output" => out.per_thread = boolean(name, value.as_deref())?,

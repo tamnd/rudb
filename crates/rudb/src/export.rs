@@ -75,9 +75,7 @@ pub(crate) fn write(
         return Ok((0, files));
     }
     if !split.directory() {
-        let mut sink = Sink::open(copy, &copy.path, result, zone)?;
-        sink.write(result.chunks())?;
-        return Ok((sink.finish(&mut files)?, files));
+        return Ok((write_one(copy, result, zone, &mut files)?, files));
     }
     let root = Path::new(&copy.path);
     match split.existing {
@@ -97,6 +95,65 @@ pub(crate) fn write(
         write_partitioned(copy, root, result, zone, &mut files)?
     };
     Ok((rows, files))
+}
+
+/// Leaves the one file `copy` names the way the pin does when the query fails. The pin opens the
+/// file before the first row comes, so with `USE_TMP_FILE` off a file that was there is left
+/// empty, and otherwise the query never touched it. The pin leaves a CSV file the names of its
+/// header without the line break after them, which this does not.
+pub(crate) fn query_failed(copy: &CopyTo) {
+    let target = Path::new(&copy.path);
+    let split = &copy.partitioned;
+    if !split.directory() && split.use_tmp_file == Some(false) && target.is_file() {
+        let _ = File::create(target);
+    }
+}
+
+/// Writes the rows of `result` to the one file `copy` names, adds it to `files` and answers how
+/// many rows there were.
+///
+/// Over a file that is there already, the pin writes a file named `tmp_` and the name beside it
+/// and moves that over the old one at the end, unless `USE_TMP_FILE` is off, so a `COPY` that
+/// fails leaves the old file as it was. A file the `COPY` made is removed when it fails.
+fn write_one(
+    copy: &CopyTo,
+    result: &QueryResult,
+    zone: SessionTimeZone,
+    files: &mut Vec<Wrote>,
+) -> Result<usize> {
+    let target = Path::new(&copy.path);
+    let existed = target.is_file();
+    let temporary = copy.partitioned.use_tmp_file.unwrap_or(existed) && copy.path != "/dev/stdout";
+    let path = match target.file_name() {
+        Some(name) if temporary => {
+            let name = format!("tmp_{}", name.to_string_lossy());
+            target.with_file_name(name).to_string_lossy().into_owned()
+        }
+        _ => copy.path.clone(),
+    };
+    let wrote = (|| {
+        let mut sink = Sink::open(copy, &path, result, zone)?;
+        sink.write(result.chunks())?;
+        sink.finish(files)
+    })();
+    let rows = match wrote {
+        Ok(rows) => rows,
+        Err(error) => {
+            if path != copy.path || !existed {
+                let _ = std::fs::remove_file(&path);
+            }
+            return Err(error);
+        }
+    };
+    if path != copy.path {
+        std::fs::rename(&path, target).map_err(|error| {
+            Error::io(format!("Could not rename \"{path}\" to \"{}\": {error}", copy.path))
+        })?;
+        if let Some(file) = files.last_mut() {
+            file.path.clone_from(&copy.path);
+        }
+    }
+    Ok(rows)
 }
 
 /// What a `COPY ... TO` with `RETURN_STATS` answers: a row for each file, with its rows, its size,
