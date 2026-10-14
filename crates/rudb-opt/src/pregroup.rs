@@ -52,21 +52,26 @@
 //! value when C is stored with a dictionary. That is done here rather than left to the pass, which
 //! runs before this one.
 //!
+//! When the store counted no nulls in C and the argument of the `avg` is never null over it, as
+//! `strlen(C)` is, the average's count is the `count(*)` of the rows, and the partial and the sum
+//! of it above are shared with a `count(*)` the aggregate asks for itself. That takes the `CASE`
+//! out of the projection and one sum out of the grouping by the keys, which is ClickBench q29.
+//!
 //! The projection is only there when an `avg` is, and otherwise the top aggregate keeps the index.
 //! Either way the top node answers under the index the aggregate had and in its order. A second run
 //! finds the top aggregate reading an aggregate, or a projection over one, and leaves it.
 
 use std::collections::HashMap;
 
+use rudb_common::rules::Rule;
 use rudb_common::{LogicalType, Result};
 use rudb_functions::signature;
-use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan};
+use rudb_plan::{ColumnBinding, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 
 use crate::eager::rebind;
 use crate::estimate::{self, Facts};
-use crate::fromkey;
 use crate::pass::{Context, Pass};
-use crate::walk;
+use crate::{fromkey, nonulls, walk};
 
 /// Groups by the one column the group keys are computed from, before grouping by the keys.
 #[derive(Debug, Clone, Copy)]
@@ -78,15 +83,17 @@ impl Pass for PreGrouping {
     }
 
     fn run(&self, plan: &mut Plan, context: &Context) -> Result<()> {
-        pregroup(plan, context.facts());
+        pregroup(plan, context.facts(), context.allows(Rule::ValidityFree));
         Ok(())
     }
 }
 
-/// Rewrites every aggregate in `plan` that this applies to.
-pub fn pregroup(plan: &mut Plan, stats: &Facts) {
+/// Rewrites every aggregate in `plan` that this applies to. `free` says whether a column the store
+/// counted no nulls in may be read as one that has none, which is [`Rule::ValidityFree`].
+pub fn pregroup(plan: &mut Plan, stats: &Facts, free: bool) {
     let mut moved = false;
-    let root = walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| split(plan, at, stats));
+    let root =
+        walk::restack(plan, plan.root(), &mut moved, &mut |plan, at| split(plan, at, stats, free));
     if moved {
         plan.set_root(root);
     }
@@ -110,7 +117,7 @@ enum Split {
 }
 
 /// The two stage form of `at` when it is an aggregate this applies to.
-fn split(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
+fn split(plan: &mut Plan, at: NodeRef, stats: &Facts, free: bool) -> Option<NodeRef> {
     let Node::Aggregate { input, index, groups, aggregates } = *plan.node(at) else { return None };
     let below = match *plan.node(input) {
         Node::Project { input, .. } => input,
@@ -141,7 +148,8 @@ fn split(plan: &mut Plan, at: NodeRef, stats: &Facts) -> Option<NodeRef> {
     let mut partials: Vec<ExprRef> = Vec::new();
     let mut splits = Vec::with_capacity(calls.len());
     for &call in &calls {
-        splits.push(partial(plan, call, column, &mut partials)?);
+        let never_null = |plan: &Plan, arg| free && nonulls::never_null(plan, input, arg);
+        splits.push(partial(plan, call, column, &never_null, &mut partials)?);
     }
     Some(rewrite(plan, input, index, column, column_ty, &keys, &calls, &partials, &splits))
 }
@@ -173,10 +181,14 @@ fn worth(plan: &Plan, input: NodeRef, column: ColumnBinding, stats: &Facts) -> b
 
 /// Adds what `call` needs from the grouping by the column to `partials`, and says how the call is
 /// answered from them. Nothing when the call cannot be done in two stages.
+///
+/// The count of an average whose argument `never_null` proves is never null is a `count(*)`, and
+/// one `count(*)` among the partials serves every call that wants one.
 fn partial(
     plan: &mut Plan,
     call: ExprRef,
     column: ColumnBinding,
+    never_null: &dyn Fn(&Plan, ExprRef) -> bool,
     partials: &mut Vec<ExprRef>,
 ) -> Option<Split> {
     let Expr::Aggregate { name, args, distinct, filter } = *plan.expr(call) else { return None };
@@ -188,7 +200,13 @@ fn partial(
     let span = plan.expr_span(call);
     let at = partials.len();
     match (plan.string(name), args.as_slice()) {
-        ("count_star", []) | ("count", [_]) if returns == LogicalType::BigInt => {
+        ("count_star", []) if returns == LogicalType::BigInt => {
+            Some(Split::Counted(rows(plan, partials).unwrap_or_else(|| {
+                partials.push(call);
+                at
+            })))
+        }
+        ("count", [_]) if returns == LogicalType::BigInt => {
             partials.push(call);
             Some(Split::Counted(at))
         }
@@ -219,6 +237,19 @@ fn partial(
                 filter: None,
             };
             partials.push(plan.add_expr_at(sum, summed, span));
+            if never_null(plan, *arg) {
+                let count = rows(plan, partials).unwrap_or_else(|| {
+                    let count = Expr::Aggregate {
+                        name: plan.intern("count_star"),
+                        args: Slice::EMPTY,
+                        distinct: false,
+                        filter: None,
+                    };
+                    partials.push(plan.add_expr_at(count, LogicalType::BigInt, span));
+                    at + 1
+                });
+                return Some(Split::Mean(at, count));
+            }
             let count = Expr::Aggregate {
                 name: plan.intern("count"),
                 args: only,
@@ -230,6 +261,14 @@ fn partial(
         }
         _ => None,
     }
+}
+
+/// Where a `count(*)` is among the partials, if one is.
+fn rows(plan: &Plan, partials: &[ExprRef]) -> Option<usize> {
+    partials.iter().position(|&partial| {
+        matches!(*plan.expr(partial), Expr::Aggregate { name, args, distinct: false, filter: None }
+            if plan.string(name) == "count_star" && plan.expr_list(args).is_empty())
+    })
 }
 
 /// Puts the grouping by the column over `input` and the grouping by the keys over that.
@@ -265,6 +304,8 @@ fn rewrite(
     let mut outer_calls = Vec::new();
     // Where each call's answer is among the outer aggregates: one of them, or a sum and a count.
     let mut answers: Vec<(usize, Option<usize>)> = Vec::with_capacity(calls.len());
+    // The outer sum of each partial count, so two calls counting the same rows share one.
+    let mut counted: HashMap<usize, usize> = HashMap::new();
     let total = |plan: &mut Plan, name: &str, arg: ExprRef, ty: LogicalType, span| {
         let args = plan.add_expr_list(&[arg]);
         let call = Expr::Aggregate { name: plan.intern(name), args, distinct: false, filter: None };
@@ -288,17 +329,29 @@ fn rewrite(
                 answers.push((outer_calls.len() - 1, None));
             }
             Split::Counted(at) => {
-                let arg = read(plan, 1 + at, LogicalType::BigInt);
-                outer_calls.push(total(plan, "sum", arg, ty, span));
-                answers.push((outer_calls.len() - 1, None));
+                // Without the projection the outer aggregate answers each call in its own place.
+                let count = match counted.get(&at) {
+                    Some(&count) if mean => count,
+                    _ => {
+                        let arg = read(plan, 1 + at, LogicalType::BigInt);
+                        outer_calls.push(total(plan, "sum", arg, ty, span));
+                        counted.insert(at, outer_calls.len() - 1);
+                        outer_calls.len() - 1
+                    }
+                };
+                answers.push((count, None));
             }
             Split::Mean(sum, count) => {
                 let summed = plan.expr_type(partials[sum]).clone();
                 let arg = read(plan, 1 + sum, summed.clone());
                 outer_calls.push(total(plan, "sum", arg, summed, span));
-                let arg = read(plan, 1 + count, LogicalType::BigInt);
-                outer_calls.push(total(plan, "sum", arg, LogicalType::BigInt, span));
-                answers.push((outer_calls.len() - 2, Some(outer_calls.len() - 1)));
+                let sum = outer_calls.len() - 1;
+                let count = *counted.entry(count).or_insert_with(|| {
+                    let arg = read(plan, 1 + count, LogicalType::BigInt);
+                    outer_calls.push(total(plan, "sum", arg, LogicalType::BigInt, span));
+                    outer_calls.len() - 1
+                });
+                answers.push((sum, Some(count)));
             }
         }
     }
@@ -352,7 +405,10 @@ fn rewrite(
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::Provenance;
+    use std::sync::Arc;
+
+    use rudb_common::bounds::{Bound, End, Spread, Test, Zones};
+    use rudb_common::{Provenance, Stat};
     use rudb_plan::Plan;
 
     use super::pregroup;
@@ -377,10 +433,10 @@ mod tests {
     fn grouped(text: &str, stats: &Facts) -> String {
         let mut plan =
             Plan::parse(text).unwrap_or_else(|error| panic!("{text} did not parse: {error}"));
-        pregroup(&mut plan, stats);
+        pregroup(&mut plan, stats, true);
         plan.validate().unwrap_or_else(|error| panic!("{text} did not stay valid: {error}"));
         let once = plan.to_string();
-        pregroup(&mut plan, stats);
+        pregroup(&mut plan, stats, true);
         assert_eq!(plan.to_string(), once, "a second run moved the plan again");
         once
     }
@@ -405,6 +461,56 @@ mod tests {
                 "          Get memory.main.hits AS hits #0 [Referer::VARCHAR]\n",
             )
         );
+    }
+
+    /// A store of `Referer` that counted its nulls and counted none.
+    #[derive(Debug)]
+    struct Valued;
+
+    impl Zones for Valued {
+        fn column(&self, name: &str) -> Option<usize> {
+            (name == "Referer").then_some(0)
+        }
+
+        fn surviving(&self, _tests: &[Test]) -> Option<u64> {
+            None
+        }
+
+        fn spread(&self, _tests: &[Test]) -> Option<Spread> {
+            None
+        }
+
+        fn extreme(&self, _column: usize, _end: End) -> Stat<Bound> {
+            Stat::Unknown
+        }
+
+        fn nulls(&self, _column: usize) -> Stat<u64> {
+            Stat::exact(0, Provenance::NullCount)
+        }
+    }
+
+    #[test]
+    fn the_average_of_a_length_of_a_string_with_no_nulls_shares_the_count_of_the_rows() {
+        let stats = counted(10_000_000, 2_700_000);
+        let mut plan = Plan::parse(HOSTS).expect("the plan parses");
+        plan.set_zones(0, Arc::new(Valued) as Arc<dyn Zones>);
+        pregroup(&mut plan, &stats, true);
+        plan.validate().expect("the plan stays valid");
+        assert_eq!(
+            plan.to_string(),
+            concat!(
+                "Project #1 [#4.0::VARCHAR AS column0, \"/\"(CAST(#4.1::HUGEINT)::DOUBLE, CAST(#4.2::BIGINT)::DOUBLE)::DOUBLE AS column1, #4.2::BIGINT AS column2, #4.3::VARCHAR AS column3]\n",
+                "  Aggregate #4 groups=[regexp_replace(#2.0::VARCHAR, 'x'::VARCHAR, 'y'::VARCHAR)::VARCHAR] aggregates=[sum(#2.1::HUGEINT)::HUGEINT, sum(#2.2::BIGINT)::BIGINT, min(#2.0::VARCHAR)::VARCHAR]\n",
+                "    Project #2 [#3.0::VARCHAR AS column0, \"*\"(CAST(strlen(#3.0::VARCHAR)::BIGINT)::HUGEINT, CAST(#3.1::BIGINT)::HUGEINT)::HUGEINT AS column1, #3.1::BIGINT AS column2]\n",
+                "      Aggregate #3 groups=[#0.0::VARCHAR] aggregates=[count_star()::BIGINT]\n",
+                "        Filter (#0.0::VARCHAR <> ''::VARCHAR)::BOOLEAN\n",
+                "          Get memory.main.hits AS hits #0 [Referer::VARCHAR]\n",
+            )
+        );
+        let mut plan = Plan::parse(HOSTS).expect("the plan parses");
+        plan.set_zones(0, Arc::new(Valued) as Arc<dyn Zones>);
+        pregroup(&mut plan, &stats, false);
+        assert_eq!(plan.to_string(), grouped(HOSTS, &stats), "the rule is off");
     }
 
     #[test]

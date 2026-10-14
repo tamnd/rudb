@@ -3,7 +3,8 @@
 //! A store that counted the nulls of a column and counted zero has settled every question about the
 //! nulls of that column. So `x IS NULL` over it is `FALSE`, `x IS NOT NULL` is `TRUE`, and neither
 //! one has to be asked of a row. `count(x)` over it is `count(*)`, which is a counter rather than a
-//! walk of the mask. That is the rewrite section 5.10 of `spec/stats/05-every-query.md` asks for, and
+//! walk of the mask, and so is a count of `length(x)` or of another function that only answers
+//! null for a null. That is the rewrite section 5.10 of `spec/stats/05-every-query.md` asks for, and
 //! what it buys is a branch taken out of the inner loop rather than a better guess about how often
 //! the branch is taken.
 //!
@@ -203,8 +204,7 @@ fn counted(plan: &mut Plan, input: NodeRef, aggregates: Slice) -> Option<Slice> 
             continue;
         }
         let [argument] = *plan.expr_list(args) else { continue };
-        let Expr::Column(binding) = *plan.expr(argument) else { continue };
-        if !estimate::never_null(plan, input, binding) {
+        if !never_null(plan, input, argument) {
             continue;
         }
         let name = plan.intern("count_star");
@@ -214,6 +214,26 @@ fn counted(plan: &mut Plan, input: NodeRef, aggregates: Slice) -> Option<Slice> 
         *slot = plan.add_expr_at(aggregate, ty, span);
     }
     (rewritten != held).then(|| plan.add_expr_list(&rewritten))
+}
+
+/// Functions that answer every argument that is not null with a value that is not null.
+const VALUED: [&str; 5] = ["strlen", "length", "octet_length", "lower", "upper"];
+
+/// Whether `expr`, read over `input`, is never null: a column the store counted no nulls in, a
+/// constant that is not null, or one of [`VALUED`] over arguments that are never null.
+///
+/// A cast is not one of them, because a cast can be the one that makes a null, as one from JSON
+/// does with a JSON `null`.
+pub(crate) fn never_null(plan: &Plan, input: NodeRef, expr: ExprRef) -> bool {
+    match *plan.expr(expr) {
+        Expr::Column(binding) => estimate::never_null(plan, input, binding),
+        Expr::Constant(value) => !plan.value(value).is_null(),
+        Expr::Function { name, args } => {
+            VALUED.contains(&plan.string(name))
+                && plan.expr_list(args).iter().all(|&arg| never_null(plan, input, arg))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +340,19 @@ mod tests {
             "Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]\n  \
              Get memory.main.t AS t #0 [d::INTEGER]\n"
         );
+    }
+
+    #[test]
+    fn a_count_of_a_length_of_a_column_with_no_nulls_is_a_count_of_the_rows() {
+        let text = "Aggregate #1 groups=[] aggregates=[count(strlen(#0.0::VARCHAR)::BIGINT)::BIGINT]\n  \
+                    Get memory.main.t AS t #0 [d::VARCHAR]\n";
+        assert_eq!(
+            settled(text, &empty()),
+            "Aggregate #1 groups=[] aggregates=[count_star()::BIGINT]\n  \
+             Get memory.main.t AS t #0 [d::VARCHAR]\n"
+        );
+        let cast = text.replace("strlen(#0.0::VARCHAR)::BIGINT", "CAST(#0.0::VARCHAR)::BIGINT");
+        assert_eq!(settled(&cast, &empty()), cast);
     }
 
     #[test]
