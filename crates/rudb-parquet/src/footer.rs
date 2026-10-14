@@ -1,5 +1,6 @@
 //! The whole footer as it was written, which is what `parquet_metadata`, `parquet_schema`,
-//! `parquet_kv_metadata` and `parquet_file_metadata` print.
+//! `parquet_kv_metadata` and `parquet_file_metadata` print, and `parquet_full_metadata` prints all
+//! four of them at once.
 //!
 //! [`crate::Metadata`] reads the footer a scan needs, narrowed to the fields a reader uses. These
 //! four functions print the footer instead, so they need every field, whether each one was written
@@ -395,7 +396,7 @@ fn read_filter(file: &dyn File, size: u64, meta: &Node) -> Result<Option<Filter>
     Ok(Some(Filter::from_bytes(&held)))
 }
 
-/// The four tables that print a footer.
+/// The tables that print a footer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataTable {
     /// `parquet_metadata`, a row per column chunk of each row group.
@@ -406,9 +407,28 @@ pub enum MetadataTable {
     KeyValue,
     /// `parquet_file_metadata`, one row for the file.
     File,
+    /// `parquet_full_metadata`, one row for the file with each of the tables in [`Self::PARTS`] as
+    /// a list of its rows.
+    Full,
 }
 
 impl MetadataTable {
+    /// The tables `parquet_full_metadata` puts in its row, in the order of its columns.
+    pub const PARTS: [Self; 4] = [Self::File, Self::Columns, Self::Schema, Self::KeyValue];
+
+    /// The name of the function that prints the table, which is also the name of its column in
+    /// `parquet_full_metadata`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Columns => "parquet_metadata",
+            Self::Schema => "parquet_schema",
+            Self::KeyValue => "parquet_kv_metadata",
+            Self::File => "parquet_file_metadata",
+            Self::Full => "parquet_full_metadata",
+        }
+    }
+
     /// The columns the table answers, the pin's names and types in the pin's order.
     #[must_use]
     pub fn fields(self) -> Vec<Field> {
@@ -486,6 +506,10 @@ impl MetadataTable {
                 ("footer_size", T::UBigInt),
                 ("column_orders", T::list(T::Varchar)),
             ]),
+            Self::Full => Self::PARTS
+                .iter()
+                .map(|part| Field::new(part.name(), T::list(T::Struct(part.fields()))))
+                .collect(),
         }
     }
 
@@ -494,11 +518,13 @@ impl MetadataTable {
     /// A value in a `VARCHAR` column can come back as some other type, a statistic in the type of
     /// its column or a type length as an integer, and the caller casts it to text. The pin does
     /// the same, and what a timestamp with a time zone looks like as text is the session's to say.
+    /// That cast has to happen before the rows are put in a list, so [`Self::Full`] has no rows of
+    /// its own here, and the caller builds its row out of the rows of [`Self::PARTS`].
     ///
     /// # Errors
     ///
     /// When a column's type cannot be worked out from the schema, or a statistic is not the size
-    /// its type has, in the pin's words.
+    /// its type has, in the pin's words, and always for [`Self::Full`].
     pub fn rows(self, footer: &RawFooter, path: &str) -> Result<Vec<Vec<Value>>> {
         match self {
             Self::Columns => column_rows(footer, path),
@@ -514,6 +540,9 @@ impl MetadataTable {
                 })
                 .collect()),
             Self::File => Ok(vec![file_row(footer, path)]),
+            Self::Full => {
+                Err(Error::internal("parquet_full_metadata is built from the other four"))
+            }
         }
     }
 }

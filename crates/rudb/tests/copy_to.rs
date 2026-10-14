@@ -1078,3 +1078,127 @@ fn return_stats_answers_what_each_parquet_file_holds_as_the_pin_does() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn the_full_metadata_is_a_row_per_file_with_the_other_four_tables_as_lists() {
+    let db = Database::new();
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-full-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("makes the directory");
+    let one = root.join("fm1.parquet");
+    let two = root.join("fm2.parquet");
+    db.execute(&format!(
+        "COPY (SELECT 1 AS a, 'x' AS b) TO '{}' (KV_METADATA {{foo: 'bar'}})",
+        one.display()
+    ))
+    .expect("writes");
+    db.execute(&format!("COPY (SELECT 2 AS a) TO '{}'", two.display())).expect("writes");
+    let full = format!("parquet_full_metadata('{}/fm*.parquet')", root.display());
+    let lens = values(
+        &db,
+        &format!(
+            "SELECT len(parquet_file_metadata), len(parquet_metadata), len(parquet_schema), \
+             len(parquet_kv_metadata) FROM {full}"
+        ),
+    );
+    let big = rudb_common::Value::BigInt;
+    assert_eq!(
+        lens,
+        vec![vec![big(1), big(2), big(3), big(1)], vec![big(1), big(1), big(2), big(0)]]
+    );
+    let text = |value: &str| rudb_common::Value::Varchar(value.into());
+    let picked = values(
+        &db,
+        &format!(
+            "SELECT parquet_file_metadata[1].file_name = parquet_metadata[1].file_name, \
+             parquet_metadata[1].path_in_schema, parquet_metadata[1].stats_min, \
+             parquet_schema[1].name, parquet_kv_metadata[1].key::VARCHAR, \
+             parquet_kv_metadata[1].value::VARCHAR FROM {full}"
+        ),
+    );
+    assert_eq!(
+        picked,
+        vec![
+            vec![
+                rudb_common::Value::Boolean(true),
+                text("a"),
+                text("1"),
+                text("duckdb_schema"),
+                text("foo"),
+                text("bar"),
+            ],
+            vec![
+                rudb_common::Value::Boolean(true),
+                text("a"),
+                text("2"),
+                text("duckdb_schema"),
+                rudb_common::Value::Null,
+                rudb_common::Value::Null,
+            ],
+        ]
+    );
+    let types = values(
+        &db,
+        &format!(
+            "SELECT typeof(parquet_file_metadata), typeof(parquet_schema), \
+             typeof(parquet_kv_metadata) FROM parquet_full_metadata('{}')",
+            two.display()
+        ),
+    );
+    assert_eq!(
+        types,
+        vec![vec![
+            text(
+                "STRUCT(file_name VARCHAR, created_by VARCHAR, num_rows BIGINT, num_row_groups \
+                 BIGINT, format_version BIGINT, encryption_algorithm VARCHAR, \
+                 footer_signing_key_metadata VARCHAR, file_size_bytes UBIGINT, footer_size \
+                 UBIGINT, column_orders VARCHAR[])[]"
+            ),
+            text(
+                "STRUCT(file_name VARCHAR, \"name\" VARCHAR, \"type\" VARCHAR, type_length \
+                 VARCHAR, repetition_type VARCHAR, num_children BIGINT, converted_type VARCHAR, \
+                 scale BIGINT, \"precision\" BIGINT, field_id BIGINT, logical_type VARCHAR, \
+                 duckdb_type VARCHAR, column_id BIGINT)[]"
+            ),
+            text("STRUCT(file_name VARCHAR, \"key\" BLOB, \"value\" BLOB)[]"),
+        ]]
+    );
+    let missing = root.join("nope.parquet");
+    for (arguments, message) in [
+        (
+            format!("'{}'", missing.display()),
+            format!("IO Error: No files found that match the pattern \"{}\"", missing.display()),
+        ),
+        (
+            "NULL".to_string(),
+            "Parser Error: \"ParquetMetadata\" cannot take NULL list as parameter".to_string(),
+        ),
+        (
+            "[]".to_string(),
+            "IO Error: \"ParquetMetadata\" needs at least one file to read".to_string(),
+        ),
+        (
+            "[NULL]".to_string(),
+            "Parser Error: \"ParquetMetadata\" reader cannot take NULL input as parameter"
+                .to_string(),
+        ),
+        (
+            "1".to_string(),
+            "Binder Error: No function matches the given name and argument types \
+             'parquet_full_metadata(INTEGER)'. You might need to add explicit type casts.\n\t\
+             Candidate functions:\n\t\"parquet_full_metadata\"(VARCHAR)\n\t\
+             \"parquet_full_metadata\"(ANY[])\n\t\"parquet_full_metadata\"(VARIANT)\n"
+                .to_string(),
+        ),
+        (
+            format!("'{}', foo := 1", two.display()),
+            "Binder Error: Invalid named parameter \"foo\" for function parquet_full_metadata\n\
+             Function does not accept any named parameters."
+                .to_string(),
+        ),
+    ] {
+        let sql = format!("SELECT * FROM parquet_full_metadata({arguments})");
+        let error = db.query(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

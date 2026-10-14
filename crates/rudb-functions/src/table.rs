@@ -124,6 +124,8 @@ pub enum TableFunction {
     ParquetKvMetadata,
     /// `parquet_file_metadata(path)`, a row per file.
     ParquetFileMetadata,
+    /// `parquet_full_metadata(path)`, a row per file with the rows of the four above for it.
+    ParquetFullMetadata,
     /// `parquet_bloom_probe(path, column, value)`, a row per row group of each file saying whether
     /// the column's bloom filter rules the value out.
     ParquetBloomProbe,
@@ -233,6 +235,7 @@ impl TableFunction {
             Self::ParquetSchema => "parquet_schema",
             Self::ParquetKvMetadata => "parquet_kv_metadata",
             Self::ParquetFileMetadata => "parquet_file_metadata",
+            Self::ParquetFullMetadata => "parquet_full_metadata",
             Self::ParquetBloomProbe => "parquet_bloom_probe",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
@@ -435,6 +438,7 @@ impl TableFunction {
             Self::ParquetSchema => Some(MetadataTable::Schema),
             Self::ParquetKvMetadata => Some(MetadataTable::KeyValue),
             Self::ParquetFileMetadata => Some(MetadataTable::File),
+            Self::ParquetFullMetadata => Some(MetadataTable::Full),
             _ => None,
         }
     }
@@ -496,6 +500,7 @@ impl TableFunction {
             ("parquet_schema", Self::ParquetSchema),
             ("parquet_kv_metadata", Self::ParquetKvMetadata),
             ("parquet_file_metadata", Self::ParquetFileMetadata),
+            ("parquet_full_metadata", Self::ParquetFullMetadata),
             ("parquet_bloom_probe", Self::ParquetBloomProbe),
         ] {
             if name.eq_ignore_ascii_case(spelled) {
@@ -947,7 +952,8 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::ParquetMetadata
         | TableFunction::ParquetSchema
         | TableFunction::ParquetKvMetadata
-        | TableFunction::ParquetFileMetadata => {
+        | TableFunction::ParquetFileMetadata
+        | TableFunction::ParquetFullMetadata => {
             function.parquet_table().map(|table| Columns::Fixed(table.fields()))
         }
         TableFunction::ReadText
@@ -1053,6 +1059,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ParquetSchema
         | TableFunction::ParquetKvMetadata
         | TableFunction::ParquetFileMetadata
+        | TableFunction::ParquetFullMetadata
         | TableFunction::ParquetBloomProbe
         | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
@@ -1635,15 +1642,21 @@ pub fn keyword_categories(classes: u8) -> Vec<&'static str> {
 
 /// DuckDB's message for a call that matched a name and no overload of it.
 ///
-/// The candidate list it prints carries fifteen named parameters that none of them accept here, so
-/// what is listed is the two overloads that exist. The first line is the one a test in the wild
-/// asserts on and it is reproduced exactly.
+/// For a reader the candidate list it prints carries fifteen named parameters that none of them
+/// accept here, so what is listed is the two overloads that exist. The first line is the one a test
+/// in the wild asserts on and it is reproduced exactly. The tables that print a footer take no
+/// named parameter, and their list is the pin's three overloads with the name quoted.
 fn no_overload(function: TableFunction, arguments: &[LogicalType]) -> Error {
     let written: Vec<String> = arguments.iter().map(ToString::to_string).collect();
     let name = function.name();
+    let candidates = if function.parquet_table().is_some() {
+        ["VARCHAR", "ANY[]", "VARIANT"].map(|first| format!("\t\"{name}\"({first})\n")).concat()
+    } else {
+        format!("\t{name}(VARCHAR)\n\t{name}(VARCHAR[])\n")
+    };
     Error::binder(format!(
         "No function matches the given name and argument types '{name}({})'. You might need to \
-         add explicit type casts.\n\tCandidate functions:\n\t{name}(VARCHAR)\n\t{name}(VARCHAR[])\n",
+         add explicit type casts.\n\tCandidate functions:\n{candidates}",
         written.join(", ")
     ))
 }
