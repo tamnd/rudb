@@ -594,6 +594,7 @@ impl<'a> Sink<'a> {
                 dictionary: copy.dictionary_size_limit,
                 string_dictionary: copy.string_dictionary_page_size_limit,
                 data_page: copy.data_page_size_limit,
+                bloom: copy.bloom_filter_false_positive_ratio,
             });
             Body::Parquet { writer, stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
