@@ -1,4 +1,4 @@
-//! Gzip, which is DEFLATE in a thin wrapper. Decompression only.
+//! Gzip, which is DEFLATE in a thin wrapper.
 //!
 //! DEFLATE is RFC 1951 and the wrapper is RFC 1952. A gzip file is one or more members end to end,
 //! each a header, a DEFLATE stream and a trailer with the CRC-32 and the length of what the stream
@@ -21,23 +21,24 @@ const FAST: u32 = 10;
 /// The longest code DEFLATE allows.
 const LONGEST: usize = 15;
 
-const LENGTH_BASE: [u16; 29] = [
+pub(crate) const LENGTH_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
 ];
-const LENGTH_EXTRA: [u8; 29] =
+pub(crate) const LENGTH_EXTRA: [u8; 29] =
     [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-const DISTANCE_BASE: [u16; 30] = [
+pub(crate) const DISTANCE_BASE: [u16; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
-const DISTANCE_EXTRA: [u8; 30] = [
+pub(crate) const DISTANCE_EXTRA: [u8; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
 
 /// The order a dynamic block writes the lengths of the code length code in.
-const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+pub(crate) const ORDER: [usize; 19] =
+    [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
 /// The CRC-32 table, for the polynomial gzip and zip and PNG all use.
 const CRC: [u32; 256] = {
@@ -92,6 +93,18 @@ pub fn decompress_onto(input: &[u8], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Compresses `input` as one gzip member with the header the pin's `MiniZStream` writes, which
+/// has no name, no time and an unknown system.
+#[must_use]
+pub fn compress(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() / 2 + 64);
+    out.extend_from_slice(&[MAGIC[0], MAGIC[1], 8, 0, 0, 0, 0, 0, 0, 0xff]);
+    crate::deflate::compress_onto(input, &mut out);
+    out.extend_from_slice(&crc32(input).to_le_bytes());
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out
+}
+
 /// Decompresses one member onto the end of `out` and gives back whatever follows it.
 fn member<'a>(input: &'a [u8], out: &mut Vec<u8>) -> Result<&'a [u8]> {
     if input.len() < 18 {
@@ -136,7 +149,7 @@ fn member<'a>(input: &'a [u8], out: &mut Vec<u8>) -> Result<&'a [u8]> {
 }
 
 /// The CRC-32 of `bytes`.
-fn crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut c = !0u32;
     for &byte in bytes {
         c = CRC[((c ^ u32::from(byte)) & 0xFF) as usize] ^ (c >> 8);
@@ -426,7 +439,17 @@ fn codes(
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32, decompress};
+    use super::{compress, crc32, decompress};
+
+    #[test]
+    fn a_member_written_here_reads_back() {
+        let text = b"a page of a parquet file, with the same words in it more than once".repeat(30);
+        let member = compress(&text);
+        assert_eq!(member[..10], [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
+        assert!(member.len() < text.len() / 10, "{}", member.len());
+        assert_eq!(decompress(&member).expect("inflates"), text);
+        assert_eq!(decompress(&compress(b"")).expect("inflates"), b"");
+    }
 
     #[test]
     fn the_crc_is_the_one_everybody_uses() {
