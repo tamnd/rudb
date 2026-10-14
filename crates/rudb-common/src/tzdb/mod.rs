@@ -144,11 +144,11 @@ pub struct Zone(&'static Entry);
 impl Zone {
     /// The zone file of a release with a name, found without regard to case, as `pg_open_tzfile`
     /// finds it.
-    #[must_use]
     ///
     /// A name is looked up in the data once, and so is the file it finds, however many names find
     /// it. A session that only reads its default zone and checks the name of the system's zone
-    /// builds no listing of every zone.
+    /// builds no listing of every zone, and compiles no rules until it asks for an offset.
+    #[must_use]
     pub fn file(release: Release, name: &str) -> Option<Zone> {
         type Found = HashMap<(Release, String), &'static Entry>;
         static FOUND: LazyLock<Mutex<Found>> = LazyLock::new(Mutex::default);
@@ -161,12 +161,13 @@ impl Zone {
         let same = |entry: &&&'static Entry| entry.release() == Some(release) && entry.name == name;
         let entry = match found.values().find(same) {
             Some(&entry) => entry,
-            None => {
-                let entry =
-                    Entry { name, source: Source::File(release, at), state: OnceLock::new() };
-                entry.state()?;
-                Box::leak(Box::new(entry))
-            }
+            // The rules are compiled when something first asks for an offset, which most sessions
+            // never do. Every zone of both releases compiles, as a test checks.
+            None => Box::leak(Box::new(Entry {
+                name,
+                source: Source::File(release, at),
+                state: OnceLock::new(),
+            })),
         };
         found.insert(key, entry);
         Some(Zone(entry))
@@ -241,10 +242,10 @@ impl Zone {
     ///
     /// # Panics
     ///
-    /// Never: a handle is made only for a zone whose rules load.
+    /// Never: the rules of every zone of both releases load, and a POSIX zone is only made once
+    /// its string has been read.
     #[must_use]
     pub fn state(self) -> &'static State {
-        // A handle exists only for a zone whose rules load.
         self.0.state().expect("a zone handle has rules")
     }
 }
@@ -335,6 +336,15 @@ mod tests {
                         listed.name
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_zone_of_both_releases_compiles() {
+        for release in [Release::Postgres, Release::Icu] {
+            for zone in Zone::files(release) {
+                assert!(zone.0.state().is_some(), "{}", zone.name());
             }
         }
     }
