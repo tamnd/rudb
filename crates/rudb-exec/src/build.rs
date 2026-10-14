@@ -2585,7 +2585,8 @@ impl<'a> Building<'a, '_> {
                 function @ (TableFunction::ParquetMetadata
                 | TableFunction::ParquetSchema
                 | TableFunction::ParquetKvMetadata
-                | TableFunction::ParquetFileMetadata),
+                | TableFunction::ParquetFileMetadata
+                | TableFunction::ParquetFullMetadata),
             ) => {
                 let kind = function
                     .parquet_table()

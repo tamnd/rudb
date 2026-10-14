@@ -1,6 +1,7 @@
 //! `read_text(path)` and `read_blob(path)`, one row per file with the whole of it in a column, and
-//! `glob(path)`, one row per file with only its name, and the four that print a Parquet footer,
-//! `parquet_metadata`, `parquet_schema`, `parquet_kv_metadata` and `parquet_file_metadata`.
+//! `glob(path)`, one row per file with only its name, and the five that print a Parquet footer,
+//! `parquet_metadata`, `parquet_schema`, `parquet_kv_metadata`, `parquet_file_metadata` and
+//! `parquet_full_metadata`.
 //!
 //! The binder expanded the patterns, so the arguments are one constant per file in the order the
 //! rows go out. The files are read while the operator is built, like the other metadata tables
@@ -13,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
 use rudb_functions::{TableFunction, content_fields, parquet_bloom_excludes, parquet_footer};
 use rudb_kernels::cast_in_time_zone;
-use rudb_parquet::MetadataTable;
+use rudb_parquet::{MetadataTable, RawFooter};
 use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::Vector;
 
@@ -70,10 +71,10 @@ pub(crate) fn contents(
     Metadata::new(name, &content_fields(blob), &rows, plan, index, columns)
 }
 
-/// The rows of one of the four functions that print a Parquet footer, a file after another.
+/// The rows of one of the functions that print a Parquet footer, a file after another.
 ///
-/// A statistic comes back from the footer in its column's type and is turned into text here, in
-/// the session's time zone, which is where a `TIMESTAMPTZ` bound gets the offset it prints with.
+/// `parquet_full_metadata` has a row per file, with the rows of each of the other four for that
+/// file as a list of structs, the way the pin puts them together.
 ///
 /// # Errors
 ///
@@ -87,25 +88,53 @@ pub(crate) fn parquet_tables(
     columns: Slice,
     time_zone: SessionTimeZone,
 ) -> Result<Metadata> {
-    let fields = table.fields();
     let mut rows = Vec::new();
     for path in paths(plan, args)? {
         let footer = parquet_footer(&path)?;
-        for mut row in table.rows(&footer, &path)? {
-            for (value, field) in row.iter_mut().zip(&fields) {
-                let typed = !matches!(value, Value::Null | Value::Varchar(_));
-                if field.ty == LogicalType::Varchar && typed {
-                    let held =
-                        Vector::from_values(value.logical_type(), std::slice::from_ref(value))?;
-                    let cast =
-                        cast_in_time_zone(&held, &LogicalType::Varchar, false, Some(time_zone))?;
-                    *value = cast.value_at(0);
-                }
+        if table != MetadataTable::Full {
+            rows.extend(printed(table, &footer, &path, time_zone)?);
+            continue;
+        }
+        let mut row = Vec::with_capacity(MetadataTable::PARTS.len());
+        for part in MetadataTable::PARTS {
+            let fields = part.fields();
+            let values = printed(part, &footer, &path, time_zone)?
+                .into_iter()
+                .map(|values| {
+                    let names = fields.iter().map(|field| field.name.clone());
+                    Value::Struct(names.zip(values).collect())
+                })
+                .collect();
+            row.push(Value::List { element: LogicalType::Struct(fields), values });
+        }
+        rows.push(row);
+    }
+    Metadata::new(function.name(), &table.fields(), &rows, plan, index, columns)
+}
+
+/// The rows of `table` for the file at `path`, with every value in a `VARCHAR` column as text.
+///
+/// A statistic comes back from the footer in its column's type and is turned into text here, in
+/// the session's time zone, which is where a `TIMESTAMPTZ` bound gets the offset it prints with.
+fn printed(
+    table: MetadataTable,
+    footer: &RawFooter,
+    path: &str,
+    time_zone: SessionTimeZone,
+) -> Result<Vec<Vec<Value>>> {
+    let fields = table.fields();
+    let mut rows = table.rows(footer, path)?;
+    for row in &mut rows {
+        for (value, field) in row.iter_mut().zip(&fields) {
+            let typed = !matches!(value, Value::Null | Value::Varchar(_));
+            if field.ty == LogicalType::Varchar && typed {
+                let held = Vector::from_values(value.logical_type(), std::slice::from_ref(value))?;
+                let cast = cast_in_time_zone(&held, &LogicalType::Varchar, false, Some(time_zone))?;
+                *value = cast.value_at(0);
             }
-            rows.push(row);
         }
     }
-    Metadata::new(function.name(), &fields, &rows, plan, index, columns)
+    Ok(rows)
 }
 
 /// Whether `ty` is a struct, list, array or map, which the pin has no cast to from a value that is

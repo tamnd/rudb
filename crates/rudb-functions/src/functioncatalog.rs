@@ -304,6 +304,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ParquetSchema,
     TableFunction::ParquetKvMetadata,
     TableFunction::ParquetFileMetadata,
+    TableFunction::ParquetFullMetadata,
     TableFunction::ParquetBloomProbe,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
@@ -372,6 +373,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         | TableFunction::ParquetSchema
         | TableFunction::ParquetKvMetadata
         | TableFunction::ParquetFileMetadata
+        | TableFunction::ParquetFullMetadata
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
         | TableFunction::PragmaStorageInfo => vec![1],
@@ -431,6 +433,7 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
         | TableFunction::ParquetSchema
         | TableFunction::ParquetKvMetadata
         | TableFunction::ParquetFileMetadata
+        | TableFunction::ParquetFullMetadata
         | TableFunction::JsonEach
         | TableFunction::JsonTree
         | TableFunction::PragmaTableInfo

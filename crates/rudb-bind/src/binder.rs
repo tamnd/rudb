@@ -4610,7 +4610,7 @@ impl<'a> Binder<'a> {
             // The footer tables take their patterns the way the file readers do, a pattern that
             // matches nothing included, which is an error here and no rows for `read_text`.
             Columns::Fixed(fields) if resolved.function.parquet_table().is_some() => {
-                let paths = self.file_paths(cast[0], resolved.function.name())?;
+                let paths = self.footer_paths(cast[0])?;
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
             }
@@ -5432,10 +5432,7 @@ impl<'a> Binder<'a> {
             let value = self.plan.add_value(value);
             values.push(self.plan.add_expr(Expr::Constant(value), ty));
         }
-        if fold::value_of(&self.plan, path)?.is_some_and(|value| value.is_null()) {
-            return Err(Error::parser("\"ParquetMetadata\" cannot take NULL list as parameter"));
-        }
-        for path in self.file_paths(path, "ParquetMetadata")? {
+        for path in self.footer_paths(path)? {
             values.push(self.path_constant(&path));
         }
         Ok(values)
@@ -5562,6 +5559,25 @@ impl<'a> Binder<'a> {
             paths.extend(files(&pattern)?);
         }
         Ok(paths)
+    }
+
+    /// The files a function that prints a Parquet footer names, with the pin's errors, which call
+    /// the reader `"ParquetMetadata"` for every one of them and quote it where the others do not.
+    fn footer_paths(&self, expr: ExprRef) -> Result<Vec<String>> {
+        match fold::value_of(&self.plan, expr)? {
+            Some(Value::Null) => {
+                return Err(Error::parser(
+                    "\"ParquetMetadata\" cannot take NULL list as parameter",
+                ));
+            }
+            Some(Value::List { values, .. }) if values.iter().any(Value::is_null) => {
+                return Err(Error::parser(
+                    "\"ParquetMetadata\" reader cannot take NULL input as parameter",
+                ));
+            }
+            _ => {}
+        }
+        self.file_paths(expr, "ParquetMetadata")
     }
 
     /// The files a JSON read with `allow_empty` names, where a pattern that matches nothing adds
