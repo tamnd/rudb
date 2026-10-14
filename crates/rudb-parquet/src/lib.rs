@@ -40,6 +40,7 @@ mod assemble;
 mod bloom;
 mod chunk;
 mod delta;
+mod encode;
 mod footer;
 mod hybrid;
 mod metadata;

@@ -1,5 +1,5 @@
-//! The Parquet writer: a flat schema, dictionary or `PLAIN` values, and `UNCOMPRESSED` or `SNAPPY`
-//! pages.
+//! The Parquet writer: a flat schema, dictionary, `PLAIN` or delta values, and `UNCOMPRESSED` or
+//! `SNAPPY` pages.
 //!
 //! What it writes is what the pin writes for the same columns. Every
 //! column is `OPTIONAL`, the root of the schema is `duckdb_schema`, integers narrower than 32 bits
@@ -16,8 +16,9 @@
 //! enum always has a dictionary of every member and `RLE_DICTIONARY` pages. A data page is closed
 //! once the estimated size of its values reaches the data page limit, which by default is so high
 //! that a column chunk is one page. Levels and indices are written in the hybrid encoding with the
-//! pin's choice of runs, so a file comes out the same bytes as the pin's for the same rows. The
-//! delta encodings of the version two pages are the next step.
+//! pin's choice of runs, so a file comes out the same bytes as the pin's for the same rows. A
+//! version two file, which `PARQUET_VERSION` asks for, has `RLE_DICTIONARY` pages for a dictionary
+//! and the encodings in [`crate::encode`] for a chunk with none.
 //!
 //! Each column chunk records its null count and, where the pin does, the smallest and the largest
 //! value in both the old `min` and `max` fields and the newer `min_value` and `max_value`, in the
@@ -41,6 +42,7 @@ use rudb_compress::Codec;
 use rudb_vector::Chunk;
 
 use crate::bloom::{Filter, xxh64};
+use crate::encode;
 use crate::metadata::Physical;
 use crate::runs::{Runs, index_width};
 use crate::thrift;
@@ -51,7 +53,10 @@ const BOUND_BYTES: usize = 256;
 /// The value encodings this writer uses, by their wire numbers.
 const PLAIN: i32 = 0;
 const PLAIN_DICTIONARY: i32 = 2;
+const DELTA_BINARY_PACKED: i32 = 5;
+const DELTA_LENGTH_BYTE_ARRAY: i32 = 6;
 const RLE_DICTIONARY: i32 = 8;
+const BYTE_STREAM_SPLIT: i32 = 9;
 
 /// How large the pin lets a dictionary and a data page grow, which `COPY ... TO` sets with
 /// `DICTIONARY_SIZE_LIMIT`, `STRING_DICTIONARY_PAGE_SIZE_LIMIT` and `DATA_PAGE_SIZE_LIMIT`, and
@@ -735,6 +740,8 @@ pub struct Writer<W: Write> {
     limits: Limits,
     /// The field id of each element of [`Self::schema`], from [`Writer::set_field_ids`].
     field_ids: Vec<Option<i32>>,
+    /// The format version the footer states, from [`Writer::set_version`].
+    version: i32,
 }
 
 /// The field id `FIELD_IDS` gives a column, with the ones it gives the columns under it.
@@ -914,6 +921,7 @@ impl<W: Write> Writer<W> {
             unbounded,
             limits: Limits::default(),
             field_ids: Vec::new(),
+            version: 1,
         };
         writer.put(b"PAR1")?;
         Ok(writer)
@@ -927,6 +935,15 @@ impl<W: Write> Writer<W> {
     /// Sets how large a dictionary and a data page may grow.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// Sets the format version, which `PARQUET_VERSION` gives as one or two. A version two file
+    /// writes `RLE_DICTIONARY` pages for a dictionary, and a chunk with no dictionary falls back
+    /// to `DELTA_BINARY_PACKED` for an integer, `DELTA_LENGTH_BYTE_ARRAY` for a string or a blob
+    /// and `BYTE_STREAM_SPLIT` for a float, which is what the pin does. Its data pages are still
+    /// version one pages, as the pin's are.
+    pub fn set_version(&mut self, version: i32) {
+        self.version = version;
     }
 
     /// Gives the columns that `ids` names their field ids, which go in the footer's schema.
@@ -1089,9 +1106,11 @@ impl<W: Write> Writer<W> {
         let physical = self.columns[at].physical;
         let enumerated = self.columns[at].members.is_some();
         let (encoding, width) = match &gathered.dictionary {
-            Some((_, count)) if enumerated => (RLE_DICTIONARY, index_width(*count)),
+            Some((_, count)) if enumerated || self.version == 2 => {
+                (RLE_DICTIONARY, index_width(*count))
+            }
             Some((_, count)) => (PLAIN_DICTIONARY, index_width(*count)),
-            None => (PLAIN, 0),
+            None => (self.fallback(at), 0),
         };
         let mut dictionary = None;
         if let Some((body, count)) = &gathered.dictionary {
@@ -1113,7 +1132,10 @@ impl<W: Write> Writer<W> {
             if max_def > 0 {
                 levels(&gathered.defs[rows.clone()], max_def, &mut body);
             }
-            if encoding != PLAIN {
+            let start = values.start.checked_sub(1).map_or(0, |at| gathered.ends[at]);
+            let end = values.end.checked_sub(1).map_or(0, |at| gathered.ends[at]);
+            let plain = &gathered.plain[start..end];
+            if gathered.dictionary.is_some() {
                 body.push(width);
                 if !values.is_empty() {
                     let mut indices = Runs::new(width);
@@ -1122,14 +1144,41 @@ impl<W: Write> Writer<W> {
                     }
                     body.extend_from_slice(&indices.finish());
                 }
-            } else {
-                let start = values.start.checked_sub(1).map_or(0, |at| gathered.ends[at]);
-                let end = values.end.checked_sub(1).map_or(0, |at| gathered.ends[at]);
-                if physical == Physical::Boolean {
-                    body.extend_from_slice(&packed(&gathered.plain[start..end]));
-                } else {
-                    body.extend_from_slice(&gathered.plain[start..end]);
+            } else if encoding == DELTA_BINARY_PACKED {
+                let unsigned = self.columns[at].ty == LogicalType::UInteger;
+                let integers = match physical {
+                    Physical::Int32 => plain
+                        .chunks_exact(4)
+                        .map(|bytes| {
+                            let bytes = <[u8; 4]>::try_from(bytes).unwrap_or_default();
+                            if unsigned {
+                                i64::from(u32::from_le_bytes(bytes))
+                            } else {
+                                i64::from(i32::from_le_bytes(bytes))
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => plain
+                        .chunks_exact(8)
+                        .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap_or_default()))
+                        .collect(),
+                };
+                encode::binary_packed(&integers, &mut body);
+            } else if encoding == DELTA_LENGTH_BYTE_ARRAY {
+                let mut strings = Vec::with_capacity(values.len());
+                let mut from = start;
+                for &to in &gathered.ends[values] {
+                    strings.push(&gathered.plain[from + 4..to]);
+                    from = to;
                 }
+                encode::length_byte_array(&strings, &mut body);
+            } else if encoding == BYTE_STREAM_SPLIT {
+                let width = if physical == Physical::Float { 4 } else { 8 };
+                encode::stream_split(plain, width, &mut body);
+            } else if physical == Physical::Boolean {
+                body.extend_from_slice(&packed(plain));
+            } else {
+                body.extend_from_slice(plain);
             }
             let mut data = thrift::Writer::default();
             data.i32(1, rows.len() as i32);
@@ -1151,6 +1200,22 @@ impl<W: Write> Writer<W> {
             _ => None,
         };
         Ok((self.chunk_meta(at, first, dictionary, encoding, written), filter))
+    }
+
+    /// The encoding of the values of column `at` in a chunk with no dictionary. A version one
+    /// file has nothing but `PLAIN`, and a version two file has the encodings the pin turns to,
+    /// for the types it writes through a dictionary when it can.
+    fn fallback(&self, at: usize) -> i32 {
+        let column = &self.columns[at];
+        if self.version == 1 || !column.dictionary {
+            return PLAIN;
+        }
+        match column.physical {
+            Physical::Int32 | Physical::Int64 => DELTA_BINARY_PACKED,
+            Physical::ByteArray => DELTA_LENGTH_BYTE_ARRAY,
+            Physical::Float | Physical::Double => BYTE_STREAM_SPLIT,
+            _ => PLAIN,
+        }
     }
 
     /// Writes one page: its header, of page type `kind` with the type's own header in `inner`,
@@ -1341,7 +1406,7 @@ impl<W: Write> Writer<W> {
             });
         }
         let mut footer = thrift::Writer::default();
-        footer.i32(1, 1);
+        footer.i32(1, self.version);
         footer.list_of_nested(2, schema);
         footer.int(3, self.rows);
         footer.list_of_nested(4, groups);
@@ -2055,6 +2120,95 @@ mod tests {
         assert!(bytes == pin, "differs from the pin's file");
         for (at, values) in values.iter().enumerate() {
             assert!(read_back(pin, at) == *values, "{} reads back", names[at]);
+        }
+    }
+
+    /// The columns of a file, their values and the file the pin wrote of them.
+    type File<'a> = (Vec<(&'a str, LogicalType)>, Vec<Vec<Value>>, &'a [u8]);
+
+    #[test]
+    fn version_two_files_come_out_as_the_pins_bytes() {
+        // COPY (SELECT i*7-50 AS a, CASE WHEN i%5=0 THEN NULL ELSE i*i*1000000000 END AS b,
+        // (4000000000 - i*3)::UINTEGER AS c, CASE WHEN i%6=0 THEN NULL ELSE repeat('x', i) END
+        // AS d, i/3.0 AS e, (i*1.5)::FLOAT AS f, i%2=0 AS g, (i*1.25)::DECIMAL(30,2) AS h,
+        // (i%3)::TINYINT AS k, NULL::INTEGER AS n, (200+i)::UTINYINT AS u, TIMESTAMP
+        // '2020-01-01' + INTERVAL (i) SECOND AS t, ('b' || i)::BLOB AS bl, (i*1000)::HUGEINT AS
+        // hu FROM range(20) r(i)) TO 'v2-types.parquet' (FORMAT parquet, PARQUET_VERSION v2,
+        // COMPRESSION uncompressed), in the pin.
+        let types = [
+            ("a", LogicalType::BigInt),
+            ("b", LogicalType::BigInt),
+            ("c", LogicalType::UInteger),
+            ("d", LogicalType::Varchar),
+            ("e", LogicalType::Double),
+            ("f", LogicalType::Float),
+            ("g", LogicalType::Boolean),
+            ("h", LogicalType::Decimal { width: 30, scale: 2 }),
+            ("k", LogicalType::TinyInt),
+            ("n", LogicalType::Integer),
+            ("u", LogicalType::UTinyInt),
+            ("t", LogicalType::Timestamp),
+            ("bl", LogicalType::Blob),
+            ("hu", LogicalType::HugeInt),
+        ];
+        let mut rows: Vec<Vec<Value>> = vec![Vec::new(); types.len()];
+        for i in 0..20_i64 {
+            let row = [
+                Value::BigInt(i * 7 - 50),
+                if i % 5 == 0 { Value::Null } else { Value::BigInt(i * i * 1_000_000_000) },
+                Value::UInteger(4_000_000_000 - i as u32 * 3),
+                if i % 6 == 0 { Value::Null } else { Value::Varchar("x".repeat(i as usize)) },
+                Value::Double(i as f64 / 3.0),
+                Value::Float(i as f32 * 1.5),
+                Value::Boolean(i % 2 == 0),
+                Value::Decimal { unscaled: i128::from(i) * 125, width: 30, scale: 2 },
+                Value::TinyInt((i % 3) as i8),
+                Value::Null,
+                Value::UTinyInt(200 + i as u8),
+                Value::Timestamp(1_577_836_800_000_000 + i * 1_000_000),
+                Value::Blob(format!("b{i}").into_bytes()),
+                // A `HUGEINT` comes to the writer as the `DOUBLE` it is stored as.
+                Value::Double((i * 1000) as f64),
+            ];
+            for (column, value) in rows.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        // The same for (SELECT CASE WHEN i%7=0 THEN NULL ELSE (i*i) % 1009 - 500 END AS a FROM
+        // range(2100) r(i)), which takes two blocks of deltas.
+        let blocks = (0..2100_i64)
+            .map(|i| if i % 7 == 0 { Value::Null } else { Value::BigInt((i * i) % 1009 - 500) })
+            .collect::<Vec<_>>();
+        let files: [File<'_>; 2] = [
+            (types.to_vec(), rows, include_bytes!("../testdata/v2-types.parquet")),
+            (
+                vec![("a", LogicalType::BigInt)],
+                vec![blocks],
+                include_bytes!("../testdata/v2-blocks.parquet"),
+            ),
+        ];
+        for (types, rows, pin) in files {
+            let fields: Vec<_> =
+                types.iter().map(|(name, ty)| Field::new(*name, ty.clone())).collect();
+            let columns = types
+                .iter()
+                .zip(&rows)
+                .map(|((_, ty), values)| column(super::storage(ty).expect("stored"), values));
+            let chunk = Chunk::new(columns.collect()).expect("a chunk");
+            let mut writer =
+                Writer::new(Vec::new(), &fields, Codec::Uncompressed, PIN).expect("starts");
+            writer.set_version(2);
+            writer.write_group(&[chunk]).expect("writes");
+            let bytes = writer.finish().expect("finishes");
+            // The pin writes no nan_count, which a newer DuckDB does and this writer does too, so
+            // only what comes before the footer is the pin's byte for byte.
+            let footer =
+                u32::from_le_bytes(pin[pin.len() - 8..pin.len() - 4].try_into().expect("four"));
+            let pages = pin.len() - 8 - footer as usize;
+            assert!(bytes[..pages] == pin[..pages], "{} differs from the pin's file", types[0].0);
+            for (at, values) in rows.iter().enumerate() {
+                assert_eq!(&read_back(pin, at), values, "{} reads back", types[at].0);
+            }
         }
     }
 
