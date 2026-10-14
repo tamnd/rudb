@@ -619,3 +619,85 @@ fn a_partition_key_takes_over_a_file_column_of_its_name_and_goes_after_the_row_n
     let sql = format!("SELECT count(*) FROM '{root}/a=8/*.parquet' WHERE a = 8");
     assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(1));
 }
+
+/// `parquet_bloom_probe` over `bloom.parquet`, whose every answer but those for `z` is the pin's.
+#[test]
+fn a_bloom_probe_answers_for_every_row_group_the_way_the_pin_does() {
+    let database = Database::new();
+    let file = format!("{}/../rudb-parquet/testdata/bloom.parquet", env!("CARGO_MANIFEST_DIR"));
+    let probe = |column: &str, value: &str| -> Vec<Value> {
+        let sql = format!(
+            "SELECT bloom_filter_excludes FROM parquet_bloom_probe('{file}', '{column}', {value}) \
+             ORDER BY row_group_id"
+        );
+        let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        (0..result.len()).map(|row| result.value_at(row, 0)).collect()
+    };
+    let (yes, no) = (Value::Boolean(true), Value::Boolean(false));
+    for (column, value, first, second) in [
+        ("a", "1", &no, &yes),
+        ("a", "11", &yes, &no),
+        ("A", "5", &yes, &yes),
+        ("n", "'12'", &yes, &no),
+        ("s", "'v2'", &no, &yes),
+        ("s", "10", &yes, &yes),
+        ("d", "0", &no, &yes),
+        ("d", "-0.0", &no, &yes),
+        ("d", "5.5", &yes, &no),
+        ("d", "7.5", &yes, &yes),
+        ("d", "'nan'", &no, &no),
+        ("dc", "2", &no, &yes),
+        ("dc", "12.0", &yes, &no),
+        ("tz", "'00:00:01+01'", &no, &yes),
+        ("tz", "'23:00:01+00'", &no, &yes),
+        ("tz", "'00:00:01+00'", &yes, &yes),
+        ("u", "'00000000-0000-0000-0000-000000000011'", &yes, &no),
+        ("tn", "TIMESTAMP '2026-01-01 00:00:02'", &no, &yes),
+        ("tn", "'2026-01-01 00:00:12'", &yes, &no),
+        ("w", "7", &no, &no),
+        // The pin answers these two the other way round, out of the filter of `st.y`.
+        ("z", "11", &no, &no),
+        ("z", "101", &yes, &yes),
+    ] {
+        let expected = vec![first.clone(), second.clone()];
+        assert_eq!(probe(column, value), expected, "{column} {value}");
+    }
+    let rows = database
+        .query(&format!("SELECT * FROM parquet_bloom_probe(['{file}', '{file}'], 'a', 1)"))
+        .expect("probes");
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.value_at(3, 0), Value::Varchar(file.clone()));
+    assert_eq!(rows.value_at(3, 1), Value::BigInt(1));
+    for (arguments, message) in [
+        (
+            format!("'{file}', 'st', NULL::INTEGER"),
+            "Invalid Input Error: Can't have NULL parameters for parquet_bloom_probe".to_string(),
+        ),
+        (
+            format!("'{file}', 'st', 1"),
+            "Invalid Input Error: Failed to cast value: Unimplemented type for cast (INTEGER -> \
+             STRUCT(x BIGINT, y BIGINT))"
+                .to_string(),
+        ),
+        (
+            format!("'{file}', 'a', 'abc'"),
+            "Invalid Input Error: Failed to cast value: Could not convert string 'abc' to INT64"
+                .to_string(),
+        ),
+        (format!("'{file}', 'q', 1"), format!("Invalid Input Error: Column q not found in {file}")),
+        (
+            format!("'{file}', 1, 1"),
+            "Binder Error: No function matches the given name and argument types \
+             'parquet_bloom_probe(VARCHAR, INTEGER, INTEGER)'. You might need to add explicit \
+             type casts.\n\tCandidate functions:\n\t\"parquet_bloom_probe\"(VARCHAR, VARCHAR, \
+             ANY)\n\t\"parquet_bloom_probe\"(ANY[], VARCHAR, ANY)\n\t\"parquet_bloom_probe\"\
+             (VARIANT, VARCHAR, ANY)\n"
+                .to_string(),
+        ),
+    ] {
+        let sql = format!("SELECT * FROM parquet_bloom_probe({arguments})");
+        let error = database.query(&sql).expect_err(&sql).to_string();
+        assert_eq!(error.lines().next(), message.lines().next(), "{sql}");
+        assert_eq!(error, message, "{sql}");
+    }
+}

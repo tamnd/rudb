@@ -4603,6 +4603,10 @@ impl<'a> Binder<'a> {
                 cast = paths.iter().map(|path| self.path_constant(path)).collect();
                 fields
             }
+            Columns::Fixed(fields) if resolved.function == TableFunction::ParquetBloomProbe => {
+                cast = self.bloom_probe_arguments(&cast)?;
+                fields
+            }
             // The footer tables take their patterns the way the file readers do, a pattern that
             // matches nothing included, which is an error here and no rows for `read_text`.
             Columns::Fixed(fields) if resolved.function.parquet_table().is_some() => {
@@ -5401,6 +5405,40 @@ impl<'a> Binder<'a> {
         if let Some(&rows) = rows.value() {
             self.plan.want_mirror(path, binary_as_string, rows);
         }
+    }
+
+    /// The arguments of `parquet_bloom_probe` the way the executor takes them, the column name and
+    /// the value first and then one constant per file the pattern matches.
+    ///
+    /// Both are needed here as values, and a null in either is the pin's error before it looks
+    /// for a file, as is a null pattern, which it names the way it names its whole family.
+    fn bloom_probe_arguments(&mut self, cast: &[ExprRef]) -> Result<Vec<ExprRef>> {
+        let [path, column, probe] = cast[..] else {
+            return Err(Error::internal("parquet_bloom_probe bound without its three arguments"));
+        };
+        let mut values = Vec::new();
+        for expr in [column, probe] {
+            let Some(value) = fold::value_of(&self.plan, expr)? else {
+                return Err(Error::not_implemented(
+                    "a parquet_bloom_probe argument that is not a constant",
+                ));
+            };
+            if value.is_null() {
+                return Err(Error::invalid_input(
+                    "Can't have NULL parameters for parquet_bloom_probe",
+                ));
+            }
+            let ty = self.plan.expr_type(expr).clone();
+            let value = self.plan.add_value(value);
+            values.push(self.plan.add_expr(Expr::Constant(value), ty));
+        }
+        if fold::value_of(&self.plan, path)?.is_some_and(|value| value.is_null()) {
+            return Err(Error::parser("\"ParquetMetadata\" cannot take NULL list as parameter"));
+        }
+        for path in self.file_paths(path, "ParquetMetadata")? {
+            values.push(self.path_constant(&path));
+        }
+        Ok(values)
     }
 
     /// One file name, as a constant expression in the plan.

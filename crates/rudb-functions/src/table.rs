@@ -124,6 +124,9 @@ pub enum TableFunction {
     ParquetKvMetadata,
     /// `parquet_file_metadata(path)`, a row per file.
     ParquetFileMetadata,
+    /// `parquet_bloom_probe(path, column, value)`, a row per row group of each file saying whether
+    /// the column's bloom filter rules the value out.
+    ParquetBloomProbe,
     /// `rudb_strategies()`, every seam and every implementation registered against it.
     RudbStrategies,
     /// `rudb_links()`, every relationship declared and what is stored for it.
@@ -230,6 +233,7 @@ impl TableFunction {
             Self::ParquetSchema => "parquet_schema",
             Self::ParquetKvMetadata => "parquet_kv_metadata",
             Self::ParquetFileMetadata => "parquet_file_metadata",
+            Self::ParquetBloomProbe => "parquet_bloom_probe",
             Self::RudbStrategies => "rudb_strategies",
             Self::RudbLinks => "rudb_links",
             Self::RudbDeviceCard => "rudb_device_card",
@@ -492,6 +496,7 @@ impl TableFunction {
             ("parquet_schema", Self::ParquetSchema),
             ("parquet_kv_metadata", Self::ParquetKvMetadata),
             ("parquet_file_metadata", Self::ParquetFileMetadata),
+            ("parquet_bloom_probe", Self::ParquetBloomProbe),
         ] {
             if name.eq_ignore_ascii_case(spelled) {
                 return Some(function);
@@ -729,6 +734,9 @@ fn resolve_found(function: TableFunction, arguments: &[LogicalType]) -> Result<R
             columns: Columns::Fixed(name_columns(function)),
         });
     }
+    if function == TableFunction::ParquetBloomProbe {
+        return bloom_probe(arguments);
+    }
     if function == TableFunction::RudbDeviceCard {
         return device_card(arguments);
     }
@@ -945,6 +953,7 @@ fn file_columns(function: TableFunction) -> Option<Columns> {
         TableFunction::ReadText
         | TableFunction::ReadBlob
         | TableFunction::Glob
+        | TableFunction::ParquetBloomProbe
         | TableFunction::Range
         | TableFunction::GenerateSeries
         | TableFunction::Unnest
@@ -1044,6 +1053,7 @@ fn fixed_columns(function: TableFunction) -> Option<Vec<Field>> {
         | TableFunction::ParquetSchema
         | TableFunction::ParquetKvMetadata
         | TableFunction::ParquetFileMetadata
+        | TableFunction::ParquetBloomProbe
         | TableFunction::RudbDeviceCard
         | TableFunction::PragmaTableInfo
         | TableFunction::PragmaShow
@@ -1094,6 +1104,43 @@ pub fn content_fields(blob: bool) -> Vec<Field> {
         Field::new("size", LogicalType::BigInt),
         Field::new("last_modified", LogicalType::TimestampTz),
     ]
+}
+
+/// `parquet_bloom_probe(path, column, value)`, whose path is a pattern or a list of them the way
+/// the footer tables take it, whose column is a name and whose value is anything.
+///
+/// A null column or value resolves, so that the binder can turn it down in the pin's words, which
+/// are about nulls rather than overloads. The value keeps its own type, and each file casts it to
+/// the column's.
+fn bloom_probe(arguments: &[LogicalType]) -> Result<ResolvedTable> {
+    let function = TableFunction::ParquetBloomProbe;
+    let path = match arguments.first() {
+        Some(LogicalType::List(element))
+            if matches!(**element, LogicalType::Varchar | LogicalType::Null) =>
+        {
+            Some(arguments[0].clone())
+        }
+        Some(LogicalType::Null) => Some(LogicalType::Null),
+        Some(LogicalType::Varchar) => Some(LogicalType::Varchar),
+        _ => None,
+    };
+    let column = matches!(arguments.get(1), Some(LogicalType::Varchar | LogicalType::Null));
+    let (Some(path), true, 3) = (path, column, arguments.len()) else {
+        let name = function.name();
+        return Err(Error::binder(format!(
+            "No function matches the given name and argument types '{name}({})'. You might need \
+             to add explicit type casts.\n\tCandidate functions:\n\t\"{name}\"(VARCHAR, VARCHAR, \
+             ANY)\n\t\"{name}\"(ANY[], VARCHAR, ANY)\n\t\"{name}\"(VARIANT, VARCHAR, ANY)\n",
+            arguments.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        )));
+    };
+    let fields = vec![
+        Field::new("file_name", LogicalType::Varchar),
+        Field::new("row_group_id", LogicalType::BigInt),
+        Field::new("bloom_filter_excludes", LogicalType::Boolean),
+    ];
+    let wanted = vec![path, arguments[1].clone(), arguments[2].clone()];
+    Ok(ResolvedTable { function, arguments: wanted, columns: Columns::Fixed(fields) })
 }
 
 /// `rudb_device_card(path)` and `rudb_device_card(path, iterations)`.

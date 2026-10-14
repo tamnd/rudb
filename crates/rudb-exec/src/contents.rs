@@ -11,10 +11,10 @@
 use std::time::UNIX_EPOCH;
 
 use rudb_common::{Error, Field, LogicalType, Result, SessionTimeZone, Value};
-use rudb_functions::{TableFunction, content_fields, parquet_footer};
+use rudb_functions::{TableFunction, content_fields, parquet_bloom_excludes, parquet_footer};
 use rudb_kernels::cast_in_time_zone;
 use rudb_parquet::MetadataTable;
-use rudb_plan::{Expr, Plan, Slice};
+use rudb_plan::{Expr, ExprRef, Plan, Slice};
 use rudb_vector::Vector;
 
 use crate::metadata::{Metadata, text};
@@ -108,16 +108,98 @@ pub(crate) fn parquet_tables(
     Metadata::new(function.name(), &fields, &rows, plan, index, columns)
 }
 
+/// Whether `ty` is a struct, list, array or map, which the pin has no cast to from a value that is
+/// neither text nor one of those.
+fn nested(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::Struct(_)
+            | LogicalType::List(_)
+            | LogicalType::Array(..)
+            | LogicalType::Map(..)
+    )
+}
+
+/// The rows of `parquet_bloom_probe`, a row per row group of each file saying whether the column's
+/// bloom filter rules the value out.
+///
+/// The binder put the column name and the value ahead of the files. The value is cast to the
+/// column's type in each file, in the session's time zone, and a value that does not cast is the
+/// pin's error about it, as is a column the file does not have.
+///
+/// # Errors
+///
+/// When a file is missing or is not Parquet, when it has no such column, and when the value does
+/// not cast to the column's type.
+pub(crate) fn bloom_probe(
+    plan: &Plan,
+    args: Slice,
+    index: u32,
+    columns: Slice,
+    time_zone: SessionTimeZone,
+) -> Result<Metadata> {
+    let arguments = plan.expr_list(args);
+    let [column, probe, files @ ..] = arguments else {
+        return Err(Error::internal("parquet_bloom_probe without its column and value"));
+    };
+    let column = match constant(plan, *column)? {
+        Value::Varchar(column) => column.clone(),
+        other => return Err(Error::internal(format!("a column name arrived as {other}"))),
+    };
+    let probe = constant(plan, *probe)?;
+    let held = Vector::from_values(probe.logical_type(), std::slice::from_ref(probe))?;
+    let mut rows = Vec::new();
+    for path in names(plan, files)? {
+        let footer = parquet_footer(&path)?;
+        let Some((at, ty, group)) = footer.probe_column(&column)? else {
+            return Err(Error::invalid_input(format!("Column {column} not found in {path}")));
+        };
+        if nested(&ty) && !nested(&probe.logical_type()) && !matches!(probe, Value::Varchar(_)) {
+            return Err(Error::invalid_input(format!(
+                "Failed to cast value: Unimplemented type for cast ({} -> {ty})",
+                probe.logical_type()
+            )));
+        }
+        let value = cast_in_time_zone(&held, &ty, false, Some(time_zone))
+            .map_err(|error| {
+                Error::invalid_input(format!("Failed to cast value: {}", error.message()))
+            })?
+            .value_at(0);
+        let value = if group { Value::Null } else { value };
+        let excludes = parquet_bloom_excludes(&path, &footer, at, &value)?;
+        for (group, excludes) in excludes.into_iter().enumerate() {
+            let group = i64::try_from(group).unwrap_or(i64::MAX);
+            rows.push(vec![text(&path), Value::BigInt(group), Value::Boolean(excludes)]);
+        }
+    }
+    let fields = [
+        Field::new("file_name", LogicalType::Varchar),
+        Field::new("row_group_id", LogicalType::BigInt),
+        Field::new("bloom_filter_excludes", LogicalType::Boolean),
+    ];
+    Metadata::new(TableFunction::ParquetBloomProbe.name(), &fields, &rows, plan, index, columns)
+}
+
 /// The file names the binder folded the arguments into, in the order the rows go out.
 fn paths(plan: &Plan, args: Slice) -> Result<Vec<String>> {
-    plan.expr_list(args)
+    names(plan, plan.expr_list(args))
+}
+
+/// The file names among some of the arguments.
+fn names(plan: &Plan, arguments: &[ExprRef]) -> Result<Vec<String>> {
+    arguments
         .iter()
-        .map(|argument| match plan.expr(*argument) {
-            Expr::Constant(reference) => match plan.value(*reference) {
-                Value::Varchar(path) => Ok(path.clone()),
-                other => Err(Error::internal(format!("a file name arrived as {other}"))),
-            },
-            _ => Err(Error::internal("a file name that the binder did not fold")),
+        .map(|argument| match constant(plan, *argument)? {
+            Value::Varchar(path) => Ok(path.clone()),
+            other => Err(Error::internal(format!("a file name arrived as {other}"))),
         })
         .collect()
+}
+
+/// The value of an argument the binder folded into a constant.
+fn constant(plan: &Plan, argument: ExprRef) -> Result<&Value> {
+    match plan.expr(argument) {
+        Expr::Constant(reference) => Ok(plan.value(*reference)),
+        _ => Err(Error::internal("a table function argument that the binder did not fold")),
+    }
 }

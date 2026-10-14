@@ -304,6 +304,7 @@ const TABLE_FUNCTIONS: &[TableFunction] = &[
     TableFunction::ParquetSchema,
     TableFunction::ParquetKvMetadata,
     TableFunction::ParquetFileMetadata,
+    TableFunction::ParquetBloomProbe,
     TableFunction::RudbStrategies,
     TableFunction::RudbLinks,
     TableFunction::RudbDeviceCard,
@@ -355,6 +356,7 @@ fn positional_counts(function: TableFunction) -> Vec<usize> {
         TableFunction::RudbDeviceCard | TableFunction::JsonEach | TableFunction::JsonTree => {
             vec![1, 2]
         }
+        TableFunction::ParquetBloomProbe => vec![3],
         TableFunction::Unnest
         | TableFunction::ReadParquet
         | TableFunction::ReadCsv
@@ -413,6 +415,8 @@ const fn positional_type(function: TableFunction, at: usize) -> &'static str {
     match function {
         TableFunction::RudbDeviceCard if at == 0 => "VARCHAR",
         TableFunction::Unnest => "ANY",
+        TableFunction::ParquetBloomProbe if at == 2 => "ANY",
+        TableFunction::ParquetBloomProbe => "VARCHAR",
         TableFunction::ReadParquet
         | TableFunction::ReadCsv
         | TableFunction::ReadJson

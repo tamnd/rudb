@@ -549,6 +549,21 @@ pub fn parquet_footer(path: &str) -> Result<rudb_parquet::RawFooter> {
     rudb_parquet::RawFooter::read(open_file(path)?.as_ref(), path)
 }
 
+/// Whether each row group's bloom filter for top level column `column` of the Parquet file at
+/// `path` rules `value` out, for `parquet_bloom_probe`, with `footer` the file's own.
+///
+/// # Errors
+///
+/// When the file is missing or cannot be read.
+pub fn parquet_bloom_excludes(
+    path: &str,
+    footer: &rudb_parquet::RawFooter,
+    column: usize,
+    value: &Value,
+) -> Result<Vec<bool>> {
+    footer.bloom_excludes(open_file(path)?.as_ref(), column, value)
+}
+
 /// What the row groups of one column said about how many distinct values it holds.
 ///
 /// Two numbers rather than one, because a column's distinct count is not in the footer and what is

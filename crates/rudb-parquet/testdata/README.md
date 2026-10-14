@@ -174,3 +174,27 @@ COPY (
 All three columns ascend, so a filter on any of them rules groups out and the groups that survive are narrow enough to interpolate inside. `d` is stored as an `INT64` of hundredths, which is what makes reading its bounds as plain integers wrong: the footer's 7 is 0.07. `t` and `ms` are the same instants in two units, microseconds and milliseconds, which is what makes reading a timestamp's bounds without the unit wrong the same way.
 
 DuckDB reads it as n=8192 with `d` from 0.00 to 81.91 and `t` from 2020-01-01 00:00:00 to 2020-01-06 16:31:00, and answers 1000 rows for `d < 10.00`, 3192 for `d >= 50.00`, 1001 for `d BETWEEN 20.00 AND 30.00`, none for `d > 999.00`, 1440 for `t < '2020-01-02 00:00:00'` and 2432 for `t >= '2020-01-05 00:00:00'`.
+
+## bloom.parquet
+
+Written by duckdb v2.0.0-dev84237 (cc7e7bac7f), Snappy, two row groups of 2048 rows, for `parquet_bloom_probe`. Each column holds three values in a row group, and the second group's values are the first group's plus ten, so a value present in one group is ruled out in the other.
+
+```sql
+SET threads = 1;
+COPY (
+  SELECT i // 2048 * 10 + i % 3 AS a,
+         (i // 2048 * 10 + i % 3)::INTEGER AS n,
+         'v' || (i // 2048 * 10 + i % 3) AS s,
+         ((i // 2048 * 10 + i % 3) / 2)::DOUBLE AS d,
+         (i // 2048 * 10 + i % 3)::DECIMAL(4,1) AS dc,
+         ('00:00:' || lpad((i // 2048 * 10 + i % 3)::VARCHAR, 2, '0') || '+01')::TIMETZ AS tz,
+         ('00000000-0000-0000-0000-0000000000' || lpad((i // 2048 * 10 + i % 3)::VARCHAR, 2, '0'))::UUID AS u,
+         (TIMESTAMP '2026-01-01' + INTERVAL (i // 2048 * 10 + i % 3) SECOND)::TIMESTAMP_NS AS tn,
+         i AS w,
+         {'x': i % 3, 'y': i % 3 + 100} AS st,
+         i % 3 + 10 AS z
+  FROM range(4096) r(i)
+) TO 'bloom.parquet' (ROW_GROUP_SIZE 2048);
+```
+
+Every column has a bloom filter except `w`, which has too many values for a dictionary. The struct is there for `z` after it. The pin looks up a column's filter by its place among the top-level columns rather than among the leaves, so for `z` it reads the filter of `st.y`, and it answers that 11 is ruled out of both groups and 101 is in both. That is tamnd/duckdb#51, and the answers the tests hold for `z` are the ones its own filter gives.
