@@ -4028,7 +4028,7 @@ impl<'a> FileScan<'a> {
         sideways: Option<Arc<Sideways<'a>>>,
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
-        let given = if function == TableFunction::ReadCsv {
+        let mut given = if function == TableFunction::ReadCsv {
             csv_options(plan, options, settings)?
         } else {
             Given::default()
@@ -4050,6 +4050,8 @@ impl<'a> FileScan<'a> {
         };
         let slots = slots(&produced, &named, &paths);
         let can_have_nan = named.contains(&("can_have_nan", Value::Boolean(true)));
+        // A Parquet read has no CSV options, but matches its files by name the same way.
+        given.union_by_name |= named.contains(&("union_by_name", Value::Boolean(true)));
         let numbered = slots.contains(&Slot::Number);
         let wanted: Vec<Field> = produced
             .iter()
