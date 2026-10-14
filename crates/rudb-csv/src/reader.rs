@@ -158,6 +158,7 @@ impl Reader {
         let escape = given.escape.or(quote);
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
         let mut rows = reader.sample_rows(&sample)?;
+        let empty = sample.is_empty();
         drop(sample);
         // The punctuation comes from the first block, as the pin's comes from its first chunk, and
         // only the rows go on to more of the file when the sample asks for more than a block held.
@@ -170,7 +171,7 @@ impl Reader {
         }
         let (header, mut fields) = describe(&rows, told, reader.given.types.as_deref());
         reader.sampled = rows.len().saturating_sub(usize::from(header));
-        reader.empty = sample.is_empty();
+        reader.empty = empty;
         if let Some(types) = &reader.given.types {
             let width = rows.iter().map(Vec::len).max().unwrap_or(types.len());
             reader.set_widths(&rows, header, width, types.len())?;
