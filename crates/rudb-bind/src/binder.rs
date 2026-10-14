@@ -23,10 +23,10 @@ use rudb_common::{
     Span, SqlState, Stat, StateKey, TableNames, UnknownTypes, Value, ValuesNames, WindowOrder,
 };
 use rudb_functions::{
-    Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, Resolved, Retype, TYPES_SET,
-    TableFunction, add_extras, content_files, csv_columns, csv_fields, csv_given, csv_types,
-    extras, files, is_file, is_pattern, json_text, kind_of, parquet_footers, parquet_outline,
-    resolve, resolve_pragma, resolve_table,
+    Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, MAIN_FILE, Resolved, Retype,
+    TYPES_SET, TableFunction, add_extras, content_files, csv_columns, csv_fields, csv_given,
+    csv_types, csv_union, extras, files, is_file, is_pattern, json_text, kind_of, open_csv,
+    parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -4667,9 +4667,16 @@ impl<'a> Binder<'a> {
                         let into = copy_into.unwrap_or_default();
                         self.copy_fields(&paths, &options.given, &into, &mut written_options)?
                     }
-                    // Parquet takes the first file's footer as the answer and CSV sniffs all of
-                    // them, which is not a choice made here. See `csv_fields`.
-                    Columns::Csv => csv_fields(&paths, options.given.clone())?,
+                    Columns::Csv if options.given.union_by_name => {
+                        csv_union(&paths, &options.given, |one, other| {
+                            forced(one, other).unwrap_or(LogicalType::Varchar)
+                        })?
+                    }
+                    // Parquet takes the first file's footer as the answer and CSV sniffs the first
+                    // few, which is not a choice made here. See `csv_fields`.
+                    Columns::Csv => {
+                        self.csv_fields(&paths, &options.given, &mut written_options)?
+                    }
                     Columns::Json => {
                         if let Some(into) = copy_into {
                             self.copy_json_columns(&into, &mut written_options);
@@ -4865,8 +4872,14 @@ impl<'a> Binder<'a> {
         into: &[Field],
         written: &mut Vec<(&'static str, Value, ExprRef)>,
     ) -> Result<Vec<Field>> {
-        let sniffed = csv_fields(paths, given.clone())?;
-        if sniffed.len() != into.len() {
+        let (sniffed, _) = csv_fields(paths, given.clone())?;
+        // A file with nothing in it is read as no rows whatever the table looks like.
+        let empty = || {
+            paths.iter().try_fold(true, |all, path| {
+                Ok::<_, Error>(all && open_csv(path, given.clone())?.empty())
+            })
+        };
+        if sniffed.len() != into.len() && !empty()? {
             let set: Vec<String> =
                 into.iter().map(|field| format!("'{}' : '{}'", field.name, field.ty)).collect();
             return Err(Error::invalid_input(format!(
@@ -4887,11 +4900,43 @@ impl<'a> Binder<'a> {
         for (parameter, value, ty) in
             [("names", names, list), (TYPES_SET, Value::Boolean(true), LogicalType::Boolean)]
         {
-            let reference = self.plan.add_value(value.clone());
-            let expr = self.plan.add_expr(Expr::Constant(reference), ty);
-            written.push((parameter, value, expr));
+            self.hidden(written, parameter, value, ty);
         }
         Ok(into.to_vec())
+    }
+
+    /// The columns of a `read_csv` of `paths`, with the file their names came from written into
+    /// the plan when there are several, so the scan can name it when a later file does not fit.
+    /// See [`csv_fields`].
+    fn csv_fields(
+        &mut self,
+        paths: &[String],
+        given: &Given,
+        written: &mut Vec<(&'static str, Value, ExprRef)>,
+    ) -> Result<Vec<Field>> {
+        let (fields, main) = csv_fields(paths, given.clone())?;
+        if paths.len() > 1 {
+            self.hidden(
+                written,
+                MAIN_FILE,
+                Value::Varchar(paths[main].clone()),
+                LogicalType::Varchar,
+            );
+        }
+        Ok(fields)
+    }
+
+    /// Writes a parameter into the plan that the call did not write, for the executor to read.
+    fn hidden(
+        &mut self,
+        written: &mut Vec<(&'static str, Value, ExprRef)>,
+        parameter: &'static str,
+        value: Value,
+        ty: LogicalType,
+    ) {
+        let reference = self.plan.add_value(value.clone());
+        let expr = self.plan.add_expr(Expr::Constant(reference), ty);
+        written.push((parameter, value, expr));
     }
 
     /// `pragma_table_info('t')` or `pragma_show('t')`, answered while it is bound.
@@ -5111,7 +5156,11 @@ impl<'a> Binder<'a> {
         // The multi file options, which the pin parses in one place for every reader.
         let shared = matches!(
             *parameter,
-            "filename" | "hive_partitioning" | "hive_types" | "hive_types_autocast"
+            "filename"
+                | "hive_partitioning"
+                | "hive_types"
+                | "hive_types_autocast"
+                | "union_by_name"
         ) || function.reads_contents();
         if value == Value::Null && shared {
             // The ones the shared file options refuse rather than the reader's own list.
@@ -5371,7 +5420,7 @@ impl<'a> Binder<'a> {
             TableFunction::ReadJson => {
                 Read::uncounted(self.json_fields(function, &paths, &mut written)?)
             }
-            _ => Read::uncounted(csv_fields(&paths, Given::default())?),
+            _ => Read::uncounted(self.csv_fields(&paths, &Given::default(), &mut written)?),
         };
         let taken = add_extras(&mut read.fields, &extras)?;
         if !taken.is_empty() {
@@ -8333,7 +8382,7 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         "header" | "auto_detect" | "null_padding" => {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
-        "buffer_size" | "max_line_size" | "maximum_line_size" | "skip" => {
+        "buffer_size" | "files_to_sniff" | "max_line_size" | "maximum_line_size" | "skip" => {
             format!("\"{parameter}\" expects a non-null integer value")
         }
         "columns" => format!("{} columns requires a struct as input", function.name()),

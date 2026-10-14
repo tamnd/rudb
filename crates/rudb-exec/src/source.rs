@@ -3974,6 +3974,8 @@ struct Cutting {
     ///
     /// The reader it was opened with is inside it, so [`Cutting::reader`] is `None` while it is set.
     split: Option<(Arc<Split>, usize)>,
+    /// [`Piece::missing`] for the file being cut.
+    missing: Vec<usize>,
 }
 
 /// What one morsel covers, and the reader open on it.
@@ -3991,6 +3993,16 @@ struct Piece {
     failure: Option<Error>,
     /// The ordinal in the file of the next row this morsel produces.
     row: i64,
+    /// The places in [`FileScan::wanted`] of the columns this file does not have, which are null in
+    /// every row. Only a read with `union_by_name` has any.
+    missing: Vec<usize>,
+}
+
+impl Piece {
+    /// A morsel that covers nothing and carries `error`.
+    fn failed(file: usize, error: Error) -> Self {
+        Self { file, reader: None, failure: Some(error), row: 0, missing: Vec::new() }
+    }
 }
 
 impl<'a> FileScan<'a> {
@@ -4083,6 +4095,7 @@ impl<'a> FileScan<'a> {
                 row: 0,
                 given: 0,
                 split: None,
+                missing: Vec::new(),
             }),
             open: Mutex::new(HashMap::new()),
             counters: None,
@@ -4173,19 +4186,48 @@ impl<'a> FileScan<'a> {
         cutting.gather = 0;
         cutting.pieces = 1;
         cutting.skipping = Vec::new();
+        cutting.missing = Vec::new();
         let Some(path) = self.paths.get(cutting.at) else { return Ok(()) };
         let mut reader =
             FileReader::open(self.function, path, self.given.clone(), self.json.as_ref())?;
-        let first = if cutting.at == 0 { None } else { self.paths.first().map(String::as_str) };
-        let held = positions(self.function, &self.wanted, &reader.fields(), path, first)?;
-        reader.project(&held)?;
-        reader.settle(&self.wanted)?;
+        let fields = reader.fields();
+        // Where each wanted column is in the file, or `None` for one it does not have, which only
+        // a read by name allows.
+        let held: Vec<Option<usize>> = if self.given.union_by_name {
+            let place = |field: &Field| {
+                fields.iter().position(|column| column.name.eq_ignore_ascii_case(&field.name))
+            };
+            self.wanted.iter().map(place).collect()
+        } else {
+            // The file the names came from, which the binder says when it was not the first.
+            let main = self.given.main.as_deref().or(self.paths.first().map(String::as_str));
+            let first = main.filter(|main| main != path);
+            positions(self.function, &self.wanted, &fields, path, first)?
+                .into_iter()
+                .map(Some)
+                .collect()
+        };
+        let present: Vec<usize> = held.iter().filter_map(|at| *at).collect();
+        reader.project(&present)?;
+        if present.len() == held.len() {
+            reader.settle(&self.wanted)?;
+        } else {
+            let wanted: Vec<Field> = (self.wanted.iter().zip(&held))
+                .filter(|(_, at)| at.is_some())
+                .map(|(field, _)| field.clone())
+                .collect();
+            reader.settle(&wanted)?;
+            cutting.missing = (held.iter().enumerate())
+                .filter(|(_, at)| at.is_none())
+                .map(|(at, _)| at)
+                .collect();
+        }
         cutting.groups = reader.row_groups();
         cutting.skipping = self
             .tests
             .iter()
             .filter_map(|(at, op, value)| {
-                Some(Test { column: *held.get(*at)?, op: *op, value: value.clone() })
+                Some(Test { column: (*held.get(*at)?)?, op: *op, value: value.clone() })
             })
             .collect();
         cutting.reader = Some(reader);
@@ -4234,6 +4276,7 @@ impl<'a> FileScan<'a> {
                 reader: Some(FileReader::Part(part)),
                 failure: None,
                 row: 0,
+                missing: cutting.missing.clone(),
             }));
         }
         if let Some(FileReader::Parquet(reader)) = cutting.reader.as_ref() {
@@ -4298,6 +4341,7 @@ impl<'a> FileScan<'a> {
                         reader: Some(FileReader::Parquet(split)),
                         failure: None,
                         row,
+                        missing: cutting.missing.clone(),
                     }));
                 }
                 let piece = next_piece(rows, cutting.part, cutting.cut);
@@ -4319,11 +4363,21 @@ impl<'a> FileScan<'a> {
                 cutting.row = cutting
                     .row
                     .saturating_add(i64::try_from(piece.end - piece.start).unwrap_or(i64::MAX));
-                Piece { file, reader: Some(FileReader::Parquet(split)), failure: None, row }
+                Piece {
+                    file,
+                    reader: Some(FileReader::Parquet(split)),
+                    failure: None,
+                    row,
+                    missing: cutting.missing.clone(),
+                }
             }
-            Some(FileReader::Csv(_) | FileReader::Json(_)) => {
-                Piece { file, reader: cutting.reader.take(), failure: None, row: 0 }
-            }
+            Some(FileReader::Csv(_) | FileReader::Json(_)) => Piece {
+                file,
+                reader: cutting.reader.take(),
+                failure: None,
+                row: 0,
+                missing: cutting.missing.clone(),
+            },
             // Either the row groups of the file being cut have all been handed out, or there is no
             // file being cut at all, and both mean the same thing to the caller.
             _ => return Ok(None),
@@ -4388,6 +4442,21 @@ impl<'a> FileScan<'a> {
         Chunk::with_rows(columns, rows)
     }
 
+    /// The chunk with a column of nulls put in for each wanted column the file does not have.
+    fn fill(&self, chunk: Chunk, piece: &Piece) -> Result<Chunk> {
+        let rows = chunk.len();
+        let mut held = chunk.into_columns().into_iter();
+        let mut columns = Vec::with_capacity(self.wanted.len());
+        for (at, field) in self.wanted.iter().enumerate() {
+            if piece.missing.contains(&at) {
+                columns.push(Vector::constant(field.ty.clone(), Value::Null, rows));
+            } else {
+                columns.push(held.next().ok_or_else(|| Error::internal("a short file chunk"))?);
+            }
+        }
+        Chunk::with_rows(columns, rows)
+    }
+
     /// The chunk with every column in the type the first file gave it.
     ///
     /// Almost always nothing, because almost always every file has the same schema, and the check is
@@ -4435,7 +4504,7 @@ impl Source for FileScan<'_> {
                 Ok(None) => {}
                 Err(error) => {
                     let file = cutting.at.saturating_sub(1);
-                    let piece = Piece { file, reader: None, failure: Some(error), row: 0 };
+                    let piece = Piece::failed(file, error);
                     return self.hand(&mut cutting, piece);
                 }
             }
@@ -4444,7 +4513,7 @@ impl Source for FileScan<'_> {
             }
             if let Err(error) = self.advance(&mut cutting) {
                 let file = cutting.at.saturating_sub(1);
-                let piece = Piece { file, reader: None, failure: Some(error), row: 0 };
+                let piece = Piece::failed(file, error);
                 return self.hand(&mut cutting, piece);
             }
         }
@@ -4497,6 +4566,7 @@ impl Source for FileScan<'_> {
                 piece.reader = None;
                 continue;
             };
+            let chunk = if piece.missing.is_empty() { chunk } else { self.fill(chunk, &piece)? };
             let mut chunk = self.conform(chunk, file)?;
             if !self.slots.is_empty() {
                 chunk = self.place(chunk, &mut piece)?;
@@ -4833,8 +4903,8 @@ pub(crate) fn file_arguments(
 ///
 /// The disagreement is worded by whichever reader found it, because the two readers in DuckDB are
 /// two pieces of code that each wrote their own sentence and a compatibility test that compares
-/// output compares all of it. For CSV this is only reachable when a file changed between binding and
-/// running, since the binder sniffed every file and would have said the same thing first.
+/// output compares all of it. For CSV the binder only sniffed the first few files, so a file after
+/// those is where a read of files that do not agree finds out.
 pub(crate) fn positions(
     function: TableFunction,
     wanted: &[Field],
@@ -4842,6 +4912,16 @@ pub(crate) fn positions(
     path: &str,
     first: Option<&str>,
 ) -> Result<Vec<usize>> {
+    // The pin holds a CSV file to the names and to types that go into the read's, and lists
+    // everything that does not fit.
+    if matches!(function, TableFunction::ReadCsv)
+        && let Some(first) = first
+    {
+        let found = rudb_csv::disagreements(wanted, held);
+        if !found.is_empty() {
+            return Err(rudb_csv::mismatch(first, path, &found));
+        }
+    }
     let mut positions = Vec::with_capacity(wanted.len());
     for field in wanted {
         let at = held.iter().position(|column| column.name == field.name).ok_or_else(|| {
@@ -4851,9 +4931,6 @@ pub(crate) fn positions(
                     field.name
                 ));
             };
-            if matches!(function, TableFunction::ReadCsv) {
-                return rudb_csv::mismatch(first, path, &field.name);
-            }
             let candidates: Vec<&str> = held.iter().map(|column| column.name.as_str()).collect();
             Error::invalid_input(format!(
                 "Failed to read file \"{path}\": schema mismatch in glob: column \"{}\" was read \

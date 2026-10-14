@@ -1,12 +1,12 @@
-//! Where a CSV read of several files gets its types from, which is all of them and not the first.
+//! Where a CSV read of several files gets its types from, which is the first few and not the first.
 //!
 //! This is the one place the two readers behave differently and the difference is not cosmetic. A
 //! Parquet file states its schema in its footer, so the first file settles it and a later file that
 //! disagrees is cast to what the first one said. A CSV file states nothing, only what a sample of it
-//! suggests, so there is no first file's word to take, and DuckDB sniffs every file the pattern
-//! matched and combines the answers. Getting that backwards gives a directory of daily exports a
-//! column type that depends on which day sorted first, which is a wrong answer rather than a slow
-//! query.
+//! suggests, so there is no first file's word to take, and DuckDB sniffs up to ten of the files the
+//! pattern matched and combines the answers. Getting that backwards gives a directory of daily
+//! exports a column type that depends on which day sorted first, which is a wrong answer rather
+//! than a slow query.
 //!
 //! Every answer here was read off duckdb v1.4.1 against these same files, including the sentence the
 //! mismatch comes back with.
@@ -88,4 +88,34 @@ fn a_file_missing_a_column_the_first_one_has_is_the_csv_readers_own_complaint() 
         "{message}"
     );
     assert!(message.contains("files_to_sniff = -1"), "{message}");
+}
+
+#[test]
+fn union_by_name_matches_the_columns_by_name_and_fills_the_rest_with_nulls() {
+    let database = Database::new();
+    let sql =
+        format!("SELECT * FROM read_csv({}, union_by_name=true) ORDER BY ALL", sniff("odd/*.csv"));
+    let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result.names(), ["id", "other"]);
+    assert_eq!(result.len(), 2);
+    assert_eq!([result.value_at(0, 0), result.value_at(0, 1)], [Value::BigInt(1), Value::Null]);
+    assert_eq!([result.value_at(1, 0), result.value_at(1, 1)], [Value::Null, Value::BigInt(2)]);
+}
+
+#[test]
+fn a_file_after_the_ones_sniffed_is_held_to_their_types() {
+    // With one file sniffed the read is BIGINT, and the third file holds 4.5, which does not go
+    // into one. The pin lists the column with both types.
+    let database = Database::new();
+    let sql = format!("SELECT * FROM read_csv({}, files_to_sniff=1)", sniff("*.csv"));
+    let message = database.query(&sql).expect_err("4.5 is not BIGINT").message().to_string();
+    assert!(message.contains("s1.csv\nCurrent file: "), "{message}");
+    assert!(
+        message.contains(
+            "Column with name: \"id\" is expected to have type: BIGINT But has type: DOUBLE\n"
+        ),
+        "{message}"
+    );
+    let sql = format!("SELECT count(*) FROM read_csv({}, files_to_sniff=-1)", sniff("*.csv"));
+    assert_eq!(database.value(&sql).expect("every file sniffed"), Value::BigInt(4));
 }

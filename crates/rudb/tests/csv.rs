@@ -318,6 +318,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    dtypes ANY\n",
         "    escape VARCHAR\n",
         "    filename ANY\n",
+        "    files_to_sniff BIGINT\n",
         "    header BOOLEAN\n",
         "    hive_partitioning BOOLEAN\n",
         "    hive_types ANY\n",
@@ -331,6 +332,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    sep VARCHAR\n",
         "    skip BIGINT\n",
         "    types ANY\n",
+        "    union_by_name BOOLEAN\n",
     );
     assert_eq!(error.message(), expected);
 }
