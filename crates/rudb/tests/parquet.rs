@@ -620,6 +620,35 @@ fn a_partition_key_takes_over_a_file_column_of_its_name_and_goes_after_the_row_n
     assert_eq!(database.value(&sql).expect("runs"), Value::BigInt(1));
 }
 
+#[test]
+fn union_by_name_matches_the_files_by_name_and_widens_what_they_disagree_about() {
+    let database = Database::new();
+    let root = format!("{}/union-parquet", env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&root).expect("makes it");
+    for (name, rows) in [
+        ("ubn1", "SELECT 9223372036854775807 AS a"),
+        ("ubn2", "SELECT 3::INTEGER AS a, 4::INTEGER AS b"),
+        ("ubn3", "SELECT 100::INTEGER AS A, 101::INTEGER AS c"),
+    ] {
+        let sql = format!("COPY ({rows}) TO '{root}/{name}.parquet' (FORMAT PARQUET)");
+        database.execute(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    }
+    let sql = format!(
+        "SELECT a, b, c, typeof(a), typeof(b), typeof(c) FROM \
+         read_parquet('{root}/ubn*.parquet', union_by_name=true) ORDER BY a"
+    );
+    let result = database.query(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    let row = |at: usize| -> Vec<String> {
+        (0..6).map(|column| result.value_at(at, column).to_string()).collect()
+    };
+    assert_eq!(row(0), ["3", "4", "NULL", "BIGINT", "INTEGER", "INTEGER"]);
+    assert_eq!(row(1), ["100", "NULL", "101", "BIGINT", "INTEGER", "INTEGER"]);
+    assert_eq!(row(2)[..3], ["9223372036854775807", "NULL", "NULL"]);
+    // Without it every file is held to the first one's columns, and the second has no `b`.
+    let sql = format!("SELECT b FROM read_parquet(['{root}/ubn2.parquet', '{root}/ubn1.parquet'])");
+    assert!(database.query(&sql).is_err(), "{sql}");
+}
+
 /// `parquet_bloom_probe` over `bloom.parquet`, whose every answer but those for `z` is the pin's.
 #[test]
 fn a_bloom_probe_answers_for_every_row_group_the_way_the_pin_does() {

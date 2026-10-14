@@ -377,6 +377,7 @@ impl TableFunction {
             ("hive_partitioning", LogicalType::Boolean),
             ("hive_types", LogicalType::Null),
             ("hive_types_autocast", LogicalType::Boolean),
+            ("union_by_name", LogicalType::Boolean),
         ];
         // Built on first use rather than written out as a constant, because `names` takes a list
         // and a list type holds its element in a box, which a constant cannot make.

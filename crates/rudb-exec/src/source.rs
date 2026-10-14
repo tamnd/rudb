@@ -4028,7 +4028,7 @@ impl<'a> FileScan<'a> {
         sideways: Option<Arc<Sideways<'a>>>,
     ) -> Result<Self> {
         let paths = file_arguments(plan, args, function)?;
-        let given = if function == TableFunction::ReadCsv {
+        let mut given = if function == TableFunction::ReadCsv {
             csv_options(plan, options, settings)?
         } else {
             Given::default()
@@ -4050,6 +4050,8 @@ impl<'a> FileScan<'a> {
         };
         let slots = slots(&produced, &named, &paths);
         let can_have_nan = named.contains(&("can_have_nan", Value::Boolean(true)));
+        // A Parquet read has no CSV options, but matches its files by name the same way.
+        given.union_by_name |= named.contains(&("union_by_name", Value::Boolean(true)));
         let numbered = slots.contains(&Slot::Number);
         let wanted: Vec<Field> = produced
             .iter()
@@ -4479,17 +4481,28 @@ impl<'a> FileScan<'a> {
                 columns.push(column.clone());
                 continue;
             }
-            columns.push(cast(column, &field.ty, false).map_err(|error| {
-                let path = self.paths.get(file).map_or("", String::as_str);
-                Error::conversion(format!(
-                    "Error while reading file \"{path}\": failed to cast column \"{}\" from type \
-                     {} to {}: {}",
-                    field.name,
-                    column.logical_type(),
-                    field.ty,
-                    error.message()
-                ))
-            })?);
+            let error = match cast(column, &field.ty, false) {
+                Ok(column) => {
+                    columns.push(column);
+                    continue;
+                }
+                Err(error) => error,
+            };
+            // A column of nothing but nulls is null in any type, which is how the pin reads a file
+            // that wrote a column without the nesting another file of a `union_by_name` gave it.
+            if (0..rows).all(|row| column.is_null_at(row)) {
+                columns.push(Vector::constant(field.ty.clone(), Value::Null, rows));
+                continue;
+            }
+            let path = self.paths.get(file).map_or("", String::as_str);
+            return Err(Error::conversion(format!(
+                "Error while reading file \"{path}\": failed to cast column \"{}\" from type {} \
+                 to {}: {}",
+                field.name,
+                column.logical_type(),
+                field.ty,
+                error.message()
+            )));
         }
         Chunk::with_rows(columns, rows)
     }

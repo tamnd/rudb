@@ -739,24 +739,25 @@ pub fn csv_fields(paths: &[String], given: Given) -> Result<(Vec<Field>, usize)>
     Ok((fields, main))
 }
 
-/// The columns a `read_csv` of `paths` with `union_by_name` produces.
+/// The columns a read of `paths` with `union_by_name` produces, where `fields_of` is what one file
+/// holds.
 ///
-/// Every file is sniffed for itself and the columns are matched by name, without regard to case,
-/// in the order they first turn up. Where two files disagree about a column's type `force` says
-/// what it becomes, which is how a `UNION BY NAME` forces two types to one and is the binder's to
-/// say. A column only some of the files have is null in the rest.
+/// Every file is asked for itself and the columns are matched by name, without regard to case, in
+/// the order they first turn up. Where two files disagree about a column's type `force` says what
+/// it becomes, which is how a `UNION BY NAME` forces two types to one and is the binder's to say. A
+/// column only some of the files have is null in the rest.
 ///
 /// # Errors
 ///
-/// Everything [`open_csv`] reports.
-pub fn csv_union(
+/// Whatever `fields_of` reports.
+pub fn union_fields(
     paths: &[String],
-    given: &Given,
+    mut fields_of: impl FnMut(&str) -> Result<Vec<Field>>,
     force: impl Fn(&LogicalType, &LogicalType) -> LogicalType,
 ) -> Result<Vec<Field>> {
     let mut fields: Vec<Field> = Vec::new();
     for path in paths {
-        for field in open_csv(path, given.clone())?.fields() {
+        for field in fields_of(path)? {
             match fields.iter_mut().find(|held| held.name.eq_ignore_ascii_case(&field.name)) {
                 Some(held) => held.ty = force(&held.ty, &field.ty),
                 None => fields.push(field),

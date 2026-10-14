@@ -31,8 +31,8 @@ pub use entrycatalog::{
 };
 pub use file::{
     Footers, MAIN_FILE, TYPES_SET, content_files, csv_columns, csv_fields, csv_given, csv_types,
-    csv_union, files, is_file, is_pattern, json_text, open_csv, open_parquet,
-    parquet_bloom_excludes, parquet_footer, parquet_footers, parquet_outline,
+    files, is_file, is_pattern, json_text, open_csv, open_parquet, parquet_bloom_excludes,
+    parquet_footer, parquet_footers, parquet_outline, union_fields,
 };
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,

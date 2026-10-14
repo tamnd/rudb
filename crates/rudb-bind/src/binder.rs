@@ -25,8 +25,8 @@ use rudb_common::{
 use rudb_functions::{
     Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, MAIN_FILE, Resolved, Retype,
     TYPES_SET, TableFunction, add_extras, content_files, csv_columns, csv_fields, csv_given,
-    csv_types, csv_union, extras, files, is_file, is_pattern, json_text, kind_of, open_csv,
-    parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
+    csv_types, extras, files, is_file, is_pattern, json_text, kind_of, open_csv, open_parquet,
+    parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table, union_fields,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -4668,7 +4668,9 @@ impl<'a> Binder<'a> {
                         self.copy_fields(&paths, &options.given, &into, &mut written_options)?
                     }
                     Columns::Csv if options.given.union_by_name => {
-                        csv_union(&paths, &options.given, |one, other| {
+                        let fields_of =
+                            |path: &str| Ok(open_csv(path, options.given.clone())?.fields());
+                        union_fields(&paths, fields_of, |one, other| {
                             forced(one, other).unwrap_or(LogicalType::Varchar)
                         })?
                     }
@@ -4689,9 +4691,18 @@ impl<'a> Binder<'a> {
                             self.want_mirror(path, options.binary_as_string, &footers.rows);
                         }
                         measured = footers.rows;
-                        counted = footers.distincts;
                         bounded = footers.zones;
-                        footers.fields
+                        if options.union_by_name {
+                            // The first file's counts say nothing about a column it does not have,
+                            // so none are claimed.
+                            let fields_of = |path: &str| Ok(open_parquet(path)?.fields());
+                            union_fields(&paths, fields_of, |one, other| {
+                                forced(one, other).unwrap_or(LogicalType::Varchar)
+                            })?
+                        } else {
+                            counted = footers.distincts;
+                            footers.fields
+                        }
                     }
                 };
                 if options.binary_as_string {
@@ -7903,6 +7914,9 @@ struct Options {
     /// The one Parquet option here that the executor has to act on rather than the binder, since
     /// the column is not in the file and has to be counted as the rows come out of it.
     file_row_number: bool,
+    /// `union_by_name` on a `read_parquet`, which matches the columns of the files by name rather
+    /// than holding every file to the first one's. A `read_csv` has its own in [`Given`].
+    union_by_name: bool,
     /// `delim`, `sep`, `quote`, `escape` and `header`, which are what the sniffer would decide.
     given: Given,
 }
@@ -7920,6 +7934,7 @@ impl Options {
             match (*parameter, value) {
                 ("binary_as_string", Value::Boolean(on)) => options.binary_as_string = *on,
                 ("file_row_number", Value::Boolean(on)) => options.file_row_number = *on,
+                ("union_by_name", Value::Boolean(on)) => options.union_by_name = *on,
                 _ => {}
             }
         }
