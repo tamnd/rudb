@@ -1013,7 +1013,7 @@ fn logical_type(physical: Physical, element: &SchemaElement) -> Result<LogicalTy
         Physical::Boolean => LogicalType::Boolean,
         Physical::Int32 => LogicalType::Integer,
         Physical::Int64 => LogicalType::BigInt,
-        Physical::Int96 => LogicalType::TimestampNs,
+        Physical::Int96 => LogicalType::Timestamp,
         Physical::Float => LogicalType::Float,
         Physical::Double => LogicalType::Double,
         Physical::ByteArray | Physical::FixedLenByteArray => LogicalType::Blob,
