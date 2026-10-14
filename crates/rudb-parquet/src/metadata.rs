@@ -554,7 +554,7 @@ enum Logical {
 
 /// The resolution of a time or a timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unit {
+pub(crate) enum Unit {
     /// Thousandths of a second.
     Millis,
     /// Millionths, which is what DuckDB's `TIMESTAMP` is.

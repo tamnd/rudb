@@ -17,6 +17,8 @@
 use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_io::File;
 
+use crate::bloom::{Filter, Stored, probe_hashes};
+use crate::metadata::Unit;
 use crate::thrift::{Kind, Reader};
 
 /// How deep a footer may nest before it is refused, which no real footer comes near. A file that
@@ -200,6 +202,197 @@ impl RawFooter {
     fn schema(&self) -> &[Node] {
         self.root.items(2)
     }
+
+    /// The top level column `parquet_bloom_probe` names, by its place among the top level columns,
+    /// the type the pin reads it as, which is what the probed value is cast to, and whether it is
+    /// nested. The name is matched ignoring case, as the pin's identifiers are, and the first match
+    /// wins. A nested column has no single filter to probe, so nothing is ruled out in it, but the
+    /// value is still cast to its type.
+    ///
+    /// # Errors
+    ///
+    /// When the column's type is one the pin refuses to read.
+    pub fn probe_column(&self, name: &str) -> Result<Option<(usize, LogicalType, bool)>> {
+        let schema = self.schema();
+        let mut start = 1;
+        for (at, (_, element)) in self.top_level().enumerate() {
+            let (ty, next) = subtree(schema, start)?;
+            start = next;
+            if element.text(4).is_some_and(|named| named.eq_ignore_ascii_case(name)) {
+                return Ok(Some((at, ty, element.int(5).is_some_and(|children| children > 0))));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether each row group's bloom filter for top level column `column` rules `value` out, the
+    /// value already cast to the type [`RawFooter::probe_column`] gave.
+    ///
+    /// A row group whose chunk has no filter, or a filter that is not one the pin reads, rules
+    /// nothing out, and neither does a value the pin does not hash. The filter is the one of the
+    /// column's own leaf, where the pin takes the chunk at the column's place among the top level
+    /// columns and so reads another column's filter once a nested one comes first, which is
+    /// tamnd/duckdb#51.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read.
+    pub fn bloom_excludes(
+        &self,
+        file: &dyn File,
+        column: usize,
+        value: &Value,
+    ) -> Result<Vec<bool>> {
+        let groups = self.root.items(4);
+        let hashes = self.top_level().nth(column).and_then(|(leaf, element)| {
+            if element.int(5).is_some_and(|children| children > 0) {
+                return None;
+            }
+            let unit = match derive(element).ok()?.1 {
+                Info::Millis => Some(Unit::Millis),
+                Info::Micros => Some(Unit::Micros),
+                Info::Nanos => Some(Unit::Nanos),
+                _ => None,
+            };
+            let physical = element.int(1).unwrap_or(-1);
+            let stored = Stored { physical, width: element.int(2).unwrap_or(0), unit };
+            Some((leaf, probe_hashes(value, stored)?))
+        });
+        let Some((leaf, hashes)) = hashes else {
+            return Ok(vec![false; groups.len()]);
+        };
+        let size = file.len()?;
+        let mut excludes = Vec::with_capacity(groups.len());
+        for group in groups {
+            let filter = match group.items(1).get(leaf) {
+                Some(chunk) => read_filter(file, size, chunk.child(3))?,
+                None => None,
+            };
+            let ruled_out =
+                filter.is_some_and(|filter| hashes.iter().all(|&hash| !filter.contains(hash)));
+            excludes.push(ruled_out);
+        }
+        Ok(excludes)
+    }
+
+    /// The top level columns, each with the first leaf it holds and its own schema element.
+    fn top_level(&self) -> impl Iterator<Item = (usize, &Node)> {
+        let schema = self.schema();
+        let mut at = 1;
+        let mut leaf = 0;
+        std::iter::from_fn(move || {
+            let element = schema.get(at)?;
+            let first = leaf;
+            // Walks the column's subtree, counting what is still to be seen under it.
+            let mut pending = 1_i64;
+            while pending > 0 && at < schema.len() {
+                let children = schema[at].int(5).unwrap_or(0).max(0);
+                if children == 0 {
+                    leaf += 1;
+                }
+                pending += children - 1;
+                at += 1;
+            }
+            Some((first, element))
+        })
+    }
+}
+
+/// The type of the schema element at `at` with everything under it, and where the element after
+/// them is. A group is a list when it says it is one, with its element under the repeated group in
+/// between, a map when it says it is one, with its key and value under the repeated `key_value`
+/// group, and a struct of its children otherwise.
+fn subtree(schema: &[Node], at: usize) -> Result<(LogicalType, usize)> {
+    let element = schema.get(at).ok_or_else(|| Error::io("a parquet schema cut short"))?;
+    let children = element.int(5).unwrap_or(0).max(0);
+    if children == 0 {
+        return Ok((derive(element)?.0, at + 1));
+    }
+    let logical = element.get(10);
+    let converted = element.int(6);
+    let list = converted == Some(3) || logical.is_some_and(|logical| logical.get(3).is_some());
+    let map =
+        matches!(converted, Some(1 | 2)) || logical.is_some_and(|logical| logical.get(2).is_some());
+    if (list || map) && children == 1 {
+        let repeated = schema.get(at + 1).ok_or_else(|| Error::io("a parquet schema cut short"))?;
+        let inner = repeated.int(5).unwrap_or(0).max(0);
+        if map && inner == 2 {
+            let (key, next) = subtree(schema, at + 2)?;
+            let (value, next) = subtree(schema, next)?;
+            return Ok((LogicalType::Map(Box::new(key), Box::new(value)), next));
+        }
+        if list && inner == 1 {
+            let (element, next) = subtree(schema, at + 2)?;
+            return Ok((LogicalType::List(Box::new(element)), next));
+        }
+        let (element, next) = subtree(schema, at + 1)?;
+        return Ok((LogicalType::List(Box::new(element)), next));
+    }
+    let mut fields = Vec::new();
+    let mut next = at + 1;
+    for _ in 0..children {
+        let name = schema.get(next).and_then(|child| child.text(4)).unwrap_or_default();
+        let (ty, after) = subtree(schema, next)?;
+        fields.push(Field::new(name, ty));
+        next = after;
+    }
+    Ok((LogicalType::Struct(fields), next))
+}
+
+/// How far into a filter's header is read when the chunk does not say how long the filter is,
+/// which is far more than the four fields of a header take.
+const HEADER_MOST: u64 = 256;
+
+/// The bloom filter a column chunk's metadata points at, the pin's checks included: `None` when
+/// there is none, when its offset or length is out of the file, when the header is not a block
+/// filter of XXH64 left uncompressed, or when its size is not whole blocks or disagrees with the
+/// length the chunk states.
+fn read_filter(file: &dyn File, size: u64, meta: &Node) -> Result<Option<Filter>> {
+    let Some(start) = meta.int(14).and_then(|at| u64::try_from(at).ok()) else {
+        return Ok(None);
+    };
+    if start == 0 || start >= size {
+        return Ok(None);
+    }
+    let length = match meta.int(15) {
+        None => None,
+        Some(length) => match u64::try_from(length) {
+            Ok(length) if length > 0 && length <= size - start => Some(length),
+            _ => return Ok(None),
+        },
+    };
+    let window = length.unwrap_or(HEADER_MOST).min(size - start);
+    let mut bytes = vec![
+        0_u8;
+        usize::try_from(window)
+            .map_err(|_| Error::io("a bloom filter too long to read"))?
+    ];
+    file.read_exact_at(start, &mut bytes)?;
+    let mut reader = Reader::new(&bytes);
+    let Ok(header) = read_node(&mut reader, Kind::Struct, false, 0) else {
+        return Ok(None);
+    };
+    let known = header.child(2).get(1).is_some()
+        && header.child(3).get(1).is_some()
+        && header.child(4).get(1).is_some();
+    let Some(data) = header.int(1).and_then(|data| u64::try_from(data).ok()) else {
+        return Ok(None);
+    };
+    let head = reader.position() as u64;
+    if !known || data == 0 || data % 32 != 0 || data > size - start - head {
+        return Ok(None);
+    }
+    if length.is_some_and(|length| head > length || data != length - head) {
+        return Ok(None);
+    }
+    let from = usize::try_from(head).unwrap_or(usize::MAX);
+    let to = usize::try_from(head + data).unwrap_or(usize::MAX);
+    if let Some(held) = bytes.get(from..to) {
+        return Ok(Some(Filter::from_bytes(held)));
+    }
+    let mut held = vec![0_u8; to - from];
+    file.read_exact_at(start + head, &mut held)?;
+    Ok(Some(Filter::from_bytes(&held)))
 }
 
 /// The four tables that print a footer.
