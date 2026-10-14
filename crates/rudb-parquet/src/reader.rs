@@ -1075,6 +1075,7 @@ impl Cursor {
                 ty: LogicalType::Integer,
                 optional: false,
                 width: 0,
+                unit: None,
                 nested: None,
             },
             dictionary: None,

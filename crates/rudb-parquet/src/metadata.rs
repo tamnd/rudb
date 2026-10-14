@@ -166,6 +166,9 @@ pub struct SchemaColumn {
     pub optional: bool,
     /// The declared length, for `FIXED_LEN_BYTE_ARRAY` and zero for everything else.
     pub width: i32,
+    /// The unit a time or a timestamp is stored at, which its values and bounds are read from
+    /// into the unit its type holds.
+    pub(crate) unit: Option<Unit>,
     /// How the column is put together out of the leaves that store it, when it is not one of them.
     pub nested: Option<Arc<Nested>>,
 }
@@ -637,6 +640,7 @@ fn read_schema(reader: &mut Reader<'_>) -> Result<Vec<SchemaColumn>> {
                 ty,
                 optional: element.repetition != 0,
                 width: element.width,
+                unit: unit(element),
                 nested: None,
             });
             at += 1;
@@ -657,6 +661,7 @@ fn read_schema(reader: &mut Reader<'_>) -> Result<Vec<SchemaColumn>> {
             ty,
             optional: element.repetition == OPTIONAL,
             width: 0,
+            unit: None,
             nested: Some(Arc::new(Nested { root, leaves })),
         });
     }
@@ -723,6 +728,7 @@ impl Tree<'_> {
                 ty: ty.clone(),
                 optional: def > 0,
                 width: element.width,
+                unit: unit(element),
                 nested: None,
             };
             self.leaves.push(Leaf { column, path: self.path.clone(), max_def: def, max_rep: rep });
@@ -1027,9 +1033,9 @@ fn from_logical(
         Logical::Date => LogicalType::Date,
         Logical::Decimal => decimal(element)?,
         // A time the file says is at UTC is how the pin writes a zoned time, and it reads one back
-        // as a zoned time at offset zero.
-        Logical::Time(Unit::Micros, true) => LogicalType::TimeTz,
-        Logical::Time(Unit::Nanos, _) => LogicalType::TimeNs,
+        // as a zoned time at offset zero, whatever its unit.
+        Logical::Time(_, true) => LogicalType::TimeTz,
+        Logical::Time(Unit::Nanos, false) => LogicalType::TimeNs,
         Logical::Time(..) => LogicalType::Time,
         Logical::Timestamp(unit, utc) => timestamp(unit, utc),
         Logical::Integer(width, signed) => integer(width, signed, physical)?,
@@ -1054,7 +1060,7 @@ fn from_converted(
         5 => decimal(element)?,
         6 => LogicalType::Date,
         7 | 8 => LogicalType::Time,
-        9 => LogicalType::TimestampMs,
+        9 => LogicalType::Timestamp,
         10 => LogicalType::Timestamp,
         11 => LogicalType::UTinyInt,
         12 => LogicalType::USmallInt,
@@ -1088,17 +1094,31 @@ fn decimal(element: &SchemaElement) -> Result<LogicalType> {
     LogicalType::decimal(width, scale)
 }
 
-/// A timestamp at the file's unit.
+/// A timestamp of the file's unit, which is a `TIMESTAMP` for milliseconds as well as for
+/// microseconds, the way the pin reads one.
 ///
 /// A file that says its timestamps are UTC gets the type with a zone, which is what DuckDB does
 /// with the same file, and that matters because the two types print differently.
 fn timestamp(unit: Unit, utc: bool) -> LogicalType {
     match (unit, utc) {
-        (Unit::Millis, false) => LogicalType::TimestampMs,
-        (Unit::Micros, false) => LogicalType::Timestamp,
         (Unit::Nanos, false) => LogicalType::TimestampNs,
         (Unit::Nanos, true) => LogicalType::TimestampTzNs,
+        (_, false) => LogicalType::Timestamp,
         (_, true) => LogicalType::TimestampTz,
+    }
+}
+
+/// The unit a time or a timestamp column is stored at, from its logical type or else its converted
+/// one.
+fn unit(element: &SchemaElement) -> Option<Unit> {
+    match element.logical {
+        Some(Logical::Time(unit, _) | Logical::Timestamp(unit, _)) => Some(unit),
+        Some(_) => None,
+        None => match element.converted? {
+            7 | 9 => Some(Unit::Millis),
+            8 | 10 => Some(Unit::Micros),
+            _ => None,
+        },
     }
 }
 
