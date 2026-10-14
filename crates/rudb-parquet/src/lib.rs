@@ -44,6 +44,7 @@ mod metadata;
 mod page;
 mod prune;
 mod reader;
+mod runs;
 mod thrift;
 mod values;
 mod write;
@@ -56,4 +57,4 @@ pub use metadata::{
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
 pub use prune::{Bound, Footer, Op, Test, skips};
 pub use reader::{Reader, read};
-pub use write::{ColumnStatistics, Writer, storage};
+pub use write::{ColumnStatistics, Limits, Writer, storage};

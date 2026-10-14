@@ -123,6 +123,57 @@ fn what_this_does_not_write_is_refused_by_name() {
 }
 
 #[test]
+fn the_parquet_page_limits_are_bounded_and_cast_the_way_the_pin_does() {
+    let db = Database::new();
+    for (option, message) in [
+        (
+            "DICTIONARY_SIZE_LIMIT -1",
+            "Binder Error: dictionary_size_limit must be greater than 0 or 0 to disable",
+        ),
+        (
+            "STRING_DICTIONARY_PAGE_SIZE_LIMIT 0",
+            "Binder Error: string_dictionary_page_size_limit cannot be 0 and must be less than or \
+             equal to 1073741824",
+        ),
+        (
+            "DATA_PAGE_SIZE_LIMIT 104857601",
+            "Binder Error: data_page_size_limit cannot be 0 and must be less than or equal to \
+             104857600",
+        ),
+        (
+            "DATA_PAGE_SIZE_LIMIT -5",
+            "Invalid Input Error: Copy option \"data_page_size_limit\" expected an argument of \
+             type UBIGINT - the argument \"-5\" of type INTEGER could not be cast as this type",
+        ),
+        (
+            "DICTIONARY_SIZE_LIMIT",
+            "Invalid Input Error: Copy option \"dictionary_size_limit\" requires an argument of \
+             type BIGINT",
+        ),
+    ] {
+        let sql = format!("COPY (SELECT 1 AS a) TO 'o.parquet' ({option})");
+        let error = db.execute(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+    let path =
+        std::env::temp_dir().join(format!("rudb-copy-to-pages-{}.parquet", std::process::id()));
+    db.execute(&format!(
+        "COPY (SELECT i % 7 AS a, 'v' || (i % 3) AS s FROM range(3000) r(i)) TO '{}' \
+         (DICTIONARY_SIZE_LIMIT 5, DATA_PAGE_SIZE_LIMIT 100)",
+        path.display()
+    ))
+    .expect("writes");
+    let back = format!("read_parquet('{}')", path.display());
+    let sums = values(&db, &format!("SELECT sum(a), count(DISTINCT s) FROM {back}"));
+    assert_eq!(sums[0], vec![rudb_common::Value::HugeInt(8994), rudb_common::Value::BigInt(3)]);
+    let metadata = format!("parquet_metadata('{}')", path.display());
+    let encodings = values(&db, &format!("SELECT encodings FROM {metadata} ORDER BY column_id"));
+    let text = |encoding: &str| vec![rudb_common::Value::Varchar(encoding.into())];
+    assert_eq!(encodings, vec![text("PLAIN"), text("PLAIN_DICTIONARY")]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn json_is_one_object_a_line_or_one_array() {
     let db = table();
     let rows = "{\"i\":1,\"s\":\"a,b\",\"d\":1.5,\"dt\":\"2026-01-02\",\"n\":null,\

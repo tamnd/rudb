@@ -590,6 +590,11 @@ impl<'a> Sink<'a> {
                 if copy.compression == "snappy" { Codec::Snappy } else { Codec::Uncompressed };
             let mut writer = rudb_parquet::Writer::new(out, &fields, codec, CREATED_BY)?;
             writer.set_key_values(copy.kv_metadata.clone());
+            writer.set_limits(rudb_parquet::Limits {
+                dictionary: copy.dictionary_size_limit,
+                string_dictionary: copy.string_dictionary_page_size_limit,
+                data_page: copy.data_page_size_limit,
+            });
             Body::Parquet { writer, stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
             let moments = Moments {

@@ -45,13 +45,18 @@ use rudb_common::{Error, Result};
 /// How far back a copy may reach, which is also how much input one table of positions covers.
 const BLOCK: usize = 1 << 16;
 
-/// Compresses `input` into one Snappy block.
+/// Compresses `input` into one Snappy block, byte for byte the block the pin's Snappy writes.
 ///
-/// The greedy matcher every Snappy writer uses: a table from four bytes to where they were last
-/// seen, a copy wherever the table points at the same four bytes, and a literal for whatever lies
-/// between two copies. The input is taken 64 KiB at a time with a fresh table each, so no copy
-/// reaches back past the start of its piece and every offset fits the two byte copy. The ratio is
-/// the format's usual one, and the speed is that of one hash and one compare a byte.
+/// The output has to be the pin's and not merely a valid block, because a Parquet file records
+/// where each page starts and how long it is, and those offsets are what `parquet_metadata` shows
+/// and what the pin's tests check. Any greedy matcher gives a valid block, but each finds its own
+/// copies, and a page one byte shorter moves every offset after it.
+///
+/// So this is the pin's level one compressor as its binary runs it. The input is taken 64 KiB at
+/// a time with a fresh table each, sized to the piece. The table maps four bytes to where they
+/// were last seen and starts out pointing every slot at the start of the piece. A search looks a
+/// byte at a time for 32 lookups and then further apart the longer it goes without a match. No
+/// match starts in the last 15 bytes of a piece.
 #[must_use]
 pub fn compress(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + input.len() + input.len() / 6);
@@ -67,37 +72,111 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// How near the end of a piece a match may start, which is the pin's `kInputMarginBytes`.
+const MARGIN: usize = 15;
+
 /// One piece of at most [`BLOCK`] bytes.
 fn compress_piece(piece: &[u8], out: &mut Vec<u8>) {
-    const BITS: u32 = 14;
-    let mut table = vec![0_u16; 1 << BITS];
+    let len = piece.len();
+    let size = table_size(len);
+    let mut table = vec![0_u16; size];
     let word =
         |at: usize| u32::from_le_bytes([piece[at], piece[at + 1], piece[at + 2], piece[at + 3]]);
-    let hash = |word: u32| (word.wrapping_mul(0x1E35_A7BD) >> (32 - BITS)) as usize;
-    let mut literal = 0;
-    let mut at = 0;
-    // The table holds positions plus one, so zero is an empty slot.
-    while at + 4 <= piece.len() {
-        let current = word(at);
-        let slot = hash(current);
-        let candidate = usize::from(table[slot]);
-        table[slot] = (at + 1) as u16;
-        if candidate == 0 || word(candidate - 1) != current {
+    // The pin's binary is built for SSE 4.2 and hashes with the CRC32C instruction, seeded with
+    // the byte offset mask of the table, and keeps the bits the mask keeps.
+    let mask = 2 * (size as u32 - 1);
+    let slot = |word: u32| ((crc32c(word ^ mask) & mask) >> 1) as usize;
+    let mut emitted = 0;
+    if len >= MARGIN {
+        let limit = len - MARGIN;
+        let mut at = 1;
+        'piece: loop {
+            let mut skip = 32_usize;
+            let mut next = at;
+            let mut candidate;
+            loop {
+                at = next;
+                let step = skip >> 5;
+                skip += step;
+                next = at + step;
+                if next > limit {
+                    break 'piece;
+                }
+                let current = word(at);
+                let entry = &mut table[slot(current)];
+                candidate = usize::from(*entry);
+                *entry = at as u16;
+                if word(candidate) == current {
+                    break;
+                }
+            }
+            emit_literal(&piece[emitted..at], out);
+            // A copy, and as many more as start right where the last one ended.
+            loop {
+                let mut length = 4;
+                while at + length < len && piece[candidate + length] == piece[at + length] {
+                    length += 1;
+                }
+                emit_copy(at - candidate, length, out);
+                at += length;
+                emitted = at;
+                if at >= limit {
+                    break 'piece;
+                }
+                table[slot(word(at - 1))] = (at - 1) as u16;
+                let current = word(at);
+                let entry = &mut table[slot(current)];
+                candidate = usize::from(*entry);
+                *entry = at as u16;
+                if word(candidate) != current {
+                    break;
+                }
+            }
             at += 1;
-            continue;
         }
-        let from = candidate - 1;
-        let mut length = 4;
-        while at + length < piece.len() && piece[from + length] == piece[at + length] {
-            length += 1;
-        }
-        emit_literal(&piece[literal..at], out);
-        emit_copy(at - from, length, out);
-        at += length;
-        literal = at;
     }
-    emit_literal(&piece[literal..], out);
+    emit_literal(&piece[emitted..], out);
 }
+
+/// The slots of the table for a piece: the next power of two, from 256 up to 32768.
+fn table_size(len: usize) -> usize {
+    len.clamp(256, 1 << 15).next_power_of_two()
+}
+
+/// The CRC32C of one little-endian word, which is what the instruction computes from a seed and a
+/// word, as a function of the two xored together.
+fn crc32c(word: u32) -> u32 {
+    let byte = |shift: u32| ((word >> shift) & 0xff) as usize;
+    CRC32C[3][byte(0)] ^ CRC32C[2][byte(8)] ^ CRC32C[1][byte(16)] ^ CRC32C[0][byte(24)]
+}
+
+/// The CRC32C tables for four bytes at a time: the usual table, then each one the last pushed a
+/// byte further through.
+const CRC32C: [[u32; 256]; 4] = {
+    let mut tables = [[0_u32; 256]; 4];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            bit += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+    let mut table = 1;
+    while table < 4 {
+        let mut i = 0;
+        while i < 256 {
+            let previous = tables[table - 1][i];
+            tables[table][i] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            i += 1;
+        }
+        table += 1;
+    }
+    tables
+};
 
 /// A literal element, with its length in the tag or in the bytes after it.
 fn emit_literal(bytes: &[u8], out: &mut Vec<u8>) {
@@ -115,14 +194,27 @@ fn emit_literal(bytes: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-/// A copy of `length` bytes from `offset` back, as two byte offset copies of at most 64 each.
+/// A copy of `length` bytes from `offset` back, in pieces of 64 that leave the last at least four.
 fn emit_copy(offset: usize, mut length: usize, out: &mut Vec<u8>) {
-    let offset = (offset as u16).to_le_bytes();
-    while length > 0 {
-        let take = length.min(64);
-        out.push((((take - 1) as u8) << 2) | 0b10);
-        out.extend_from_slice(&offset);
-        length -= take;
+    while length >= 68 {
+        emit_short_copy(offset, 64, out);
+        length -= 64;
+    }
+    if length > 64 {
+        emit_short_copy(offset, 60, out);
+        length -= 60;
+    }
+    emit_short_copy(offset, length, out);
+}
+
+/// A copy of four to 64 bytes, in the one byte offset form when it fits and the two byte otherwise.
+fn emit_short_copy(offset: usize, length: usize, out: &mut Vec<u8>) {
+    if length < 12 && offset < 2048 {
+        out.push((((offset >> 8) as u8) << 5) | (((length - 4) as u8) << 2) | 0b01);
+        out.push(offset as u8);
+    } else {
+        out.push((((length - 1) as u8) << 2) | 0b10);
+        out.extend_from_slice(&(offset as u16).to_le_bytes());
     }
 }
 
@@ -647,6 +739,26 @@ mod tests {
             assert_eq!(&back, input);
         }
         assert!(super::compress(&inputs[3]).len() < 20_000);
+    }
+
+    #[test]
+    fn compress_writes_the_block_the_pins_snappy_does() {
+        // The dictionary page of `i % 3` as BIGINT, as the pin writes it.
+        let words = |values: &[i64]| -> Vec<u8> {
+            values.iter().flat_map(|value| value.to_le_bytes()).collect()
+        };
+        let page = super::compress(&words(&[0, 1, 2]));
+        let mut expected = vec![0x18, 0x00, 0x00, 0x0d, 0x01, 0x3c, 0x01];
+        expected.extend_from_slice(&[0; 7]);
+        expected.push(0x02);
+        expected.extend_from_slice(&[0; 7]);
+        assert_eq!(page, expected);
+        // The plain pages of `i` and of `i * 7919 % 1000` over range(70000), which the pin
+        // compresses to 280146 and 58884 bytes.
+        let counted: Vec<i64> = (0..70_000).collect();
+        assert_eq!(super::compress(&words(&counted)).len(), 280_146);
+        let spread: Vec<i64> = (0..70_000).map(|i| i * 7919 % 1000).collect();
+        assert_eq!(super::compress(&words(&spread)).len(), 58_884);
     }
     use super::decompressed_len;
     use rudb_common::Result;

@@ -166,6 +166,12 @@ pub struct CopyTo {
     pub row_group_size: u64,
     /// For Parquet, the key value pairs `KV_METADATA` puts in the footer, in the order written.
     pub kv_metadata: Vec<(String, Vec<u8>)>,
+    /// For Parquet, `DICTIONARY_SIZE_LIMIT`, where `None` leaves it to the size of the row group.
+    pub dictionary_size_limit: Option<u64>,
+    /// For Parquet, `STRING_DICTIONARY_PAGE_SIZE_LIMIT`.
+    pub string_dictionary_page_size_limit: u64,
+    /// For Parquet, `DATA_PAGE_SIZE_LIMIT`.
+    pub data_page_size_limit: u64,
     /// For JSON, the `strftime` format a date is written with, where `None` writes its cast to
     /// VARCHAR.
     pub date_format: Option<String>,
@@ -1039,9 +1045,76 @@ fn copy_to(
     };
     if out.parquet {
         out.kv_metadata = kv_metadata(copy, typed)?;
+        parquet_limits(copy, typed, &mut out)?;
     }
     out.partitioned = partitioned;
     Ok(out)
+}
+
+/// The largest `STRING_DICTIONARY_PAGE_SIZE_LIMIT` the pin takes, which is also its default.
+const MOST_STRING_DICTIONARY: u64 = 1 << 30;
+
+/// The largest `DATA_PAGE_SIZE_LIMIT` the pin takes, which is also its default.
+const MOST_DATA_PAGE: u64 = 100 << 20;
+
+/// The Parquet dictionary and page limits, each cast to the type the pin casts it to and checked
+/// the way the pin checks it.
+fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyTo) -> Result<()> {
+    for ((name, text), written) in copy.options.iter().zip(typed) {
+        let ty = match name.as_str() {
+            "dictionary_size_limit" => LogicalType::BigInt,
+            "string_dictionary_page_size_limit" | "data_page_size_limit" => LogicalType::UBigInt,
+            _ => continue,
+        };
+        let Some(text) = text else {
+            return Err(Error::invalid_input(format!(
+                "Copy option \"{name}\" requires an argument of type {ty}"
+            )));
+        };
+        let (value, from) = match written {
+            Some(Written { ty, value: Some(value) }) => (value.clone(), ty.clone()),
+            _ => (Value::Varchar(text.clone()), LogicalType::Varchar),
+        };
+        let number = match rudb_kernels::cast::cast_value(&value, &ty, false) {
+            Ok(Value::BigInt(number)) => i128::from(number),
+            Ok(Value::UBigInt(number)) => i128::from(number),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Copy option \"{name}\" expected an argument of type {ty} - the argument \
+                     \"{text}\" of type {from} could not be cast as this type"
+                )));
+            }
+        };
+        match name.as_str() {
+            "dictionary_size_limit" => {
+                if number < 0 {
+                    return Err(Error::binder(
+                        "dictionary_size_limit must be greater than 0 or 0 to disable",
+                    ));
+                }
+                out.dictionary_size_limit = Some(number as u64);
+            }
+            "string_dictionary_page_size_limit" => {
+                if number == 0 || number > i128::from(MOST_STRING_DICTIONARY) {
+                    return Err(Error::binder(format!(
+                        "string_dictionary_page_size_limit cannot be 0 and must be less than or \
+                         equal to {MOST_STRING_DICTIONARY}"
+                    )));
+                }
+                out.string_dictionary_page_size_limit = number as u64;
+            }
+            _ => {
+                if number == 0 || number > i128::from(MOST_DATA_PAGE) {
+                    return Err(Error::binder(format!(
+                        "data_page_size_limit cannot be 0 and must be less than or equal to \
+                         {MOST_DATA_PAGE}"
+                    )));
+                }
+                out.data_page_size_limit = number as u64;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The key value pairs of a Parquet `KV_METADATA`: a field of the struct each, with a blob as its
@@ -1100,6 +1173,9 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         date_format: None,
         timestamp_format: None,
         kv_metadata: Vec::new(),
+        dictionary_size_limit: None,
+        string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
+        data_page_size_limit: MOST_DATA_PAGE,
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1185,6 +1261,9 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         date_format: None,
         timestamp_format: None,
         kv_metadata: Vec::new(),
+        dictionary_size_limit: None,
+        string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
+        data_page_size_limit: MOST_DATA_PAGE,
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1271,13 +1350,22 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         date_format: None,
         timestamp_format: None,
         kv_metadata: Vec::new(),
+        dictionary_size_limit: None,
+        string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
+        data_page_size_limit: MOST_DATA_PAGE,
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
         let written = value.as_deref().unwrap_or_default().trim_matches('\'');
         match name.as_str() {
-            // `KV_METADATA` is read from its bound value in `copy_to`.
-            "format" | "kv_metadata" => {}
+            // `KV_METADATA` and the limits are read from their bound values in `copy_to`, and
+            // `DICTIONARY_COMPRESSION_RATIO_THRESHOLD` is one the pin takes and no longer uses.
+            "format"
+            | "kv_metadata"
+            | "dictionary_size_limit"
+            | "string_dictionary_page_size_limit"
+            | "data_page_size_limit"
+            | "dictionary_compression_ratio_threshold" => {}
             "compression" | "codec" => {
                 let codec = written.to_ascii_lowercase();
                 match codec.as_str() {
@@ -1307,8 +1395,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             "row_group_size_bytes"
             | "compression_level"
             | "field_ids"
-            | "dictionary_size_limit"
-            | "string_dictionary_page_size_limit"
             | "write_bloom_filter"
             | "bloom_filter_false_positive_ratio"
             | "parquet_version"
