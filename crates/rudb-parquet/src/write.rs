@@ -4,11 +4,11 @@
 //! What it writes is what the pin writes for the same columns. Every
 //! column is `OPTIONAL`, the root of the schema is `duckdb_schema`, integers narrower than 32 bits
 //! and every unsigned width carry both the old `converted_type` and the `logicalType` union, a
-//! string is a `BYTE_ARRAY` annotated `UTF8`, a timestamp is microseconds unless it is in
-//! nanoseconds, a zoned time is the time at UTC, and a decimal is an `INT32`, an `INT64` or a
-//! sixteen byte `FIXED_LEN_BYTE_ARRAY` by its width. So a file written here reads back in the pin
-//! as the types it was written from, and in this crate's reader too, with a zoned time at offset
-//! zero.
+//! string is a `BYTE_ARRAY` annotated `UTF8`, a timestamp is at its own unit unless it is in
+//! seconds, which are written as microseconds, a zoned time is the time at UTC, and a decimal is an
+//! `INT32`, an `INT64` or a sixteen byte `FIXED_LEN_BYTE_ARRAY` by its width. So a file written
+//! here reads back in the pin as the types it was written from, and in this crate's reader too,
+//! with a zoned time at offset zero and a timestamp in seconds or milliseconds as a `TIMESTAMP`.
 //!
 //! The pages are laid out the way the pin lays them out. Each column of a row group is read whole
 //! first and, unless it is a boolean or a sixteen byte decimal, put in a dictionary that takes the
@@ -801,9 +801,7 @@ pub struct ColumnStatistics {
 ///
 /// Most types are written as themselves. An enum is written as its text and a timestamp in
 /// seconds as one in microseconds, which is what the pin does with them, a `HUGEINT` as a
-/// `DOUBLE`, which is also what the pin does, and an aggregate state as its layout. A timestamp in
-/// milliseconds is written in microseconds too, where the pin keeps it in milliseconds, because
-/// the reader here would give a file of them back as `TIMESTAMP_MS` and the pin gives `TIMESTAMP`.
+/// `DOUBLE`, which is also what the pin does, and an aggregate state as its layout.
 ///
 /// # Errors
 ///
@@ -823,7 +821,7 @@ pub fn storage(ty: &LogicalType) -> Result<LogicalType> {
                 .collect::<Result<_>>()?,
         ),
         LogicalType::Enum(_) => LogicalType::Varchar,
-        LogicalType::TimestampS | LogicalType::TimestampMs => LogicalType::Timestamp,
+        LogicalType::TimestampS => LogicalType::Timestamp,
         LogicalType::HugeInt | LogicalType::UHugeInt => LogicalType::Double,
         LogicalType::Null => LogicalType::Integer,
         // A state is written as its layout, which is what the pin writes, and read back as that
@@ -855,6 +853,7 @@ fn physical(ty: &LogicalType) -> Option<Physical> {
         | LogicalType::TimeNs
         | LogicalType::TimeTz
         | LogicalType::Timestamp
+        | LogicalType::TimestampMs
         | LogicalType::TimestampTz
         | LogicalType::TimestampNs
         | LogicalType::TimestampTzNs => Physical::Int64,
@@ -1486,7 +1485,7 @@ fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
         time.nested(2, units);
         (field, time)
     };
-    let (micros, nanos) = (2, 3);
+    let (millis, micros, nanos) = (1, 2, 3);
     // The pin writes the old annotation for everything and the new one only where the old one
     // cannot say it all, which is time zones, nanoseconds and decimals. The old one has no
     // nanoseconds, so those get only the new one.
@@ -1505,6 +1504,7 @@ fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
         LogicalType::TimeTz => (Some(8), Some(time(true, micros, 7))),
         LogicalType::TimeNs => (None, Some(time(false, nanos, 7))),
         LogicalType::Timestamp => (Some(10), Some(time(false, micros, 8))),
+        LogicalType::TimestampMs => (Some(9), Some(time(false, millis, 8))),
         LogicalType::TimestampTz => (Some(10), Some(time(true, micros, 8))),
         LogicalType::TimestampNs => (None, Some(time(false, nanos, 8))),
         LogicalType::TimestampTzNs => (None, Some(time(true, nanos, 8))),
@@ -2288,6 +2288,43 @@ mod tests {
         rows[3] = read;
         for (at, values) in rows.iter().enumerate() {
             assert_eq!(&read_back(pin, at), values, "{} reads back", names[at]);
+        }
+    }
+
+    #[test]
+    fn a_millisecond_timestamp_comes_out_as_the_pins_bytes() {
+        // SET TimeZone = 'UTC'; COPY (SELECT CASE WHEN i % 4 = 0 THEN NULL ELSE
+        // epoch_ms(981173106500 + i * 1234567)::TIMESTAMP_MS END AS a, CASE i % 3 WHEN 0 THEN
+        // 'infinity'::TIMESTAMP_MS WHEN 1 THEN '-infinity'::TIMESTAMP_MS ELSE epoch_ms(-1500 -
+        // i)::TIMESTAMP_MS END AS b FROM range(20) r(i)) TO 'timestamp-ms.parquet' (COMPRESSION
+        // uncompressed), in the pin.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for i in 0..20_i64 {
+            a.push(if i % 4 == 0 { None } else { Some(981_173_106_500 + i * 1_234_567) });
+            b.push(Some(match i % 3 {
+                0 => i64::MAX,
+                1 => -i64::MAX,
+                _ => -1500 - i,
+            }));
+        }
+        let ty = LogicalType::TimestampMs;
+        let fields = [Field::new("a", ty.clone()), Field::new("b", ty.clone())];
+        let stored = |values: &[Option<i64>]| -> Vec<Value> {
+            values.iter().map(|value| value.map_or(Value::Null, Value::TimestampMs)).collect()
+        };
+        let columns = vec![column(ty.clone(), &stored(&a)), column(ty.clone(), &stored(&b))];
+        let bytes = written(&fields, columns, Codec::Uncompressed, Limits::default());
+        let pin = include_bytes!("../testdata/timestamp-ms.parquet");
+        assert!(bytes == pin, "differs from the pin's file");
+        // It comes back as a timestamp in microseconds, as it does in the pin, with an infinity
+        // left as it is.
+        for (at, values) in [a, b].iter().enumerate() {
+            let micros =
+                |millis: i64| if millis.abs() == i64::MAX { millis } else { millis * 1_000 };
+            let values = values
+                .iter()
+                .map(|value| value.map_or(Value::Null, |v| Value::Timestamp(micros(v))));
+            assert_eq!(read_back(pin, at), values.collect::<Vec<_>>(), "{at} reads back");
         }
     }
 

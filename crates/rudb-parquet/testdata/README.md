@@ -245,3 +245,20 @@ COPY (
 ```
 
 The pin keeps the values of the 2048 rows it hands a list writer at once on one page, so `l` only gets a new page at the first entry of such a block, while `f` gets one every time its values reach the limit.
+
+## units-dict.parquet and units-delta.parquet
+
+Written by pyarrow 23.0.1, uncompressed, five rows, for a time in each of the three units and a timestamp in milliseconds with and without UTC. The pin never writes a time in milliseconds itself, which is why something else wrote these.
+
+```python
+t_ms = pa.array([3723500, None, 86399999, 0, 86400000], pa.time32('ms'))
+t_us = pa.array([3723500001, None, 86399999999, 0, 86400000000], pa.time64('us'))
+t_ns = pa.array([3723500001002, None, 86399999999999, 0, 86400000000000], pa.time64('ns'))
+ts_ms = pa.array([981173106500, None, -1500, 0, 253402300799999], pa.timestamp('ms'))
+ts_tz = pa.array([981173106500, None, -1500, 0, 1], pa.timestamp('ms', tz='UTC'))
+table = pa.table({'t_ms': t_ms, 't_us': t_us, 't_ns': t_ns, 'ts_ms': ts_ms, 'ts_tz': ts_tz})
+pq.write_table(table, 'units-dict.parquet', compression='NONE', store_schema=False, coerce_timestamps=None)
+pq.write_table(table, 'units-delta.parquet', compression='NONE', store_schema=False, use_dictionary=False, column_encoding='DELTA_BINARY_PACKED', coerce_timestamps=None)
+```
+
+The pin reads them as TIME, TIME, TIME_NS, TIMESTAMP and TIMESTAMP WITH TIME ZONE, with the first row 01:02:03.5, 01:02:03.500001, 01:02:03.500001002, 2001-02-03 04:05:06.5 and 2001-02-03 04:05:06.5+00, and the last row 24:00:00 in all three times, 9999-12-31 23:59:59.999 and 1970-01-01 00:00:00.001+00.

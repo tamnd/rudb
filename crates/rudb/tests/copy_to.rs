@@ -261,6 +261,44 @@ fn nanosecond_and_zoned_times_read_back_with_the_pins_types_and_bounds() {
 }
 
 #[test]
+fn a_millisecond_timestamp_is_written_in_milliseconds_and_read_back_as_a_timestamp() {
+    let db = Database::new();
+    db.execute("SET TimeZone = 'UTC'").expect("sets");
+    let path = std::env::temp_dir().join(format!("rudb-copy-to-ms-{}.parquet", std::process::id()));
+    db.execute(&format!(
+        "COPY (SELECT CASE WHEN i % 4 = 0 THEN NULL ELSE epoch_ms(981173106500 + i * \
+         1234567)::TIMESTAMP_MS END AS a FROM range(20) r(i)) TO '{}'",
+        path.display()
+    ))
+    .expect("writes");
+    let text = |value: &str| rudb_common::Value::Varchar(value.into());
+    let schema = format!("parquet_schema('{}')", path.display());
+    let converted = values(&db, &format!("SELECT converted_type FROM {schema} WHERE name = 'a'"));
+    assert_eq!(converted, vec![vec![text("TIMESTAMP_MILLIS")]]);
+    let metadata = format!("parquet_metadata('{}')", path.display());
+    let bounds = values(&db, &format!("SELECT stats_min, stats_max FROM {metadata}"));
+    assert_eq!(
+        bounds,
+        vec![vec![text("2001-02-03 04:25:41.067"), text("2001-02-03 10:36:03.273")]]
+    );
+    let back = format!("read_parquet('{}')", path.display());
+    let read = values(&db, &format!("SELECT typeof(a), a::VARCHAR FROM {back} LIMIT 2 OFFSET 1"));
+    assert_eq!(
+        read,
+        vec![
+            vec![text("TIMESTAMP"), text("2001-02-03 04:25:41.067")],
+            vec![text("TIMESTAMP"), text("2001-02-03 04:46:15.634")]
+        ]
+    );
+    let later = values(
+        &db,
+        &format!("SELECT count(*) FROM {back} WHERE a > TIMESTAMP '2001-02-03 06:00:00'"),
+    );
+    assert_eq!(later, vec![vec![rudb_common::Value::BigInt(11)]]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn json_is_one_object_a_line_or_one_array() {
     let db = table();
     let rows = "{\"i\":1,\"s\":\"a,b\",\"d\":1.5,\"dt\":\"2026-01-02\",\"n\":null,\

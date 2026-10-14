@@ -45,11 +45,11 @@
 
 use std::sync::Arc;
 
-use rudb_common::bounds::{End, Spread, Zones, kept, scale_of};
+use rudb_common::bounds::{End, MICROS, Spread, Zones, kept, scale_of};
 use rudb_common::stat::Provenance;
 use rudb_common::{LogicalType, Stat};
 
-use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn};
+use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn, Unit};
 
 /// The bounds vocabulary, which is shared rather than restated.
 ///
@@ -275,6 +275,14 @@ fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
             | LogicalType::UHugeInt
     );
     if let Some(scale) = scale_of(&column.ty) {
+        // A time or a timestamp is bounded in the unit the file stores it at, which for one in
+        // milliseconds is not the unit its type holds.
+        let scale = match column.unit {
+            Some(Unit::Millis) => 3,
+            Some(Unit::Micros) => MICROS,
+            Some(Unit::Nanos) => 9,
+            None => scale,
+        };
         let unscaled = match column.physical {
             Physical::Int32 => i128::from(i32::from_le_bytes(bytes.try_into().ok()?)),
             Physical::Int64 => i128::from(i64::from_le_bytes(bytes.try_into().ok()?)),
@@ -333,7 +341,7 @@ mod tests {
 
     use super::{Bound, Footer, Op, Test, read_bound, skips};
     use crate::metadata::{
-        ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats,
+        ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats, Unit,
     };
 
     /// A schema of one `INTEGER` column called `d`, which every test here filters on.
@@ -344,6 +352,7 @@ mod tests {
             ty: LogicalType::Integer,
             optional: false,
             width: 0,
+            unit: None,
             nested: None,
         }]
     }
@@ -628,6 +637,7 @@ mod tests {
             ty: LogicalType::Decimal { width: 15, scale: 2 },
             optional: false,
             width: 0,
+            unit: None,
             nested: None,
         }];
         let mut group = group(None, None);
@@ -702,6 +712,7 @@ mod tests {
             ty: LogicalType::Decimal { width: 38, scale: 4 },
             optional: false,
             width: 16,
+            unit: None,
             nested: None,
         };
         let positive = 123_456_i128.to_be_bytes();
@@ -720,10 +731,10 @@ mod tests {
     fn a_timestamp_columns_bounds_are_read_at_the_files_own_unit() {
         // The same instant in the three units a file may choose, each of which has to come back as
         // the same quantity so that the microseconds every constant arrives as compares with it.
-        for (ty, unscaled, scale) in [
-            (LogicalType::TimestampMs, 1_700_000_000_000_i64, 3),
-            (LogicalType::Timestamp, 1_700_000_000_000_000, MICROS),
-            (LogicalType::TimestampNs, 1_700_000_000_000_000_000, 9),
+        for (ty, unit, unscaled, scale) in [
+            (LogicalType::Timestamp, Unit::Millis, 1_700_000_000_000_i64, 3),
+            (LogicalType::Timestamp, Unit::Micros, 1_700_000_000_000_000, MICROS),
+            (LogicalType::TimestampNs, Unit::Nanos, 1_700_000_000_000_000_000, 9),
         ] {
             let column = SchemaColumn {
                 name: "t".to_string(),
@@ -731,6 +742,7 @@ mod tests {
                 ty,
                 optional: false,
                 width: 0,
+                unit: Some(unit),
                 nested: None,
             };
             let bytes = unscaled.to_le_bytes();

@@ -32,7 +32,7 @@ use rudb_vector::{Buffer, Data, StringColumn, Validity, Vector};
 
 use crate::chunk::Page;
 use crate::hybrid::Hybrid;
-use crate::metadata::{Encoding, Leaf, Physical, SchemaColumn};
+use crate::metadata::{Encoding, Leaf, Physical, SchemaColumn, Unit};
 use crate::page::Body;
 
 impl Page {
@@ -273,10 +273,43 @@ impl Page {
     }
 }
 
-/// The zoned time a file holds as `micros` at UTC, which is that time at offset zero. A number that
-/// is not a time of day is held to the day first, so that it cannot overflow the packing.
+/// How a value of a time or a timestamp column is brought from the unit the file stores it at to
+/// the one its type holds, the pin's reader's way, or `None` for a column that needs nothing done.
+///
+/// A millisecond timestamp is multiplied up unless it is infinite, and a time at UTC is wrapped
+/// into a day and held at offset zero, with the end of the day kept as it is.
+fn retimed(column: &SchemaColumn) -> Option<fn(i64) -> Result<i64>> {
+    if !matches!(column.physical, Physical::Int32 | Physical::Int64) {
+        return None;
+    }
+    let retime: fn(i64) -> Result<i64> = match (&column.ty, column.unit?) {
+        (LogicalType::Timestamp | LogicalType::TimestampTz, Unit::Millis) => |millis| {
+            if millis == i64::MAX || millis == -i64::MAX {
+                return Ok(millis);
+            }
+            millis.checked_mul(1_000).ok_or_else(|| {
+                Error::conversion("Could not convert Timestamp(MS) to Timestamp(US)")
+            })
+        },
+        (LogicalType::Time, Unit::Millis) => |millis| Ok(millis * 1_000),
+        (LogicalType::TimeTz, Unit::Millis) => |millis| Ok(zoned(day(millis, 86_400_000) * 1_000)),
+        (LogicalType::TimeTz, Unit::Micros) => |micros| Ok(zoned(day(micros, 86_400_000_000))),
+        (LogicalType::TimeTz, Unit::Nanos) => {
+            |nanos| Ok(zoned(day(nanos, 86_400_000_000_000) / 1_000))
+        }
+        _ => return None,
+    };
+    Some(retime)
+}
+
+/// `value` wrapped into a day of `length`, unless it is the end of the day.
+fn day(value: i64, length: i64) -> i64 {
+    if value == length { value } else { value.rem_euclid(length) }
+}
+
+/// The zoned time that is `micros` at offset zero.
 fn zoned(micros: i64) -> i64 {
-    time_tz::pack(micros.clamp(0, 86_400_000_000), 0)
+    time_tz::pack(micros, 0)
 }
 
 /// The validity a run of definition levels describes, and how many values are actually in the page.
@@ -329,6 +362,16 @@ fn plain(
     total: usize,
 ) -> Result<Data> {
     let target = column.ty.physical();
+    if let Some(retime) = retimed(column) {
+        let dense: Result<Vec<i64>> = if column.physical == Physical::Int32 {
+            let bytes = fixed::<4>(tail(body, at)?, count)?;
+            words::<4>(bytes).map(|word| retime(i32::from_le_bytes(word).into())).collect()
+        } else {
+            let bytes = fixed::<8>(tail(body, at)?, count)?;
+            words::<8>(bytes).map(|word| retime(i64::from_le_bytes(word))).collect()
+        };
+        return narrow(target, count, dense.map(Vec::into_iter)?, levels, total);
+    }
     match column.physical {
         Physical::Boolean => {
             let dense = booleans(tail(body, at)?, count)?;
@@ -344,11 +387,6 @@ fn plain(
         Physical::Int64 if target == PhysicalType::UInt64 => {
             let bytes = fixed::<8>(tail(body, at)?, count)?;
             let wire = words::<8>(bytes).map(|word| i64::from_le_bytes(word).cast_unsigned());
-            narrow(target, count, wire, levels, total)
-        }
-        Physical::Int64 if column.ty == LogicalType::TimeTz => {
-            let bytes = fixed::<8>(tail(body, at)?, count)?;
-            let wire = words::<8>(bytes).map(|word| zoned(i64::from_le_bytes(word)));
             narrow(target, count, wire, levels, total)
         }
         Physical::Int32 => {
@@ -438,6 +476,10 @@ fn delta(
                 )));
             }
             let (dense, _) = crate::delta::binary_packed(tail(body, at)?, count)?;
+            if let Some(retime) = retimed(column) {
+                let dense = dense.into_iter().map(retime).collect::<Result<Vec<_>>>()?;
+                return narrow(target, count, dense.into_iter(), levels, total);
+            }
             match (column.physical, target) {
                 (Physical::Int32, PhysicalType::UInt32) => {
                     let wire = dense.into_iter().map(|value| (value as i32).cast_unsigned());
@@ -445,9 +487,6 @@ fn delta(
                 }
                 (Physical::Int64, PhysicalType::UInt64) => {
                     narrow(target, count, dense.into_iter().map(i64::cast_unsigned), levels, total)
-                }
-                (Physical::Int64, _) if column.ty == LogicalType::TimeTz => {
-                    narrow(target, count, dense.into_iter().map(zoned), levels, total)
                 }
                 _ => narrow(target, count, dense.into_iter(), levels, total),
             }
@@ -871,7 +910,9 @@ mod tests {
     use rudb_io::{File, Filesystem, OpenMode, RealFilesystem};
     use rudb_vector::{Form, Vector};
 
-    use crate::metadata::Metadata;
+    use rudb_common::time_tz;
+
+    use crate::metadata::{Metadata, Physical, Unit};
     use crate::page::Body;
     use crate::{Pages, SchemaColumn};
 
@@ -1215,5 +1256,113 @@ mod tests {
         assert!(error.message().contains("holds no rows"), "{}", error.message());
         let error = data.decode_dictionary(&schema).unwrap_err();
         assert!(error.message().contains("asked of a data page"), "{}", error.message());
+    }
+
+    #[test]
+    fn times_and_timestamps_are_read_at_the_unit_their_type_holds() {
+        // units-dict.parquet and units-delta.parquet of the README, which pyarrow wrote with a time
+        // in each unit and timestamps in milliseconds. The values are the pin reading them.
+        let (ms, us, ns) = (3_723_500_000, 3_723_500_001, 3_723_500_001_002);
+        let rows = [
+            [Value::Time(ms), Value::Time(us), Value::TimeNs(ns)],
+            [Value::Null, Value::Null, Value::Null],
+            [
+                Value::Time(86_399_999_000),
+                Value::Time(86_399_999_999),
+                Value::TimeNs(86_399_999_999_999),
+            ],
+            [Value::Time(0), Value::Time(0), Value::TimeNs(0)],
+            [
+                Value::Time(86_400_000_000),
+                Value::Time(86_400_000_000),
+                Value::TimeNs(86_400_000_000_000),
+            ],
+        ];
+        let stamps = [
+            Some(981_173_106_500_000),
+            None,
+            Some(-1_500_000),
+            Some(0),
+            Some(253_402_300_799_999_000),
+        ];
+        let zoned = [Some(981_173_106_500_000), None, Some(-1_500_000), Some(0), Some(1_000)];
+        for name in ["units-dict.parquet", "units-delta.parquet"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+            let file = RealFilesystem::new().open(&path, OpenMode::Read).expect("committed");
+            let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
+            let types: Vec<_> = metadata.schema.iter().map(|column| column.ty.clone()).collect();
+            let wanted = [
+                LogicalType::Time,
+                LogicalType::Time,
+                LogicalType::TimeNs,
+                LogicalType::Timestamp,
+                LogicalType::TimestampTz,
+            ];
+            assert_eq!(types, wanted, "{name}");
+            let chunks = crate::reader::read(file).expect("reads");
+            let read: Vec<Vec<Value>> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    (0..chunk.len()).map(|row| (0..5).map(|at| chunk.value_at(row, at)).collect())
+                })
+                .collect();
+            let expected: Vec<Vec<Value>> = rows
+                .iter()
+                .zip(stamps.iter().zip(zoned))
+                .map(|(times, (stamp, zoned))| {
+                    let mut row = times.to_vec();
+                    row.push(stamp.map_or(Value::Null, Value::Timestamp));
+                    row.push(zoned.map_or(Value::Null, Value::TimestampTz));
+                    row
+                })
+                .collect();
+            assert_eq!(read, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_time_at_utc_is_read_as_a_zoned_time_at_offset_zero_whatever_its_unit() {
+        // The pin wraps the time into a day, keeps the end of the day, and drops what is finer
+        // than a microsecond.
+        for (physical, unit, raw, micros) in [
+            (Physical::Int32, Unit::Millis, 3_723_500, 3_723_500_000),
+            (Physical::Int32, Unit::Millis, -1, 86_399_999_000),
+            (Physical::Int64, Unit::Micros, 86_400_000_000, 86_400_000_000),
+            (Physical::Int64, Unit::Micros, 86_400_000_001, 1),
+            (Physical::Int64, Unit::Nanos, 3_723_500_001_999, 3_723_500_001),
+        ] {
+            let column = SchemaColumn {
+                name: "t".to_string(),
+                physical,
+                ty: LogicalType::TimeTz,
+                optional: true,
+                width: 0,
+                unit: Some(unit),
+                nested: None,
+            };
+            let retime = super::retimed(&column).expect("a zoned time is brought to its unit");
+            assert_eq!(retime(raw).expect("in range"), time_tz::pack(micros, 0), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_millisecond_timestamp_too_far_out_for_microseconds_is_the_pins_error() {
+        let column = SchemaColumn {
+            name: "t".to_string(),
+            physical: Physical::Int64,
+            ty: LogicalType::Timestamp,
+            optional: true,
+            width: 0,
+            unit: Some(Unit::Millis),
+            nested: None,
+        };
+        let retime = super::retimed(&column).expect("a millisecond timestamp is brought up");
+        assert_eq!(retime(i64::MAX).expect("infinity"), i64::MAX);
+        assert_eq!(retime(-i64::MAX).expect("infinity"), -i64::MAX);
+        let error = retime(i64::MAX / 1_000 + 1).expect_err("too far out");
+        assert_eq!(
+            error.to_string(),
+            "Conversion Error: Could not convert Timestamp(MS) to Timestamp(US)"
+        );
     }
 }
