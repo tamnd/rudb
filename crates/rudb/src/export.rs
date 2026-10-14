@@ -601,6 +601,7 @@ impl<'a> Sink<'a> {
                 data_page: copy.data_page_size_limit,
                 bloom: copy.bloom_filter_false_positive_ratio,
             });
+            writer.set_field_ids(&copy.field_ids);
             Body::Parquet { writer: Box::new(writer), stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
             let moments = Moments {

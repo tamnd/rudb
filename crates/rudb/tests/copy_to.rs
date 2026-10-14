@@ -1202,3 +1202,153 @@ fn the_full_metadata_is_a_row_per_file_with_the_other_four_tables_as_lists() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn field_ids_go_in_the_schema_and_are_refused_as_the_pin_refuses_them() {
+    let db = Database::new();
+    let root = std::env::temp_dir().join(format!("rudb-copy-to-ids-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("makes the directory");
+    let path = root.join("ids.parquet");
+    let schema = |query: &str, ids: &str| {
+        let sql = format!("COPY ({query}) TO '{}' (FIELD_IDS {ids})", path.display());
+        db.execute(&sql).expect(&sql);
+        let names = format!("SELECT name, field_id FROM parquet_schema('{}')", path.display());
+        values(&db, &names)
+    };
+    let text = |value: &str| rudb_common::Value::Varchar(value.into());
+    let id = |name: &str, id: Option<i64>| {
+        vec![text(name), id.map_or(rudb_common::Value::Null, rudb_common::Value::BigInt)]
+    };
+    // The answers are the pin's for the same statements.
+    assert_eq!(
+        schema("SELECT [{a: 1, b: 2}] AS l, MAP {'k': [1]} AS m", "'auto'"),
+        vec![
+            id("duckdb_schema", None),
+            id("l", Some(0)),
+            id("list", None),
+            id("element", Some(1)),
+            id("a", Some(2)),
+            id("b", Some(3)),
+            id("m", Some(4)),
+            id("key_value", None),
+            id("key", Some(5)),
+            id("value", Some(6)),
+            id("list", None),
+            id("element", Some(7)),
+        ]
+    );
+    // The members of a row with no names are named the way the pin names those of a tuple.
+    assert_eq!(
+        schema("SELECT (1, 'a') AS t", "{t: {__duckdb_field_id: 10, element1: 11, element2: 12}}"),
+        vec![
+            id("duckdb_schema", None),
+            id("t", Some(10)),
+            id("element1", Some(11)),
+            id("element2", Some(12))
+        ]
+    );
+    assert_eq!(
+        schema("SELECT range AS i, range AS j, range AS k FROM range(3)", "{\"I\": '7', j: true}"),
+        vec![id("duckdb_schema", None), id("i", Some(7)), id("j", Some(1)), id("k", None)]
+    );
+    assert_eq!(
+        schema(
+            "SELECT MAP {'my_key': [{j: 42}]} AS i",
+            "{i: {__duckdb_field_id: 42, key: 43, value: {__duckdb_field_id: 44, element: \
+             {__duckdb_field_id: 45, j: 46}}}}"
+        ),
+        vec![
+            id("duckdb_schema", None),
+            id("i", Some(42)),
+            id("key_value", None),
+            id("key", Some(43)),
+            id("value", Some(44)),
+            id("list", None),
+            id("element", Some(45)),
+            id("j", Some(46)),
+        ]
+    );
+    let not_found = |name: &str, names: &str| {
+        format!(
+            "Binder Error: Column name \"{name}\" specified in FIELD_IDS not found. Consider \
+             using WRITE_PARTITION_COLUMNS if this column is a partition column. Available \
+             column names: [{names}]"
+        )
+    };
+    let nope = not_found("nope", "beta, mid, alpha, zed");
+    let partitioned = not_found("a", "b");
+    let field_id = not_found("field_id", "f");
+    let flat = "SELECT range AS i, range AS j FROM range(3)";
+    let structs = "SELECT {f: range} AS i FROM range(3)";
+    for (query, options, message) in [
+        (flat, "FIELD_IDS", "Binder Error: FIELD_IDS requires exactly one argument"),
+        (
+            flat,
+            "FIELD_IDS 'oops'",
+            "Binder Error: Expected FIELD_IDS to be a STRUCT, e.g., {col1: 42, col2: \
+             {__duckdb_field_id: 43, nested_col: 44}, col3: 44}",
+        ),
+        (
+            flat,
+            "FIELD_IDS NULL",
+            "Binder Error: Expected FIELD_IDS to be a STRUCT, e.g., {col1: 42, col2: \
+             {__duckdb_field_id: 43, nested_col: 44}, col3: 44}",
+        ),
+        (
+            flat,
+            "FIELD_IDS {i: 42, j: 41 + 1}",
+            "Binder Error: Duplicate field_id 42 found in FIELD_IDS",
+        ),
+        ("SELECT 1 AS zed, 2 AS alpha, 3 AS mid, 4 AS beta", "FIELD_IDS {nope: 42}", nope.as_str()),
+        (
+            "SELECT 1 AS a, 2 AS b",
+            "FORMAT parquet, PARTITION_BY a, OVERWRITE, FIELD_IDS {a: 1}",
+            partitioned.as_str(),
+        ),
+        (structs, "FIELD_IDS {i: {field_id: 42, f: 43}}", field_id.as_str()),
+        (
+            flat,
+            "FIELD_IDS {i: 'abc'}",
+            "Invalid Input Error: Failed to cast value: Could not convert string 'abc' to INT32",
+        ),
+        (
+            flat,
+            "FIELD_IDS {i: i}",
+            "Invalid Input Error: Failed to cast value: Could not convert string 'i' to INT32",
+        ),
+        (
+            flat,
+            "FIELD_IDS {i: 3000000000}",
+            "Invalid Input Error: Failed to cast value: Type INT64 with value 3000000000 can't be \
+             cast because the value is out of range for the destination type INT32",
+        ),
+        (
+            flat,
+            "FIELD_IDS {i: 1024::UTINYINT}",
+            "Conversion Error: Type INT32 with value 1024 can't be cast because the value is out \
+             of range for the destination type UINT8",
+        ),
+        (
+            flat,
+            "FIELD_IDS {i: {__duckdb_field_id: 42, j: 43}}",
+            "Binder Error: Column \"i\" with type \"BIGINT\" cannot have a nested FIELD_IDS \
+             specification",
+        ),
+        (
+            "SELECT range AS __duckdb_field_id FROM range(3)",
+            "FIELD_IDS {__duckdb_field_id: 42}",
+            "Binder Error: Cannot have a column named \"__duckdb_field_id\" when writing FIELD_IDS",
+        ),
+        (
+            "SELECT {__duckdb_field_id: range} AS i FROM range(3)",
+            "FIELD_IDS {i: {__duckdb_field_id: 42, x: 1}}",
+            "Binder Error: Cannot have column named \"__duckdb_field_id\" with FIELD_IDS",
+        ),
+    ] {
+        let target = root.join("refused");
+        let sql = format!("COPY ({query}) TO '{}.parquet' ({options})", target.display());
+        let error = db.query(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

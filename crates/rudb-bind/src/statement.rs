@@ -166,6 +166,8 @@ pub struct CopyTo {
     pub row_group_size: u64,
     /// For Parquet, the key value pairs `KV_METADATA` puts in the footer, in the order written.
     pub kv_metadata: Vec<(String, Vec<u8>)>,
+    /// For Parquet, the field ids `FIELD_IDS` gives the columns, where it was written.
+    pub field_ids: Vec<rudb_parquet::FieldId>,
     /// For Parquet, `DICTIONARY_SIZE_LIMIT`, where `None` leaves it to the size of the row group.
     pub dictionary_size_limit: Option<u64>,
     /// For Parquet, `STRING_DICTIONARY_PAGE_SIZE_LIMIT`.
@@ -866,8 +868,9 @@ pub(crate) fn bind_one(
             let (root, scope) = binder.bind_query(ast, copy.query)?;
             let plan = finish(binder, root)?;
             let typed = copy_values(ast, copy, catalog, parameters, session);
-            let names = scope.columns.into_iter().map(|column| column.name).collect::<Vec<_>>();
-            copy_to(copy, &typed, &names, plan).map(Bound::CopyTo)
+            let (names, types): (Vec<_>, Vec<_>) =
+                scope.columns.into_iter().map(|column| (column.name, column.ty)).unzip();
+            copy_to(copy, &typed, &names, &types, plan).map(Bound::CopyTo)
         }
         ast::Statement::Vacuum(index) => {
             crate::vacuum::vacuum(ast, &ast.vacuums[index as usize], catalog, session)
@@ -887,6 +890,8 @@ pub(crate) fn bind_one(
 pub(crate) struct Written {
     pub(crate) ty: LogicalType,
     pub(crate) value: Option<Value>,
+    /// Why `FIELD_IDS` did not bind or did not fold, which is the error the pin gives for it.
+    pub(crate) failed: Option<Error>,
 }
 
 impl Written {
@@ -899,6 +904,9 @@ impl Written {
 /// What each option of a `COPY ... TO` was written as, for the checks the pin makes of an option's
 /// type before it reads the value. One written bare, as a word, or as anything that does not bind
 /// over no rows has none and is read from its text.
+///
+/// `FIELD_IDS` is bound with a name that is no column read as the string it spells, the way the
+/// pin binds it, and keeps the error of a value that does not bind or fold, which the pin gives.
 fn copy_values(
     ast: &Ast,
     copy: &ast::CopyTo,
@@ -906,17 +914,28 @@ fn copy_values(
     parameters: &Parameters,
     session: &Session,
 ) -> Vec<Option<Written>> {
-    let written = |expr: ast::ExprRef| {
+    let written = |name: &str, expr: ast::ExprRef| {
         if expr == NONE {
             return None;
         }
+        let ids = name == "field_ids";
         let mut binder = Binder::with(catalog, parameters, session);
-        let bound = binder.bind_expr(ast, expr, &crate::scope::Scope::empty()).ok()?;
+        binder.identifiers_as_strings = ids;
+        let bound = match binder.bind_expr(ast, expr, &crate::scope::Scope::empty()) {
+            Ok(bound) => bound,
+            Err(error) if ids => {
+                return Some(Written { ty: LogicalType::Null, value: None, failed: Some(error) });
+            }
+            Err(_) => return None,
+        };
         let ty = binder.plan().expr_type(bound).clone();
-        let value = crate::fold::value_of(binder.plan(), bound).ok().flatten();
-        Some(Written { ty, value })
+        let (value, failed) = match crate::fold::value_of(binder.plan(), bound) {
+            Ok(value) => (value, None),
+            Err(error) => (None, ids.then_some(error)),
+        };
+        Some(Written { ty, value, failed })
     };
-    copy.values.iter().map(|&expr| written(expr)).collect()
+    copy.options.iter().zip(&copy.values).map(|((name, _), &expr)| written(name, expr)).collect()
 }
 
 /// The options of a JSON `COPY ... TO`, the ones the pin takes whether or not this does.
@@ -966,10 +985,10 @@ fn refuse_written(copy: &ast::CopyTo, typed: &[Option<Written>], format: &str) -
         let Some(written) = written else { continue };
         // A bare NULL for `HEADER` is refused here for every format, before JSON says it does
         // not know the option.
-        // `KV_METADATA` takes any type and refuses a NULL for not being a struct.
+        // `KV_METADATA` and `FIELD_IDS` take any type and refuse a NULL for not being a struct.
         if written.null()
             && (!json || !bare(written) || name == "header")
-            && !matches!(name, "partition_by" | "kv_metadata")
+            && !matches!(name, "partition_by" | "kv_metadata" | "field_ids")
         {
             return Err(Error::binder(format!(
                 "NULL is not supported as a valid option for COPY option \"{name}\""
@@ -1022,6 +1041,7 @@ fn copy_to(
     copy: &ast::CopyTo,
     typed: &[Option<Written>],
     names: &[String],
+    types: &[LogicalType],
     plan: Plan,
 ) -> Result<CopyTo> {
     let lowered = copy.path.to_ascii_lowercase();
@@ -1049,6 +1069,23 @@ fn copy_to(
     if out.parquet {
         out.kv_metadata = kv_metadata(copy, typed)?;
         parquet_limits(copy, typed, &mut out)?;
+        // The ids are for the columns that go in the files, which leaves out the ones that pick
+        // the directory unless they are written too.
+        let written = (0..names.len())
+            .filter(|column| partitioned.write_columns || !partitioned.columns.contains(column));
+        let (names, types): (Vec<_>, Vec<_>) =
+            written.map(|column| (names[column].clone(), types[column].clone())).unzip();
+        for ((name, text), written) in copy.options.iter().zip(typed) {
+            if name == "field_ids" {
+                let word = text.as_ref().map(|text| Written {
+                    ty: LogicalType::Varchar,
+                    value: Some(Value::Varchar(text.trim_matches('\'').to_string())),
+                    failed: None,
+                });
+                let written = written.as_ref().or(word.as_ref());
+                out.field_ids = crate::field_ids::field_ids(written, &names, &types)?;
+            }
+        }
     }
     out.partitioned = partitioned;
     Ok(out)
@@ -1085,7 +1122,7 @@ fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyT
             )));
         };
         let (value, from) = match written {
-            Some(Written { ty, value: Some(value) }) => (value.clone(), ty.clone()),
+            Some(Written { ty, value: Some(value), .. }) => (value.clone(), ty.clone()),
             _ => (Value::Varchar(text.clone()), LogicalType::Varchar),
         };
         let number = match rudb_kernels::cast::cast_value(&value, &ty, false) {
@@ -1200,6 +1237,7 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         date_format: None,
         timestamp_format: None,
         kv_metadata: Vec::new(),
+        field_ids: Vec::new(),
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
@@ -1289,6 +1327,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         date_format: None,
         timestamp_format: None,
         kv_metadata: Vec::new(),
+        field_ids: Vec::new(),
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
@@ -1379,6 +1418,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         date_format: None,
         timestamp_format: None,
         kv_metadata: Vec::new(),
+        field_ids: Vec::new(),
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
@@ -1388,10 +1428,12 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
     for (name, value) in &copy.options {
         let written = value.as_deref().unwrap_or_default().trim_matches('\'');
         match name.as_str() {
-            // `KV_METADATA` and the limits are read from their bound values in `copy_to`, and
-            // `DICTIONARY_COMPRESSION_RATIO_THRESHOLD` is one the pin takes and no longer uses.
+            // `KV_METADATA`, `FIELD_IDS` and the limits are read from their bound values in
+            // `copy_to`, and `DICTIONARY_COMPRESSION_RATIO_THRESHOLD` is one the pin takes and no
+            // longer uses.
             "format"
             | "kv_metadata"
+            | "field_ids"
             | "dictionary_size_limit"
             | "string_dictionary_page_size_limit"
             | "data_page_size_limit"
@@ -1426,7 +1468,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             }
             "row_group_size_bytes"
             | "compression_level"
-            | "field_ids"
             | "parquet_version"
             | "geoparquet_version"
             | "preserve_order" => {
