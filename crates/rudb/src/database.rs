@@ -8044,11 +8044,13 @@ impl Shared {
                 Ok(QueryResult::empty().noting(notices))
             }
             Bound::CopyTo(mut copy) => {
-                let (optimize_ns, rewrite_ns) = optimized(&mut copy.plan, &context)?;
+                let (optimize_ns, rewrite_ns) = optimized(&mut copy.plan, &context)
+                    .inspect_err(|_| crate::export::query_failed(&copy))?;
                 let budget = self.budget();
                 let under = Under::new(budget, context.facts(), &seams, &session, Rows::ForACaller)
                     .after(Planning { parse_ns, bind_ns, rewrite_ns, optimize_ns });
-                let result = run(sql, &copy.plan, &catalog, cancel, under)?;
+                let result = run(sql, &copy.plan, &catalog, cancel, under)
+                    .inspect_err(|_| crate::export::query_failed(&copy))?;
                 let zone = session.session_time_zone();
                 let threads = self.inner.pool.threads();
                 let (rows, files) = crate::export::write(&copy, &result, zone, threads)?;

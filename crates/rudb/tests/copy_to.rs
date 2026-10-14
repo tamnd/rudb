@@ -1565,3 +1565,39 @@ fn parquet_version_two_writes_the_pins_encodings_and_is_refused_as_the_pin_refus
     }
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn a_copy_that_fails_leaves_no_file_it_made_and_keeps_the_one_it_would_replace() {
+    let db = Database::new();
+    let directory = std::env::temp_dir().join(format!("rudb-copy-to-fails-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("makes the directory");
+    let path = |name: &str| directory.join(name).display().to_string();
+    for (query, name) in [
+        ("SELECT INTERVAL '1 month -1 day' AS d", "new.parquet"),
+        (
+            "SELECT range AS d, CASE WHEN range = 5000 THEN error('boom') END FROM range(9000)",
+            "new.csv",
+        ),
+    ] {
+        let sql = format!("COPY ({query}) TO '{}'", path(name));
+        db.execute(&sql).expect_err(&sql);
+        assert!(!directory.join(name).exists(), "{sql} left the file");
+    }
+    let old = path("old.csv");
+    db.execute(&format!("COPY (SELECT 42 AS d) TO '{old}'")).expect("writes");
+    let sql = format!("COPY (SELECT error('boom') AS d) TO '{old}'");
+    let error = db.execute(&sql).expect_err(&sql).to_string();
+    assert_eq!(error, "Invalid Input Error: boom");
+    assert_eq!(std::fs::read_to_string(&old).expect("is still there"), "d\n42\n");
+    assert!(!directory.join("tmp_old.csv").exists(), "the temporary file is removed");
+    let sql = format!("COPY (SELECT 7 AS d) TO '{old}' (RETURN_FILES)");
+    let files = db.execute(&sql).expect("replaces").value_at(0, 1).to_string();
+    assert!(files.contains(&old) && !files.contains("tmp_"), "{files}");
+    assert_eq!(std::fs::read_to_string(&old).expect("is there"), "d\n7\n");
+    let sql =
+        format!("COPY (SELECT error('boom') AS d) TO '{old}' (USE_TMP_FILE false, HEADER false)");
+    db.execute(&sql).expect_err(&sql);
+    // The pin opens the file before the query fails, which leaves it empty.
+    assert_eq!(std::fs::read_to_string(&old).expect("is still there"), "");
+    let _ = std::fs::remove_dir_all(&directory);
+}
