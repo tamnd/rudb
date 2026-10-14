@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod arena;
+mod assemble;
 mod bloom;
 mod chunk;
 mod delta;
@@ -53,7 +54,8 @@ mod write;
 pub use chunk::{Page, Pages};
 pub use footer::{MetadataTable, RawFooter};
 pub use metadata::{
-    ColumnChunk, Encoding, Metadata, Outline, Physical, Region, RowGroup, SchemaColumn, Stats,
+    ColumnChunk, Encoding, Leaf, Metadata, Nested, Node, Outline, Physical, Region, RowGroup,
+    SchemaColumn, Shape, Stats,
 };
 pub use page::{Body, DataV1, DataV2, Dictionary, Header};
 pub use prune::{Bound, Footer, Op, Test, skips};

@@ -1,10 +1,10 @@
 //! The whole footer as it was written, which is what `parquet_metadata`, `parquet_schema`,
 //! `parquet_kv_metadata` and `parquet_file_metadata` print.
 //!
-//! [`crate::Metadata`] reads the footer a scan needs, narrowed to the fields a reader uses and
-//! refusing a nested schema. These four functions print the footer instead, so they need every
-//! field, whether each one was written at all, since an absent field is a NULL and a field written
-//! as zero is a zero, and a nested schema is one more thing to print. So the footer is read here
+//! [`crate::Metadata`] reads the footer a scan needs, narrowed to the fields a reader uses. These
+//! four functions print the footer instead, so they need every field, whether each one was written
+//! at all, since an absent field is a NULL and a field written as zero is a zero, and every element
+//! of a nested schema is a row of its own. So the footer is read here
 //! into a tree of Thrift values with nothing dropped, and each function's rows are read off the
 //! tree by field id the way the pin reads them off its generated structures.
 //!

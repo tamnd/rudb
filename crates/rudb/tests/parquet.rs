@@ -701,3 +701,70 @@ fn a_bloom_probe_answers_for_every_row_group_the_way_the_pin_does() {
         assert_eq!(error, message, "{sql}");
     }
 }
+
+#[test]
+fn a_nested_file_reads_as_the_pin_reads_it() {
+    // nested.parquet of the parquet crate's README, with every answer here the pin's.
+    let database = Database::new();
+    let file = format!("'{}/../rudb-parquet/testdata/nested.parquet'", env!("CARGO_MANIFEST_DIR"));
+    let text = |sql: &str| -> Vec<Vec<String>> {
+        let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        result.rows().map(|row| row.iter().map(ToString::to_string).collect()).collect()
+    };
+    assert_eq!(
+        text(&format!("SELECT typeof(COLUMNS(*)) FROM {file} LIMIT 1")),
+        [[
+            "BIGINT[]",
+            "STRUCT(a BIGINT, b VARCHAR)",
+            "MAP(VARCHAR, BIGINT)",
+            "BIGINT[]",
+            "STRUCT(x BIGINT, y BIGINT[])[]",
+            "STRUCT(p BIGINT[], q STRUCT(r BIGINT), z BIGINT[])",
+        ]]
+    );
+    assert_eq!(
+        text(&format!(
+            "SELECT count(*), count(l), sum(len(l)), sum(list_sum(l)), count(s), sum(s.a), \
+             count(m), sum(cardinality(m)), count(a), sum(a[1] + a[2]), count(ls), sum(len(ls)), \
+             sum(ls[1].x), count(sl), sum(sl.q.r), sum(sl.z[2]) FROM {file}"
+        )),
+        [[
+            "5000", "4285", "6856", "11997", "4545", "13633", "4615", "3846", "4444", "7221",
+            "4705", "9410", "4705", "4500", "12001", "4500",
+        ]]
+    );
+    assert_eq!(
+        text(&format!(
+            "SELECT l::VARCHAR, s::VARCHAR, m::VARCHAR, a::VARCHAR, ls::VARCHAR, sl::VARCHAR \
+             FROM {file} LIMIT 4 OFFSET 7"
+        )),
+        [
+            [
+                "NULL",
+                "{'a': 7, 'b': v1}",
+                "{k1=2}",
+                "[1, 1]",
+                "[{'x': 1, 'y': [2]}, NULL]",
+                "{'p': [1], 'q': {'r': 0}, 'z': [1, 1]}",
+            ],
+            [
+                "[0, 2]",
+                "{'a': NULL, 'b': v2}",
+                "{k2=3}",
+                "[0, 2]",
+                "[{'x': 2, 'y': NULL}, NULL]",
+                "{'p': [0], 'q': NULL, 'z': [2, 1]}",
+            ],
+            [
+                "[1, NULL]",
+                "{'a': 0, 'b': v0}",
+                "{k0=4}",
+                "NULL",
+                "[{'x': 0, 'y': [4]}, NULL]",
+                "{'p': [1], 'q': {'r': 2}, 'z': [0, 1]}",
+            ],
+            ["[]", "{'a': 1, 'b': v1}", "{k1=0}", "[0, 1]", "[{'x': 1, 'y': NULL}, NULL]", "NULL",],
+        ]
+    );
+    assert_eq!(text(&format!("SELECT count(*) FROM {file} WHERE s.a = 3")), [["379"]]);
+}

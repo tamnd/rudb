@@ -61,11 +61,12 @@ impl Page {
     /// The definition levels of a data page, and where its values start in [`Page::body`].
     ///
     /// A definition level of one means the value is there and a zero means it is null, for a flat
-    /// schema, which is the only shape this crate reads. An empty vector comes back when there is
-    /// nothing per row worth saying, which is either a required column, which has no level stream
-    /// at all, or an optional column whose page turned out to hold no nulls. Empty is not a column
-    /// of zeroes, and it is the reason this returns the offset as well: the caller needs to know
-    /// where the values start whether or not there were any levels in front of them.
+    /// column, and [`Page::levels`] is the one for a leaf of a nested column. An empty vector comes
+    /// back when there is nothing per row worth saying, which is either a required column, which
+    /// has no level stream at all, or an optional column whose page turned out to hold no nulls.
+    /// Empty is not a column of zeroes, and it is the reason this returns the offset as well: the
+    /// caller needs to know where the values start whether or not there were any levels in front
+    /// of them.
     ///
     /// The two page versions put the levels in the same place and describe them differently. A
     /// version one page writes each level stream with a four byte little endian length in front of
@@ -81,7 +82,7 @@ impl Page {
         let (encoding, values, start, len) = match &self.header.body {
             Body::DataV1(page) => {
                 // Flat only, so there are no repetition levels and the definition levels are at
-                // the front. A nested column never gets this far: the schema reader refuses it.
+                // the front.
                 let (start, len) = if optional { self.prefixed(0)? } else { (0, 0) };
                 (page.definition_encoding, page.values, start, len)
             }
@@ -131,6 +132,72 @@ impl Page {
         let mut levels = Vec::with_capacity(values);
         stream.read(&mut levels, values)?;
         Ok((levels, after))
+    }
+
+    /// The repetition and definition levels of a data page of a nested column's leaf, and where
+    /// its values start in [`Page::body`].
+    ///
+    /// One entry per value the header counts, which for a leaf below a list is not one per row. A
+    /// stream whose largest level is zero is not written, and comes back as zeros. Each stream is
+    /// as wide as its largest level needs, and a version one page puts the repetition levels
+    /// first, each stream behind the same four byte length [`Page::definitions`] reads.
+    ///
+    /// # Errors
+    ///
+    /// If the page holds no rows, if a level stream runs off the end of the body, or if a writer
+    /// used the encoding the format deprecated.
+    pub fn levels(&self, max_rep: u32, max_def: u32) -> Result<(Vec<u32>, Vec<u32>, usize)> {
+        let (encoding, values, streams) = match &self.header.body {
+            Body::DataV1(page) => {
+                let mut at = 0;
+                let mut streams = [(0, 0); 2];
+                for (stream, max) in streams.iter_mut().zip([max_rep, max_def]) {
+                    if max > 0 {
+                        *stream = self.prefixed(at)?;
+                        at = stream.0.checked_add(stream.1).ok_or_else(|| {
+                            Error::io("a page with impossible level lengths".to_string())
+                        })?;
+                    } else {
+                        *stream = (at, 0);
+                    }
+                }
+                (page.definition_encoding, page.values, streams)
+            }
+            Body::DataV2(page) => {
+                let rep = page.repetition_bytes as usize;
+                let def = page.definition_bytes as usize;
+                (Encoding::Rle, page.values, [(0, rep), (rep, def)])
+            }
+            Body::Dictionary(_) | Body::Index => {
+                return Err(Error::io(
+                    "levels were asked of a page that holds no rows".to_string(),
+                ));
+            }
+        };
+        let values = usize::try_from(values)
+            .map_err(|_| Error::io("a page with a negative value count".to_string()))?;
+        if encoding != Encoding::Rle && (max_rep > 0 || max_def > 0) {
+            return Err(Error::io(format!(
+                "levels in {encoding:?}, which this reader does not read"
+            )));
+        }
+        let mut read = [Vec::new(), Vec::new()];
+        for ((out, (start, len)), max) in read.iter_mut().zip(streams).zip([max_rep, max_def]) {
+            if max == 0 {
+                *out = vec![0; values];
+                continue;
+            }
+            let bytes = self.body.get(start..start.saturating_add(len)).ok_or_else(|| {
+                Error::io(format!(
+                    "a page claiming {len} bytes of levels at {start} in a body of {}",
+                    self.body.len()
+                ))
+            })?;
+            Hybrid::new(bytes, width_for(max))?.read(out, values)?;
+        }
+        let [reps, defs] = read;
+        let after = streams[1].0 + streams[1].1;
+        Ok((reps, defs, after))
     }
 
     /// Reads the four byte length a version one page writes in front of a level stream.

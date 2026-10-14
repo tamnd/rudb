@@ -340,6 +340,7 @@ mod tests {
             ty: LogicalType::Integer,
             optional: false,
             width: 0,
+            nested: None,
         }]
     }
 
@@ -366,6 +367,7 @@ mod tests {
                 }),
                 column_index: None,
                 offset_index: None,
+                leaves: Vec::new(),
             }],
             rows: 100,
             bytes: 400,
@@ -622,6 +624,7 @@ mod tests {
             ty: LogicalType::Decimal { width: 15, scale: 2 },
             optional: false,
             width: 0,
+            nested: None,
         }];
         let mut group = group(None, None);
         group.columns[0].physical = Physical::Int64;
@@ -695,6 +698,7 @@ mod tests {
             ty: LogicalType::Decimal { width: 38, scale: 4 },
             optional: false,
             width: 16,
+            nested: None,
         };
         let positive = 123_456_i128.to_be_bytes();
         assert_eq!(
@@ -723,6 +727,7 @@ mod tests {
                 ty,
                 optional: false,
                 width: 0,
+                nested: None,
             };
             let bytes = unscaled.to_le_bytes();
             let read = read_bound(&bytes, &column).expect("a timestamp bound is read");
