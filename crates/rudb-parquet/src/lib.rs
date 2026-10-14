@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod arena;
+mod bloom;
 mod chunk;
 mod delta;
 mod footer;

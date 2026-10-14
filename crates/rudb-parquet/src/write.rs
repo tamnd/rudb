@@ -40,6 +40,7 @@ use rudb_common::{Error, Field, LogicalType, Result, Value};
 use rudb_compress::Codec;
 use rudb_vector::Chunk;
 
+use crate::bloom::{Filter, xxh64};
 use crate::metadata::Physical;
 use crate::runs::{Runs, index_width};
 use crate::thrift;
@@ -53,8 +54,10 @@ const PLAIN_DICTIONARY: i32 = 2;
 const RLE_DICTIONARY: i32 = 8;
 
 /// How large the pin lets a dictionary and a data page grow, which `COPY ... TO` sets with
-/// `DICTIONARY_SIZE_LIMIT`, `STRING_DICTIONARY_PAGE_SIZE_LIMIT` and `DATA_PAGE_SIZE_LIMIT`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `DICTIONARY_SIZE_LIMIT`, `STRING_DICTIONARY_PAGE_SIZE_LIMIT` and `DATA_PAGE_SIZE_LIMIT`, and
+/// the false positive rate of the bloom filters, which `WRITE_BLOOM_FILTER` and
+/// `BLOOM_FILTER_FALSE_POSITIVE_RATIO` set.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Limits {
     /// The most values a dictionary holds, where `None` is a fifth of the rows of the row group
     /// and zero means no dictionary at all.
@@ -63,6 +66,9 @@ pub struct Limits {
     pub string_dictionary: u64,
     /// The estimated size of its values at which a data page is closed.
     pub data_page: u64,
+    /// The false positive rate of the bloom filter of each dictionary column, where `None` writes
+    /// no bloom filters.
+    pub bloom: Option<f64>,
 }
 
 impl Limits {
@@ -78,6 +84,7 @@ impl Default for Limits {
             dictionary: None,
             string_dictionary: Self::MOST_STRING_DICTIONARY,
             data_page: Self::MOST_DATA_PAGE,
+            bloom: Some(0.01),
         }
     }
 }
@@ -121,6 +128,21 @@ struct Gathered {
     indices: Vec<u32>,
     /// The body of the dictionary page and how many values it holds, when there is one.
     dictionary: Option<(Vec<u8>, usize)>,
+    /// The hash of each value of the dictionary, for the bloom filter. An enum's are not kept,
+    /// because the pin writes no bloom filter for one.
+    hashes: Vec<u64>,
+}
+
+/// A row group that has been written but whose metadata waits for the footer, because the bloom
+/// filters go after the last row group and each column chunk says where its own filter is.
+#[derive(Debug)]
+struct Group {
+    /// The metadata of each column chunk, still open, and its bloom filter when it has one.
+    columns: Vec<(thrift::Writer, Option<Filter>)>,
+    total: i64,
+    rows: i64,
+    start: u64,
+    compressed: i64,
 }
 
 /// Which bounds the pin keeps for a column, which follows the type the query gave it.
@@ -247,7 +269,7 @@ pub struct Writer<W: Write> {
     at: u64,
     columns: Vec<Column>,
     codec: Codec,
-    groups: Vec<thrift::Writer>,
+    groups: Vec<Group>,
     rows: i64,
     created_by: String,
     key_values: Vec<(String, Vec<u8>)>,
@@ -495,13 +517,7 @@ impl<W: Write> Writer<W> {
                 }
             }
         }
-        let mut group = thrift::Writer::default();
-        group.list_of_nested(1, columns);
-        group.int(2, total);
-        group.int(3, rows as i64);
-        group.int(5, start as i64);
-        group.int(6, compressed);
-        self.groups.push(group);
+        self.groups.push(Group { columns, total, rows: rows as i64, start, compressed });
         self.rows += rows as i64;
         Ok(())
     }
@@ -570,6 +586,7 @@ impl<W: Write> Writer<W> {
                         let index = entries.len() as u32;
                         entries.insert(key.into_owned(), index);
                         page.extend_from_slice(bytes);
+                        gathered.hashes.push(xxh64(if text { &bytes[4..] } else { bytes }));
                         gathered.indices.push(index);
                     }
                 }
@@ -592,6 +609,7 @@ impl<W: Write> Writer<W> {
             gathered.dictionary = Some((page, entries.len()));
         } else {
             gathered.indices = Vec::new();
+            gathered.hashes = Vec::new();
         }
         Ok(gathered)
     }
@@ -603,7 +621,7 @@ impl<W: Write> Writer<W> {
         at: usize,
         gathered: &Gathered,
         written: &mut Written,
-    ) -> Result<thrift::Writer> {
+    ) -> Result<(thrift::Writer, Option<Filter>)> {
         let physical = self.columns[at].physical;
         let enumerated = self.columns[at].members.is_some();
         let (encoding, width) = match &gathered.dictionary {
@@ -656,7 +674,17 @@ impl<W: Write> Writer<W> {
             written.pages += 1;
         }
         written.values += gathered.defined.len() as i64;
-        Ok(self.chunk_meta(at, first, dictionary, encoding, written))
+        let filter = match self.limits.bloom {
+            Some(ratio) if !gathered.hashes.is_empty() => {
+                let mut filter = Filter::new(gathered.hashes.len(), ratio);
+                for hash in &gathered.hashes {
+                    filter.insert(*hash);
+                }
+                Some(filter)
+            }
+            _ => None,
+        };
+        Ok((self.chunk_meta(at, first, dictionary, encoding, written), filter))
     }
 
     /// Writes one page: its header, of page type `kind` with the type's own header in `inner`,
@@ -755,11 +783,7 @@ impl<W: Write> Writer<W> {
         }
         counts.push(count(0, encoding, written.pages));
         meta.list_of_nested(13, counts);
-        // The pin leaves the chunk's own offset at zero and says where it is in the metadata.
-        let mut chunk = thrift::Writer::default();
-        chunk.int(2, 0);
-        chunk.nested(3, meta);
-        chunk
+        meta
     }
 
     /// What each column holds over the row groups written so far, in the order of the columns.
@@ -790,6 +814,40 @@ impl<W: Write> Writer<W> {
     ///
     /// If the write fails.
     pub fn finish_sized(mut self) -> Result<(W, u64)> {
+        let mut groups = Vec::with_capacity(self.groups.len());
+        for group in std::mem::take(&mut self.groups) {
+            let mut columns = Vec::with_capacity(group.columns.len());
+            for (mut meta, filter) in group.columns {
+                if let Some(filter) = filter {
+                    let bytes = filter.bytes();
+                    let mut header = thrift::Writer::default();
+                    header.i32(1, i32::try_from(bytes.len()).map_err(|_| too_big())?);
+                    for id in 2..=4 {
+                        let mut choice = thrift::Writer::default();
+                        choice.nested(1, thrift::Writer::default());
+                        header.nested(id, choice);
+                    }
+                    let header = header.stop();
+                    meta.int(14, self.at as i64);
+                    meta.i32(15, i32::try_from(header.len() + bytes.len()).map_err(|_| too_big())?);
+                    self.put(&header)?;
+                    self.put(&bytes)?;
+                }
+                // The pin leaves the chunk's own offset at zero and says where it is in the
+                // metadata.
+                let mut chunk = thrift::Writer::default();
+                chunk.int(2, 0);
+                chunk.nested(3, meta);
+                columns.push(chunk);
+            }
+            let mut out = thrift::Writer::default();
+            out.list_of_nested(1, columns);
+            out.int(2, group.total);
+            out.int(3, group.rows);
+            out.int(5, group.start as i64);
+            out.int(6, group.compressed);
+            groups.push(out);
+        }
         let mut schema = Vec::with_capacity(self.columns.len() + 1);
         let mut root = thrift::Writer::default();
         root.i32(3, 0);
@@ -803,7 +861,7 @@ impl<W: Write> Writer<W> {
         footer.i32(1, 1);
         footer.list_of_nested(2, schema);
         footer.int(3, self.rows);
-        footer.list_of_nested(4, std::mem::take(&mut self.groups));
+        footer.list_of_nested(4, groups);
         if !self.key_values.is_empty() {
             let pairs = self
                 .key_values
@@ -1269,6 +1327,58 @@ mod tests {
         let back: Vec<_> =
             chunks.iter().flat_map(|c| (0..c.len()).map(|row| c.value_at(row, 0))).collect();
         assert_eq!(back, values);
+    }
+
+    #[test]
+    fn bloom_filters_follow_the_last_row_group_with_the_pins_bytes() {
+        // COPY (SELECT i % 3 AS a, 'v' || (i % 2) AS s, (i % 4)::DOUBLE AS d, i AS u FROM
+        // range(20) r(i)) TO 'b.parquet', in the pin.
+        let fields = vec![
+            Field::new("a", LogicalType::BigInt),
+            Field::new("s", LogicalType::Varchar),
+            Field::new("d", LogicalType::Double),
+            Field::new("u", LogicalType::BigInt),
+        ];
+        let (mut a, mut s, mut d, mut u) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..20_i64 {
+            a.push(Value::BigInt(i % 3));
+            s.push(Value::Varchar(format!("v{}", i % 2)));
+            d.push(Value::Double((i % 4) as f64));
+            u.push(Value::BigInt(i));
+        }
+        let chunk = Chunk::new(vec![
+            column(LogicalType::BigInt, &a),
+            column(LogicalType::Varchar, &s),
+            column(LogicalType::Double, &d),
+            column(LogicalType::BigInt, &u),
+        ])
+        .expect("a chunk");
+        let mut writer =
+            Writer::new(Vec::new(), &fields, Codec::Snappy, "rudb test").expect("starts");
+        writer.write_group(&[chunk]).expect("writes");
+        let bytes = writer.finish().expect("finishes");
+        let len =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().expect("4"));
+        let tail = &bytes[bytes.len() - 8 - len as usize..bytes.len() - 8];
+        let footer = RawFooter::parse(tail, bytes.len() as u64).expect("parses");
+        let rows = MetadataTable::Columns.rows(&footer, "f.parquet").expect("rows");
+        let places: Vec<_> = rows.iter().map(|row| [row[24].clone(), row[25].clone()]).collect();
+        let at = |offset| [Value::BigInt(offset), Value::BigInt(47)];
+        assert_eq!(places, vec![at(366), at(413), at(460), [Value::Null, Value::Null]]);
+        let header = [0x15, 0x40, 0x1C, 0x1C, 0, 0, 0x1C, 0x1C, 0, 0, 0x1C, 0x1C, 0, 0, 0];
+        let filters = [
+            "0002100800000406002400020000060210004004000000984040002020410000",
+            "0020200000003000001080001010000080000004200000800040001004001000",
+            "0022004206400004082000440004400318000140000a001000c5000040600010",
+        ];
+        for (offset, filter) in [366, 413, 460].into_iter().zip(filters) {
+            assert_eq!(bytes[offset..offset + 15], header);
+            let filter: Vec<u8> = (0..32)
+                .map(|at| u8::from_str_radix(&filter[at * 2..at * 2 + 2], 16).expect("hex"))
+                .collect();
+            assert_eq!(bytes[offset + 15..offset + 47], filter[..]);
+        }
+        assert_eq!(bytes.len() - 8 - len as usize, 460 + 47);
     }
 
     /// A file held in memory, for reading a written file back.

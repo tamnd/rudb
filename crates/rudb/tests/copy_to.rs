@@ -174,6 +174,50 @@ fn the_parquet_page_limits_are_bounded_and_cast_the_way_the_pin_does() {
 }
 
 #[test]
+fn bloom_filters_are_written_for_dictionary_columns_unless_turned_off() {
+    let db = Database::new();
+    for (option, message) in [
+        ("WRITE_BLOOM_FILTER", "Binder Error: WRITE_BLOOM_FILTER requires exactly one argument"),
+        (
+            "WRITE_BLOOM_FILTER 'abc'",
+            "Invalid Input Error: Copy option \"write_bloom_filter\" expected an argument of type \
+             BOOLEAN - the argument \"abc\" of type VARCHAR could not be cast as this type",
+        ),
+        (
+            "BLOOM_FILTER_FALSE_POSITIVE_RATIO 0",
+            "Binder Error: bloom_filter_false_positive_ratio must be greater than 0",
+        ),
+        (
+            "BLOOM_FILTER_FALSE_POSITIVE_RATIO -1",
+            "Binder Error: bloom_filter_false_positive_ratio must be greater than 0",
+        ),
+        (
+            "BLOOM_FILTER_FALSE_POSITIVE_RATIO",
+            "Invalid Input Error: Copy option \"bloom_filter_false_positive_ratio\" requires an \
+             argument of type DOUBLE",
+        ),
+    ] {
+        let sql = format!("COPY (SELECT 1 AS a) TO 'o.parquet' ({option})");
+        let error = db.execute(&sql).expect_err(&sql).to_string();
+        assert_eq!(error, message, "{sql}");
+    }
+    let path =
+        std::env::temp_dir().join(format!("rudb-copy-to-bloom-{}.parquet", std::process::id()));
+    let metadata = format!("parquet_metadata('{}')", path.display());
+    let lengths = format!("SELECT bloom_filter_length FROM {metadata} ORDER BY column_id");
+    let query = "SELECT i % 3 AS a, i AS u FROM range(20) r(i)";
+    for (options, first) in [
+        ("", rudb_common::Value::BigInt(47)),
+        (" (WRITE_BLOOM_FILTER false)", rudb_common::Value::Null),
+        (" (BLOOM_FILTER_FALSE_POSITIVE_RATIO '0.5')", rudb_common::Value::BigInt(47)),
+    ] {
+        db.execute(&format!("COPY ({query}) TO '{}'{options}", path.display())).expect("writes");
+        assert_eq!(values(&db, &lengths), vec![vec![first], vec![rudb_common::Value::Null]]);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn json_is_one_object_a_line_or_one_array() {
     let db = table();
     let rows = "{\"i\":1,\"s\":\"a,b\",\"d\":1.5,\"dt\":\"2026-01-02\",\"n\":null,\

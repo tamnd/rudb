@@ -172,6 +172,9 @@ pub struct CopyTo {
     pub string_dictionary_page_size_limit: u64,
     /// For Parquet, `DATA_PAGE_SIZE_LIMIT`.
     pub data_page_size_limit: u64,
+    /// For Parquet, the false positive rate of the bloom filters, where `None` is
+    /// `WRITE_BLOOM_FILTER false`.
+    pub bloom_filter_false_positive_ratio: Option<f64>,
     /// For JSON, the `strftime` format a date is written with, where `None` writes its cast to
     /// VARCHAR.
     pub date_format: Option<String>,
@@ -1057,15 +1060,25 @@ const MOST_STRING_DICTIONARY: u64 = 1 << 30;
 /// The largest `DATA_PAGE_SIZE_LIMIT` the pin takes, which is also its default.
 const MOST_DATA_PAGE: u64 = 100 << 20;
 
-/// The Parquet dictionary and page limits, each cast to the type the pin casts it to and checked
-/// the way the pin checks it.
+/// The Parquet dictionary, page and bloom filter options, each cast to the type the pin casts it
+/// to and checked the way the pin checks it.
 fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyTo) -> Result<()> {
+    let (mut bloom, mut ratio) = (true, 0.01);
     for ((name, text), written) in copy.options.iter().zip(typed) {
         let ty = match name.as_str() {
             "dictionary_size_limit" => LogicalType::BigInt,
             "string_dictionary_page_size_limit" | "data_page_size_limit" => LogicalType::UBigInt,
+            "write_bloom_filter" => LogicalType::Boolean,
+            "bloom_filter_false_positive_ratio" => LogicalType::Double,
             _ => continue,
         };
+        // A boolean option may be written bare, and the Parquet writer is the one to refuse it.
+        if text.is_none() && ty == LogicalType::Boolean {
+            return Err(Error::binder(format!(
+                "{} requires exactly one argument",
+                name.to_ascii_uppercase()
+            )));
+        }
         let Some(text) = text else {
             return Err(Error::invalid_input(format!(
                 "Copy option \"{name}\" requires an argument of type {ty}"
@@ -1078,6 +1091,19 @@ fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyT
         let number = match rudb_kernels::cast::cast_value(&value, &ty, false) {
             Ok(Value::BigInt(number)) => i128::from(number),
             Ok(Value::UBigInt(number)) => i128::from(number),
+            Ok(Value::Boolean(on)) => {
+                bloom = on;
+                continue;
+            }
+            Ok(Value::Double(number)) => {
+                if number.is_nan() || number <= 0.0 {
+                    return Err(Error::binder(
+                        "bloom_filter_false_positive_ratio must be greater than 0",
+                    ));
+                }
+                ratio = number;
+                continue;
+            }
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Copy option \"{name}\" expected an argument of type {ty} - the argument \
@@ -1114,6 +1140,7 @@ fn parquet_limits(copy: &ast::CopyTo, typed: &[Option<Written>], out: &mut CopyT
             }
         }
     }
+    out.bloom_filter_false_positive_ratio = bloom.then_some(ratio);
     Ok(())
 }
 
@@ -1176,6 +1203,7 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
+        bloom_filter_false_positive_ratio: Some(0.01),
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1264,6 +1292,7 @@ fn json_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
+        bloom_filter_false_positive_ratio: Some(0.01),
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1353,6 +1382,7 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
         dictionary_size_limit: None,
         string_dictionary_page_size_limit: MOST_STRING_DICTIONARY,
         data_page_size_limit: MOST_DATA_PAGE,
+        bloom_filter_false_positive_ratio: Some(0.01),
         partitioned: crate::Partitioned::default(),
     };
     for (name, value) in &copy.options {
@@ -1365,6 +1395,8 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             | "dictionary_size_limit"
             | "string_dictionary_page_size_limit"
             | "data_page_size_limit"
+            | "write_bloom_filter"
+            | "bloom_filter_false_positive_ratio"
             | "dictionary_compression_ratio_threshold" => {}
             "compression" | "codec" => {
                 let codec = written.to_ascii_lowercase();
@@ -1395,8 +1427,6 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             "row_group_size_bytes"
             | "compression_level"
             | "field_ids"
-            | "write_bloom_filter"
-            | "bloom_filter_false_positive_ratio"
             | "parquet_version"
             | "geoparquet_version"
             | "preserve_order" => {
