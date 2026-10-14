@@ -97,19 +97,19 @@ fn block(finder: &mut Finder<'_>, start: usize, end: usize, out: &mut Vec<u8>) {
 
 /// How hard a level searches.
 #[derive(Debug, Clone, Copy)]
-struct Search {
+pub(crate) struct Search {
     /// How many earlier places on a chain are tried.
     chain: u32,
     /// Whether a match is held back when the next byte starts a longer one.
     lazy: bool,
     /// A match this long is taken without looking for a longer one.
-    nice: usize,
+    pub(crate) nice: usize,
     /// The bits of how far back a match may reach.
     window: u32,
 }
 
 impl Search {
-    fn at(level: i64) -> Self {
+    pub(crate) fn at(level: i64) -> Self {
         let (chain, lazy, nice, window) = match level {
             ..=0 => (1, false, 32, 17),
             1..=2 => (4, false, 32, 18),
@@ -132,7 +132,7 @@ struct Sequence {
 }
 
 /// The hash chains over the whole input, which outlive a block so a match can reach behind it.
-struct Finder<'a> {
+pub(crate) struct Finder<'a> {
     input: &'a [u8],
     search: Search,
     head: Vec<u32>,
@@ -142,11 +142,11 @@ struct Finder<'a> {
     /// The first place not in the chains yet.
     indexed: usize,
     /// The three most recent offsets, as the decoder will have them at the place being parsed.
-    recent: [u64; 3],
+    pub(crate) recent: [u64; 3],
 }
 
 impl<'a> Finder<'a> {
-    fn new(input: &'a [u8], search: Search) -> Self {
+    pub(crate) fn new(input: &'a [u8], search: Search) -> Self {
         let window = (1_usize << search.window).min(input.len().next_power_of_two());
         Self {
             input,
@@ -177,7 +177,7 @@ impl<'a> Finder<'a> {
     }
 
     /// The longest match for the bytes at `at` that ends by `end`, as its length and distance.
-    fn best(&mut self, at: usize, end: usize) -> (usize, usize) {
+    pub(crate) fn best(&mut self, at: usize, end: usize) -> (usize, usize) {
         let limit = end - at;
         if limit < MIN_MATCH {
             return (0, 0);

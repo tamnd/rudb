@@ -44,7 +44,7 @@
 pub(crate) mod bits;
 pub(crate) mod block;
 pub(crate) mod checksum;
-mod encode;
+pub(crate) mod encode;
 pub(crate) mod fse;
 pub(crate) mod huffman;
 mod literals;

@@ -651,6 +651,7 @@ impl<'a> Sink<'a> {
             let codec = match copy.compression.as_str() {
                 "snappy" => Codec::Snappy,
                 "gzip" => Codec::Gzip,
+                "brotli" => Codec::Brotli,
                 "lz4_raw" => Codec::Lz4Raw,
                 "zstd" => Codec::Zstd,
                 _ => Codec::Uncompressed,
