@@ -62,9 +62,9 @@ use std::time::Duration;
 
 use rudb_catalog::{Catalog, QualifiedName};
 use rudb_common::{
-    Clustering, Declared, DefaultNullOrder, Error, IdentifierCase, LogicalType, Memory, Result,
-    Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule, parse_clustering,
-    rule_names,
+    Clustering, Declared, DefaultNullOrder, Error, IdentifierCase, LogicalType, Memory, Parent,
+    Result, Rules, Session, ShowBehavior, Value, Variable, human, looks_like_rule,
+    parse_clustering, rule_names,
 };
 use rudb_functions::{
     Behaviour, Kept, LOCAL, SettingEntry, UNSET, every_setting, unknown_enum_value,
@@ -2045,11 +2045,54 @@ fn resolved(catalog: &Catalog, declared: &Declared) -> Result<(QualifiedName, Cl
     // A width the text named is taken as written and checked against the column's type, and a text
     // that named none leaves the width to the leading column, which is the whole of the difference
     // between the two constructors.
-    let clustering = match declared.width() {
-        Some(width) => Clustering::new(columns, width, fields)?,
-        None => Clustering::over(columns, fields)?,
+    let clustering = match (declared.parent(), declared.width()) {
+        (Some(parent), _) => through(catalog, &name, columns, parent)?,
+        (None, Some(width)) => Clustering::new(columns, width, fields)?,
+        (None, None) => Clustering::over(columns, fields)?,
     };
     Ok((name, clustering))
+}
+
+/// A child ordered through its parent, with the parent's table and column names checked and
+/// written the way the catalog spells them, so the checkpoint finds them without a second resolve.
+///
+/// The two sides have to have the same types, which is what lets the checkpoint match a child's
+/// value to a parent's by equality alone, the way a foreign key does.
+fn through(
+    catalog: &Catalog,
+    child: &QualifiedName,
+    columns: Vec<u32>,
+    parent: &Parent,
+) -> Result<Clustering> {
+    let name = catalog.resolve(&parts(parent.table()))?;
+    if name == *child {
+        return Err(Error::invalid_input(format!(
+            "invalid rudb clustering: \"{}\" cannot be ordered through itself",
+            child.table
+        )));
+    }
+    let own = catalog.table(child)?.columns();
+    let theirs = catalog.table(&name)?.columns();
+    let mut named = Vec::with_capacity(parent.columns().len());
+    for (column, &at) in parent.columns().iter().zip(&columns) {
+        let field = theirs.iter().find(|field| field.name.eq_ignore_ascii_case(column));
+        let field = field.ok_or_else(|| {
+            Error::catalog(format!(
+                "Table \"{}\" does not have a column named \"{column}\"",
+                parent.table()
+            ))
+        })?;
+        let mine = &own[at as usize];
+        if mine.ty != field.ty {
+            return Err(Error::invalid_input(format!(
+                "invalid rudb clustering: \"{}\" is {} and \"{}\" is {}, and a row is matched \
+                 to its parent by equal values",
+                mine.name, mine.ty, field.name, field.ty
+            )));
+        }
+        named.push(field.name.clone());
+    }
+    Clustering::through(columns, name.table.clone(), named, own)
 }
 
 /// A written table name cut at its dots, so a schema in front of it reaches the right table.

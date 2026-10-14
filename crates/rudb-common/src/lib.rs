@@ -56,7 +56,9 @@ pub mod variant;
 
 pub use bounds::{Bound, Op, excluded};
 pub use cancel::Cancel;
-pub use clustering::{Clustering, Declared, Width, is_clustering_setting, parse_clustering};
+pub use clustering::{
+    Clustering, Declared, Parent, Width, is_clustering_setting, parse_clustering,
+};
 pub use error::{Error, ErrorCode, Fields, Result, Span};
 pub use memory::{ALLOCATION, Memory, Reservation, human, parse_size};
 pub use rules::{Rule, Rules, looks_like_rule, rule_names};

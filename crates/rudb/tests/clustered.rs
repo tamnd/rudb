@@ -400,3 +400,200 @@ fn a_load_into_a_table_that_declared_nothing_is_left_in_the_order_it_arrived() {
     assert_eq!(first, wanted, "an undeclared load was reordered");
     let _ = std::fs::remove_file(path);
 }
+
+/// Which file is at `path`, so a file written again and renamed over it is told apart from the
+/// same file with a catalog added at the end. Nothing on a system without inode numbers.
+fn identity(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(std::fs::metadata(path).expect("the file is there").ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// A table ordered through its parent comes out of the checkpoint in the parent's order.
+///
+/// `orders` is declared in date order and `lineitem` through it, which is the layout section 12.2
+/// of the order spec measures. Neither table is loaded in that order: the order dates are scrambled
+/// the way `ROWS` scrambles ship dates, and the lines arrive grouped by order but in key order. So
+/// the order the lines are read back in, one thread and a plain scan, is the order the checkpoint
+/// put them in, and it has to be every order's lines together, the orders by date, and a line with
+/// no order at the end. There are enough lines that the write gathers them in three windows, so the
+/// edges of a window and of a chunk are both crossed.
+#[test]
+fn a_table_ordered_through_its_parent_is_stored_in_the_parent_order() {
+    let path =
+        std::env::temp_dir().join(format!("rudb-clustered-through-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    let through = "lineitem(l_orderkey) -> orders(o_orderkey)";
+    {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database
+            .execute("CREATE TABLE orders (o_orderkey BIGINT, o_orderdate DATE)")
+            .expect("creates");
+        database
+            .execute("CREATE TABLE lineitem (l_orderkey BIGINT, l_linenumber INTEGER)")
+            .expect("creates");
+        database
+            .execute(&format!(
+                "SET cluster_by = 'orders(exact(o_orderdate), o_orderkey), {through}'"
+            ))
+            .expect("declares both");
+        database
+            .execute(
+                "INSERT INTO orders SELECT r::BIGINT, \
+                 (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE FROM range(75000) AS s(r)",
+            )
+            .expect("loads the orders");
+        database
+            .execute(
+                "INSERT INTO lineitem SELECT (r // 4)::BIGINT, (r % 4 + 1)::INTEGER \
+                 FROM range(300000) AS s(r) UNION ALL SELECT 999999, 1",
+            )
+            .expect("loads the lines");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    let written = identity(&path);
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    let stored = rows(&reopened, "SELECT l_orderkey, l_linenumber FROM lineitem");
+    let mut wanted = rows(
+        &reopened,
+        "SELECT l_orderkey, l_linenumber FROM lineitem JOIN orders ON l_orderkey = o_orderkey \
+         ORDER BY o_orderdate, o_orderkey, l_linenumber",
+    );
+    wanted.push(vec![Value::BigInt(999999), Value::Integer(1)]);
+    assert_eq!(stored.len(), 300_001, "every line is still there");
+    assert!(stored == wanted, "the lines are not in the order of their orders");
+    // The declaration came back out of the file, parent and all.
+    let setting = reopened.setting("cluster_by").expect("a setting");
+    assert!(setting.contains(through), "{setting}");
+    // A session that only read does not write the file again. The reclusterer measured `lineitem`
+    // on `l_orderkey`, found it as far out of that order as a table can be, and every close sorted
+    // it by the key and wrote the whole file again in the parent's order. A close may still put a
+    // new catalog at the end of the file, so what is compared is which file it is, since a file
+    // written again is a new one renamed over the old.
+    drop(reopened);
+    assert_eq!(identity(&path), written, "a read wrote the whole file again");
+    let _ = std::fs::remove_file(path);
+}
+
+/// The order declaration builds the link it orders by, and the link is what tells the planner each
+/// order's lines are one run.
+///
+/// Without it a table in its parent's order is in no order of its own key that the planner can see,
+/// and TPC-H q18's `GROUP BY l_orderkey` went from closing each order as the key moved past it on the
+/// plain file to hashing all of them on the ordered one. Nothing here sets `graph_links`.
+#[test]
+fn a_table_ordered_through_its_parent_keeps_a_link_that_closes_its_groups_by_run() {
+    let path = std::env::temp_dir()
+        .join(format!("rudb-clustered-through-link-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database
+            .execute("CREATE TABLE orders (o_orderkey BIGINT, o_orderdate DATE)")
+            .expect("creates");
+        database
+            .execute("CREATE TABLE lineitem (l_orderkey BIGINT, l_quantity INTEGER)")
+            .expect("creates");
+        database
+            .execute(
+                "SET cluster_by = 'orders(exact(o_orderdate), o_orderkey), \
+                 lineitem(l_orderkey) -> orders(o_orderkey)'",
+            )
+            .expect("declares both");
+        database
+            .execute(
+                "INSERT INTO orders SELECT r::BIGINT, \
+                 (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE FROM range(75000) AS s(r)",
+            )
+            .expect("loads the orders");
+        database
+            .execute(
+                "INSERT INTO lineitem SELECT (r // 4)::BIGINT, (r % 50)::INTEGER \
+                 FROM range(300000) AS s(r)",
+            )
+            .expect("loads the lines");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    let listed = rows(&reopened, "SELECT name, link FROM rudb_links()");
+    assert_eq!(
+        listed,
+        vec![vec![
+            Value::Varchar("lineitem(l_orderkey) -> orders(o_orderkey)".into()),
+            Value::Varchar("monotone".into()),
+        ]],
+        "the declaration did not build the link it orders by"
+    );
+    let query = "SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey";
+    let explained = reopened.query(&format!("EXPLAIN {query}")).expect("the explain ran");
+    let Value::Varchar(plan) = explained.value_at(0, 1) else { panic!("no plan") };
+    assert!(plan.contains("groups closed by run"), "{plan}");
+    let summed = rows(&reopened, &format!("SELECT count(*), sum(q)::BIGINT FROM ({query})"));
+    assert_eq!(summed, vec![vec![Value::BigInt(75_000), Value::BigInt(7_350_000)]]);
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The same through a text key, which is matched by comparing values rather than integers.
+///
+/// Two orders share a key here, and a line with that key goes with the one written first, which
+/// is the earlier of the two dates.
+#[test]
+fn a_table_ordered_through_its_parent_by_a_text_key_is_stored_in_the_parent_order() {
+    let path = std::env::temp_dir()
+        .join(format!("rudb-clustered-through-text-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    {
+        let database = Database::open(name).expect("a file name starts a native database");
+        database.execute("SET threads = 1").expect("sets the thread count");
+        database.execute("CREATE TABLE orders (o_key VARCHAR, o_day DATE)").expect("creates");
+        database.execute("CREATE TABLE lines (l_key VARCHAR, l_at INTEGER)").expect("creates");
+        database
+            .execute(
+                "SET cluster_by = 'orders(exact(o_day), o_key), lines(l_key) -> orders(o_key)'",
+            )
+            .expect("declares both");
+        database
+            .execute(
+                "INSERT INTO orders SELECT 'k' || r, \
+                 (DATE '1992-01-01' + ((r * 7919) % 2400)::INTEGER)::DATE FROM range(20000) AS s(r) \
+                 UNION ALL SELECT 'k7', DATE '1991-06-01'",
+            )
+            .expect("loads the orders");
+        database
+            .execute(
+                "INSERT INTO lines SELECT 'k' || (r // 3), r::INTEGER FROM range(60000) AS s(r) \
+                 UNION ALL SELECT NULL, 60000",
+            )
+            .expect("loads the lines");
+        database.execute("CHECKPOINT").expect("commits");
+    }
+    let reopened = Database::open(name).expect("the file opens again");
+    reopened.execute("SET threads = 1").expect("sets the thread count");
+    let stored = rows(&reopened, "SELECT l_at FROM lines");
+    let mut wanted = rows(
+        &reopened,
+        "SELECT l_at FROM lines JOIN (SELECT o_key, min(o_day) AS o_day FROM orders GROUP BY o_key) \
+         ON l_key = o_key ORDER BY o_day, o_key, l_at",
+    );
+    wanted.push(vec![Value::Integer(60000)]);
+    assert_eq!(stored.len(), 60_001, "every line is still there");
+    assert!(stored == wanted, "the lines are not in the order of their orders");
+    assert_eq!(stored[0], vec![Value::Integer(21)], "the order dated first is the second k7");
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}

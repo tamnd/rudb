@@ -49,7 +49,8 @@ pub(crate) fn links(
 }
 
 /// Every relationship declared for this catalog: the ones `graph_links` names, then one for each
-/// foreign key a table was created with that the setting does not already name.
+/// foreign key a table was created with and each parent a table is ordered through that the setting
+/// does not already name.
 ///
 /// Section 2.5 of spec/graph/02-the-data-model.md lists the foreign keys first, as the path that
 /// needs nothing from the user, and the setting second, for data that arrived without constraints.
@@ -89,8 +90,38 @@ pub fn declared(catalog: &Catalog, setting: &str) -> Vec<Relationship> {
                 declared.push(link);
             }
         }
+        if let Some(link) = ordered_through(catalog, table)
+            && !listed(&declared, &link)
+        {
+            declared.push(link);
+        }
     }
     declared
+}
+
+/// The relationship a table is stored in the order of, when its rows are ordered through a parent.
+///
+/// `lineitem(l_orderkey) -> orders(o_orderkey)` in `cluster_by` is the same sentence as in
+/// `graph_links`, and it says more: the checkpoint puts each child's rows together and in its
+/// parent's place. What makes that worth anything after the load is the link, because a link in the
+/// monotone form is the file's proof that every key is one run of rows, which an aggregate on the
+/// key closes as it goes and a join to the parent reads in order. Without it the rows are in the
+/// order and nothing downstream knows: TPC-H q18 grouped a million and a half orders through a
+/// hash table on an ordered file where the plain one closed them in key order, a hundred times the
+/// work. So the declaration that orders a table declares the relationship too, and a checkpoint
+/// builds and verifies it like any other.
+fn ordered_through(catalog: &Catalog, table: &Table) -> Option<Relationship> {
+    let clustering = table.clustering()?;
+    let parent = clustering.parent()?;
+    let held = table_named(catalog, parent.table())?;
+    let columns = clustering
+        .columns()
+        .iter()
+        .map(|&at| table.columns().get(at as usize).map(|field| field.name.clone()))
+        .collect::<Option<Vec<String>>>()?;
+    let child = Side::composite(table.name().table.clone(), columns).ok()?;
+    let parent = Side::composite(held.name().table.clone(), parent.columns().to_vec()).ok()?;
+    Relationship::declare(child, parent).ok()
 }
 
 /// Every relationship [`declared`] gives, then one for each link or adjacency a table's file holds

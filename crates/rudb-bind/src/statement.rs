@@ -3268,6 +3268,11 @@ fn clustered(
     targets: &[usize],
     fields: &[Field],
 ) -> Result<rudb_plan::NodeRef> {
+    // A table ordered through its parent is ordered by where the parent's rows are stored, which
+    // an insert cannot see, so its rows go in as they come and the checkpoint puts them in order.
+    if clustering.parent().is_some() {
+        return Ok(input);
+    }
     let mut keys: Vec<SortKey> = Vec::with_capacity(clustering.columns().len());
     for (at, &column) in clustering.columns().iter().enumerate() {
         let Some(from) = targets.iter().position(|&target| target == column as usize) else {

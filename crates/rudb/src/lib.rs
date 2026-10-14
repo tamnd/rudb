@@ -114,6 +114,7 @@ mod export;
 mod foreign;
 mod journal;
 mod mirror;
+mod ordered;
 mod prepared;
 mod recluster;
 mod result;

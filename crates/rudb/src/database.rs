@@ -2864,6 +2864,7 @@ fn persist_anchored(
     }
     let temporary = scratch(path)?;
     let mut writer: Option<rudb_native::Writer> = None;
+    let mut orders = crate::ordered::Orders::default();
     for name in &names {
         let table = catalog.table(name)?;
         let fields = table.columns().to_vec();
@@ -2878,7 +2879,10 @@ fn persist_anchored(
         if !constraints.is_empty() {
             open = open.constrain(constraints)?;
         }
-        write_parts(&mut open, table.rows(), 0, &fields)?;
+        match orders.of(catalog, name, &|_| true)? {
+            Some(order) => crate::ordered::write(&mut open, table.rows(), &order, &fields)?,
+            None => write_parts(&mut open, table.rows(), 0, &fields)?,
+        }
         writer = Some(open);
     }
     let mut writer = writer.ok_or_else(|| Error::internal("a catalog with tables wrote none"))?;
@@ -3544,6 +3548,11 @@ fn index(
             continue;
         };
         let Some(at) = table.column_index(column) else { continue };
+        // A key no form can map is passed over like the rest, and not refused at the build, which
+        // would fail the checkpoint over a relationship that only ever made a query faster.
+        if !rudb_native::graph::mappable(&table.columns()[at].ty) {
+            continue;
+        }
         let name = table.name().clone();
         if only.is_some_and(|only| !only.contains(&name.table)) {
             continue;
@@ -3706,9 +3715,13 @@ fn edges_of(catalog: &Catalog, declared: &[rudb_graph::Relationship]) -> Vec<Edg
 ///
 /// One column is its index and two are a pair, which is `rudb_native::graph::key_of`. The columns
 /// have to be of the same count on both sides of a relationship, and the parser already refuses one
-/// whose sides differ, so this does not check it again.
+/// whose sides differ, so this does not check it again. A column of a type with no integer key form
+/// has no number, so a relationship over text is passed over rather than failing the build.
 fn key_in(table: &rudb_catalog::Table, columns: &[String]) -> Option<usize> {
     let at = columns.iter().map(|column| table.column_index(column)).collect::<Option<Vec<_>>>()?;
+    if !at.iter().all(|&at| rudb_native::graph::mappable(&table.columns()[at].ty)) {
+        return None;
+    }
     rudb_native::graph::key_of(&at)
 }
 
@@ -3893,6 +3906,10 @@ fn appended(
         return Ok(None);
     }
     let mut writer: Option<rudb_native::Writer> = None;
+    let mut orders = crate::ordered::Orders::default();
+    let whole = |name: &QualifiedName| {
+        dirty.iter().any(|d| d == name) && !extended.contains_key(&name.table)
+    };
     for name in &dirty {
         let table = catalog.table(name)?;
         let fields = table.columns().to_vec();
@@ -3916,7 +3933,11 @@ fn appended(
         // Said even when there is nothing, because a table extended in place starts from what
         // its old directory held, and an index dropped since is still in that.
         open = open.constrain(table.stored_constraints()?)?;
-        write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?;
+        let order = if kept.is_none() { orders.of(catalog, name, &whole)? } else { None };
+        match order {
+            Some(order) => crate::ordered::write(&mut open, table.rows(), &order, &fields)?,
+            None => write_parts(&mut open, table.rows(), kept.unwrap_or(0), &fields)?,
+        }
         writer = Some(open);
     }
     let Some(mut writer) = writer else { return Ok(None) };
@@ -8510,7 +8531,11 @@ impl Shared {
                     // the first two are a `stat` and a count.
                     let alone = !path.exists() && catalog.stored_tables().count() == 1;
                     let empty = target.rows().is_empty();
-                    if empty && (alone || appendable(path, &catalog, &insert.name)?) {
+                    // A table ordered through its parent is put in order by the checkpoint, which
+                    // needs the rows in memory and the parent beside them, so it loads the slow way.
+                    let ordered =
+                        target.clustering().is_none_or(|clustering| clustering.parent().is_none());
+                    if empty && ordered && (alone || appendable(path, &catalog, &insert.name)?) {
                         let table = target.name().table.clone();
                         let fields = target.columns().to_vec();
                         // The declaration the target already carries, which is the one the binder

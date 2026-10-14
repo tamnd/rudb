@@ -103,6 +103,14 @@ fn decayed(table: &Table, depth: f64, whole: bool) -> Option<Width> {
         return None;
     }
     let clustering = table.clustering()?;
+    // A table ordered through its parent is in the parent's order and not in its own columns',
+    // so measured on its own leading column it looks as decayed as a table can be, and sorting it
+    // by that column would be undone by the checkpoint that puts it back through the parent. Every
+    // close would write it twice over. The checkpoint that writes such a table whole is what puts
+    // it in order.
+    if clustering.parent().is_some() {
+        return None;
+    }
     let reader = match table.rows() {
         Rows::Native(reader) | Rows::Grown(reader, _) | Rows::Masked(reader, ..) => reader,
         Rows::Memory(_) => return None,
