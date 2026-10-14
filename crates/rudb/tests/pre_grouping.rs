@@ -31,6 +31,10 @@ fn agree(database: &Database) {
     // The group of nulls counts none of its values, whether or not the count becomes a sum of one.
     let nulls = sorted(database, "SELECT count(s), count(length(s)), count(*) FROM t GROUP BY s");
     assert!(nulls.contains(&vec![Value::BigInt(0), Value::BigInt(0), Value::BigInt(1177)]));
+    same(database);
+}
+
+fn same(database: &Database) {
     for query in QUERIES {
         database.execute("SET disabled_optimizers = 'pre_grouping'").expect("turns it off");
         let wanted = sorted(database, query);
@@ -72,6 +76,32 @@ fn pre_grouping_answers_what_one_grouping_answers() {
     let plan = file.plan(QUERIES[0]).expect("the plan");
     assert_eq!(plan.matches("Aggregate #").count(), 2, "not grouped by s first:\n{plan}");
     agree(&file);
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn without_nulls_in_the_column_the_average_counts_the_rows_it_already_counts() {
+    let path =
+        std::env::temp_dir().join(format!("rudb-pre-grouping-valued-{}.rudb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let name = path.to_str().expect("a UTF-8 temporary path");
+    {
+        let writing = Database::open(name).expect("a file name starts a native database");
+        writing.execute(TABLE[0]).expect("the file table is made");
+        writing
+            .execute(
+                "INSERT INTO t SELECT i, 'v' || (i % 97)::VARCHAR || '-' || (i % 7)::VARCHAR \
+                 FROM range(20000) r(i)",
+            )
+            .expect("the rows go in");
+        writing.execute("CHECKPOINT").expect("the file table is committed");
+    }
+    let file = Database::open(name).expect("the written file opens again");
+    let plan = file.plan(QUERIES[0]).expect("the plan");
+    assert_eq!(plan.matches("Aggregate #").count(), 2, "not grouped by s first:\n{plan}");
+    assert!(!plan.contains("CASE"), "the average still counts its values one by one:\n{plan}");
+    same(&file);
     drop(file);
     let _ = std::fs::remove_file(&path);
 }
