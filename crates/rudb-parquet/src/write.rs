@@ -89,10 +89,29 @@ impl Default for Limits {
     }
 }
 
-/// One column as it is stored.
+/// How many rows the pin hands its column writers at a time, which is where a page under a list
+/// is allowed to end.
+const BLOCK_ROWS: usize = 2048;
+
+/// One leaf column as it is stored, which for a flat column is the column itself.
 #[derive(Debug)]
 struct Column {
+    /// Its name in the schema.
     name: String,
+    /// The names from the top of the schema down to it, which is its `path_in_schema`.
+    path: Vec<String>,
+    /// The same names without the repeated groups of a list or a map, which are what
+    /// `RETURN_STATS` calls it by.
+    reported_path: Vec<String>,
+    /// The definition level at which it holds a value, and the most its repetition level gets to.
+    /// A flat column has one and zero.
+    max_def: u16,
+    max_rep: u16,
+    /// Whether it is `OPTIONAL` rather than `REQUIRED`, which only a map's key is.
+    optional: bool,
+    /// Whether a page of it can end anywhere, which under a list the pin only lets it do where
+    /// a block of [`BLOCK_ROWS`] rows starts.
+    spans: bool,
     ty: LogicalType,
     physical: Physical,
     bounds: Bounds,
@@ -114,12 +133,437 @@ struct Members {
     seen: Vec<bool>,
 }
 
+/// How a column of the query is laid out: a leaf, which is one column chunk, or a group of the
+/// columns under it, with the levels that say how much of it is there.
+#[derive(Debug)]
+enum Shape {
+    /// The leaf at this index of the writer's columns.
+    Leaf(usize),
+    /// A struct, which is there at definition level `def`.
+    Struct { fields: Vec<Shape>, def: u16 },
+    /// A list, which is there and empty at `def` and whose elements after the first repeat at
+    /// `rep + 1`.
+    List { element: Box<Shape>, def: u16, rep: u16 },
+    /// An array of `size` elements. The pin writes it as a list, except that a null array still
+    /// takes `size` entries.
+    Array { element: Box<Shape>, size: usize, def: u16, rep: u16 },
+    /// A map, which has the levels of a list and the key and the value of each entry under it.
+    Map { key: Box<Shape>, value: Box<Shape>, def: u16, rep: u16 },
+}
+
+/// One `SchemaElement` of the footer: a group, or the leaf at an index of the writer's columns.
+#[derive(Debug)]
+enum Element {
+    Group { name: String, repetition: i32, children: usize, converted: Option<i32> },
+    Leaf(usize),
+}
+
+/// Where a column goes in the schema: under which names, at which levels, and whether it may
+/// be null and may have its pages end anywhere.
+#[derive(Debug, Clone)]
+struct Place {
+    path: Vec<String>,
+    reported_path: Vec<String>,
+    def: u16,
+    rep: u16,
+    optional: bool,
+    spans: bool,
+}
+
+/// The leaves and the schema elements of the columns laid out so far.
+#[derive(Debug, Default)]
+struct Layout {
+    columns: Vec<Column>,
+    schema: Vec<Element>,
+}
+
+impl Layout {
+    /// Lays out a column named `name` of the type `ty` the query gave it, the way the pin does: a
+    /// struct is a group, a list or an array is a group holding a repeated group named `list`
+    /// that holds the `element`, and a map is a group holding a repeated group named `key_value`
+    /// that holds a required `key` and a `value`. The definition level of a column is one more
+    /// than its group's when it can be null, and a list's element is two more, for an empty
+    /// list and a null element.
+    fn lay_out(&mut self, name: &str, ty: &LogicalType, at: Place) -> Result<Shape> {
+        let Place { mut path, mut reported_path, def, rep, optional, spans } = at;
+        path.push(name.to_string());
+        reported_path.push(name.to_string());
+        let def = if optional { def } else { def - 1 };
+        let repetition = i32::from(optional);
+        let group = |name: &str, repetition, children, converted| Element::Group {
+            name: name.to_string(),
+            repetition,
+            children,
+            converted,
+        };
+        match ty {
+            LogicalType::Struct(fields) => {
+                if fields.is_empty() {
+                    return Err(Error::invalid_input(
+                        "Empty STRUCT columns are not supported in the Parquet format",
+                    ));
+                }
+                self.schema.push(group(name, repetition, fields.len(), None));
+                let mut shapes = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let place = Place {
+                        path: path.clone(),
+                        reported_path: reported_path.clone(),
+                        def: def + 1,
+                        rep,
+                        optional: true,
+                        spans,
+                    };
+                    shapes.push(self.lay_out(&field.name, &field.ty, place)?);
+                }
+                Ok(Shape::Struct { fields: shapes, def })
+            }
+            LogicalType::List(element) | LogicalType::Array(element, _) => {
+                self.schema.push(group(name, repetition, 1, Some(3)));
+                self.schema.push(group("list", 2, 1, None));
+                path.push("list".to_string());
+                let place = Place {
+                    path,
+                    reported_path,
+                    def: def + 2,
+                    rep: rep + 1,
+                    optional: true,
+                    spans: false,
+                };
+                let element = Box::new(self.lay_out("element", element, place)?);
+                Ok(match ty {
+                    LogicalType::Array(_, size) => {
+                        Shape::Array { element, size: *size as usize, def, rep }
+                    }
+                    _ => Shape::List { element, def, rep },
+                })
+            }
+            LogicalType::Map(key, value) => {
+                self.schema.push(group(name, repetition, 1, Some(1)));
+                self.schema.push(group("key_value", 2, 2, None));
+                path.push("key_value".to_string());
+                let place = |optional| Place {
+                    path: path.clone(),
+                    reported_path: reported_path.clone(),
+                    def: def + 2,
+                    rep: rep + 1,
+                    optional,
+                    spans: false,
+                };
+                let key = Box::new(self.lay_out("key", key, place(false))?);
+                let value = Box::new(self.lay_out("value", value, place(true))?);
+                Ok(Shape::Map { key, value, def, rep })
+            }
+            _ => {
+                let mut column = leaf(name, ty)?;
+                column.path = path;
+                column.reported_path = reported_path;
+                column.max_def = def;
+                column.max_rep = rep;
+                column.optional = optional;
+                column.spans = spans;
+                self.schema.push(Element::Leaf(self.columns.len()));
+                self.columns.push(column);
+                Ok(Shape::Leaf(self.columns.len() - 1))
+            }
+        }
+    }
+}
+
+/// A leaf column of the type `ty` the query gave it, at the levels of a flat column.
+fn leaf(name: &str, ty: &LogicalType) -> Result<Column> {
+    let stored = storage(ty)?;
+    let physical = physical(&stored).ok_or_else(|| {
+        Error::not_implemented(format!(
+            "COPY TO a Parquet file with a column of type {ty} is not supported yet"
+        ))
+    })?;
+    let bounds = match (ty, &stored) {
+        (LogicalType::HugeInt | LogicalType::UHugeInt, _) => Bounds::None,
+        (
+            _,
+            LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt,
+        ) => Bounds::Unsigned,
+        (_, LogicalType::Varchar) => Bounds::Text,
+        (_, LogicalType::Blob) => Bounds::Bytes,
+        _ => Bounds::Signed,
+    };
+    let members = match ty {
+        LogicalType::Enum(labels) => Some(Members {
+            labels: Arc::clone(labels),
+            index: labels.iter().zip(0..).map(|(label, at)| (label.clone(), at)).collect(),
+            seen: vec![false; labels.len()],
+        }),
+        _ => None,
+    };
+    Ok(Column {
+        name: name.to_string(),
+        path: vec![name.to_string()],
+        reported_path: vec![name.to_string()],
+        max_def: 1,
+        max_rep: 0,
+        optional: true,
+        spans: true,
+        ty: stored,
+        physical,
+        bounds,
+        reported: !matches!(ty, LogicalType::Enum(_)),
+        dictionary: !matches!(physical, Physical::Boolean | Physical::FixedLenByteArray),
+        members,
+    })
+}
+
+/// One leaf column of a row group while its values are read.
+#[derive(Debug, Default)]
+struct Gathering {
+    gathered: Gathered,
+    written: Written,
+    /// The dictionary so far, by the bytes of each value, and its page.
+    entries: HashMap<Vec<u8>, u32>,
+    page: Vec<u8>,
+    /// Whether values still go in the dictionary.
+    open: bool,
+    /// How many entries say a struct right above the column is null, which the pin counts with
+    /// the column's own nulls.
+    chain: i64,
+    /// How many entries say a group above the column is null or a list above it is empty, which
+    /// the pin counts as nulls of a column under a list.
+    parent: i64,
+}
+
+impl Gathering {
+    fn level(&mut self, column: &Column, rep: u16, def: u16) {
+        self.gathered.defs.push(def);
+        if column.max_rep > 0 {
+            self.gathered.reps.push(rep);
+        }
+    }
+}
+
+/// Walks the values of one column of the query down to its leaves.
+struct Walk<'a> {
+    columns: &'a mut [Column],
+    states: &'a mut [Gathering],
+    /// The index of the first of `columns` among the writer's.
+    first: usize,
+    /// The most entries a dictionary takes.
+    most: u64,
+    limits: Limits,
+}
+
+impl Walk<'_> {
+    /// Takes `value`, whose first entry repeats at `rep`, into the leaves under `shape`.
+    fn value(&mut self, shape: &Shape, value: &Value, rep: u16) -> Result<()> {
+        let unexpected = || {
+            Error::internal(format!("a {} value in a nested parquet column", value.logical_type()))
+        };
+        match shape {
+            Shape::Leaf(at) => self.leaf(at - self.first, value, rep),
+            Shape::Struct { fields, def } => match value {
+                Value::Null => {
+                    for field in fields {
+                        self.absent(field, rep, def - 1, false, true);
+                    }
+                    Ok(())
+                }
+                Value::Struct(members) => {
+                    for (field, (_, member)) in fields.iter().zip(members) {
+                        self.value(field, member, rep)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(unexpected()),
+            },
+            Shape::List { element, def, rep: own }
+            | Shape::Array { element, def, rep: own, .. } => match value {
+                Value::Null => {
+                    if let Shape::Array { size, .. } = shape {
+                        for k in 0..*size {
+                            self.absent(
+                                element,
+                                if k == 0 { rep } else { own + 1 },
+                                def - 1,
+                                false,
+                                false,
+                            );
+                        }
+                    } else {
+                        self.absent(element, rep, def - 1, true, false);
+                    }
+                    Ok(())
+                }
+                Value::List { values, .. } if values.is_empty() => {
+                    self.absent(element, rep, *def, true, false);
+                    Ok(())
+                }
+                Value::List { values, .. } => {
+                    for (k, value) in values.iter().enumerate() {
+                        self.value(element, value, if k == 0 { rep } else { own + 1 })?;
+                    }
+                    Ok(())
+                }
+                _ => Err(unexpected()),
+            },
+            Shape::Map { key, value: held, def, rep: own } => match value {
+                Value::Null => {
+                    self.absent(key, rep, def - 1, true, false);
+                    self.absent(held, rep, def - 1, true, false);
+                    Ok(())
+                }
+                Value::Map { entries, .. } if entries.is_empty() => {
+                    self.absent(key, rep, *def, true, false);
+                    self.absent(held, rep, *def, true, false);
+                    Ok(())
+                }
+                Value::Map { entries, .. } => {
+                    for (k, (entry_key, entry_value)) in entries.iter().enumerate() {
+                        let rep = if k == 0 { rep } else { own + 1 };
+                        self.value(key, entry_key, rep)?;
+                        self.value(held, entry_value, rep)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(unexpected()),
+            },
+        }
+    }
+
+    /// Writes an entry at `def` into every leaf under `shape`, for a group above them that is
+    /// null or a list above them that is empty. `empty` says it came from a list, under which
+    /// an array takes one entry rather than one for each element, and `counted` that it came
+    /// from a struct with nothing but structs between it and the leaf.
+    fn absent(&mut self, shape: &Shape, rep: u16, def: u16, empty: bool, counted: bool) {
+        match shape {
+            Shape::Leaf(at) => {
+                let at = at - self.first;
+                let state = &mut self.states[at];
+                state.level(&self.columns[at], rep, def);
+                state.parent += 1;
+                state.chain += i64::from(counted);
+            }
+            Shape::Struct { fields, .. } => {
+                for field in fields {
+                    self.absent(field, rep, def, empty, counted);
+                }
+            }
+            Shape::List { element, .. } => self.absent(element, rep, def, true, false),
+            Shape::Map { key, value, .. } => {
+                self.absent(key, rep, def, true, false);
+                self.absent(value, rep, def, true, false);
+            }
+            Shape::Array { element, size, rep: own, .. } => {
+                if empty {
+                    self.absent(element, rep, def, true, false);
+                } else {
+                    for k in 0..*size {
+                        self.absent(element, if k == 0 { rep } else { own + 1 }, def, false, false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes one value of the leaf at `at`: its levels, its statistics, its plain encoding,
+    /// and its place in the dictionary the pin would build, which takes the first of each value
+    /// until there would be more entries than a fifth of the rows of the group, or than
+    /// `DICTIONARY_SIZE_LIMIT`, or for strings and blobs more bytes than
+    /// `STRING_DICTIONARY_PAGE_SIZE_LIMIT`.
+    fn leaf(&mut self, at: usize, value: &Value, rep: u16) -> Result<()> {
+        let column = &mut self.columns[at];
+        let state = &mut self.states[at];
+        if value.is_null() {
+            if !column.optional {
+                return Err(Error::io(
+                    "Parquet writer: map key column is not allowed to contain NULL values",
+                ));
+            }
+            state.level(column, rep, column.max_def - 1);
+            state.written.nulls += 1;
+            return Ok(());
+        }
+        state.level(column, rep, column.max_def);
+        let (gathered, written) = (&mut state.gathered, &mut state.written);
+        if is_nan(value) {
+            written.nans += 1;
+        } else if column.members.is_none() {
+            written.take(value, column.bounds);
+        }
+        let begin = gathered.plain.len();
+        plain(value, column, &mut gathered.plain, true)?;
+        gathered.ends.push(gathered.plain.len());
+        if let Some(members) = &mut column.members {
+            let index = match value {
+                Value::Varchar(label) => members.index.get(label.as_str()).copied(),
+                _ => None,
+            };
+            let index = index.ok_or_else(|| {
+                Error::internal(format!("{value} is not a member of the enum written"))
+            })?;
+            members.seen[index as usize] = true;
+            gathered.indices.push(index);
+        } else if state.open {
+            let text = column.physical == Physical::ByteArray;
+            let bytes = &gathered.plain[begin..];
+            let key = dictionary_key(bytes, column.physical);
+            if let Some(&index) = state.entries.get(key.as_ref()) {
+                gathered.indices.push(index);
+            } else if state.entries.len() as u64 + 1 > self.most
+                || (text && (state.page.len() + bytes.len()) as u64 > self.limits.string_dictionary)
+            {
+                state.open = false;
+            } else {
+                let index = state.entries.len() as u32;
+                state.entries.insert(key.into_owned(), index);
+                state.page.extend_from_slice(bytes);
+                gathered.hashes.push(xxh64(if text { &bytes[4..] } else { bytes }));
+                gathered.indices.push(index);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What is left to do once every value of a leaf has been read: its dictionary, and its null
+/// count, which takes in the nulls of the structs right above it and, under a list, every entry
+/// that says a group above it is missing.
+fn finish(state: Gathering, column: &Column) -> (Gathered, Written) {
+    let Gathering { mut gathered, mut written, entries, page, open, chain, parent } = state;
+    written.nulls += chain + if column.max_rep > 0 { parent } else { 0 };
+    if let Some(members) = &column.members {
+        // The members no row has held are in the dictionary as empty strings, and the bounds
+        // are those of the members held so far in the file, which is the pin's.
+        let mut page = Vec::new();
+        for (label, seen) in members.labels.iter().zip(&members.seen) {
+            if *seen {
+                written.take(&Value::Varchar(label.clone()), column.bounds);
+                byte_array(label.as_bytes(), &mut page, true);
+            } else {
+                page.extend_from_slice(&0_u32.to_le_bytes());
+            }
+        }
+        gathered.dictionary = Some((page, members.labels.len()));
+    } else if open && !entries.is_empty() {
+        gathered.dictionary = Some((page, entries.len()));
+    } else {
+        gathered.indices = Vec::new();
+        gathered.hashes = Vec::new();
+    }
+    (gathered, written)
+}
+
 /// One column of a row group, read in full before any of it is written, because whether a
 /// dictionary holds it is only known once every value has been seen.
 #[derive(Debug, Default)]
 struct Gathered {
-    /// Whether each row holds a value.
-    defined: Vec<bool>,
+    /// The definition level of each entry, of which a flat column has one for each row.
+    defs: Vec<u16>,
+    /// The repetition level of each entry, for a column under a list or a map.
+    reps: Vec<u16>,
+    /// Where the entries of each block of [`BLOCK_ROWS`] rows start.
+    starts: Vec<usize>,
     /// The plain encoding of each value, framed, one after another. A boolean's is one byte.
     plain: Vec<u8>,
     /// Where each value's encoding ends in `plain`.
@@ -267,14 +711,19 @@ fn cut_high(bytes: &[u8], text: bool) -> Option<Vec<u8>> {
 pub struct Writer<W: Write> {
     out: W,
     at: u64,
+    /// The leaf columns, in the order of the schema.
     columns: Vec<Column>,
+    /// How each column of the query is laid out, and which of the leaves are its own.
+    shapes: Vec<Shape>,
+    leaves: Vec<Range<usize>>,
+    schema: Vec<Element>,
     codec: Codec,
     groups: Vec<Group>,
     rows: i64,
     created_by: String,
     key_values: Vec<(String, Vec<u8>)>,
     totals: Vec<ColumnStatistics>,
-    /// For each column, whether a row group has had no bounds, which leaves the file with none.
+    /// For each leaf, whether a row group has had no bounds, which leaves the file with none.
     unbounded: Vec<bool>,
     limits: Limits,
 }
@@ -283,9 +732,10 @@ pub struct Writer<W: Write> {
 /// with `RETURN_STATS` reports.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnStatistics {
-    /// The name of the column.
-    pub name: String,
-    /// How many values it holds, the nulls among them.
+    /// The name of the column and of each column it is in, the outermost first, which leaves
+    /// out the repeated group of a list or a map.
+    pub path: Vec<String>,
+    /// How many values it holds, the nulls among them, which under a list counts its levels.
     pub values: i64,
     /// How many of them are null.
     pub nulls: i64,
@@ -312,10 +762,21 @@ pub struct ColumnStatistics {
 ///
 /// # Errors
 ///
-/// For a type this writer has no Parquet form for yet: the nested types, `UUID`, `INTERVAL`,
+/// For a type this writer has no Parquet form for yet, at any depth: a union, `UUID`, `INTERVAL`,
 /// `BIT`, `TIME WITH TIME ZONE` and nanosecond timestamps.
 pub fn storage(ty: &LogicalType) -> Result<LogicalType> {
     Ok(match ty {
+        LogicalType::List(element) => LogicalType::List(Box::new(storage(element)?)),
+        LogicalType::Array(element, size) => LogicalType::Array(Box::new(storage(element)?), *size),
+        LogicalType::Map(key, value) => {
+            LogicalType::Map(Box::new(storage(key)?), Box::new(storage(value)?))
+        }
+        LogicalType::Struct(fields) => LogicalType::Struct(
+            fields
+                .iter()
+                .map(|field| Ok(Field { ty: storage(&field.ty)?, ..field.clone() }))
+                .collect::<Result<_>>()?,
+        ),
         LogicalType::Enum(_) => LogicalType::Varchar,
         LogicalType::TimestampS | LogicalType::TimestampMs => LogicalType::Timestamp,
         LogicalType::HugeInt | LogicalType::UHugeInt => LogicalType::Double,
@@ -386,52 +847,26 @@ impl<W: Write> Writer<W> {
                 "COPY TO a Parquet file with the {codec:?} codec is not supported yet"
             )));
         }
-        let mut columns = Vec::with_capacity(fields.len());
+        let mut layout = Layout::default();
+        let (mut shapes, mut leaves) = (Vec::new(), Vec::new());
         for field in fields {
-            let ty = storage(&field.ty)?;
-            let physical = physical(&ty).ok_or_else(|| {
-                Error::not_implemented(format!(
-                    "COPY TO a Parquet file with a column of type {} is not supported yet",
-                    field.ty
-                ))
-            })?;
-            let bounds = match (&field.ty, &ty) {
-                (LogicalType::HugeInt | LogicalType::UHugeInt, _) => Bounds::None,
-                (
-                    _,
-                    LogicalType::UTinyInt
-                    | LogicalType::USmallInt
-                    | LogicalType::UInteger
-                    | LogicalType::UBigInt,
-                ) => Bounds::Unsigned,
-                (_, LogicalType::Varchar) => Bounds::Text,
-                (_, LogicalType::Blob) => Bounds::Bytes,
-                _ => Bounds::Signed,
+            let first = layout.columns.len();
+            let top = Place {
+                path: Vec::new(),
+                reported_path: Vec::new(),
+                def: 1,
+                rep: 0,
+                optional: true,
+                spans: true,
             };
-            let reported = !matches!(field.ty, LogicalType::Enum(_));
-            let dictionary = !matches!(physical, Physical::Boolean | Physical::FixedLenByteArray);
-            let members = match &field.ty {
-                LogicalType::Enum(labels) => Some(Members {
-                    labels: Arc::clone(labels),
-                    index: labels.iter().zip(0..).map(|(label, at)| (label.clone(), at)).collect(),
-                    seen: vec![false; labels.len()],
-                }),
-                _ => None,
-            };
-            columns.push(Column {
-                name: field.name.clone(),
-                ty,
-                physical,
-                bounds,
-                reported,
-                dictionary,
-                members,
-            });
+            shapes.push(layout.lay_out(&field.name, &field.ty, top)?);
+            leaves.push(first..layout.columns.len());
         }
+        let Layout { columns, schema } = layout;
         let totals = columns
             .iter()
             .map(|column| ColumnStatistics {
-                name: column.name.clone(),
+                path: column.reported_path.clone(),
                 nans: matches!(column.physical, Physical::Float | Physical::Double).then_some(0),
                 min_exact: true,
                 max_exact: true,
@@ -443,6 +878,9 @@ impl<W: Write> Writer<W> {
             out,
             at: 0,
             columns,
+            shapes,
+            leaves,
+            schema,
             codec,
             groups: Vec::new(),
             rows: 0,
@@ -484,37 +922,20 @@ impl<W: Write> Writer<W> {
         if rows == 0 {
             return Ok(());
         }
-        if chunks.iter().any(|chunk| chunk.width() != self.columns.len()) {
+        if chunks.iter().any(|chunk| chunk.width() != self.shapes.len()) {
             return Err(Error::internal("a chunk with the wrong number of columns"));
         }
         let start = self.at;
         let mut columns = Vec::with_capacity(self.columns.len());
         let (mut total, mut compressed) = (0, 0);
-        for column in 0..self.columns.len() {
-            let mut written = Written::default();
-            let gathered = self.gather(column, chunks, rows, &mut written)?;
-            columns.push(self.write_chunk(column, &gathered, &mut written)?);
-            total += written.uncompressed;
-            compressed += written.compressed;
-            let totals = &mut self.totals[column];
-            totals.values += written.values;
-            totals.nulls += written.nulls;
-            totals.nans = totals.nans.map(|nans| nans + written.nans);
-            totals.size += written.compressed;
-            // A row group with no bounds leaves the file with none, as in the pin, which still
-            // takes in the bounds of a group that kept none in the file only for its NaNs.
-            match (&written.min, &written.max) {
-                (Some(min), Some(max)) if !self.unbounded[column] => {
-                    bound(&mut totals.min, min, Ordering::Less);
-                    bound(&mut totals.max, max, Ordering::Greater);
-                    totals.min_exact &= !written.min_cut;
-                    totals.max_exact &= !written.max_cut;
-                }
-                _ => {
-                    self.unbounded[column] = true;
-                    totals.min = None;
-                    totals.max = None;
-                }
+        for field in 0..self.shapes.len() {
+            let first = self.leaves[field].start;
+            for (column, (gathered, mut written)) in
+                (first..).zip(self.gather(field, chunks, rows)?)
+            {
+                self.write_leaf(column, &gathered, &mut written, &mut columns)?;
+                total += written.uncompressed;
+                compressed += written.compressed;
             }
         }
         self.groups.push(Group { columns, total, rows: rows as i64, start, compressed });
@@ -522,96 +943,81 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
-    /// Reads one column of a row group, takes in its statistics, and builds the dictionary the
-    /// pin would: one entry for each value the first time it is seen, until there would be more
-    /// than a fifth of the rows of the group, or than `DICTIONARY_SIZE_LIMIT`, or for strings and
-    /// blobs more bytes than `STRING_DICTIONARY_PAGE_SIZE_LIMIT`. A column that outgrows its
-    /// dictionary, or has no value at all, is written plain. A boolean or a sixteen byte decimal
-    /// never has one, and an enum always has its own, which lists every member.
+    /// Writes one leaf column of a row group and takes in what it holds.
+    fn write_leaf(
+        &mut self,
+        column: usize,
+        gathered: &Gathered,
+        written: &mut Written,
+        columns: &mut Vec<(thrift::Writer, Option<Filter>)>,
+    ) -> Result<()> {
+        columns.push(self.write_chunk(column, gathered, written)?);
+        let totals = &mut self.totals[column];
+        totals.values += written.values;
+        totals.nulls += written.nulls;
+        totals.nans = totals.nans.map(|nans| nans + written.nans);
+        totals.size += written.compressed;
+        // A row group with no bounds leaves the file with none, as in the pin, which still
+        // takes in the bounds of a group that kept none in the file only for its NaNs.
+        match (&written.min, &written.max) {
+            (Some(min), Some(max)) if !self.unbounded[column] => {
+                bound(&mut totals.min, min, Ordering::Less);
+                bound(&mut totals.max, max, Ordering::Greater);
+                totals.min_exact &= !written.min_cut;
+                totals.max_exact &= !written.max_cut;
+            }
+            _ => {
+                self.unbounded[column] = true;
+                totals.min = None;
+                totals.max = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads one column of the query for a row group into its leaves, taking in their statistics
+    /// and building the dictionaries the pin would. A leaf that outgrows its dictionary, or has no
+    /// value at all, is written plain. A boolean or a sixteen byte decimal never has one, and an
+    /// enum always has its own, which lists every member.
     fn gather(
         &mut self,
-        at: usize,
+        field: usize,
         chunks: &[Chunk],
         rows: usize,
-        written: &mut Written,
-    ) -> Result<Gathered> {
+    ) -> Result<Vec<(Gathered, Written)>> {
         let limits = self.limits;
-        let column = &mut self.columns[at];
-        let mut gathered = Gathered { defined: Vec::with_capacity(rows), ..Gathered::default() };
-        let most = limits.dictionary.unwrap_or(rows as u64 / 5);
-        let mut entries: HashMap<Vec<u8>, u32> = HashMap::new();
-        let mut page = Vec::new();
-        let mut open = column.dictionary;
-        let text = column.physical == Physical::ByteArray;
+        let leaves = self.leaves[field].clone();
+        let mut states: Vec<Gathering> = self.columns[leaves.clone()]
+            .iter()
+            .map(|column| Gathering { open: column.dictionary, ..Gathering::default() })
+            .collect();
+        let mut walk = Walk {
+            columns: &mut self.columns[leaves.clone()],
+            states: &mut states,
+            first: leaves.start,
+            most: limits.dictionary.unwrap_or(rows as u64 / 5),
+            limits,
+        };
+        let mut row = 0;
         for chunk in chunks {
-            let vector = chunk.column(at)?;
+            let vector = chunk.column(field)?;
             // row at a time: the Parquet writer encodes values one by one; a writer that takes a
             // vector's flat data whole is not built yet.
-            for row in 0..vector.len() {
-                let value = vector.try_value_at(row)?;
-                if value.is_null() {
-                    gathered.defined.push(false);
-                    written.nulls += 1;
-                    continue;
-                }
-                gathered.defined.push(true);
-                if is_nan(&value) {
-                    written.nans += 1;
-                } else if column.members.is_none() {
-                    written.take(&value, column.bounds);
-                }
-                let begin = gathered.plain.len();
-                plain(&value, column, &mut gathered.plain, true)?;
-                gathered.ends.push(gathered.plain.len());
-                if let Some(members) = &mut column.members {
-                    let index = match &value {
-                        Value::Varchar(label) => members.index.get(label.as_str()).copied(),
-                        _ => None,
-                    };
-                    let index = index.ok_or_else(|| {
-                        Error::internal(format!("{value} is not a member of the enum written"))
-                    })?;
-                    members.seen[index as usize] = true;
-                    gathered.indices.push(index);
-                } else if open {
-                    let bytes = &gathered.plain[begin..];
-                    let key = dictionary_key(bytes, column.physical);
-                    if let Some(&index) = entries.get(key.as_ref()) {
-                        gathered.indices.push(index);
-                    } else if entries.len() as u64 + 1 > most
-                        || (text && (page.len() + bytes.len()) as u64 > limits.string_dictionary)
-                    {
-                        open = false;
-                    } else {
-                        let index = entries.len() as u32;
-                        entries.insert(key.into_owned(), index);
-                        page.extend_from_slice(bytes);
-                        gathered.hashes.push(xxh64(if text { &bytes[4..] } else { bytes }));
-                        gathered.indices.push(index);
+            for at in 0..vector.len() {
+                if row % BLOCK_ROWS == 0 {
+                    for state in walk.states.iter_mut() {
+                        state.gathered.starts.push(state.gathered.defs.len());
                     }
                 }
+                row += 1;
+                walk.value(&self.shapes[field], &vector.try_value_at(at)?, 0)?;
             }
         }
-        if let Some(members) = &column.members {
-            // The members no row has held are in the dictionary as empty strings, and the
-            // bounds are those of the members held so far in the file, which is the pin's.
-            let mut page = Vec::new();
-            for (label, seen) in members.labels.iter().zip(&members.seen) {
-                if *seen {
-                    written.take(&Value::Varchar(label.clone()), column.bounds);
-                    byte_array(label.as_bytes(), &mut page, true);
-                } else {
-                    page.extend_from_slice(&0_u32.to_le_bytes());
-                }
-            }
-            gathered.dictionary = Some((page, members.labels.len()));
-        } else if open && !entries.is_empty() {
-            gathered.dictionary = Some((page, entries.len()));
-        } else {
-            gathered.indices = Vec::new();
-            gathered.hashes = Vec::new();
-        }
-        Ok(gathered)
+        Ok(states
+            .into_iter()
+            .zip(&self.columns[leaves])
+            .map(|(state, column)| finish(state, column))
+            .collect())
     }
 
     /// Writes one column of a row group, its dictionary page first when it has one, and hands
@@ -638,15 +1044,17 @@ impl<W: Write> Writer<W> {
             self.page(2, body, (7, header), written)?;
         }
         let first = self.at;
-        for (rows, values) in pages(gathered, width, self.limits.data_page) {
-            let mut levels = Runs::new(1);
-            for defined in &gathered.defined[rows.clone()] {
-                levels.push(u32::from(*defined));
+        let column = &self.columns[at];
+        let (max_rep, max_def) = (column.max_rep, column.max_def);
+        let split = pages(gathered, column, width, self.limits.data_page);
+        for (rows, values) in split {
+            let mut body = Vec::new();
+            if max_rep > 0 {
+                levels(&gathered.reps[rows.clone()], max_rep, &mut body);
             }
-            let levels = levels.finish();
-            let mut body = Vec::with_capacity(4 + levels.len());
-            body.extend_from_slice(&(levels.len() as u32).to_le_bytes());
-            body.extend_from_slice(&levels);
+            if max_def > 0 {
+                levels(&gathered.defs[rows.clone()], max_def, &mut body);
+            }
             if encoding != PLAIN {
                 body.push(width);
                 if !values.is_empty() {
@@ -673,7 +1081,7 @@ impl<W: Write> Writer<W> {
             self.page(0, &body, (5, data), written)?;
             written.pages += 1;
         }
-        written.values += gathered.defined.len() as i64;
+        written.values += gathered.defs.len() as i64;
         let filter = match self.limits.bloom {
             Some(ratio) if !gathered.hashes.is_empty() => {
                 let mut filter = Filter::new(gathered.hashes.len(), ratio);
@@ -729,7 +1137,8 @@ impl<W: Write> Writer<W> {
         // The pin lists the encodings of the values only, and not the `RLE` of the definition
         // levels.
         meta.list_of_ints(2, &[i64::from(encoding)]);
-        meta.list_of_strings(3, &[column.name.as_str()]);
+        let path: Vec<&str> = column.path.iter().map(String::as_str).collect();
+        meta.list_of_strings(3, &path);
         meta.i32(4, if self.codec == Codec::Snappy { 1 } else { 0 });
         meta.int(5, written.values);
         meta.int(6, written.uncompressed);
@@ -848,14 +1257,26 @@ impl<W: Write> Writer<W> {
             out.int(6, group.compressed);
             groups.push(out);
         }
-        let mut schema = Vec::with_capacity(self.columns.len() + 1);
+        let mut schema = Vec::with_capacity(self.schema.len() + 1);
         let mut root = thrift::Writer::default();
         root.i32(3, 0);
         root.string(4, "duckdb_schema");
-        root.i32(5, self.columns.len() as i32);
+        root.i32(5, self.shapes.len() as i32);
         schema.push(root);
-        for column in &self.columns {
-            schema.push(element(column));
+        for at in &self.schema {
+            schema.push(match at {
+                Element::Leaf(column) => element(&self.columns[*column]),
+                Element::Group { name, repetition, children, converted } => {
+                    let mut group = thrift::Writer::default();
+                    group.i32(3, *repetition);
+                    group.string(4, name);
+                    group.i32(5, *children as i32);
+                    if let Some(converted) = converted {
+                        group.i32(6, *converted);
+                    }
+                    group
+                }
+            });
         }
         let mut footer = thrift::Writer::default();
         footer.i32(1, 1);
@@ -908,7 +1329,7 @@ fn element(column: &Column) -> thrift::Writer {
     if column.physical == Physical::FixedLenByteArray {
         element.i32(2, 16);
     }
-    element.i32(3, 1);
+    element.i32(3, i32::from(column.optional));
     element.string(4, &column.name);
     let micros = |utc: bool, field: i16| {
         let mut unit = thrift::Writer::default();
@@ -1100,16 +1521,37 @@ fn dictionary_key(bytes: &[u8], physical: Physical) -> Cow<'_, [u8]> {
     }
 }
 
-/// Where the pin ends the data pages of a column chunk, as the rows and the values each one
+/// Appends a page's levels of one kind, in the hybrid encoding at the width of the most they get
+/// to, after their length in bytes.
+fn levels(levels: &[u16], most: u16, out: &mut Vec<u8>) {
+    let mut runs = Runs::new((16 - most.leading_zeros()) as u8);
+    for level in levels {
+        runs.push(u32::from(*level));
+    }
+    let runs = runs.finish();
+    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+    out.extend_from_slice(&runs);
+}
+
+/// Where the pin ends the data pages of a column chunk, as the entries and the values each one
 /// holds. There is one page unless the estimated size of the values on it reaches `limit`, which
-/// closes it after the value that did. A value is estimated at its plain size, which for a
-/// boolean is a byte, or with a dictionary at the whole bytes its index takes. A null adds
-/// nothing.
-fn pages(gathered: &Gathered, width: u8, limit: u64) -> Vec<(Range<usize>, Range<usize>)> {
+/// closes it after the value that did. Under a list the page only closes on the first entry of a
+/// block of [`BLOCK_ROWS`] rows, since the pin keeps the values of the rows it is handed at once
+/// on one page. A value is estimated at its plain size, which for a boolean is a byte, or with a
+/// dictionary at the whole bytes its index takes. A null or a missing list adds nothing.
+fn pages(
+    gathered: &Gathered,
+    column: &Column,
+    width: u8,
+    limit: u64,
+) -> Vec<(Range<usize>, Range<usize>)> {
     let mut pages = Vec::new();
     let (mut row, mut value, mut size, mut values) = (0, 0, 0_u64, 0_usize);
-    for (at, defined) in gathered.defined.iter().enumerate() {
-        if !*defined {
+    let mut starts = gathered.starts.iter().peekable();
+    for (at, &def) in gathered.defs.iter().enumerate() {
+        while starts.next_if(|&&start| start < at).is_some() {}
+        let first = starts.peek() == Some(&&at);
+        if def != column.max_def {
             continue;
         }
         size += if width == 0 {
@@ -1119,13 +1561,13 @@ fn pages(gathered: &Gathered, width: u8, limit: u64) -> Vec<(Range<usize>, Range
             u64::from(width.div_ceil(8))
         };
         values += 1;
-        if size >= limit {
+        if size >= limit && (column.spans || first) {
             pages.push((row..at + 1, value..values));
             (row, value, size) = (at + 1, values, 0);
         }
     }
-    if row < gathered.defined.len() {
-        pages.push((row..gathered.defined.len(), value..values));
+    if row < gathered.defs.len() {
+        pages.push((row..gathered.defs.len(), value..values));
     }
     pages
 }
@@ -1136,7 +1578,7 @@ mod tests {
     use rudb_compress::Codec;
     use rudb_vector::{Chunk, Vector};
 
-    use super::Writer;
+    use super::{Limits, Writer};
     use crate::footer::{MetadataTable, RawFooter};
     use crate::metadata::{Metadata, Physical};
 
@@ -1314,11 +1756,7 @@ mod tests {
         let chunk = Chunk::new(vec![column(LogicalType::BigInt, &values)]).expect("a chunk");
         let mut writer =
             Writer::new(Vec::new(), &fields, Codec::Snappy, "rudb test").expect("starts");
-        writer.set_limits(super::Limits {
-            dictionary: Some(0),
-            data_page: 16,
-            ..Default::default()
-        });
+        writer.set_limits(Limits { dictionary: Some(0), data_page: 16, ..Default::default() });
         writer.write_group(&[chunk]).expect("writes");
         let bytes = writer.finish().expect("finishes");
         let expected = [Value::Null, Value::BigInt(4), Value::BigInt(204), Value::BigInt(195)];
@@ -1379,6 +1817,197 @@ mod tests {
             assert_eq!(bytes[offset + 15..offset + 47], filter[..]);
         }
         assert_eq!(bytes.len() - 8 - len as usize, 460 + 47);
+    }
+
+    const PIN: &str = "DuckDB version v2.0.0-dev84237 (build cc7e7bac7f)";
+
+    /// Writes `columns` as one row group the way the pin would, under its own name.
+    fn written(fields: &[Field], columns: Vec<Vector>, codec: Codec, limits: Limits) -> Vec<u8> {
+        let chunk = Chunk::new(columns).expect("a chunk");
+        let mut writer = Writer::new(Vec::new(), fields, codec, PIN).expect("starts");
+        writer.set_limits(limits);
+        writer.write_group(&[chunk]).expect("writes");
+        let bytes = writer.finish().expect("finishes");
+        if let Ok(dir) = std::env::var("RUDB_DUMP") {
+            std::fs::write(format!("{dir}/{}.parquet", fields[0].name), &bytes).expect("dumps");
+        }
+        bytes
+    }
+
+    fn list(element: LogicalType, values: Vec<Value>) -> Value {
+        Value::List { element, values }
+    }
+
+    fn row(members: &[(&str, Value)]) -> Value {
+        Value::Struct(members.iter().map(|(name, value)| ((*name).into(), value.clone())).collect())
+    }
+
+    #[test]
+    fn nested_columns_come_out_as_the_pins_bytes() {
+        // The four files of the README's nested section, which the pin wrote uncompressed. They
+        // are not read back, since the reader does not take a nested schema yet.
+        let int = LogicalType::Integer;
+        let text = LogicalType::Varchar;
+        let ints = LogicalType::List(Box::new(int.clone()));
+        let pairs =
+            LogicalType::Struct(vec![Field::new("a", int.clone()), Field::new("b", text.clone())]);
+        let map = LogicalType::Map(Box::new(int.clone()), Box::new(text.clone()));
+        let lists = LogicalType::List(Box::new(ints.clone()));
+        let i = Value::Integer;
+        let v = |text: &str| Value::Varchar(text.into());
+        let map_of = |entries: Vec<(Value, Value)>| Value::Map {
+            key: Box::new(int.clone()),
+            value: Box::new(text.clone()),
+            entries,
+        };
+        let files: [(&str, LogicalType, Vec<Value>, &[u8]); 4] = [
+            (
+                "l",
+                ints.clone(),
+                vec![
+                    list(int.clone(), vec![i(1), i(2), Value::Null]),
+                    list(int.clone(), vec![]),
+                    Value::Null,
+                    list(int.clone(), vec![i(3)]),
+                ],
+                include_bytes!("../testdata/nested-list.parquet"),
+            ),
+            (
+                "s",
+                pairs,
+                vec![
+                    row(&[("a", i(1)), ("b", v("x"))]),
+                    Value::Null,
+                    row(&[("a", Value::Null), ("b", v("y"))]),
+                ],
+                include_bytes!("../testdata/nested-struct.parquet"),
+            ),
+            (
+                "m",
+                map.clone(),
+                vec![
+                    map_of(vec![(i(1), v("a")), (i(2), Value::Null)]),
+                    map_of(vec![]),
+                    Value::Null,
+                ],
+                include_bytes!("../testdata/nested-map.parquet"),
+            ),
+            (
+                "ll",
+                lists,
+                vec![
+                    list(
+                        ints.clone(),
+                        vec![list(int.clone(), vec![i(1)]), Value::Null, list(int.clone(), vec![])],
+                    ),
+                    Value::Null,
+                    list(ints.clone(), vec![list(int.clone(), vec![i(2), i(3)])]),
+                ],
+                include_bytes!("../testdata/nested-lists.parquet"),
+            ),
+        ];
+        for (name, ty, values, pin) in files {
+            let fields = [Field::new(name, ty.clone())];
+            let bytes =
+                written(&fields, vec![column(ty, &values)], Codec::Uncompressed, Limits::default());
+            assert!(bytes == pin, "{name} differs from the pin's file");
+        }
+    }
+
+    #[test]
+    fn deeper_nesting_with_dictionaries_and_blooms_comes_out_as_the_pins_bytes() {
+        // nested.parquet of the README, 5000 rows of every kind of nesting the pin writes.
+        let big = LogicalType::BigInt;
+        let text = LogicalType::Varchar;
+        let bigs = LogicalType::List(Box::new(big.clone()));
+        let pair = LogicalType::Array(Box::new(big.clone()), 2);
+        let s =
+            LogicalType::Struct(vec![Field::new("a", big.clone()), Field::new("b", text.clone())]);
+        let m = LogicalType::Map(Box::new(text.clone()), Box::new(big.clone()));
+        let element =
+            LogicalType::Struct(vec![Field::new("x", big.clone()), Field::new("y", bigs.clone())]);
+        let ls = LogicalType::List(Box::new(element.clone()));
+        let r = LogicalType::Struct(vec![Field::new("r", big.clone())]);
+        let sl = LogicalType::Struct(vec![
+            Field::new("p", bigs.clone()),
+            Field::new("q", r),
+            Field::new("z", pair.clone()),
+        ]);
+        let types = [bigs.clone(), s, m, pair, ls, sl];
+        let names = ["l", "s", "m", "a", "ls", "sl"];
+        let mut values: [Vec<Value>; 6] = Default::default();
+        let b = Value::BigInt;
+        let or_null = |null: bool, value: Value| if null { Value::Null } else { value };
+        for i in 0..5000_i64 {
+            values[0].push(if i % 7 == 0 {
+                Value::Null
+            } else if i % 5 == 0 {
+                list(big.clone(), vec![])
+            } else {
+                list(big.clone(), vec![b(i % 4), or_null(i % 3 == 0, b(i % 6))])
+            });
+            let a = or_null(i % 4 == 0, b(i % 9));
+            values[1].push(or_null(
+                i % 11 == 0,
+                row(&[("a", a), ("b", Value::Varchar(format!("v{}", i % 3)))]),
+            ));
+            values[2].push(if i % 13 == 0 {
+                Value::Null
+            } else {
+                let entries = if i % 6 == 0 {
+                    vec![]
+                } else {
+                    vec![(Value::Varchar(format!("k{}", i % 3)), b(i % 5))]
+                };
+                Value::Map { key: Box::new(text.clone()), value: Box::new(big.clone()), entries }
+            });
+            values[3].push(or_null(i % 9 == 0, list(big.clone(), vec![b(i % 2), b(i % 3)])));
+            let y = or_null(i % 2 == 0, list(big.clone(), vec![b(i % 5)]));
+            let pairs = list(element.clone(), vec![row(&[("x", b(i % 3)), ("y", y)]), Value::Null]);
+            values[4].push(or_null(i % 17 == 0, pairs));
+            let q = or_null(i % 8 == 0, row(&[("r", b(i % 7))]));
+            let z = list(big.clone(), vec![b(i % 3), b(1)]);
+            values[5].push(or_null(
+                i % 10 == 0,
+                row(&[("p", list(big.clone(), vec![b(i % 2)])), ("q", q), ("z", z)]),
+            ));
+        }
+        let fields: Vec<_> =
+            names.iter().zip(&types).map(|(name, ty)| Field::new(*name, ty.clone())).collect();
+        let columns =
+            types.iter().zip(&values).map(|(ty, values)| column(ty.clone(), values)).collect();
+        let bytes = written(&fields, columns, Codec::Snappy, Limits::default());
+        assert!(
+            bytes == include_bytes!("../testdata/nested.parquet"),
+            "differs from the pin's file"
+        );
+    }
+
+    #[test]
+    fn a_page_under_a_list_only_closes_where_a_block_of_rows_starts() {
+        // list-paged.parquet of the README, with DATA_PAGE_SIZE_LIMIT 1000.
+        let big = LogicalType::BigInt;
+        let bigs = LogicalType::List(Box::new(big.clone()));
+        let (mut l, mut f) = (Vec::new(), Vec::new());
+        for i in 0..5000_i64 {
+            l.push(if i % 7 == 0 {
+                Value::Null
+            } else if i % 5 == 0 {
+                list(big.clone(), vec![])
+            } else {
+                let second = if i % 3 == 0 { Value::Null } else { Value::BigInt(i % 6) };
+                list(big.clone(), vec![Value::BigInt(i % 4), second])
+            });
+            f.push(Value::BigInt(i));
+        }
+        let fields = [Field::new("l", bigs.clone()), Field::new("f", big.clone())];
+        let limits = Limits { data_page: 1000, ..Default::default() };
+        let bytes =
+            written(&fields, vec![column(bigs, &l), column(big, &f)], Codec::Snappy, limits);
+        assert!(
+            bytes == include_bytes!("../testdata/list-paged.parquet"),
+            "differs from the pin's file"
+        );
     }
 
     /// A file held in memory, for reading a written file back.

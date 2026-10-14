@@ -148,7 +148,12 @@ pub(crate) fn statistics(files: Vec<Wrote>) -> Result<QueryResult> {
                 .into_iter()
                 .map(|(key, value)| (Value::Varchar(key.into()), Value::Varchar(value)))
                 .collect();
-            let name = format!("\"{}\"", column.name.replace('"', "\"\""));
+            let quoted: Vec<String> = column
+                .path
+                .iter()
+                .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+                .collect();
+            let name = quoted.join(".");
             columns.push((Value::Varchar(name), map(&text, entries)));
         }
         columns.sort_by_key(|(name, _)| name.to_string());
@@ -537,7 +542,7 @@ enum Body {
         moments: Moments,
     },
     Parquet {
-        writer: rudb_parquet::Writer<Counted>,
+        writer: Box<rudb_parquet::Writer<Counted>>,
         /// The type each column is cast to before it is stored.
         stored: Vec<LogicalType>,
         /// The chunks of the row group not written yet, and how many rows they hold.
@@ -596,7 +601,7 @@ impl<'a> Sink<'a> {
                 data_page: copy.data_page_size_limit,
                 bloom: copy.bloom_filter_false_positive_ratio,
             });
-            Body::Parquet { writer, stored, group: Vec::new(), waiting: 0 }
+            Body::Parquet { writer: Box::new(writer), stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
             let moments = Moments {
                 zone,
