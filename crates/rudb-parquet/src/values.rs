@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, PhysicalType, Result};
+use rudb_common::{Error, LogicalType, PhysicalType, Result, time_tz};
 use rudb_vector::{Buffer, Data, StringColumn, Validity, Vector};
 
 use crate::chunk::Page;
@@ -273,6 +273,12 @@ impl Page {
     }
 }
 
+/// The zoned time a file holds as `micros` at UTC, which is that time at offset zero. A number that
+/// is not a time of day is held to the day first, so that it cannot overflow the packing.
+fn zoned(micros: i64) -> i64 {
+    time_tz::pack(micros.clamp(0, 86_400_000_000), 0)
+}
+
 /// The validity a run of definition levels describes, and how many values are actually in the page.
 ///
 /// Both from one pass. They were two functions and each walked the levels, which for a nullable
@@ -338,6 +344,11 @@ fn plain(
         Physical::Int64 if target == PhysicalType::UInt64 => {
             let bytes = fixed::<8>(tail(body, at)?, count)?;
             let wire = words::<8>(bytes).map(|word| i64::from_le_bytes(word).cast_unsigned());
+            narrow(target, count, wire, levels, total)
+        }
+        Physical::Int64 if column.ty == LogicalType::TimeTz => {
+            let bytes = fixed::<8>(tail(body, at)?, count)?;
+            let wire = words::<8>(bytes).map(|word| zoned(i64::from_le_bytes(word)));
             narrow(target, count, wire, levels, total)
         }
         Physical::Int32 => {
@@ -434,6 +445,9 @@ fn delta(
                 }
                 (Physical::Int64, PhysicalType::UInt64) => {
                     narrow(target, count, dense.into_iter().map(i64::cast_unsigned), levels, total)
+                }
+                (Physical::Int64, _) if column.ty == LogicalType::TimeTz => {
+                    narrow(target, count, dense.into_iter().map(zoned), levels, total)
                 }
                 _ => narrow(target, count, dense.into_iter(), levels, total),
             }

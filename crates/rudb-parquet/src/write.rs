@@ -4,9 +4,11 @@
 //! What it writes is what the pin writes for the same columns. Every
 //! column is `OPTIONAL`, the root of the schema is `duckdb_schema`, integers narrower than 32 bits
 //! and every unsigned width carry both the old `converted_type` and the `logicalType` union, a
-//! string is a `BYTE_ARRAY` annotated `UTF8`, a timestamp is microseconds, and a decimal is an
-//! `INT32`, an `INT64` or a sixteen byte `FIXED_LEN_BYTE_ARRAY` by its width. So a file written
-//! here reads back in the pin as the types it was written from, and in this crate's reader too.
+//! string is a `BYTE_ARRAY` annotated `UTF8`, a timestamp is microseconds unless it is in
+//! nanoseconds, a zoned time is the time at UTC, and a decimal is an `INT32`, an `INT64` or a
+//! sixteen byte `FIXED_LEN_BYTE_ARRAY` by its width. So a file written here reads back in the pin
+//! as the types it was written from, and in this crate's reader too, with a zoned time at offset
+//! zero.
 //!
 //! The pages are laid out the way the pin lays them out. Each column of a row group is read whole
 //! first and, unless it is a boolean or a sixteen byte decimal, put in a dictionary that takes the
@@ -37,7 +39,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
-use rudb_common::{Error, Field, LogicalType, Result, Value};
+use rudb_common::{Error, Field, LogicalType, Result, Value, time_tz};
 use rudb_compress::Codec;
 use rudb_vector::Chunk;
 
@@ -497,6 +499,16 @@ impl Walk<'_> {
             return Ok(());
         }
         state.level(column, rep, column.max_def);
+        // The pin writes a zoned time as the same instant at UTC, so that is what is counted,
+        // bounded and encoded.
+        let utc;
+        let value = match value {
+            Value::TimeTz(key) => {
+                utc = Value::TimeTz(time_tz::pack(time_tz::at_utc(*key), 0));
+                &utc
+            }
+            value => value,
+        };
         let (gathered, written) = (&mut state.gathered, &mut state.written);
         if is_nan(value) {
             written.nans += 1;
@@ -788,13 +800,15 @@ pub struct ColumnStatistics {
 /// The type a column of `ty` has to be cast to before it is handed to a [`Writer`].
 ///
 /// Most types are written as themselves. An enum is written as its text and a timestamp in
-/// seconds or milliseconds as one in microseconds, which is what the pin does with them, a
-/// `HUGEINT` as a `DOUBLE`, which is also what the pin does, and an aggregate state as its layout.
+/// seconds as one in microseconds, which is what the pin does with them, a `HUGEINT` as a
+/// `DOUBLE`, which is also what the pin does, and an aggregate state as its layout. A timestamp in
+/// milliseconds is written in microseconds too, where the pin keeps it in milliseconds, because
+/// the reader here would give a file of them back as `TIMESTAMP_MS` and the pin gives `TIMESTAMP`.
 ///
 /// # Errors
 ///
-/// For a type this writer has no Parquet form for yet, at any depth: a union, `UUID`, `INTERVAL`,
-/// `BIT`, `TIME WITH TIME ZONE` and nanosecond timestamps.
+/// For a type this writer has no Parquet form for yet, at any depth: a union, `UUID`, `INTERVAL`
+/// and `BIT`.
 pub fn storage(ty: &LogicalType) -> Result<LogicalType> {
     Ok(match ty {
         LogicalType::List(element) => LogicalType::List(Box::new(storage(element)?)),
@@ -838,8 +852,12 @@ fn physical(ty: &LogicalType) -> Option<Physical> {
         LogicalType::BigInt
         | LogicalType::UBigInt
         | LogicalType::Time
+        | LogicalType::TimeNs
+        | LogicalType::TimeTz
         | LogicalType::Timestamp
-        | LogicalType::TimestampTz => Physical::Int64,
+        | LogicalType::TimestampTz
+        | LogicalType::TimestampNs
+        | LogicalType::TimestampTzNs => Physical::Int64,
         LogicalType::Float => Physical::Float,
         LogicalType::Double => Physical::Double,
         LogicalType::Varchar | LogicalType::Blob => Physical::ByteArray,
@@ -1458,16 +1476,20 @@ fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
     }
     element.i32(3, i32::from(column.optional));
     element.string(4, &column.name);
-    let micros = |utc: bool, field: i16| {
-        let mut unit = thrift::Writer::default();
-        unit.nested(2, thrift::Writer::default());
+    // A `TimeType` or a `TimestampType`, which is `field` of the union, at the unit that is
+    // `unit` of the `TimeUnit` union.
+    let time = |utc: bool, unit: i16, field: i16| {
+        let mut units = thrift::Writer::default();
+        units.nested(unit, thrift::Writer::default());
         let mut time = thrift::Writer::default();
         time.boolean(1, utc);
-        time.nested(2, unit);
+        time.nested(2, units);
         (field, time)
     };
+    let (micros, nanos) = (2, 3);
     // The pin writes the old annotation for everything and the new one only where the old one
-    // cannot say it all, which is time zones and decimals.
+    // cannot say it all, which is time zones, nanoseconds and decimals. The old one has no
+    // nanoseconds, so those get only the new one.
     let (converted, logical) = match &column.ty {
         LogicalType::TinyInt => (Some(15), None),
         LogicalType::SmallInt => (Some(16), None),
@@ -1479,9 +1501,13 @@ fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
         LogicalType::UBigInt => (Some(14), None),
         LogicalType::Varchar => (Some(0), None),
         LogicalType::Date => (Some(6), None),
-        LogicalType::Time => (Some(8), Some(micros(false, 7))),
-        LogicalType::Timestamp => (Some(10), Some(micros(false, 8))),
-        LogicalType::TimestampTz => (Some(10), Some(micros(true, 8))),
+        LogicalType::Time => (Some(8), Some(time(false, micros, 7))),
+        LogicalType::TimeTz => (Some(8), Some(time(true, micros, 7))),
+        LogicalType::TimeNs => (None, Some(time(false, nanos, 7))),
+        LogicalType::Timestamp => (Some(10), Some(time(false, micros, 8))),
+        LogicalType::TimestampTz => (Some(10), Some(time(true, micros, 8))),
+        LogicalType::TimestampNs => (None, Some(time(false, nanos, 8))),
+        LogicalType::TimestampTzNs => (None, Some(time(true, nanos, 8))),
         LogicalType::Decimal { width, scale } => {
             let mut decimal = thrift::Writer::default();
             decimal.i32(1, i32::from(*scale));
@@ -1533,6 +1559,7 @@ fn plain(value: &Value, column: &Column, out: &mut Vec<u8>, framed: bool) -> Res
             | Value::TimestampTzNs(value),
             _,
         ) => out.extend_from_slice(&value.to_le_bytes()),
+        (Value::TimeTz(key), _) => out.extend_from_slice(&time_tz::at_utc(*key).to_le_bytes()),
         (Value::UBigInt(value), _) => out.extend_from_slice(&value.to_le_bytes()),
         (Value::Float(value), _) => out.extend_from_slice(&value.to_le_bytes()),
         (Value::Double(value), _) => out.extend_from_slice(&value.to_le_bytes()),
@@ -1611,6 +1638,7 @@ fn integer(value: &Value) -> i128 {
         | Value::TimestampNs(value)
         | Value::TimeNs(value)
         | Value::TimestampTzNs(value) => i128::from(*value),
+        Value::TimeTz(key) => i128::from(time_tz::at_utc(*key)),
         Value::UBigInt(value) => i128::from(*value),
         _ => 0,
     }
@@ -1704,7 +1732,7 @@ fn pages(
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{Field, LogicalType, Value};
+    use rudb_common::{Field, LogicalType, Value, time_tz};
     use rudb_compress::Codec;
     use rudb_vector::{Chunk, Vector};
 
@@ -2209,6 +2237,57 @@ mod tests {
             for (at, values) in rows.iter().enumerate() {
                 assert_eq!(&read_back(pin, at), values, "{} reads back", types[at].0);
             }
+        }
+    }
+
+    #[test]
+    fn nanosecond_and_zoned_times_come_out_as_the_pins_bytes() {
+        // SET TimeZone = 'UTC'; COPY (SELECT make_timestamp_ns(1577836800000000000 + i *
+        // 123456789123) AS a, make_timestamp_ns(1577836800000000001 + (i % 3) *
+        // 1000000007)::TIMESTAMPTZ_NS AS b, CASE WHEN i % 4 = 0 THEN NULL ELSE ('01:02:03.' ||
+        // lpad((i * 12345678)::VARCHAR, 9, '0'))::TIME_NS END AS c, (lpad((i % 24)::VARCHAR, 2,
+        // '0') || ':02:03.25' || CASE WHEN i % 2 = 0 THEN '+' ELSE '-' END || lpad((i %
+        // 16)::VARCHAR, 2, '0') || ':30')::TIMETZ AS d FROM range(20) r(i)) TO
+        // 'time-units.parquet' (COMPRESSION uncompressed), in the pin.
+        let types = [
+            LogicalType::TimestampNs,
+            LogicalType::TimestampTzNs,
+            LogicalType::TimeNs,
+            LogicalType::TimeTz,
+        ];
+        let (mut rows, mut read): (Vec<Vec<Value>>, Vec<Value>) = (vec![Vec::new(); 4], Vec::new());
+        for i in 0..20_i64 {
+            let micros = (i % 24) * 3_600_000_000 + 123_250_000;
+            let offset = (if i % 2 == 0 { 1 } else { -1 }) * ((i % 16) as i32 * 3600 + 1800);
+            let row = [
+                Value::TimestampNs(1_577_836_800_000_000_000 + i * 123_456_789_123),
+                Value::TimestampTzNs(1_577_836_800_000_000_001 + (i % 3) * 1_000_000_007),
+                if i % 4 == 0 {
+                    Value::Null
+                } else {
+                    Value::TimeNs(3_723_000_000_000 + i * 12_345_678)
+                },
+                Value::TimeTz(time_tz::pack(micros, offset)),
+            ];
+            read.push(Value::TimeTz(time_tz::pack(
+                time_tz::at_utc(time_tz::pack(micros, offset)),
+                0,
+            )));
+            for (column, value) in rows.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        let names = ["a", "b", "c", "d"];
+        let fields: Vec<_> =
+            names.iter().zip(&types).map(|(name, ty)| Field::new(*name, ty.clone())).collect();
+        let columns = types.iter().zip(&rows).map(|(ty, values)| column(ty.clone(), values));
+        let bytes = written(&fields, columns.collect(), Codec::Uncompressed, Limits::default());
+        let pin = include_bytes!("../testdata/time-units.parquet");
+        assert!(bytes == pin, "differs from the pin's file");
+        // A zoned time comes back as the same instant at offset zero, as it does in the pin.
+        rows[3] = read;
+        for (at, values) in rows.iter().enumerate() {
+            assert_eq!(&read_back(pin, at), values, "{} reads back", names[at]);
         }
     }
 
