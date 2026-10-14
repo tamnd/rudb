@@ -10,7 +10,7 @@
 //! no quote at all rather than as having the default one, which is visible in `sniff_csv` and is
 //! reproduced because the same field is printed back in an error message.
 
-use rudb_common::{Error, LogicalType, Result};
+use rudb_common::LogicalType;
 
 /// The delimiters tried, in the order they are tried.
 ///
@@ -113,6 +113,17 @@ pub struct Given {
     /// lines stepped over still count when an error names a line. Both were measured on
     /// `v2.0.0-dev84237`, where `"x` then `y",1` read with `skip=1` starts at `y",1`.
     pub skip: usize,
+    /// Whether the files of a read are matched by column name, each sniffed alone, with a null
+    /// for a column a file does not have. That is `union_by_name` on a call.
+    pub union_by_name: bool,
+    /// How many files the binder sniffs to settle the columns of a read of several, which is
+    /// `files_to_sniff` on a call. `None` is the pin's default of ten, and `usize::MAX` is `-1`,
+    /// which is all of them.
+    pub files_to_sniff: Option<usize>,
+    /// The file the binder took the names from, which the executor names when a later file does
+    /// not have them. It is the first file with a row in it rather than the first file, so the
+    /// binder says which one it was.
+    pub main: Option<String>,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.
@@ -223,13 +234,10 @@ impl Dialect {
 /// and the one to take is the candidate under which all the lines agree, because a delimiter that
 /// is really just a character inside the data will land in some lines and not others. Among the
 /// candidates that agree, the one that found the most columns wins, since a file is more likely to
-/// have three columns separated by something than one column containing it.
-///
-/// # Errors
-///
-/// When the sample has no complete line in it, which is a file of one unterminated line and is the
-/// one case where there is nothing to count.
-pub fn delimiter(sample: &[u8], quote: Option<u8>) -> Result<u8> {
+/// have three columns separated by something than one column containing it. An empty sample has
+/// nothing to count and is a comma.
+#[must_use]
+pub fn delimiter(sample: &[u8], quote: Option<u8>) -> u8 {
     let mut best = (1usize, DELIMITERS[0]);
     for candidate in DELIMITERS {
         let dialect = Dialect { delimiter: candidate, quote, escape: quote, header: false };
@@ -238,10 +246,7 @@ pub fn delimiter(sample: &[u8], quote: Option<u8>) -> Result<u8> {
             best = (width, candidate);
         }
     }
-    if sample.iter().all(|&byte| byte != b'\n' && byte != b'\r') && sample.is_empty() {
-        return Err(Error::io("the file is empty"));
-    }
-    Ok(best.1)
+    best.1
 }
 
 /// The number of fields every line has under `dialect`, when they all have the same number.
@@ -286,10 +291,10 @@ mod tests {
 
     #[test]
     fn the_delimiter_is_the_one_every_line_agrees_on() {
-        assert_eq!(delimiter(b"a,b,c\n1,2,3\n", None).unwrap(), b',');
-        assert_eq!(delimiter(b"a|b\n1|x\n", None).unwrap(), b'|');
-        assert_eq!(delimiter(b"a;b\n1;x\n", None).unwrap(), b';');
-        assert_eq!(delimiter(b"a\tb\n1\tx\n", None).unwrap(), b'\t');
+        assert_eq!(delimiter(b"a,b,c\n1,2,3\n", None), b',');
+        assert_eq!(delimiter(b"a|b\n1|x\n", None), b'|');
+        assert_eq!(delimiter(b"a;b\n1;x\n", None), b';');
+        assert_eq!(delimiter(b"a\tb\n1\tx\n", None), b'\t');
     }
 
     #[test]
@@ -297,24 +302,24 @@ mod tests {
         // The semicolon splits the first line into two and the second into one, so it is a
         // character in the data. The comma splits both into two and is the answer.
         let sample = b"a,b;c\n1,2\n";
-        assert_eq!(delimiter(sample, None).unwrap(), b',');
+        assert_eq!(delimiter(sample, None), b',');
     }
 
     #[test]
     fn the_delimiter_that_finds_more_columns_wins_among_the_ones_that_agree() {
         // Every line is one field under a tab and three under a comma, and both are consistent.
-        assert_eq!(delimiter(b"a,b,c\nx,y,z\n", None).unwrap(), b',');
+        assert_eq!(delimiter(b"a,b,c\nx,y,z\n", None), b',');
     }
 
     #[test]
     fn a_file_with_nothing_to_split_on_is_comma_separated_and_one_column() {
-        assert_eq!(delimiter(b"a\nb\n", None).unwrap(), b',');
+        assert_eq!(delimiter(b"a\nb\n", None), b',');
     }
 
     #[test]
     fn a_delimiter_inside_a_quoted_field_does_not_count() {
         let sample = b"a,b\n1,\"x,y\"\n";
-        assert_eq!(delimiter(sample, Some(b'"')).unwrap(), b',');
+        assert_eq!(delimiter(sample, Some(b'"')), b',');
     }
 
     #[test]

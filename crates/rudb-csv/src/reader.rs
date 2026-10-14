@@ -73,6 +73,10 @@ pub struct Reader {
     /// Where a reader gives up rather than reading on to finish a record, which only a guess
     /// sets. See [`crate::split`].
     cap: u64,
+    /// How many rows the sniffer saw past the header, and whether the file had nothing in it at
+    /// all, which is what the binder weighs when it combines the files of a read.
+    sampled: usize,
+    empty: bool,
 }
 
 impl Reader {
@@ -130,6 +134,8 @@ impl Reader {
             origin: 0,
             end: u64::MAX,
             cap: u64::MAX,
+            sampled: 0,
+            empty: false,
         };
         reader.fill(0)?;
         reader.skip_lines()?;
@@ -145,7 +151,7 @@ impl Reader {
             let quote = given.quote.or_else(|| dialect::quote(&sample));
             let delimiter = match given.delimiter {
                 Some(byte) => byte,
-                None => dialect::delimiter(&sample, quote)?,
+                None => dialect::delimiter(&sample, quote),
             };
             (quote, delimiter, given.header)
         };
@@ -153,6 +159,8 @@ impl Reader {
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
         let rows = reader.sample_rows(&sample)?;
         let (header, mut fields) = describe(&rows, told, reader.given.types.as_deref());
+        reader.sampled = rows.len().saturating_sub(usize::from(header));
+        reader.empty = sample.is_empty();
         if let Some(types) = &reader.given.types {
             let width = rows.iter().map(Vec::len).max().unwrap_or(types.len());
             reader.set_widths(&rows, header, width, types.len())?;
@@ -256,6 +264,19 @@ impl Reader {
             row.len(),
             self.path,
         )))
+    }
+
+    /// How many rows the sniffer saw past the header, which is none for a file that is empty or
+    /// is only a header.
+    #[must_use]
+    pub const fn sampled(&self) -> usize {
+        self.sampled
+    }
+
+    /// Whether the file had nothing in it past the lines `skip` stepped over.
+    #[must_use]
+    pub const fn empty(&self) -> bool {
+        self.empty
     }
 
     /// The columns this reader will produce, in order.
@@ -508,6 +529,8 @@ impl Reader {
             origin: from,
             end,
             cap: u64::MAX,
+            sampled: self.sampled,
+            empty: self.empty,
         }
     }
 
@@ -903,12 +926,16 @@ fn describe(
     });
     // An empty file has no row to take names from, so it has no header whatever it was told.
     // A single row is a header too once the call set the types, which was measured: `1,2` alone
-    // read as two `VARCHAR` columns comes back with no rows.
-    let enough = rows.len() > 1 || set.is_some();
+    // read as two `VARCHAR` columns comes back with no rows. So is a single row that is all text,
+    // which was measured as well: `a,b` alone is a header and `a,1` alone is a row.
+    let text = || types(rows, width).iter().all(|ty| *ty == LogicalType::Varchar);
+    let enough = rows.len() > 1 || set.is_some() || (rows.len() == 1 && text());
     let header = !rows.is_empty() && told.unwrap_or(enough && (all_text || !first_fits));
     if !header {
         let types = match set {
             Some(set) => set.to_vec(),
+            // An empty file is one text column, which is the pin's answer for one.
+            None if rows.is_empty() => vec![LogicalType::Varchar],
             None => types(rows, width),
         };
         let fields = types

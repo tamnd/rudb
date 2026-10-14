@@ -16,9 +16,9 @@
 //! a file, handing back chunks.
 //!
 //! [`combine`] is the fourth, and it is there because a read can cover more than one file.
-//! `read_csv('data/*.csv')` sniffs every file the pattern matched and combines the answers, since a
-//! file that says nothing about itself cannot be the one file whose word is taken the way a Parquet
-//! footer is.
+//! `read_csv('data/*.csv')` sniffs the first few files the pattern matched and combines the
+//! answers, since a file that says nothing about itself cannot be the one file whose word is taken
+//! the way a Parquet footer is.
 //!
 //! [`split`] is the fifth, and it is there because a file can be large. It cuts one file into
 //! ranges that are read on separate threads, and has each range guess where its first record
@@ -37,7 +37,7 @@ pub mod reader;
 pub mod scan;
 pub mod split;
 
-pub use combine::{across, mismatch, widen};
+pub use combine::{can_cast, disagreements, merge, mismatch};
 pub use dialect::{Dialect, Given, Retype};
 pub use reader::Reader;
 pub use split::{Part, Split};

@@ -393,6 +393,7 @@ impl TableFunction {
                     ("dtypes", LogicalType::Null),
                     ("escape", LogicalType::Varchar),
                     ("filename", LogicalType::Null),
+                    ("files_to_sniff", LogicalType::BigInt),
                     ("header", LogicalType::Boolean),
                     ("hive_partitioning", LogicalType::Boolean),
                     ("hive_types", LogicalType::Null),
@@ -406,6 +407,7 @@ impl TableFunction {
                     ("sep", LogicalType::Varchar),
                     ("skip", LogicalType::BigInt),
                     ("types", LogicalType::Null),
+                    ("union_by_name", LogicalType::Boolean),
                 ]
             });
         static READ_CONTENTS: &[(&str, LogicalType)] = &[("allow_empty", LogicalType::Boolean)];

@@ -7,8 +7,8 @@
 //! A read can cover more than one file, because the path can be a pattern, and the two formats
 //! settle their schema differently when it does. A Parquet file states its schema in its footer, so
 //! the first file's word is taken and a later file that disagrees is cast to it. A CSV file states
-//! nothing, so [`csv_fields`] sniffs every file the pattern named and combines the answers, which is
-//! what the binary does and is the only way the answer can be right.
+//! nothing, so [`csv_fields`] sniffs the first few files the pattern named and combines the
+//! answers, which is what the binary does.
 //!
 //! The file is opened twice for a query that runs, once by the binder to read the schema and once
 //! by the executor to read the rows. That is what DuckDB does too and it is not a mistake: the
@@ -120,6 +120,20 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
                 }
                 given.retype = Some(csv_types(name, value, &mut LogicalType::parse)?);
             }
+            ("union_by_name", Value::Boolean(on)) => given.union_by_name = *on,
+            ("files_to_sniff", Value::BigInt(count)) => {
+                given.files_to_sniff = Some(match *count {
+                    -1 => usize::MAX,
+                    count if count >= 1 => usize::try_from(count).unwrap_or(usize::MAX),
+                    _ => {
+                        return Err(Error::binder(
+                            "Unsupported parameter for files_to_sniff: value must be -1 for all \
+                             files or higher than one.",
+                        ));
+                    }
+                });
+            }
+            (MAIN_FILE, Value::Varchar(path)) => given.main = Some(path.clone()),
             ("columns", value) => {
                 let (names, types) = csv_columns(value, &mut LogicalType::parse)?;
                 given.names = Some(names);
@@ -300,6 +314,10 @@ pub fn json_text(path: &str, compression: scan::Compression) -> Result<String> {
 /// parameters rather than beside them because that list is what the executor rebuilds the reader
 /// from. See [`Given::typed`] for what it changes.
 pub const TYPES_SET: &str = "types_set";
+
+/// The name of the setting the binder writes into the plan of a read of several CSV files to say
+/// which of them the names came from, which is [`Given::main`]. Hidden the way [`TYPES_SET`] is.
+pub const MAIN_FILE: &str = "main_file";
 
 /// The strings a list parameter was given, refusing a null in the list, which DuckDB does too.
 fn strings(parameter: &str, values: &[Value]) -> Result<Vec<String>> {
@@ -656,30 +674,96 @@ fn largest_distincts(reader: &Reader, largest: &mut [Counted]) {
     }
 }
 
-/// The columns a `read_csv` of `paths` produces, sniffed out of the front of every one of them.
+/// The columns a `read_csv` of `paths` produces, and which of the paths their names came from.
 ///
-/// Every file and not only the first, which is the one place this differs from Parquet and is
-/// DuckDB's rule rather than a choice made here. It was measured at two, three, four and six files:
-/// four files where only the fourth holds a decimal answer DOUBLE, and six where only the sixth
-/// holds text answer VARCHAR. A Parquet file states its schema in its footer, so there is a first
-/// file's word to take. A CSV file states nothing, so there is not, and a directory of daily exports
-/// where one day happens to hold whole numbers in an otherwise decimal column would come out BIGINT
-/// or DOUBLE depending on which day sorted first. So all of them are sniffed and the answers are
-/// combined by [`rudb_csv::across`].
+/// This is the pin's `CSVSchemaDiscovery`. One file is sniffed for itself. Of several, the first is
+/// sniffed and then the ones after it until the samples come to 20480 lines or `files_to_sniff`
+/// files, ten unless the call said, have been sniffed. A file the sniffer found no rows in has no
+/// say while a later one does: the first file with a row in it gives the names, and every one with
+/// a row after it is folded in by [`rudb_csv::merge`], by position. So a directory of daily exports
+/// where one day happens to hold whole numbers in an otherwise decimal column comes out DOUBLE
+/// whichever day sorted first, as long as that day is among the ones sniffed, and a file after them
+/// is held to the answer by the scan, which names the file the names came from when it does not
+/// fit.
 ///
-/// That is an open and one sample read per file at bind time. It is what the binary does, it is the
-/// only way the answer can be right, and it is a sample against a scan that is about to read all of
-/// those files anyway.
+/// When no file sniffed had a row, every column is text unless the call set its type, since there
+/// was nothing to say otherwise.
 ///
 /// # Errors
 ///
-/// Everything [`open_csv`] reports, and a file that is missing a column the first one has.
-pub fn csv_fields(paths: &[String], given: Given) -> Result<Vec<Field>> {
-    let mut sniffed = Vec::with_capacity(paths.len());
-    for path in paths {
-        sniffed.push((path.clone(), open_csv(path, given.clone())?.fields()));
+/// Everything [`open_csv`] reports, and DuckDB's message when every file sniffed was empty.
+pub fn csv_fields(paths: &[String], given: Given) -> Result<(Vec<Field>, usize)> {
+    const LINES: usize = 2048 * 10;
+    let [first, rest @ ..] = paths else {
+        return Err(Error::internal("a read_csv with no files"));
+    };
+    if rest.is_empty() {
+        return Ok((open_csv(first, given)?.fields(), 0));
     }
-    rudb_csv::across(&sniffed)
+    let most = given.files_to_sniff.unwrap_or(10).min(paths.len());
+    let typed = given.types.is_some() || given.retype.is_some();
+    let mut best: Option<(usize, Vec<Field>, usize)> = None;
+    let mut lines = 0;
+    let mut rowless = true;
+    for (at, path) in paths.iter().enumerate() {
+        if at > 0 && (lines >= LINES || at >= most) {
+            break;
+        }
+        let reader = open_csv(path, given.clone())?;
+        lines += reader.sampled();
+        rowless &= reader.sampled() == 0;
+        // An empty file has no columns at all here, where alone it would have one.
+        let fields = if reader.empty() { Vec::new() } else { reader.fields() };
+        let rows = reader.sampled();
+        match best.as_mut() {
+            Some((_, settled, settled_rows)) if !settled.is_empty() && *settled_rows > 0 => {
+                if rows > 0 {
+                    rudb_csv::merge(settled, &fields);
+                }
+            }
+            _ => best = Some((at, fields, rows)),
+        }
+    }
+    let (main, mut fields, _) = best.unwrap_or_default();
+    if fields.is_empty() {
+        return Err(Error::invalid_input(
+            "No columns found in CSV files. Provide the columns option or ensure at least one file \
+             contains a header or data row.",
+        ));
+    }
+    for field in &mut fields {
+        if field.ty == LogicalType::Null || (rowless && !typed) {
+            field.ty = LogicalType::Varchar;
+        }
+    }
+    Ok((fields, main))
+}
+
+/// The columns a `read_csv` of `paths` with `union_by_name` produces.
+///
+/// Every file is sniffed for itself and the columns are matched by name, without regard to case,
+/// in the order they first turn up. Where two files disagree about a column's type `force` says
+/// what it becomes, which is how a `UNION BY NAME` forces two types to one and is the binder's to
+/// say. A column only some of the files have is null in the rest.
+///
+/// # Errors
+///
+/// Everything [`open_csv`] reports.
+pub fn csv_union(
+    paths: &[String],
+    given: &Given,
+    force: impl Fn(&LogicalType, &LogicalType) -> LogicalType,
+) -> Result<Vec<Field>> {
+    let mut fields: Vec<Field> = Vec::new();
+    for path in paths {
+        for field in open_csv(path, given.clone())?.fields() {
+            match fields.iter_mut().find(|held| held.name.eq_ignore_ascii_case(&field.name)) {
+                Some(held) => held.ty = force(&held.ty, &field.ty),
+                None => fields.push(field),
+            }
+        }
+    }
+    Ok(fields)
 }
 
 #[cfg(test)]
