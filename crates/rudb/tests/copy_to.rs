@@ -114,10 +114,6 @@ fn what_this_does_not_write_is_refused_by_name() {
             "COPY (SELECT 1 AS x) TO 'o.parquet' (BOGUS 1)",
             "Unrecognized option \"bogus\" for parquet",
         ),
-        (
-            "COPY (SELECT '00000000-0000-0000-0000-000000000000'::UUID AS x) TO 'o.parquet'",
-            "type UUID is not supported yet",
-        ),
     ] {
         let error = db.execute(sql).expect_err(sql).to_string();
         assert!(error.starts_with("Not implemented Error"), "{sql} gave {error}");
@@ -295,6 +291,76 @@ fn a_millisecond_timestamp_is_written_in_milliseconds_and_read_back_as_a_timesta
         &format!("SELECT count(*) FROM {back} WHERE a > TIMESTAMP '2001-02-03 06:00:00'"),
     );
     assert_eq!(later, vec![vec![rudb_common::Value::BigInt(11)]]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn uuids_and_intervals_are_written_and_read_back_the_way_the_pin_does() {
+    let db = Database::new();
+    let path =
+        std::env::temp_dir().join(format!("rudb-copy-to-uuid-{}.parquet", std::process::id()));
+    db.execute(&format!(
+        "COPY (SELECT CASE WHEN i % 4 = 0 THEN NULL ELSE ('0000000' || (i % 7) || \
+         '-1234-5678-9abc-def012345678')::UUID END AS u, CASE WHEN i % 5 = 0 THEN NULL WHEN i % 2 \
+         = 0 THEN 'f0e1d2c3-b4a5-9687-7869-5a4b3c2d1e0f'::UUID ELSE ('8' || (i % 3) || \
+         '000000-0000-0000-0000-000000000000')::UUID END AS w, CASE WHEN i % 5 = 0 THEN NULL ELSE \
+         INTERVAL (i) MONTH + INTERVAL (i * 3) DAY + INTERVAL (i * 1234567) MICROSECOND END AS v, \
+         INTERVAL (i % 3) DAY AS d FROM range(20) r(i)) TO '{}'",
+        path.display()
+    ))
+    .expect("writes");
+    let text = |value: &str| rudb_common::Value::Varchar(value.into());
+    let null = rudb_common::Value::Null;
+    let metadata = format!("parquet_metadata('{}')", path.display());
+    let bounds = values(
+        &db,
+        &format!(
+            "SELECT stats_min, stats_max, bloom_filter_length FROM {metadata} ORDER BY column_id"
+        ),
+    );
+    let bloom = |length: i64| rudb_common::Value::BigInt(length);
+    assert_eq!(
+        bounds,
+        vec![
+            vec![
+                text("00000000-1234-5678-9abc-def012345678"),
+                text("00000006-1234-5678-9abc-def012345678"),
+                null.clone()
+            ],
+            vec![
+                text("80000000-0000-0000-0000-000000000000"),
+                text("f0e1d2c3-b4a5-9687-7869-5a4b3c2d1e0f"),
+                bloom(47)
+            ],
+            vec![null.clone(), null.clone(), null.clone()],
+            vec![null.clone(), null.clone(), bloom(47)],
+        ]
+    );
+    let back = format!("read_parquet('{}')", path.display());
+    let read = values(
+        &db,
+        &format!(
+            "SELECT typeof(u), typeof(v), v::VARCHAR, d::VARCHAR FROM {back} LIMIT 1 OFFSET 1"
+        ),
+    );
+    assert_eq!(
+        read,
+        vec![vec![
+            text("UUID"),
+            text("INTERVAL"),
+            text("1 month 3 days 00:00:01.234"),
+            text("1 day")
+        ]]
+    );
+    let some = values(
+        &db,
+        &format!("SELECT count(*) FROM {back} WHERE u = '00000003-1234-5678-9abc-def012345678'"),
+    );
+    assert_eq!(some, vec![vec![rudb_common::Value::BigInt(3)]]);
+    let error = db
+        .execute(&format!("COPY (SELECT INTERVAL '1 month -1 day' AS v) TO '{}'", path.display()))
+        .expect_err("refused");
+    assert_eq!(error.to_string(), "IO Error: Parquet files do not support negative intervals");
     let _ = std::fs::remove_file(&path);
 }
 

@@ -1071,10 +1071,10 @@ fn from_converted(
         17 => LogicalType::Integer,
         18 => LogicalType::BigInt,
         20 => LogicalType::Blob,
-        // `MAP`, `LIST`, `MAP_KEY_VALUE` and `INTERVAL` all land here, and every one of them is
-        // either nested, which the schema reader has already refused, or a type rudb does not have
-        // yet. Falling back on the physical type would read the bytes and call them something they
-        // are not, so this says so instead.
+        21 => LogicalType::Interval,
+        // `MAP`, `LIST` and `MAP_KEY_VALUE` land here, and every one of them is nested, which the
+        // schema reader has already refused. Falling back on the physical type would read the
+        // bytes and call them something they are not, so this says so instead.
         other => {
             return Err(Error::not_implemented(format!(
                 "a parquet converted type of {other} on a {physical:?} column"

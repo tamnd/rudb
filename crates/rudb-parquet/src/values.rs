@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use rudb_common::{Error, LogicalType, PhysicalType, Result, time_tz};
+use rudb_common::{Error, LogicalType, PhysicalType, Result, time_tz, uuid};
 use rudb_vector::{Buffer, Data, StringColumn, Validity, Vector};
 
 use crate::chunk::Page;
@@ -235,7 +235,7 @@ impl Page {
                                 .to_string(),
                         ));
                     }
-                    Physical::FixedLenByteArray => decimal_width(column)?,
+                    Physical::FixedLenByteArray => fixed_width(column)?,
                     Physical::Boolean | Physical::ByteArray => {
                         unreachable!("booleans take the fallback and byte arrays their own arm")
                     }
@@ -418,22 +418,72 @@ fn plain(
              not read yet"
                 .to_string(),
         )),
-        Physical::FixedLenByteArray if matches!(column.ty, LogicalType::Decimal { .. }) => {
-            let width = decimal_width(column)?;
+        Physical::FixedLenByteArray => {
+            let width = fixed_width(column)?;
             let wanted = count.checked_mul(width).ok_or_else(|| {
                 Error::io(format!("a page claiming {count} values of {width} bytes each"))
             })?;
             let bytes = tail(body, at)?.get(..wanted).ok_or_else(|| {
                 Error::io(format!("a page needing {wanted} bytes of values with fewer left"))
             })?;
-            narrow(target, count, bytes.chunks_exact(width).map(signed_big_endian), levels, total)
+            let values = bytes.chunks_exact(width);
+            match column.ty {
+                LogicalType::Uuid => {
+                    let held =
+                        values.map(|bytes| uuid::from_bytes(bytes.try_into().unwrap_or_default()));
+                    narrow(target, count, held, levels, total)
+                }
+                // The months and the days are signed and the milliseconds are not, which is how
+                // the pin's reader takes them.
+                LogicalType::Interval => {
+                    let word = |bytes: &[u8], at: usize| {
+                        <[u8; 4]>::try_from(&bytes[at..at + 4]).unwrap_or_default()
+                    };
+                    let dense = values
+                        .map(|bytes| {
+                            let millis = u32::from_le_bytes(word(bytes, 8));
+                            (
+                                i32::from_le_bytes(word(bytes, 0)),
+                                i32::from_le_bytes(word(bytes, 4)),
+                                i64::from(millis) * 1_000,
+                            )
+                        })
+                        .collect();
+                    Ok(Data::Interval(Buffer::from_vec(spread(dense, levels, total))))
+                }
+                _ => narrow(target, count, values.map(signed_big_endian), levels, total),
+            }
         }
-        Physical::FixedLenByteArray => Err(Error::io(
-            "a FIXED_LEN_BYTE_ARRAY column that is not a decimal, which this reader does not \
-             read yet"
-                .to_string(),
-        )),
     }
+}
+
+/// The byte width of a value of a fixed length byte array column, which is sixteen for a `UUID`
+/// and twelve for an `INTERVAL`, the sizes the pin reads them at.
+///
+/// # Errors
+///
+/// For a column of either of those types stored at another width, for a decimal as in
+/// [`decimal_width`], and for a column of any other type, which this reader does not read yet.
+fn fixed_width(column: &SchemaColumn) -> Result<usize> {
+    let (name, width) = match column.ty {
+        LogicalType::Decimal { .. } => return decimal_width(column),
+        LogicalType::Uuid => ("UUID", 16),
+        LogicalType::Interval => ("INTERVAL", 12),
+        _ => {
+            return Err(Error::io(
+                "a FIXED_LEN_BYTE_ARRAY column that is not a decimal, a UUID or an interval, \
+                 which this reader does not read yet"
+                    .to_string(),
+            ));
+        }
+    };
+    if usize::try_from(column.width) != Ok(width) {
+        return Err(Error::io(format!(
+            "a {name} column {} stored in {} bytes a value",
+            column.name, column.width
+        )));
+    }
+    Ok(width)
 }
 
 /// The byte width of a decimal stored as a fixed length byte array, which is at most sixteen

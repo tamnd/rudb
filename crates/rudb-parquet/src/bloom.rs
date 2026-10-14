@@ -94,6 +94,8 @@ pub(crate) struct Stored {
     pub(crate) width: i64,
     /// The unit of a time or a timestamp column, from its logical type or else its converted one.
     pub(crate) unit: Option<Unit>,
+    /// Whether the file says its filters hold each interval normalised.
+    pub(crate) normalized: bool,
 }
 
 /// The physical types a hash depends on.
@@ -147,6 +149,13 @@ pub(crate) fn probe_hashes(value: &Value, stored: Stored) -> Option<Vec<u64>> {
         Value::Decimal { unscaled, .. } if int64 => long(i64::try_from(unscaled).ok()?),
         Value::Uuid(held) if stored.physical == FIXED && stored.width == 16 => {
             vec![xxh64(&uuid::to_bytes(held))]
+        }
+        // An interval is only looked for in a file that says it hashed each one normalised,
+        // since without that a filter misses an interval written in another form.
+        Value::Interval { months, days, micros }
+            if stored.normalized && stored.physical == FIXED && stored.width == 12 =>
+        {
+            vec![crate::write::normalized_hash(months, days, micros)]
         }
         // A time of day is hashed at the unit the file holds, and a `TIME` has no nanoseconds to
         // give a file that holds them.
