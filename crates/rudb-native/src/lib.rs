@@ -13022,6 +13022,29 @@ impl<'a> Cursor<'a> {
         Ok(&held[from..from + len])
     }
 
+    /// The bytes from here that are already in memory, which out of the file is the rest of the
+    /// window and may be none.
+    fn ahead(&self) -> &[u8] {
+        match &self.window {
+            Some(window) => window
+                .held
+                .get(self.at.saturating_sub(window.start)..)
+                .filter(|_| self.at >= window.start)
+                .unwrap_or_default(),
+            None => self.bytes.get(self.at..).unwrap_or_default(),
+        }
+    }
+
+    /// A page's place, length and checksum, twenty bytes read at once.
+    fn page(&mut self) -> Result<Page> {
+        let bytes = self.take(20)?;
+        Ok(Page {
+            offset: u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")),
+            length: u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes")),
+            hash: u64::from_le_bytes(bytes[12..].try_into().expect("eight bytes")),
+        })
+    }
+
     /// Moves over a checked field without reading its payload from a windowed directory.
     fn skip(&mut self, len: usize) -> Result<()> {
         let end = self.at.checked_add(len).ok_or_else(|| invalid("directory offset overflow"))?;
@@ -13669,7 +13692,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         dictionaries.push(match cur.u8()? {
             0 => None,
             tag if tag == dictionary_tag(&field.ty) => {
-                let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+                let page = cur.page()?;
                 let end = page
                     .offset
                     .checked_add(u64::from(page.length))
@@ -13730,10 +13753,12 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         if index.offset < HEADER || end > size || index.length != wanted {
             return Err(invalid("index page range is outside the file"));
         }
+        // Twelve bytes a column, read as one block rather than as two fields for each.
+        let block = cur.take(width * 12)?;
         let mut pages = Vec::with_capacity(width);
-        for _ in 0..width {
-            let offset = cur.u64()?;
-            let length = cur.u32()?;
+        for entry in block.chunks_exact(12) {
+            let offset = u64::from_le_bytes(entry[..8].try_into().expect("eight bytes"));
+            let length = u32::from_le_bytes(entry[8..].try_into().expect("four bytes"));
             let end = offset
                 .checked_add(u64::from(length))
                 .ok_or_else(|| invalid("page offset overflow"))?;
@@ -13747,7 +13772,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             if !coded_type(&field.ty) || dictionaries[column].is_none() {
                 continue;
             }
-            let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+            let page = cur.page()?;
             let end = page
                 .offset
                 .checked_add(u64::from(page.length))
@@ -13768,7 +13793,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 1 => {}
                 _ => return Err(invalid("a sieve page has an unknown tag")),
             }
-            let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+            let page = cur.page()?;
             let end = page
                 .offset
                 .checked_add(u64::from(page.length))
@@ -13785,7 +13810,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
                 1 => {}
                 _ => return Err(invalid("a part range page has an unknown tag")),
             }
-            let page = Page { offset: cur.u64()?, length: cur.u32()?, hash: cur.u64()? };
+            let page = cur.page()?;
             let end = page
                 .offset
                 .checked_add(u64::from(page.length))
@@ -13797,6 +13822,14 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         }
         let mut ranges = Vec::with_capacity(width);
         for column in 0..width {
+            let ty = &fields.get(column).ok_or_else(|| invalid("a stripe range has no column"))?.ty;
+            if let Some((range, used)) = range_in(cur.ahead(), stripe_rows) {
+                cur.at += used;
+                let low = range.low.map(|bound| scaled_as(bound, ty));
+                let high = range.high.map(|bound| scaled_as(bound, ty));
+                ranges.push(Range { low, high, ..range });
+                continue;
+            }
             let low = cur.bound()?;
             let high = cur.bound()?;
             let nulls = cur.u32()? as usize;
@@ -13816,7 +13849,6 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             // is what the power is over. So the type puts it back on the way in and an old file
             // prunes as well as a new one. A file that already wrote the power keeps it, because
             // this leaves anything that is not an integer alone.
-            let ty = &fields.get(column).ok_or_else(|| invalid("a stripe range has no column"))?.ty;
             let low = low.map(|bound| scaled_as(bound, ty));
             let high = high.map(|bound| scaled_as(bound, ty));
             ranges.push(Range { low, high, nulls, exact, sum });
@@ -14385,6 +14417,34 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
         constraints,
         owned,
     })
+}
+
+/// A stripe's range of one column read out of bytes already in memory, and how many it took, as
+/// [`read_directory`] reads one through its cursor.
+///
+/// The ranges are most of a directory, two bounds and three small fields for every column of every
+/// stripe, and through the cursor each field was a call that asked whether it was in the window.
+/// `None` when the bytes run out first or say something the directory refuses, and the cursor then
+/// reads the range itself, to the same range or to the error it has always given.
+fn range_in(bytes: &[u8], rows: usize) -> Option<(Range, usize)> {
+    let mut at = 0;
+    let low = bounds::get(bytes, &mut at).ok()?;
+    let high = bounds::get(bytes, &mut at).ok()?;
+    let nulls = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize;
+    if nulls > rows {
+        return None;
+    }
+    let exact = *bytes.get(at + 4)? != 0;
+    at += 6;
+    let sum = match *bytes.get(at - 1)? {
+        0 => None,
+        1 => {
+            at += 16;
+            Some(i128::from_le_bytes(bytes.get(at - 16..at)?.try_into().ok()?))
+        }
+        _ => return None,
+    };
+    Some((Range { low, high, nulls, exact, sum }, at))
 }
 
 /// How many keys or columns follow, in the key block.
