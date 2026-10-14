@@ -557,6 +557,7 @@ dependencies = [
  "rudb-common",
  "rudb-functions",
  "rudb-kernels",
+ "rudb-parquet",
  "rudb-parse",
  "rudb-pgtypes",
  "rudb-plan",

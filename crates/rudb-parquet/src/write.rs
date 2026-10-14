@@ -205,7 +205,7 @@ impl Layout {
                 }
                 self.schema.push(group(name, repetition, fields.len(), None));
                 let mut shapes = Vec::with_capacity(fields.len());
-                for field in fields {
+                for (at, field) in fields.iter().enumerate() {
                     let place = Place {
                         path: path.clone(),
                         reported_path: reported_path.clone(),
@@ -214,7 +214,7 @@ impl Layout {
                         optional: true,
                         spans,
                     };
-                    shapes.push(self.lay_out(&field.name, &field.ty, place)?);
+                    shapes.push(self.lay_out(&member_name(&field.name, at), &field.ty, place)?);
                 }
                 Ok(Shape::Struct { fields: shapes, def })
             }
@@ -268,6 +268,13 @@ impl Layout {
             }
         }
     }
+}
+
+/// The name a struct's member at `at` is written under, which for a member with no name, as the
+/// members of a row like `(1, 'a')` are, is the name the pin gives the member of a tuple.
+#[must_use]
+pub fn member_name(name: &str, at: usize) -> Cow<'_, str> {
+    if name.is_empty() { Cow::Owned(format!("element{}", at + 1)) } else { Cow::Borrowed(name) }
 }
 
 /// A leaf column of the type `ty` the query gave it, at the levels of a flat column.
@@ -726,6 +733,23 @@ pub struct Writer<W: Write> {
     /// For each leaf, whether a row group has had no bounds, which leaves the file with none.
     unbounded: Vec<bool>,
     limits: Limits,
+    /// The field id of each element of [`Self::schema`], from [`Writer::set_field_ids`].
+    field_ids: Vec<Option<i32>>,
+}
+
+/// The field id `FIELD_IDS` gives a column, with the ones it gives the columns under it.
+///
+/// The element of a list is under it as `element`, and the key and the value of a map as `key`
+/// and `value`, which are the names the pin writes them with. The repeated group between a list or
+/// a map and what it holds has no id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldId {
+    /// The name of the column, which is matched to a column's without regard to case.
+    pub name: String,
+    /// The id, where one was given.
+    pub id: Option<i32>,
+    /// The ids of the columns under it.
+    pub children: Vec<FieldId>,
 }
 
 /// What one column of a file holds over all of its row groups, which is what a `COPY ... TO`
@@ -889,6 +913,7 @@ impl<W: Write> Writer<W> {
             totals,
             unbounded,
             limits: Limits::default(),
+            field_ids: Vec::new(),
         };
         writer.put(b"PAR1")?;
         Ok(writer)
@@ -902,6 +927,39 @@ impl<W: Write> Writer<W> {
     /// Sets how large a dictionary and a data page may grow.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// Gives the columns that `ids` names their field ids, which go in the footer's schema.
+    pub fn set_field_ids(&mut self, ids: &[FieldId]) {
+        self.field_ids = vec![None; self.schema.len()];
+        let mut at = 0;
+        for _ in 0..self.shapes.len() {
+            self.mark(ids, &mut at);
+        }
+    }
+
+    /// Gives the schema element at `at` and the ones under it their ids, where `ids` are the ids
+    /// of it and the columns beside it, and moves `at` past them.
+    fn mark(&mut self, ids: &[FieldId], at: &mut usize) {
+        let (name, mut children, converted) = match &self.schema[*at] {
+            Element::Group { name, children, converted, .. } => (name, *children, *converted),
+            Element::Leaf(column) => (&self.columns[*column].name, 0, None),
+        };
+        let found = ids.iter().find(|id| id.name.eq_ignore_ascii_case(name));
+        self.field_ids[*at] = found.and_then(|id| id.id);
+        *at += 1;
+        // A list and a map hold a repeated group with no id, and the ids under the column are for
+        // what is under that.
+        if converted.is_some()
+            && let Element::Group { children: held, .. } = &self.schema[*at]
+        {
+            children = *held;
+            *at += 1;
+        }
+        let under = found.map_or(&[][..], |id| &id.children);
+        for _ in 0..children {
+            self.mark(under, at);
+        }
     }
 
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
@@ -1263,9 +1321,10 @@ impl<W: Write> Writer<W> {
         root.string(4, "duckdb_schema");
         root.i32(5, self.shapes.len() as i32);
         schema.push(root);
-        for at in &self.schema {
-            schema.push(match at {
-                Element::Leaf(column) => element(&self.columns[*column]),
+        for (at, element_at) in self.schema.iter().enumerate() {
+            let id = self.field_ids.get(at).copied().flatten();
+            schema.push(match element_at {
+                Element::Leaf(column) => element(&self.columns[*column], id),
                 Element::Group { name, repetition, children, converted } => {
                     let mut group = thrift::Writer::default();
                     group.i32(3, *repetition);
@@ -1273,6 +1332,9 @@ impl<W: Write> Writer<W> {
                     group.i32(5, *children as i32);
                     if let Some(converted) = converted {
                         group.i32(6, *converted);
+                    }
+                    if let Some(id) = id {
+                        group.i32(9, id);
                     }
                     group
                 }
@@ -1322,8 +1384,8 @@ fn too_big() -> Error {
     Error::not_implemented("a parquet page of more than 2 GiB")
 }
 
-/// The `SchemaElement` of one column.
-fn element(column: &Column) -> thrift::Writer {
+/// The `SchemaElement` of one column, with its field id if it has one.
+fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
     let mut element = thrift::Writer::default();
     element.i32(1, physical_wire(column.physical));
     if column.physical == Physical::FixedLenByteArray {
@@ -1369,6 +1431,9 @@ fn element(column: &Column) -> thrift::Writer {
     if let LogicalType::Decimal { width, scale } = &column.ty {
         element.i32(7, i32::from(*scale));
         element.i32(8, i32::from(*width));
+    }
+    if let Some(id) = id {
+        element.i32(9, id);
     }
     if let Some((field, inner)) = logical {
         let mut union = thrift::Writer::default();

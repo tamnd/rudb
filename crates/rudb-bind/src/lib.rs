@@ -28,6 +28,7 @@ mod context;
 mod counted;
 mod explain;
 mod expr;
+mod field_ids;
 mod figure;
 pub mod fold;
 mod jsondatum;
