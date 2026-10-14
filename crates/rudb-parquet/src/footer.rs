@@ -256,7 +256,8 @@ impl RawFooter {
                 _ => None,
             };
             let physical = element.int(1).unwrap_or(-1);
-            let stored = Stored { physical, width: element.int(2).unwrap_or(0), unit };
+            let width = element.int(2).unwrap_or(0);
+            let stored = Stored { physical, width, unit, normalized: self.normalized_intervals() };
             Some((leaf, probe_hashes(value, stored)?))
         });
         let Some((leaf, hashes)) = hashes else {
@@ -274,6 +275,15 @@ impl RawFooter {
             excludes.push(ruled_out);
         }
         Ok(excludes)
+    }
+
+    /// Whether the file says its bloom filters hold each interval normalised, the key value pair
+    /// the pin writes beside the filters of an interval column.
+    fn normalized_intervals(&self) -> bool {
+        self.root.items(5).iter().any(|pair| {
+            pair.bytes(1) == Some(b"duckdb.interval_bloom_filter".as_slice())
+                && pair.bytes(2) == Some(b"normalized-v1".as_slice())
+        })
     }
 
     /// The top level columns, each with the first leaf it holds and its own schema element.

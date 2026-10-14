@@ -6,13 +6,17 @@
 //! and every unsigned width carry both the old `converted_type` and the `logicalType` union, a
 //! string is a `BYTE_ARRAY` annotated `UTF8`, a timestamp is at its own unit unless it is in
 //! seconds, which are written as microseconds, a zoned time is the time at UTC, and a decimal is an
-//! `INT32`, an `INT64` or a sixteen byte `FIXED_LEN_BYTE_ARRAY` by its width. So a file written
+//! `INT32`, an `INT64` or a sixteen byte `FIXED_LEN_BYTE_ARRAY` by its width. A `UUID` is its
+//! sixteen bytes and an `INTERVAL` the twelve bytes of its months, days and milliseconds, both as
+//! a `FIXED_LEN_BYTE_ARRAY`. So a file written
 //! here reads back in the pin as the types it was written from, and in this crate's reader too,
 //! with a zoned time at offset zero and a timestamp in seconds or milliseconds as a `TIMESTAMP`.
 //!
 //! The pages are laid out the way the pin lays them out. Each column of a row group is read whole
 //! first and, unless it is a boolean or a sixteen byte decimal, put in a dictionary that takes the
-//! first of each value until there would be more entries than a fifth of the rows. A column that
+//! first of each value until there would be more entries than a fifth of the rows. Two intervals
+//! that compare equal, such as a month and thirty days, are one entry, as they are in the pin's
+//! dictionary, so the later one is written as the first. A column that
 //! fits is written as a plain dictionary page and then version one `PLAIN_DICTIONARY` data pages
 //! of indices, and one that does not, or has no value at all, as version one `PLAIN` pages. An
 //! enum always has a dictionary of every member and `RLE_DICTIONARY` pages. A data page is closed
@@ -39,7 +43,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
-use rudb_common::{Error, Field, LogicalType, Result, Value, time_tz};
+use rudb_common::{Error, Field, LogicalType, Result, Value, time_tz, uuid};
 use rudb_compress::Codec;
 use rudb_vector::Chunk;
 
@@ -303,6 +307,7 @@ fn leaf(name: &str, ty: &LogicalType) -> Result<Column> {
         ) => Bounds::Unsigned,
         (_, LogicalType::Varchar) => Bounds::Text,
         (_, LogicalType::Blob) => Bounds::Bytes,
+        (_, LogicalType::Interval) => Bounds::None,
         _ => Bounds::Signed,
     };
     let members = match ty {
@@ -313,6 +318,11 @@ fn leaf(name: &str, ty: &LogicalType) -> Result<Column> {
         }),
         _ => None,
     };
+    // The pin writes a decimal that takes sixteen bytes without a dictionary, and a `UUID` or an
+    // `INTERVAL` with one.
+    let dictionary = physical != Physical::Boolean
+        && !(physical == Physical::FixedLenByteArray
+            && matches!(stored, LogicalType::Decimal { .. }));
     Ok(Column {
         name: name.to_string(),
         path: vec![name.to_string()],
@@ -325,7 +335,7 @@ fn leaf(name: &str, ty: &LogicalType) -> Result<Column> {
         physical,
         bounds,
         reported: !matches!(ty, LogicalType::Enum(_)),
-        dictionary: !matches!(physical, Physical::Boolean | Physical::FixedLenByteArray),
+        dictionary,
         members,
     })
 }
@@ -531,7 +541,7 @@ impl Walk<'_> {
         } else if state.open {
             let text = column.physical == Physical::ByteArray;
             let bytes = &gathered.plain[begin..];
-            let key = dictionary_key(bytes, column.physical);
+            let key = dictionary_key(value, bytes, column.physical);
             if let Some(&index) = state.entries.get(key.as_ref()) {
                 gathered.indices.push(index);
             } else if state.entries.len() as u64 + 1 > self.most
@@ -543,6 +553,11 @@ impl Walk<'_> {
                 state.entries.insert(key.into_owned(), index);
                 state.page.extend_from_slice(bytes);
                 gathered.hashes.push(xxh64(if text { &bytes[4..] } else { bytes }));
+                // The pin hashes an interval a second time as it is once normalised, which is the
+                // form its own comparisons use.
+                if let Value::Interval { months, days, micros } = value {
+                    gathered.hashes.push(normalized_hash(*months, *days, *micros));
+                }
                 gathered.indices.push(index);
             }
         }
@@ -805,8 +820,7 @@ pub struct ColumnStatistics {
 ///
 /// # Errors
 ///
-/// For a type this writer has no Parquet form for yet, at any depth: a union, `UUID`, `INTERVAL`
-/// and `BIT`.
+/// For a type this writer has no Parquet form for yet, at any depth: a union and `BIT`.
 pub fn storage(ty: &LogicalType) -> Result<LogicalType> {
     Ok(match ty {
         LogicalType::List(element) => LogicalType::List(Box::new(storage(element)?)),
@@ -862,7 +876,9 @@ fn physical(ty: &LogicalType) -> Option<Physical> {
         LogicalType::Varchar | LogicalType::Blob => Physical::ByteArray,
         LogicalType::Decimal { width, .. } if *width <= 9 => Physical::Int32,
         LogicalType::Decimal { width, .. } if *width <= 18 => Physical::Int64,
-        LogicalType::Decimal { .. } => Physical::FixedLenByteArray,
+        LogicalType::Decimal { .. } | LogicalType::Uuid | LogicalType::Interval => {
+            Physical::FixedLenByteArray
+        }
         _ => return None,
     })
 }
@@ -1318,7 +1334,10 @@ impl<W: Write> Writer<W> {
         if matches!(column.physical, Physical::Float | Physical::Double) {
             stats.int(9, written.nans);
         }
-        meta.nested(12, stats);
+        // The pin's interval column has no statistics at all, not even a count of its nulls.
+        if column.ty != LogicalType::Interval {
+            meta.nested(12, stats);
+        }
         let count = |kind: i32, encoding: i32, count: i32| {
             let mut pages = thrift::Writer::default();
             pages.i32(1, kind);
@@ -1427,6 +1446,14 @@ impl<W: Write> Writer<W> {
         footer.list_of_nested(2, schema);
         footer.int(3, self.rows);
         footer.list_of_nested(4, groups);
+        // With bloom filters on, a file with an interval in it says its filters hold the second
+        // hash of each interval, which a reader has to know before it looks for one.
+        if self.limits.bloom.is_some()
+            && self.columns.iter().any(|column| column.ty == LogicalType::Interval)
+        {
+            self.key_values
+                .push((INTERVAL_BLOOM_KEY.to_string(), INTERVAL_BLOOM_VALUE.as_bytes().to_vec()));
+        }
         if !self.key_values.is_empty() {
             let pairs = self
                 .key_values
@@ -1471,7 +1498,8 @@ fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
     let mut element = thrift::Writer::default();
     element.i32(1, physical_wire(column.physical));
     if column.physical == Physical::FixedLenByteArray {
-        element.i32(2, 16);
+        let width = if column.ty == LogicalType::Interval { INTERVAL_BYTES } else { 16 };
+        element.i32(2, width as i32);
     }
     element.i32(3, i32::from(column.optional));
     element.string(4, &column.name);
@@ -1514,6 +1542,8 @@ fn element(column: &Column, id: Option<i32>) -> thrift::Writer {
             decimal.i32(2, i32::from(*width));
             (Some(5), Some((5, decimal)))
         }
+        LogicalType::Uuid => (None, Some((14, thrift::Writer::default()))),
+        LogicalType::Interval => (Some(21), None),
         _ => (None, None),
     };
     if let Some(converted) = converted {
@@ -1572,6 +1602,13 @@ fn plain(value: &Value, column: &Column, out: &mut Vec<u8>, framed: bool) -> Res
             out.extend_from_slice(&(*unscaled as i64).to_le_bytes());
         }
         (Value::Decimal { unscaled, .. }, _) => out.extend_from_slice(&unscaled.to_be_bytes()),
+        (Value::Uuid(held), _) => out.extend_from_slice(&uuid::to_bytes(*held)),
+        (Value::Interval { months, days, micros }, _) => {
+            if *months < 0 || *days < 0 || *micros < 0 {
+                return Err(Error::io("Parquet files do not support negative intervals"));
+            }
+            interval(*months, *days, *micros, out);
+        }
         (other, _) => {
             return Err(Error::internal(format!(
                 "a {} value in the parquet column {} of type {}",
@@ -1582,6 +1619,75 @@ fn plain(value: &Value, column: &Column, out: &mut Vec<u8>, framed: bool) -> Res
         }
     }
     Ok(())
+}
+
+/// The key value pair the pin writes in a file whose bloom filters hold intervals normalised.
+const INTERVAL_BLOOM_KEY: &str = "duckdb.interval_bloom_filter";
+const INTERVAL_BLOOM_VALUE: &str = "normalized-v1";
+
+/// How many bytes an interval takes.
+const INTERVAL_BYTES: usize = 12;
+
+/// Appends the pin's encoding of an interval, which is three unsigned little endian words: the
+/// months, the days with the whole days of the microseconds added, and the milliseconds left over,
+/// with any microseconds under a millisecond dropped.
+fn interval(months: i32, days: i32, micros: i64, out: &mut Vec<u8>) {
+    let days = i64::from(days) + micros / MICROS_PER_DAY;
+    let millis = micros % MICROS_PER_DAY / 1000;
+    out.extend_from_slice(&(months as u32).to_le_bytes());
+    out.extend_from_slice(&(days as u32).to_le_bytes());
+    out.extend_from_slice(&(millis as u32).to_le_bytes());
+}
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// The hash the pin puts in a bloom filter for an interval besides the hash of its bytes, which is
+/// that of the bytes of the interval normalised, and the only one it looks for.
+pub(crate) fn normalized_hash(months: i32, days: i32, micros: i64) -> u64 {
+    let (months, days, micros) = normalized(months, days, micros);
+    let mut bytes = Vec::with_capacity(INTERVAL_BYTES);
+    interval(months, days, micros, &mut bytes);
+    xxh64(&bytes)
+}
+
+/// An interval the way the pin's `interval_t::Normalize` makes it: the whole days of the
+/// microseconds carried into the days and the whole months of the days, thirty days each, into the
+/// months, so that the days and the microseconds are never negative. A field that would not fit in
+/// its type is held at its limit, and what it could not hold is moved to the next field down.
+fn normalized(months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
+    let (months, days, mut micros) = carried(months, days, micros);
+    let mut days_left = days;
+    let months = borrowed(months, &mut days_left, 30);
+    let days = borrowed(days_left, &mut micros, MICROS_PER_DAY);
+    (months, days, micros)
+}
+
+/// The months, days and microseconds of an interval with the carries done, each wide enough to
+/// hold what it was carried.
+fn carried(months: i32, days: i32, micros: i64) -> (i64, i64, i64) {
+    let days = i64::from(days) + micros.div_euclid(MICROS_PER_DAY);
+    let micros = micros.rem_euclid(MICROS_PER_DAY);
+    let months = i64::from(months) + days.div_euclid(30);
+    (months, days.rem_euclid(30), micros)
+}
+
+/// `value` held at the limit of an `i32`, with what it lost moved into `lower` at `scale` of
+/// `lower` each, held at the limit of an `i64` itself, which is the pin's `interval_t::Borrow`.
+fn borrowed(value: i64, lower: &mut i64, scale: i64) -> i32 {
+    let Ok(narrow) = i32::try_from(value) else {
+        let narrow = if value > 0 { i32::MAX } else { i32::MIN };
+        let left = value - i64::from(narrow);
+        let most = i64::MAX / scale - 1;
+        *lower = if left > most {
+            i64::MAX
+        } else if left < -most {
+            i64::MIN
+        } else {
+            *lower + left * scale
+        };
+        return narrow;
+    };
+    narrow
 }
 
 fn byte_array(bytes: &[u8], out: &mut Vec<u8>, framed: bool) {
@@ -1640,6 +1746,9 @@ fn integer(value: &Value) -> i128 {
         | Value::TimestampTzNs(value) => i128::from(*value),
         Value::TimeTz(key) => i128::from(time_tz::at_utc(*key)),
         Value::UBigInt(value) => i128::from(*value),
+        // The stored form of a UUID is signed in the order of its bytes, which is the order the
+        // pin bounds a UUID in.
+        Value::Uuid(held) => *held,
         _ => 0,
     }
 }
@@ -1662,8 +1771,17 @@ fn is_nan(value: &Value) -> bool {
 }
 
 /// The bytes a dictionary tells values apart by, which are their plain encoding, except that
-/// every NaN is one value and so are both zeros, which is how the pin compares floats.
-fn dictionary_key(bytes: &[u8], physical: Physical) -> Cow<'_, [u8]> {
+/// every NaN is one value and so are both zeros, which is how the pin compares floats, and two
+/// intervals are one value when they are once normalised, which is how it compares those.
+fn dictionary_key<'a>(value: &Value, bytes: &'a [u8], physical: Physical) -> Cow<'a, [u8]> {
+    if let Value::Interval { months, days, micros } = value {
+        let (months, days, micros) = carried(*months, *days, *micros);
+        let mut key = Vec::with_capacity(24);
+        for part in [months, days, micros] {
+            key.extend_from_slice(&part.to_le_bytes());
+        }
+        return Cow::Owned(key);
+    }
     match physical {
         Physical::Float => match <[u8; 4]>::try_from(bytes).map(f32::from_le_bytes) {
             Ok(value) if value.is_nan() => Cow::Owned(f32::NAN.to_le_bytes().to_vec()),
@@ -1732,11 +1850,11 @@ fn pages(
 
 #[cfg(test)]
 mod tests {
-    use rudb_common::{Field, LogicalType, Value, time_tz};
+    use rudb_common::{Field, LogicalType, Value, time_tz, uuid};
     use rudb_compress::Codec;
     use rudb_vector::{Chunk, Vector};
 
-    use super::{Limits, Writer};
+    use super::{Limits, Writer, normalized};
     use crate::footer::{MetadataTable, RawFooter};
     use crate::metadata::{Metadata, Physical};
 
@@ -2325,6 +2443,102 @@ mod tests {
                 .iter()
                 .map(|value| value.map_or(Value::Null, |v| Value::Timestamp(micros(v))));
             assert_eq!(read_back(pin, at), values.collect::<Vec<_>>(), "{at} reads back");
+        }
+    }
+
+    fn interval(months: i32, days: i32, micros: i64) -> Value {
+        Value::Interval { months, days, micros }
+    }
+
+    #[test]
+    fn uuids_and_intervals_come_out_as_the_pins_bytes() {
+        // SET TimeZone = 'UTC'; COPY (SELECT CASE WHEN i % 4 = 0 THEN NULL ELSE ('0000000' || (i
+        // % 7) || '-1234-5678-9abc-def012345678')::UUID END AS u, CASE WHEN i % 5 = 0 THEN NULL
+        // WHEN i % 2 = 0 THEN 'f0e1d2c3-b4a5-9687-7869-5a4b3c2d1e0f'::UUID ELSE ('8' || (i % 3) ||
+        // '000000-0000-0000-0000-000000000000')::UUID END AS w, CASE WHEN i % 5 = 0 THEN NULL ELSE
+        // INTERVAL (i) MONTH + INTERVAL (i * 3) DAY + INTERVAL (i * 1234567) MICROSECOND END AS v,
+        // INTERVAL (i % 3) DAY AS d FROM range(20) r(i)) TO 'uuid-interval.parquet' (COMPRESSION
+        // uncompressed), in the pin.
+        let parsed = |text: String| Value::Uuid(uuid::parse(&text).expect("a uuid"));
+        let mut rows: Vec<Vec<Value>> = vec![Vec::new(); 4];
+        for i in 0..20_i32 {
+            let row = [
+                if i % 4 == 0 {
+                    Value::Null
+                } else {
+                    parsed(format!("0000000{}-1234-5678-9abc-def012345678", i % 7))
+                },
+                match i {
+                    _ if i % 5 == 0 => Value::Null,
+                    _ if i % 2 == 0 => parsed("f0e1d2c3-b4a5-9687-7869-5a4b3c2d1e0f".to_string()),
+                    _ => parsed(format!("8{}000000-0000-0000-0000-000000000000", i % 3)),
+                },
+                if i % 5 == 0 { Value::Null } else { interval(i, i * 3, i64::from(i) * 1_234_567) },
+                interval(0, i % 3, 0),
+            ];
+            for (column, value) in rows.iter_mut().zip(row) {
+                column.push(value);
+            }
+        }
+        let types =
+            [LogicalType::Uuid, LogicalType::Uuid, LogicalType::Interval, LogicalType::Interval];
+        let names = ["u", "w", "v", "d"];
+        let fields: Vec<_> =
+            names.iter().zip(&types).map(|(name, ty)| Field::new(*name, ty.clone())).collect();
+        let columns = types.iter().zip(&rows).map(|(ty, values)| column(ty.clone(), values));
+        let bytes = written(&fields, columns.collect(), Codec::Uncompressed, Limits::default());
+        let pin = include_bytes!("../testdata/uuid-interval.parquet");
+        assert!(bytes == pin, "differs from the pin's file");
+        // An interval keeps whole milliseconds only, which is all the format holds.
+        rows[2] = rows[2]
+            .iter()
+            .map(|value| match value {
+                Value::Interval { months, days, micros } => {
+                    interval(*months, *days, micros / 1_000 * 1_000)
+                }
+                other => other.clone(),
+            })
+            .collect();
+        for (at, values) in rows.iter().enumerate() {
+            assert_eq!(&read_back(pin, at), values, "{at} reads back");
+        }
+    }
+
+    #[test]
+    fn intervals_that_compare_equal_share_a_dictionary_entry_as_in_the_pin() {
+        // A month and thirty days are one entry, and so are a day and twenty four hours, so each
+        // pair comes back as the one written first.
+        let values = (0..100)
+            .map(|i| match i % 4 {
+                0 => interval(1, 0, 0),
+                1 => interval(0, 30, 0),
+                2 => interval(0, 1, 0),
+                _ => interval(0, 0, 86_400_000_000),
+            })
+            .collect::<Vec<_>>();
+        let fields = [Field::new("v", LogicalType::Interval)];
+        let columns = vec![column(LogicalType::Interval, &values)];
+        let bytes = written(&fields, columns, Codec::Uncompressed, Limits::default());
+        let expected =
+            (0..100).map(|i| if i % 4 < 2 { interval(1, 0, 0) } else { interval(0, 1, 0) });
+        assert_eq!(read_back(&bytes, 0), expected.collect::<Vec<_>>());
+        // An interval that is out of range once normalised is held the way the pin holds it.
+        assert_eq!(normalized(i32::MAX, 1000, 0), (i32::MAX, 1000, 0));
+        assert_eq!(normalized(0, 31, 86_400_000_001), (1, 2, 1));
+    }
+
+    #[test]
+    fn a_negative_interval_is_the_pins_error() {
+        let fields = [Field::new("v", LogicalType::Interval)];
+        for value in [interval(1, -1, 0), interval(0, 0, -1), interval(-1, 0, 0)] {
+            let mut writer =
+                Writer::new(Vec::new(), &fields, Codec::Uncompressed, PIN).expect("starts");
+            let chunk = Chunk::new(vec![column(LogicalType::Interval, &[value])]).expect("a chunk");
+            let error = writer.write_group(&[chunk]).expect_err("refused");
+            assert_eq!(
+                error.to_string(),
+                "IO Error: Parquet files do not support negative intervals"
+            );
         }
     }
 

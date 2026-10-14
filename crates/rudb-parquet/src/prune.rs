@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use rudb_common::bounds::{End, MICROS, Spread, Zones, kept, scale_of};
 use rudb_common::stat::Provenance;
-use rudb_common::{LogicalType, Stat};
+use rudb_common::{LogicalType, Stat, uuid};
 
 use crate::metadata::{ColumnChunk, Metadata, Physical, RowGroup, SchemaColumn, Unit};
 
@@ -308,8 +308,12 @@ fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
         Physical::Float => Some(Bound::Real(f64::from(f32::from_le_bytes(bytes.try_into().ok()?)))),
         Physical::Double => Some(Bound::Real(f64::from_le_bytes(bytes.try_into().ok()?))),
         Physical::ByteArray => Some(Bound::Bytes(bytes.to_vec())),
-        // An INT96 has no ordering this reader agrees with anybody about, and a fixed length byte
-        // array that is not a decimal is a UUID, which is not read yet.
+        // A UUID is bounded by its bytes, whose order is the order of the number it is held as.
+        Physical::FixedLenByteArray if column.ty == LogicalType::Uuid => {
+            Some(Bound::Int(uuid::from_bytes(bytes.try_into().ok()?)))
+        }
+        // An INT96 has no ordering this reader agrees with anybody about, and an interval has no
+        // bounds in a file the pin writes.
         Physical::Int96 | Physical::FixedLenByteArray => None,
     }
 }
