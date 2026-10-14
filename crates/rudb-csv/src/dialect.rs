@@ -48,7 +48,7 @@ pub struct Dialect {
 /// `(Set By User)` rather than `(Auto-Detected)`, which is why this is carried into the reader
 /// rather than folded into a [`Dialect`] and forgotten.
 ///
-/// The last eight are not punctuation, and they are here because they travel the same road: the
+/// The rest are not punctuation, and they are here because they travel the same road: the
 /// binder works them out from the call to sniff the file with and the executor works them out again
 /// from the plan to read it with, and a second struct beside this one would be a second thing for
 /// the two ends to keep in step.
@@ -124,6 +124,10 @@ pub struct Given {
     /// not have them. It is the first file with a row in it rather than the first file, so the
     /// binder says which one it was.
     pub main: Option<String>,
+    /// How many chunks of [`Given::CHUNK`] rows the sniffer looks at, which is `sample_size` on a
+    /// call rounded up to a whole chunk, the way the pin counts it. `None` is the pin's default of
+    /// ten, and `usize::MAX` is `-1`, which is the whole file.
+    pub sample_chunks: Option<usize>,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.
@@ -159,6 +163,25 @@ impl Given {
     #[must_use]
     pub fn line_limit(&self) -> usize {
         self.max_line.unwrap_or(Self::MAX_LINE)
+    }
+
+    /// How many rows the pin's sniffer reads at a time, which `sample_size` is counted in.
+    pub const CHUNK: usize = 2048;
+
+    /// How many rows the sniffer looks at.
+    #[must_use]
+    pub fn sample(&self) -> usize {
+        self.sample_chunks.map_or(crate::infer::SAMPLE, |chunks| chunks.saturating_mul(Self::CHUNK))
+    }
+
+    /// The `sample_size` the block under a conversion error shows, which is the pin's chunk count
+    /// times the chunk size. For `-1` that product wraps, and what the pin prints is the wrapped
+    /// number.
+    #[must_use]
+    pub fn sample_shown(&self) -> u64 {
+        self.sample_chunks.map_or(crate::infer::SAMPLE as u64, |chunks| {
+            (chunks as u64).wrapping_mul(Self::CHUNK as u64)
+        })
     }
 
     /// How a byte is written in the block under a conversion error, and where it came from.

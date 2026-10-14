@@ -133,6 +133,19 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
                     }
                 });
             }
+            ("sample_size", Value::BigInt(size)) => {
+                given.sample_chunks = Some(match *size {
+                    -1 => usize::MAX,
+                    size if size >= 1 => {
+                        usize::try_from(size).unwrap_or(usize::MAX).div_ceil(Given::CHUNK)
+                    }
+                    _ => {
+                        return Err(Error::binder(
+                            "Unsupported parameter for SAMPLE_SIZE: cannot be smaller than 1",
+                        ));
+                    }
+                });
+            }
             (MAIN_FILE, Value::Varchar(path)) => given.main = Some(path.clone()),
             ("columns", value) => {
                 let (names, types) = csv_columns(value, &mut LogicalType::parse)?;
@@ -677,14 +690,14 @@ fn largest_distincts(reader: &Reader, largest: &mut [Counted]) {
 /// The columns a `read_csv` of `paths` produces, and which of the paths their names came from.
 ///
 /// This is the pin's `CSVSchemaDiscovery`. One file is sniffed for itself. Of several, the first is
-/// sniffed and then the ones after it until the samples come to 20480 lines or `files_to_sniff`
-/// files, ten unless the call said, have been sniffed. A file the sniffer found no rows in has no
-/// say while a later one does: the first file with a row in it gives the names, and every one with
-/// a row after it is folded in by [`rudb_csv::merge`], by position. So a directory of daily exports
-/// where one day happens to hold whole numbers in an otherwise decimal column comes out DOUBLE
-/// whichever day sorted first, as long as that day is among the ones sniffed, and a file after them
-/// is held to the answer by the scan, which names the file the names came from when it does not
-/// fit.
+/// sniffed and then the ones after it until the samples come to as many lines as one sample has,
+/// which is 20480 unless `sample_size` says, or until `files_to_sniff` files, ten unless the call
+/// said, have been sniffed. A file the sniffer found no rows in has no say while a later one does:
+/// the first file with a row in it gives the names, and every one with a row after it is folded in
+/// by [`rudb_csv::merge`], by position. So a directory of daily exports where one day happens to
+/// hold whole numbers in an otherwise decimal column comes out DOUBLE whichever day sorted first,
+/// as long as that day is among the ones sniffed, and a file after them is held to the answer by
+/// the scan, which names the file the names came from when it does not fit.
 ///
 /// When no file sniffed had a row, every column is text unless the call set its type, since there
 /// was nothing to say otherwise.
@@ -693,7 +706,6 @@ fn largest_distincts(reader: &Reader, largest: &mut [Counted]) {
 ///
 /// Everything [`open_csv`] reports, and DuckDB's message when every file sniffed was empty.
 pub fn csv_fields(paths: &[String], given: Given) -> Result<(Vec<Field>, usize)> {
-    const LINES: usize = 2048 * 10;
     let [first, rest @ ..] = paths else {
         return Err(Error::internal("a read_csv with no files"));
     };
@@ -706,7 +718,7 @@ pub fn csv_fields(paths: &[String], given: Given) -> Result<(Vec<Field>, usize)>
     let mut lines = 0;
     let mut rowless = true;
     for (at, path) in paths.iter().enumerate() {
-        if at > 0 && (lines >= LINES || at >= most) {
+        if at > 0 && (lines >= given.sample() || at >= most) {
             break;
         }
         let reader = open_csv(path, given.clone())?;

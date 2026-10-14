@@ -329,6 +329,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    null_padding BOOLEAN\n",
         "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
+        "    sample_size BIGINT\n",
         "    sep VARCHAR\n",
         "    skip BIGINT\n",
         "    types ANY\n",
@@ -342,6 +343,42 @@ fn written(name: &str, text: &str) -> String {
     let path = format!("{}/csv-{name}", env!("CARGO_TARGET_TMPDIR"));
     std::fs::write(&path, text).expect("writes");
     format!("'{path}'")
+}
+
+#[test]
+fn sample_size_is_counted_in_chunks_and_minus_one_reads_the_whole_file() {
+    let database = Database::new();
+    // `x` is on the 2501st line, after the first chunk of 2048 rows and before the second ends.
+    let rows: String = (1..=3000)
+        .map(|n| if n == 2500 { format!("{n},x\n") } else { format!("{n},{n}\n") })
+        .collect();
+    let file = written("sample-chunks.csv", &format!("a,b\n{rows}"));
+    let typed = |options: &str| {
+        let sql = format!("SELECT typeof(b) FROM read_csv({file}{options}) LIMIT 1");
+        database.value(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"))
+    };
+    assert_eq!(typed(""), Value::Varchar("VARCHAR".into()));
+    assert_eq!(typed(", sample_size=2048"), Value::Varchar("BIGINT".into()));
+    assert_eq!(typed(", sample_size=1"), Value::Varchar("BIGINT".into()));
+    assert_eq!(typed(", sample_size=2049"), Value::Varchar("VARCHAR".into()));
+    let sql = format!("SELECT b FROM read_csv({file}, sample_size=2048)");
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().starts_with("CSV Error on Line: 2501\n"), "{error}");
+    assert!(error.message().contains("\n  sample_size = 2048\n"), "{error}");
+    let sql = format!("SELECT * FROM read_csv({file}, sample_size=0)");
+    let error = database.query(&sql).unwrap_err();
+    assert_eq!(error.message(), "Unsupported parameter for SAMPLE_SIZE: cannot be smaller than 1");
+    // Past the first block the sniffer reads, so `-1` has to read on to find the `x`.
+    let rows: String = (1..=200_000)
+        .map(|n| if n == 150_000 { format!("{n},x\n") } else { format!("{n},{n}\n") })
+        .collect();
+    let file = written("sample-whole.csv", &format!("a,b\n{rows}"));
+    let sql = format!("SELECT typeof(b) FROM read_csv({file}, sample_size=-1) LIMIT 1");
+    let result = database.value(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result, Value::Varchar("VARCHAR".into()));
+    let sql = format!("SELECT count(*) FROM read_csv({file}, sample_size=-1)");
+    let result = database.value(&sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+    assert_eq!(result, Value::BigInt(200_000));
 }
 
 #[test]
@@ -603,6 +640,7 @@ fn skip_steps_over_lines_before_the_file_is_sniffed_and_they_still_count() {
     for (options, expected) in [
         ("skip=-1", "skip_rows option from read_csv scanner, must be equal or higher than 0"),
         ("skip=NULL", "\"skip\" expects a non-null integer value"),
+        ("sample_size=NULL", "\"sample_size\" expects a non-null integer value"),
     ] {
         assert_eq!(read(options).unwrap_err(), expected, "{options}");
     }

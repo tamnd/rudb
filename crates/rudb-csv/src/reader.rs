@@ -157,10 +157,21 @@ impl Reader {
         };
         let escape = given.escape.or(quote);
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
-        let rows = reader.sample_rows(&sample)?;
+        let mut rows = reader.sample_rows(&sample)?;
+        let empty = sample.is_empty();
+        drop(sample);
+        // The punctuation comes from the first block, as the pin's comes from its first chunk, and
+        // only the rows go on to more of the file when the sample asks for more than a block held.
+        // A block that came back short was the end of the file, which is nearly every file, so
+        // those are not read again to find that out.
+        let mut more = reader.buffer.len() >= reader.block;
+        while more && rows.len() <= reader.given.sample() {
+            more = reader.grow()?;
+            rows = reader.sample_rows(&reader.buffer)?;
+        }
         let (header, mut fields) = describe(&rows, told, reader.given.types.as_deref());
         reader.sampled = rows.len().saturating_sub(usize::from(header));
-        reader.empty = sample.is_empty();
+        reader.empty = empty;
         if let Some(types) = &reader.given.types {
             let width = rows.iter().map(Vec::len).max().unwrap_or(types.len());
             reader.set_widths(&rows, header, width, types.len())?;
@@ -635,7 +646,7 @@ impl Reader {
             Given::shown(self.given.escape, self.dialect.escape),
             self.dialect.header,
             Given::source(self.given.header.is_some()),
-            infer::SAMPLE,
+            self.given.sample_shown(),
         )
     }
 
@@ -859,6 +870,19 @@ impl Reader {
         Ok(())
     }
 
+    /// Reads as much again as is held onto the end of the buffer, for a sample the first block
+    /// did not hold all of, and says whether the file may have more. Doubling keeps the rows split
+    /// again each time to twice the sample.
+    fn grow(&mut self) -> Result<bool> {
+        let (block, held) = (self.block, self.buffer.len());
+        let asked = held.max(block);
+        self.block = asked;
+        let grown = self.fill(0);
+        self.block = block;
+        grown?;
+        Ok(self.buffer.len() == held + asked)
+    }
+
     /// Whether a field read one record at a time is a null, which is the same test
     /// [`convert::is_null`] makes on a range.
     fn is_null(&self, text: &str) -> bool {
@@ -874,7 +898,7 @@ impl Reader {
         let mut rows = Vec::new();
         let mut fields = Vec::new();
         let mut at = 0;
-        while rows.len() <= infer::SAMPLE {
+        while rows.len() <= self.given.sample() {
             // The end of the block is not the end of the file, so a record the block cut in half is
             // simply not part of the sample.
             let Some(next) = crate::scan::record(sample, at, self.dialect, false, &mut fields)?
