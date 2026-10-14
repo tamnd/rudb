@@ -114,7 +114,10 @@ fn what_this_does_not_write_is_refused_by_name() {
             "COPY (SELECT 1 AS x) TO 'o.parquet' (BOGUS 1)",
             "Unrecognized option \"bogus\" for parquet",
         ),
-        ("COPY (SELECT [1] AS x) TO 'o.parquet'", "type INTEGER[] is not supported yet"),
+        (
+            "COPY (SELECT '00000000-0000-0000-0000-000000000000'::UUID AS x) TO 'o.parquet'",
+            "type UUID is not supported yet",
+        ),
     ] {
         let error = db.execute(sql).expect_err(sql).to_string();
         assert!(error.starts_with("Not implemented Error"), "{sql} gave {error}");
@@ -1043,6 +1046,25 @@ fn return_stats_answers_what_each_parquet_file_holds_as_the_pin_does() {
     let keys = parts.iter().map(|row| row[3].clone()).collect::<Vec<_>>();
     assert_eq!(keys, ["{b=false}", "{b=true}"]);
     assert!(parts[0][2].starts_with("{'\"i\"'=") && !parts[0][2].contains("\"b\""), "{parts:?}");
+    // A nested leaf is named by its path without the repeated groups, and only leaves are named.
+    assert_eq!(
+        stats(
+            "COPY (SELECT * FROM (VALUES ([1,2,NULL], {'a':1,'b':'x'})) t(l, s)) TO \
+             'DIR/n.parquet' (FORMAT parquet, RETURN_STATS)"
+        ),
+        [[
+            "DIR/n.parquet".into(),
+            "1".into(),
+            "{'\"l\".\"element\"'={column_size_bytes=N, max=2, max_is_exact=true, min=1, \
+             min_is_exact=true, null_count=1, num_values=3}, '\"s\".\"a\"'={column_size_bytes=N, \
+             max=1, max_is_exact=true, min=1, min_is_exact=true, null_count=0, num_values=1}, \
+             '\"s\".\"b\"'={column_size_bytes=N, max=x, max_is_exact=true, min=x, \
+             min_is_exact=true, null_count=0, num_values=1}}"
+                .to_string(),
+            "NULL".into(),
+            "{row_group_count=1}".into(),
+        ]]
+    );
     // A column with no values has no bounds and no NaN count.
     assert_eq!(
         stats("COPY (SELECT f FROM s LIMIT 0) TO 'DIR/e.parquet' (RETURN_STATS)"),

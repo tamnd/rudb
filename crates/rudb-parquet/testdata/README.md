@@ -198,3 +198,50 @@ COPY (
 ```
 
 Every column has a bloom filter except `w`, which has too many values for a dictionary. The struct is there for `z` after it. The pin looks up a column's filter by its place among the top-level columns rather than among the leaves, so for `z` it reads the filter of `st.y`, and it answers that 11 is ruled out of both groups and 101 is in both. That is tamnd/duckdb#51, and the answers the tests hold for `z` are the ones its own filter gives.
+
+## nested-list.parquet, nested-struct.parquet, nested-map.parquet and nested-lists.parquet
+
+Written by duckdb v2.0.0-dev84237 (cc7e7bac7f), uncompressed, one column each, for the writer's nested columns. They are small enough that a byte that comes out wrong can be found by reading the file in a hex dump, and between them they hold a null, an empty and a full value of a list, a struct, a map and a list of lists.
+
+```sql
+COPY (SELECT * FROM (VALUES ([1,2,NULL]),([]),(NULL),([3])) t(l)) TO 'nested-list.parquet' (FORMAT parquet, CODEC uncompressed);
+COPY (SELECT * FROM (VALUES ({'a':1,'b':'x'}),(NULL),({'a':NULL,'b':'y'})) t(s)) TO 'nested-struct.parquet' (FORMAT parquet, CODEC uncompressed);
+COPY (SELECT * FROM (VALUES (MAP {1:'a',2:NULL}),(MAP {}),(NULL)) t(m)) TO 'nested-map.parquet' (FORMAT parquet, CODEC uncompressed);
+COPY (SELECT * FROM (VALUES ([[1],NULL,[]]),(NULL),([[2,3]])) t(ll)) TO 'nested-lists.parquet' (FORMAT parquet, CODEC uncompressed);
+```
+
+The pin's footer gives `l.list.element` 6 values and 3 nulls, `s.a` 3 values and 2 nulls, `s.b` 3 values and 1 null, `m.key_value.key` 4 values and 2 nulls, `m.key_value.value` 4 values and 3 nulls, and `ll.list.element.list.element` 6 values and 3 nulls. A null count is not the number of null values a leaf holds. A null struct counts once for every leaf under it, and once more if the struct is itself inside a list.
+
+## nested.parquet
+
+Written by duckdb v2.0.0-dev84237 (cc7e7bac7f), Snappy, 5000 rows in one row group, with dictionaries and bloom filters on every leaf.
+
+```sql
+SET threads = 1;
+COPY (
+  SELECT CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN [] ELSE [i % 4, CASE WHEN i % 3 = 0 THEN NULL ELSE i % 6 END] END AS l,
+         CASE WHEN i % 11 = 0 THEN NULL ELSE {'a': CASE WHEN i % 4 = 0 THEN NULL ELSE i % 9 END, 'b': 'v' || (i % 3)} END AS s,
+         CASE WHEN i % 13 = 0 THEN NULL WHEN i % 6 = 0 THEN MAP {} ELSE MAP {'k' || (i % 3): i % 5} END AS m,
+         (CASE WHEN i % 9 = 0 THEN NULL ELSE [i % 2, i % 3] END)::BIGINT[2] AS a,
+         CASE WHEN i % 17 = 0 THEN NULL ELSE [{'x': i % 3, 'y': CASE WHEN i % 2 = 0 THEN NULL ELSE [i % 5] END}, NULL] END AS ls,
+         (CASE WHEN i % 10 = 0 THEN NULL ELSE {'p': [i % 2], 'q': CASE WHEN i % 8 = 0 THEN NULL ELSE {'r': i % 7} END, 'z': [i % 3, 1]} END)::STRUCT(p BIGINT[], q STRUCT(r BIGINT), z BIGINT[2]) AS sl
+  FROM range(5000) t(i)
+) TO 'nested.parquet' (FORMAT parquet);
+```
+
+The array casts sit outside the `CASE` because the pin cannot build a `CASE` of a fixed size array. Every column has a `CASE` that can make it null, because the pin writes a column that cannot be null as REQUIRED, without definition levels for the top level. A null array still takes an entry for each of its elements, so `a.list.element` has 10000 values. `ls.list.element.x` has 9705 values and 9705 nulls, though 4705 of its values are there, since the null second element of every list is counted once as a null struct and once as a null under a list.
+
+## list-paged.parquet
+
+Written by duckdb v2.0.0-dev84237 (cc7e7bac7f), Snappy, 5000 rows in one row group, for where a data page under a list ends.
+
+```sql
+SET threads = 1;
+COPY (
+  SELECT CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN [] ELSE [i % 4, CASE WHEN i % 3 = 0 THEN NULL ELSE i % 6 END] END AS l,
+         i AS f
+  FROM range(5000) t(i)
+) TO 'list-paged.parquet' (FORMAT parquet, DATA_PAGE_SIZE_LIMIT 1000);
+```
+
+The pin keeps the values of the 2048 rows it hands a list writer at once on one page, so `l` only gets a new page at the first entry of such a block, while `f` gets one every time its values reach the limit.
