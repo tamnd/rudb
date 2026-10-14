@@ -9,9 +9,9 @@
 //!
 //! Everything in here is the footer and nothing in here is data. The structures are the ones
 //! `parquet.thrift` defines, narrowed to the fields a reader uses, and a field this version does
-//! not read is skipped rather than rejected. The one place that is not conservative is the schema:
-//! a nested schema is an error with a name on it rather than a flat schema that quietly loses a
-//! level, because a repetition level this reader ignored would be a wrong answer and not a missing
+//! not read is skipped rather than rejected. A column below the root that is a group, or that is
+//! repeated, is read as the tree it is, with the definition and repetition levels of every node
+//! worked out here, because a level the reader got wrong would be a wrong answer and not a missing
 //! feature.
 //!
 //! Sizes are read as the file states them and not trusted. An offset out of the file, a negative
@@ -19,6 +19,8 @@
 //! and each one is checked where it is used rather than assumed away here.
 
 use std::fmt::Write as _;
+use std::ops::Range;
+use std::sync::Arc;
 
 use rudb_common::bounds::End;
 use rudb_common::{Error, Field, LogicalType, Result};
@@ -147,10 +149,11 @@ impl Encoding {
     }
 }
 
-/// One column of a flat schema.
+/// One column of the schema, which is one child of its root.
 ///
-/// The name is the leaf's name, which for a flat schema is the column's name, and the reader
-/// rejects anything deeper than flat, so there is no path here and no repetition level.
+/// For a leaf that is the column the file stores. For a group, or a leaf the file repeats, it is
+/// the tree in [`SchemaColumn::nested`], and the physical type is the first leaf's, which nothing
+/// decodes by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaColumn {
     /// What the column is called.
@@ -163,6 +166,75 @@ pub struct SchemaColumn {
     pub optional: bool,
     /// The declared length, for `FIXED_LEN_BYTE_ARRAY` and zero for everything else.
     pub width: i32,
+    /// How the column is put together out of the leaves that store it, when it is not one of them.
+    pub nested: Option<Arc<Nested>>,
+}
+
+/// A column that is stored in leaves below it, and the levels that say how they fit together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nested {
+    /// The column itself.
+    pub root: Node,
+    /// The leaves, in the order the file stores them.
+    pub leaves: Vec<Leaf>,
+}
+
+/// One leaf of a nested column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Leaf {
+    /// The leaf as a flat column, which is what its pages are decoded as.
+    pub column: SchemaColumn,
+    /// The names from the column down to the leaf, which is what a column chunk is matched by.
+    pub path: Vec<String>,
+    /// The definition level of a value that is there.
+    pub max_def: u32,
+    /// The repetition level of a value that is not the first of the innermost list it is in.
+    pub max_rep: u32,
+}
+
+/// One node of a nested column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    /// The definition level at which this node is there, which is its parent's when it is required.
+    pub def: u32,
+    /// The repetition level of the innermost list this node is in, which is zero outside of one.
+    ///
+    /// A level after this node's first that is above this one belongs to this node still. That is
+    /// how DuckDB writes a fixed size array that is null, with an entry for every element of it.
+    pub rep: u32,
+    /// Which of [`Nested::leaves`] are below this node.
+    pub leaves: Range<usize>,
+    /// What the node is.
+    pub shape: Shape,
+}
+
+/// What a node of a nested column is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shape {
+    /// The leaf at this place in [`Nested::leaves`].
+    Leaf(usize),
+    /// A struct, with a node per field.
+    Struct(Vec<Node>),
+    /// A list, which holds an element at definition level `def` and repeats at level `rep`.
+    List {
+        /// The definition level at which the list is there and not empty.
+        def: u32,
+        /// The repetition level of every element after the first.
+        rep: u32,
+        /// The element.
+        element: Box<Node>,
+    },
+    /// A map, which is a list whose element is a key and a value.
+    Map {
+        /// The definition level at which the map is there and not empty.
+        def: u32,
+        /// The repetition level of every entry after the first.
+        rep: u32,
+        /// The key.
+        key: Box<Node>,
+        /// The value.
+        value: Box<Node>,
+    },
 }
 
 /// What a writer said about the values in one column chunk.
@@ -270,6 +342,12 @@ pub struct ColumnChunk {
     /// Bounds without offsets are not actionable. The column index says page four cannot hold a
     /// matching row, and this is what says where page four starts and which row it starts at.
     pub offset_index: Option<Region>,
+    /// The chunk of every leaf of a nested column, in the order of [`Nested::leaves`].
+    ///
+    /// Empty for a flat column. For a nested one the sizes above are the sum of these, the place is
+    /// the first leaf's and there are no statistics, since a bound on a leaf is not a bound on the
+    /// column it is in.
+    pub leaves: Vec<ColumnChunk>,
 }
 
 /// A stretch of the file to read, as the footer describes it.
@@ -446,20 +524,32 @@ struct RawChunk {
 }
 
 /// Matches every chunk of a row group to the schema column it belongs to.
+///
+/// The chunks of a nested column's leaves become one chunk for the column, holding them.
 fn resolve(group: RawGroup, schema: &[SchemaColumn]) -> Result<RowGroup> {
     let mut columns = Vec::with_capacity(group.columns.len());
+    let mut leaves: Vec<Vec<Option<ColumnChunk>>> = schema
+        .iter()
+        .map(|column| {
+            column.nested.as_ref().map_or(Vec::new(), |nested| vec![None; nested.leaves.len()])
+        })
+        .collect();
     for chunk in group.columns {
-        let [name] = &chunk.path[..] else {
-            return Err(Error::not_implemented(format!(
-                "a parquet column at path {}, which is nested",
+        let place = schema.iter().enumerate().find_map(|(at, column)| match &column.nested {
+            None => (chunk.path.len() == 1 && column.name == chunk.path[0]).then_some((at, None)),
+            Some(nested) => nested
+                .leaves
+                .iter()
+                .position(|leaf| leaf.path == chunk.path)
+                .map(|leaf| (at, Some(leaf))),
+        });
+        let Some((column, leaf)) = place else {
+            return Err(Error::io(format!(
+                "a column chunk for {}, which is not a column",
                 chunk.path.join(".")
             )));
         };
-        let column =
-            schema.iter().position(|candidate| &candidate.name == name).ok_or_else(|| {
-                Error::io(format!("a column chunk for {name}, which is not a column"))
-            })?;
-        columns.push(ColumnChunk {
+        let resolved = ColumnChunk {
             column,
             physical: chunk.physical,
             compression: chunk.compression,
@@ -472,45 +562,250 @@ fn resolve(group: RawGroup, schema: &[SchemaColumn]) -> Result<RowGroup> {
             stats: chunk.stats,
             column_index: chunk.column_index,
             offset_index: chunk.offset_index,
-        });
+            leaves: Vec::new(),
+        };
+        match leaf {
+            None => columns.push(resolved),
+            Some(leaf) => leaves[column][leaf] = Some(resolved),
+        }
     }
+    for (column, parts) in leaves.into_iter().enumerate() {
+        if parts.is_empty() {
+            continue;
+        }
+        let parts = parts.into_iter().collect::<Option<Vec<ColumnChunk>>>().ok_or_else(|| {
+            Error::io(format!("a row group missing a leaf of column {}", schema[column].name))
+        })?;
+        columns.push(combined(column, parts));
+    }
+    columns.sort_by_key(|chunk| chunk.column);
     Ok(RowGroup { columns, rows: group.rows, bytes: group.bytes })
+}
+
+/// The chunk of a nested column, out of the chunks of its leaves.
+fn combined(column: usize, leaves: Vec<ColumnChunk>) -> ColumnChunk {
+    let first = &leaves[0];
+    let mut encodings = Vec::new();
+    for leaf in &leaves {
+        for encoding in &leaf.encodings {
+            if !encodings.contains(encoding) {
+                encodings.push(*encoding);
+            }
+        }
+    }
+    ColumnChunk {
+        column,
+        physical: first.physical,
+        compression: first.compression,
+        encodings,
+        values: leaves.iter().map(|leaf| leaf.values).sum(),
+        compressed_size: leaves.iter().map(|leaf| leaf.compressed_size).sum(),
+        uncompressed_size: leaves.iter().map(|leaf| leaf.uncompressed_size).sum(),
+        data_page_offset: first.data_page_offset,
+        dictionary_page_offset: first.dictionary_page_offset,
+        stats: None,
+        column_index: None,
+        offset_index: None,
+        leaves,
+    }
 }
 
 /// Reads the `schema` list, which is a tree written as a preorder walk.
 ///
 /// The first element is the root and it is not a column. Every element after it carries how many
-/// children it has, and a flat schema is one where the root's children all have none. This reader
-/// requires that, so a group below the root is an error naming the column it came from rather than
-/// a column list that is silently wrong.
+/// children it has. A child of the root with none, which the file does not repeat, is a flat
+/// column, and any other child of the root is the tree below it.
 fn read_schema(reader: &mut Reader<'_>) -> Result<Vec<SchemaColumn>> {
     let (len, kind) = reader.list_begin()?;
     expect(kind, Kind::Struct, "the schema")?;
+    let mut elements = Vec::with_capacity(len);
+    for _ in 0..len {
+        elements.push(read_schema_element(reader)?);
+    }
     let mut columns = Vec::with_capacity(len.saturating_sub(1));
-    for at in 0..len {
-        let element = read_schema_element(reader)?;
-        if at == 0 {
+    let mut at = 1;
+    while at < elements.len() {
+        let element = &elements[at];
+        if element.children == 0 && element.repetition != REPEATED {
+            let physical = element.physical.ok_or_else(|| {
+                Error::io(format!("a leaf column named {} with no type", element.name))
+            })?;
+            let ty = logical_type(physical, element)?;
+            columns.push(SchemaColumn {
+                name: element.name.clone(),
+                physical,
+                ty,
+                optional: element.repetition != 0,
+                width: element.width,
+                nested: None,
+            });
+            at += 1;
             continue;
         }
-        if element.children != 0 {
-            return Err(Error::not_implemented(format!(
-                "a parquet group column named {}, which is a nested schema",
-                element.name
-            )));
-        }
-        let physical = element.physical.ok_or_else(|| {
-            Error::io(format!("a leaf column named {} with no type", element.name))
-        })?;
-        let ty = logical_type(physical, &element)?;
+        let mut tree = Tree { elements: &elements, at, path: Vec::new(), leaves: Vec::new() };
+        let (name, ty, root) = tree.field(0, 0)?;
+        at = tree.at;
+        let leaves = tree.leaves;
+        let physical = leaves
+            .first()
+            .ok_or_else(|| Error::io(format!("a group column named {name} with no leaves")))?
+            .column
+            .physical;
         columns.push(SchemaColumn {
-            name: element.name,
+            name,
             physical,
             ty,
-            optional: element.repetition != 0,
-            width: element.width,
+            optional: element.repetition == OPTIONAL,
+            width: 0,
+            nested: Some(Arc::new(Nested { root, leaves })),
         });
     }
     Ok(columns)
+}
+
+/// `OPTIONAL` in the schema's `repetition_type`.
+const OPTIONAL: i64 = 1;
+
+/// `REPEATED` in the schema's `repetition_type`.
+const REPEATED: i64 = 2;
+
+/// The walk that turns the elements below one child of the root into a [`Nested`].
+struct Tree<'a> {
+    elements: &'a [SchemaElement],
+    at: usize,
+    path: Vec<String>,
+    leaves: Vec<Leaf>,
+}
+
+impl Tree<'_> {
+    /// The next element, as a field whose parent is there at level `def` inside lists at `rep`.
+    ///
+    /// A repeated element is a list of itself, which is how a file that does not use the `LIST`
+    /// annotation writes one. Anything else is there at its parent's level, or one above that when
+    /// it is optional.
+    fn field(&mut self, def: u32, rep: u32) -> Result<(String, LogicalType, Node)> {
+        let element = self.next()?;
+        let repetition = self.elements[element].repetition;
+        if repetition == REPEATED {
+            let first = self.leaves.len();
+            let (name, ty, inner) = self.body(element, def + 1, rep + 1)?;
+            let shape = Shape::List { def: def + 1, rep: rep + 1, element: Box::new(inner) };
+            let node = Node { def, rep, leaves: first..self.leaves.len(), shape };
+            return Ok((name, LogicalType::List(Box::new(ty)), node));
+        }
+        let own = if repetition == OPTIONAL { def + 1 } else { def };
+        self.body(element, own, rep)
+    }
+
+    /// Steps to the next element and says where it is.
+    fn next(&mut self) -> Result<usize> {
+        if self.at >= self.elements.len() {
+            return Err(Error::io("a parquet schema with fewer elements than it says it has"));
+        }
+        self.at += 1;
+        Ok(self.at - 1)
+    }
+
+    /// The node for the element at `element`, which is there at level `def` inside lists at `rep`.
+    fn body(&mut self, element: usize, def: u32, rep: u32) -> Result<(String, LogicalType, Node)> {
+        let first = self.leaves.len();
+        let elements = self.elements;
+        let element = &elements[element];
+        self.path.push(element.name.clone());
+        let (ty, shape) = if element.children <= 0 {
+            let physical = element.physical.ok_or_else(|| {
+                Error::io(format!("a leaf column named {} with no type", element.name))
+            })?;
+            let ty = logical_type(physical, element)?;
+            let column = SchemaColumn {
+                name: self.path.join("."),
+                physical,
+                ty: ty.clone(),
+                optional: def > 0,
+                width: element.width,
+                nested: None,
+            };
+            self.leaves.push(Leaf { column, path: self.path.clone(), max_def: def, max_rep: rep });
+            (ty, Shape::Leaf(first))
+        } else if is_list(element) {
+            self.list(element, def, rep)?
+        } else if is_map(element) {
+            self.map(element, def, rep)?
+        } else {
+            let mut fields = Vec::new();
+            let mut nodes = Vec::new();
+            for _ in 0..element.children {
+                let (name, ty, node) = self.field(def, rep)?;
+                fields.push(Field::new(name, ty));
+                nodes.push(node);
+            }
+            (LogicalType::Struct(fields), Shape::Struct(nodes))
+        };
+        self.path.pop();
+        let node = Node { def, rep, leaves: first..self.leaves.len(), shape };
+        Ok((element.name.clone(), ty, node))
+    }
+
+    /// A group annotated as a list, whose one child is the repeated group.
+    ///
+    /// That child holds the element when it is a group of one, which is the three level form every
+    /// current writer uses. Otherwise the child is the element itself, which is the two level form
+    /// older writers left behind.
+    fn list(&mut self, list: &SchemaElement, def: u32, rep: u32) -> Result<(LogicalType, Shape)> {
+        let repeated = self.repeated(list)?;
+        let (ty, element) = if self.elements[repeated].children == 1 {
+            self.path.push(self.elements[repeated].name.clone());
+            let (_, ty, element) = self.field(def + 1, rep + 1)?;
+            self.path.pop();
+            (ty, element)
+        } else {
+            let (_, ty, element) = self.body(repeated, def + 1, rep + 1)?;
+            (ty, element)
+        };
+        let shape = Shape::List { def: def + 1, rep: rep + 1, element: Box::new(element) };
+        Ok((LogicalType::List(Box::new(ty)), shape))
+    }
+
+    /// A group annotated as a map, whose one child is the repeated group of a key and a value.
+    fn map(&mut self, map: &SchemaElement, def: u32, rep: u32) -> Result<(LogicalType, Shape)> {
+        let repeated = self.repeated(map)?;
+        if self.elements[repeated].children != 2 {
+            return Err(Error::not_implemented(format!(
+                "a parquet map named {} whose entries are not a key and a value",
+                map.name
+            )));
+        }
+        self.path.push(self.elements[repeated].name.clone());
+        let (_, key_ty, key) = self.field(def + 1, rep + 1)?;
+        let (_, value_ty, value) = self.field(def + 1, rep + 1)?;
+        self.path.pop();
+        let shape =
+            Shape::Map { def: def + 1, rep: rep + 1, key: Box::new(key), value: Box::new(value) };
+        Ok((LogicalType::Map(Box::new(key_ty), Box::new(value_ty)), shape))
+    }
+
+    /// The one repeated child of a list or a map, stepped past.
+    fn repeated(&mut self, group: &SchemaElement) -> Result<usize> {
+        let child = self.next()?;
+        if group.children != 1 || self.elements[child].repetition != REPEATED {
+            return Err(Error::not_implemented(format!(
+                "a parquet {} named {} that is not one repeated group",
+                if is_map(group) { "map" } else { "list" },
+                group.name
+            )));
+        }
+        Ok(child)
+    }
+}
+
+/// Whether a group is annotated as a list.
+fn is_list(element: &SchemaElement) -> bool {
+    matches!(element.logical, Some(Logical::List)) || element.converted == Some(3)
+}
+
+/// Whether a group is annotated as a map, which old writers spelled `MAP_KEY_VALUE`.
+fn is_map(element: &SchemaElement) -> bool {
+    matches!(element.logical, Some(Logical::Map)) || matches!(element.converted, Some(1 | 2))
 }
 
 /// One element of the schema list, with the annotations still separate.
@@ -550,6 +845,10 @@ enum Logical {
     Timestamp(Unit, bool),
     /// `INTEGER`, with a width and a sign, which is how the newer files spell `UINT_32`.
     Integer(i8, bool),
+    /// `LIST`, on a group.
+    List,
+    /// `MAP`, on a group.
+    Map,
 }
 
 /// The resolution of a time or a timestamp.
@@ -594,6 +893,14 @@ fn read_logical_type(reader: &mut Reader<'_>) -> Result<Option<Logical>> {
             1 => {
                 reader.skip(field.kind)?;
                 logical = Some(Logical::String);
+            }
+            2 => {
+                reader.skip(field.kind)?;
+                logical = Some(Logical::Map);
+            }
+            3 => {
+                reader.skip(field.kind)?;
+                logical = Some(Logical::List);
             }
             4 => {
                 reader.skip(field.kind)?;
@@ -719,6 +1026,12 @@ fn from_logical(
         Logical::Time(_) => LogicalType::Time,
         Logical::Timestamp(unit, utc) => timestamp(unit, utc),
         Logical::Integer(width, signed) => integer(width, signed, physical)?,
+        Logical::List | Logical::Map => {
+            return Err(Error::io(format!(
+                "a leaf column named {} annotated as a list or a map",
+                element.name
+            )));
+        }
     })
 }
 

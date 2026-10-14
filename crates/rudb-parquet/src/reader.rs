@@ -80,6 +80,7 @@ use rudb_compress::Codec;
 use rudb_io::File;
 use rudb_vector::{Chunk, VECTOR_SIZE, Vector};
 
+use crate::assemble::{Part, assemble};
 use crate::chunk::Pages;
 use crate::metadata::{Metadata, SchemaColumn};
 use crate::page::Body;
@@ -367,7 +368,7 @@ impl Reader {
     /// # Errors
     ///
     /// If the file is not Parquet, or its footer does not parse, or its schema is one this crate
-    /// refuses, which today means a nested one.
+    /// refuses.
     pub fn open(file: Box<dyn File>) -> Result<Self> {
         let file: Arc<dyn File> = Arc::from(file);
         let metadata = Metadata::read(file.as_ref())?;
@@ -504,6 +505,11 @@ impl Reader {
         }
         let mut total = 0u64;
         for chunk in self.locate(self.group)? {
+            if !chunk.parts.is_empty() {
+                // A nested column is read whole wherever a piece starts.
+                total = total.saturating_add(chunk.len as u64);
+                continue;
+            }
             let mut cursor = self.read_column(&chunk);
             total = total.saturating_add(cursor.first_page(self.file.as_ref())?);
         }
@@ -863,6 +869,20 @@ impl Reader {
             let len = usize::try_from(chunk.compressed_size).map_err(|_| {
                 Error::io(format!("a column chunk of {} bytes", chunk.compressed_size))
             })?;
+            let mut parts = Vec::with_capacity(chunk.leaves.len());
+            for leaf in &chunk.leaves {
+                let len = usize::try_from(leaf.compressed_size).map_err(|_| {
+                    Error::io(format!("a column chunk of {} bytes", leaf.compressed_size))
+                })?;
+                parts.push(Part {
+                    start: leaf.start(),
+                    len,
+                    codec: leaf.compression,
+                    values: leaf.values,
+                });
+            }
+            let rows = usize::try_from(group.rows)
+                .map_err(|_| Error::io(format!("a row group of {} rows", group.rows)))?;
             plan.push(Where {
                 group: at,
                 column: wanted,
@@ -870,6 +890,8 @@ impl Reader {
                 len,
                 codec: chunk.compression,
                 values: chunk.values,
+                parts,
+                rows,
             });
         }
         Ok(plan)
@@ -888,14 +910,18 @@ impl Reader {
             group: chunk.group,
             column: chunk.column,
         };
-        Cursor::new(
+        let mut cursor = Cursor::new(
             chunk.start,
             chunk.len,
             chunk.codec,
             chunk.values,
             self.metadata.schema[chunk.column].clone(),
             Some(cached),
-        )
+        );
+        if !chunk.parts.is_empty() {
+            cursor.parts = Some((chunk.parts.clone(), chunk.rows));
+        }
+        cursor
     }
 }
 
@@ -946,6 +972,10 @@ struct Where {
     len: usize,
     codec: Codec,
     values: i64,
+    /// The chunk of every leaf, for a nested column, and empty for a flat one.
+    parts: Vec<Part>,
+    /// How many rows the row group holds.
+    rows: usize,
 }
 
 /// One column's decoded pages, and how far into them the reader has got.
@@ -994,6 +1024,11 @@ struct Cursor {
     /// stays empty on a column of strings that is not dictionary encoded, and `arena.rs` is what
     /// gets a run back to that column.
     spare: Vec<u8>,
+    /// The leaves of a nested column and the rows of its row group, until they are put together.
+    ///
+    /// A nested column is read whole, the first time anything is asked of it, and is one page from
+    /// then on.
+    parts: Option<(Vec<Part>, usize)>,
 }
 
 impl Cursor {
@@ -1021,6 +1056,7 @@ impl Cursor {
             row: 0,
             bytes_read: 0,
             spare: Vec::new(),
+            parts: None,
         }
     }
 
@@ -1039,6 +1075,7 @@ impl Cursor {
                 ty: LogicalType::Integer,
                 optional: false,
                 width: 0,
+                nested: None,
             },
             dictionary: None,
             cached: None,
@@ -1048,6 +1085,7 @@ impl Cursor {
             row: 0,
             bytes_read: 0,
             spare: Vec::new(),
+            parts: None,
         }
     }
 
@@ -1056,6 +1094,10 @@ impl Cursor {
     /// Zero when the column has no pages left, which the caller turns into an error, because a
     /// column that runs out before the row group does is a column shorter than the one beside it.
     fn left(&mut self, file: Option<&dyn File>) -> Result<usize> {
+        if self.parts.is_some() {
+            let file = file.ok_or_else(|| Error::internal("a nested column with no file"))?;
+            self.assemble(file)?;
+        }
         while self.page.as_ref().is_none_or(|page| self.offset >= page.len()) {
             self.page = None;
             self.offset = 0;
@@ -1157,6 +1199,11 @@ impl Cursor {
     /// The dictionary page is the one page that cannot be stepped over, because every data page
     /// after it is written in terms of it.
     fn seek(&mut self, file: &dyn File, target: usize) -> Result<()> {
+        if self.parts.is_some() {
+            self.assemble(file)?;
+            self.offset = target;
+            return Ok(());
+        }
         while self.row < target {
             let (prefix, header, _, total) = self.peek(file)?;
             if matches!(header.body, Body::Index) {
@@ -1266,6 +1313,13 @@ impl Cursor {
     /// the wrong shape for anything large. That is deliberate. This is for the handful of rows a
     /// `LIMIT` left standing, and a caller with a lot of rows to pick should be scanning.
     fn pick(&mut self, file: &dyn File, wanted: &[usize]) -> Result<Vec<Value>> {
+        if self.parts.is_some() {
+            self.assemble(file)?;
+            let page = self.page.as_ref().ok_or_else(|| Error::internal("a nested page"))?;
+            let indices: Vec<u32> =
+                wanted.iter().map(|&at| u32::try_from(at).unwrap_or(u32::MAX)).collect();
+            return Ok(page.gather(&indices)?.iter().collect());
+        }
         let mut out = Vec::with_capacity(wanted.len());
         let mut next = 0;
         while next < wanted.len() {
@@ -1310,6 +1364,25 @@ impl Cursor {
             self.left -= i64::from(header.values());
         }
         Ok(out)
+    }
+
+    /// Puts a nested column together out of its leaves, as the one page the cursor holds.
+    fn assemble(&mut self, file: &dyn File) -> Result<()> {
+        let Some((parts, rows)) = self.parts.take() else { return Ok(()) };
+        let nested = self
+            .column
+            .nested
+            .clone()
+            .ok_or_else(|| Error::internal("leaves for a column that is not nested"))?;
+        let timing = Timing::start(Stage::Decode);
+        let built = assemble(file, &nested, &self.column.ty, &parts, rows);
+        timing.stop(0);
+        let (page, read) = built?;
+        self.bytes_read = self.bytes_read.saturating_add(read);
+        self.page = Some(page);
+        self.offset = 0;
+        self.left = 0;
+        Ok(())
     }
 
     /// Reads exactly one encoded page, discovering its variable-width header with bounded probes.

@@ -229,7 +229,7 @@ COPY (
 ) TO 'nested.parquet' (FORMAT parquet);
 ```
 
-The array casts sit outside the `CASE` because the pin cannot build a `CASE` of a fixed size array. Every column has a `CASE` that can make it null, because the pin writes a column that cannot be null as REQUIRED, without definition levels for the top level. A null array still takes an entry for each of its elements, so `a.list.element` has 10000 values. `ls.list.element.x` has 9705 values and 9705 nulls, though 4705 of its values are there, since the null second element of every list is counted once as a null struct and once as a null under a list.
+The array casts sit outside the `CASE` because the pin cannot build a `CASE` of a fixed size array. Every column has a `CASE` that can make it null, because the pin writes a column that cannot be null as REQUIRED, without definition levels for the top level. A null array still takes an entry for each of its elements, so `a.list.element` has 10000 values. `ls.list.element.x` has 9705 values and 9705 nulls, though 4705 of its values are there, since the null second element of every list is counted once as a null struct and once as a null under a list. The pin reads `a` and `sl.z` back as `BIGINT[]`, since the file stores a fixed size array as a list, and reads a null array as NULL rather than as the elements it was written with.
 
 ## list-paged.parquet
 

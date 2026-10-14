@@ -1844,8 +1844,7 @@ mod tests {
 
     #[test]
     fn nested_columns_come_out_as_the_pins_bytes() {
-        // The four files of the README's nested section, which the pin wrote uncompressed. They
-        // are not read back, since the reader does not take a nested schema yet.
+        // The four files of the README's nested section, which the pin wrote uncompressed.
         let int = LogicalType::Integer;
         let text = LogicalType::Varchar;
         let ints = LogicalType::List(Box::new(int.clone()));
@@ -1911,7 +1910,17 @@ mod tests {
             let bytes =
                 written(&fields, vec![column(ty, &values)], Codec::Uncompressed, Limits::default());
             assert!(bytes == pin, "{name} differs from the pin's file");
+            assert_eq!(read_back(pin, 0), values, "{name} reads back");
         }
+    }
+
+    /// Column `at` of every row of a file, read back.
+    fn read_back(bytes: &[u8], at: usize) -> Vec<Value> {
+        let chunks = crate::reader::read(Box::new(Memory(bytes.to_vec()))).expect("reads");
+        chunks
+            .iter()
+            .flat_map(|chunk| (0..chunk.len()).map(|row| chunk.value_at(row, at)))
+            .collect()
     }
 
     #[test]
@@ -1977,10 +1986,11 @@ mod tests {
         let columns =
             types.iter().zip(&values).map(|(ty, values)| column(ty.clone(), values)).collect();
         let bytes = written(&fields, columns, Codec::Snappy, Limits::default());
-        assert!(
-            bytes == include_bytes!("../testdata/nested.parquet"),
-            "differs from the pin's file"
-        );
+        let pin = include_bytes!("../testdata/nested.parquet");
+        assert!(bytes == pin, "differs from the pin's file");
+        for (at, values) in values.iter().enumerate() {
+            assert!(read_back(pin, at) == *values, "{} reads back", names[at]);
+        }
     }
 
     #[test]
@@ -2004,10 +2014,10 @@ mod tests {
         let limits = Limits { data_page: 1000, ..Default::default() };
         let bytes =
             written(&fields, vec![column(bigs, &l), column(big, &f)], Codec::Snappy, limits);
-        assert!(
-            bytes == include_bytes!("../testdata/list-paged.parquet"),
-            "differs from the pin's file"
-        );
+        let pin = include_bytes!("../testdata/list-paged.parquet");
+        assert!(bytes == pin, "differs from the pin's file");
+        assert!(read_back(pin, 0) == l, "the list reads back");
+        assert!(read_back(pin, 1) == f, "the column after it reads back");
     }
 
     /// A file held in memory, for reading a written file back.

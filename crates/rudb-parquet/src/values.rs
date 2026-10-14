@@ -32,7 +32,7 @@ use rudb_vector::{Buffer, Data, StringColumn, Validity, Vector};
 
 use crate::chunk::Page;
 use crate::hybrid::Hybrid;
-use crate::metadata::{Encoding, Physical, SchemaColumn};
+use crate::metadata::{Encoding, Leaf, Physical, SchemaColumn};
 use crate::page::Body;
 
 impl Page {
@@ -65,22 +65,66 @@ impl Page {
         column: &SchemaColumn,
         dictionary: Option<&Arc<Vector>>,
     ) -> Result<Vector> {
-        let encoding = match &self.header.body {
-            Body::DataV1(page) => page.encoding,
-            Body::DataV2(page) => page.encoding,
-            Body::Dictionary(_) | Body::Index => {
-                return Err(Error::io(
-                    "values were asked of a page that holds no rows".to_string(),
-                ));
-            }
-        };
+        let encoding = self.encoding()?;
         let total = usize::try_from(self.header.values())
             .map_err(|_| Error::io("a page with a negative value count".to_string()))?;
         let (levels, at) = self.definitions(column.optional)?;
-        let (validity, valid) = presence(&levels, total);
+        self.values(column, dictionary, encoding, &levels, at, total)
+    }
+
+    /// A data page of one leaf of a nested column, as its repetition levels, its definition levels
+    /// and a vector with a row for each of them.
+    ///
+    /// A row of the vector is null wherever the definition level is below the leaf's largest, and
+    /// which of the nodes above the leaf was missing there is for the caller to work out from the
+    /// level.
+    ///
+    /// # Errors
+    ///
+    /// For everything [`Page::decode`] fails on.
+    pub fn decode_leaf(
+        &mut self,
+        leaf: &Leaf,
+        dictionary: Option<&Arc<Vector>>,
+    ) -> Result<(Vec<u32>, Vec<u32>, Vector)> {
+        let encoding = self.encoding()?;
+        let total = usize::try_from(self.header.values())
+            .map_err(|_| Error::io("a page with a negative value count".to_string()))?;
+        let (reps, defs, at) = self.levels(leaf.max_rep, leaf.max_def)?;
+        let present: Vec<u32> = if leaf.max_def == 0 {
+            Vec::new()
+        } else {
+            defs.iter().map(|&def| u32::from(def == leaf.max_def)).collect()
+        };
+        let values = self.values(&leaf.column, dictionary, encoding, &present, at, total)?;
+        Ok((reps, defs, values))
+    }
+
+    /// The encoding of a data page's values.
+    fn encoding(&self) -> Result<Encoding> {
+        match &self.header.body {
+            Body::DataV1(page) => Ok(page.encoding),
+            Body::DataV2(page) => Ok(page.encoding),
+            Body::Dictionary(_) | Body::Index => {
+                Err(Error::io("values were asked of a page that holds no rows".to_string()))
+            }
+        }
+    }
+
+    /// The values of a data page whose levels have been read, which are one or zero a row.
+    fn values(
+        &mut self,
+        column: &SchemaColumn,
+        dictionary: Option<&Arc<Vector>>,
+        encoding: Encoding,
+        levels: &[u32],
+        at: usize,
+        total: usize,
+    ) -> Result<Vector> {
+        let (validity, valid) = presence(levels, total);
         match encoding {
             Encoding::Plain => {
-                let data = plain(column, &mut self.body, at, valid, &levels, total)?;
+                let data = plain(column, &mut self.body, at, valid, levels, total)?;
                 Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity))
             }
             Encoding::PlainDictionary | Encoding::RleDictionary => {
@@ -89,7 +133,7 @@ impl Page {
                         "a dictionary encoded page in a chunk with no dictionary page".to_string(),
                     )
                 })?;
-                let codes = codes(&self.body, at, valid, &levels, total, dictionary.len())?;
+                let codes = codes(&self.body, at, valid, levels, total, dictionary.len())?;
                 // `dictionary_over` and not `stable_dictionary`, and the difference is most of what
                 // the Parquet quadrant costs. A Parquet dictionary belongs to one column chunk, so
                 // code 7 here and code 7 in the next row group are different strings, and the
@@ -118,7 +162,7 @@ impl Page {
             | Encoding::DeltaLengthByteArray
             | Encoding::DeltaByteArray
             | Encoding::ByteStreamSplit => {
-                let data = delta(column, encoding, &mut self.body, at, valid, &levels, total)?;
+                let data = delta(column, encoding, &mut self.body, at, valid, levels, total)?;
                 Ok(Vector::flat(column.ty.clone(), data)?.with_validity(validity))
             }
             other => {
