@@ -262,6 +262,10 @@ fn rules_out(test: &Test, chunk: &ColumnChunk, column: &SchemaColumn) -> bool {
 /// above two billion as an `i32` gives a negative number, and a skip decided on that is a row group
 /// dropped from an answer, so the unsigned types read through the unsigned word of the same width.
 fn read_bound(bytes: &[u8], column: &SchemaColumn) -> Option<Bound> {
+    // A zoned time is bounded at UTC, which is not the order its values compare in here.
+    if column.ty == LogicalType::TimeTz {
+        return None;
+    }
     let unsigned = matches!(
         column.ty,
         LogicalType::UTinyInt

@@ -839,8 +839,8 @@ enum Logical {
     Date,
     /// `DECIMAL`, whose precision and scale are on the element itself as well.
     Decimal,
-    /// `TIME`, at the unit the file states.
-    Time(Unit),
+    /// `TIME`, at the unit the file states, and whether it is UTC.
+    Time(Unit, bool),
     /// `TIMESTAMP`, at the unit the file states, and whether it is UTC.
     Timestamp(Unit, bool),
     /// `INTEGER`, with a width and a sign, which is how the newer files spell `UINT_32`.
@@ -914,7 +914,10 @@ fn read_logical_type(reader: &mut Reader<'_>) -> Result<Option<Logical>> {
                 reader.skip(field.kind)?;
                 logical = Some(Logical::Date);
             }
-            7 => logical = Some(Logical::Time(read_time(reader)?.0)),
+            7 => {
+                let (unit, utc) = read_time(reader)?;
+                logical = Some(Logical::Time(unit, utc));
+            }
             8 => {
                 let (unit, utc) = read_time(reader)?;
                 logical = Some(Logical::Timestamp(unit, utc));
@@ -1023,7 +1026,11 @@ fn from_logical(
         Logical::Uuid => LogicalType::Uuid,
         Logical::Date => LogicalType::Date,
         Logical::Decimal => decimal(element)?,
-        Logical::Time(_) => LogicalType::Time,
+        // A time the file says is at UTC is how the pin writes a zoned time, and it reads one back
+        // as a zoned time at offset zero.
+        Logical::Time(Unit::Micros, true) => LogicalType::TimeTz,
+        Logical::Time(Unit::Nanos, _) => LogicalType::TimeNs,
+        Logical::Time(..) => LogicalType::Time,
         Logical::Timestamp(unit, utc) => timestamp(unit, utc),
         Logical::Integer(width, signed) => integer(width, signed, physical)?,
         Logical::List | Logical::Map => {
@@ -1090,6 +1097,7 @@ fn timestamp(unit: Unit, utc: bool) -> LogicalType {
         (Unit::Millis, false) => LogicalType::TimestampMs,
         (Unit::Micros, false) => LogicalType::Timestamp,
         (Unit::Nanos, false) => LogicalType::TimestampNs,
+        (Unit::Nanos, true) => LogicalType::TimestampTzNs,
         (_, true) => LogicalType::TimestampTz,
     }
 }

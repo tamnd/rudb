@@ -221,6 +221,46 @@ fn bloom_filters_are_written_for_dictionary_columns_unless_turned_off() {
 }
 
 #[test]
+fn nanosecond_and_zoned_times_read_back_with_the_pins_types_and_bounds() {
+    let db = Database::new();
+    db.execute("SET TimeZone = 'UTC'").expect("sets");
+    let path =
+        std::env::temp_dir().join(format!("rudb-copy-to-units-{}.parquet", std::process::id()));
+    db.execute(&format!(
+        "COPY (SELECT TIMESTAMP_NS '2020-01-01 00:00:01.123456789' AS a, \
+         TIME_NS '01:02:03.123456789' AS b, TIMETZ '21:02:03+01:30' AS c, \
+         TIMESTAMPTZ_NS '2020-01-01 00:00:01.5+00' AS d) TO '{}'",
+        path.display()
+    ))
+    .expect("writes");
+    let text = |value: &str| rudb_common::Value::Varchar(value.into());
+    let metadata = format!("parquet_metadata('{}')", path.display());
+    let bounds =
+        values(&db, &format!("SELECT stats_min, stats_max FROM {metadata} ORDER BY column_id"));
+    let expected = [
+        "2020-01-01 00:00:01.123456789",
+        "01:02:03.123456789",
+        "19:32:03+00",
+        "2020-01-01 00:00:01.5+00",
+    ];
+    assert_eq!(bounds, expected.map(|bound| vec![text(bound), text(bound)]).to_vec());
+    let back = values(
+        &db,
+        &format!(
+            "SELECT typeof(a), typeof(b), typeof(c), typeof(d), a::VARCHAR, b::VARCHAR, \
+             c::VARCHAR, d::VARCHAR FROM read_parquet('{}')",
+            path.display()
+        ),
+    );
+    let types = ["TIMESTAMP_NS", "TIME_NS", "TIME WITH TIME ZONE", "TIMESTAMPTZ_NS"];
+    assert_eq!(
+        back,
+        vec![types.iter().chain(&expected).map(|value| text(value)).collect::<Vec<_>>()]
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn json_is_one_object_a_line_or_one_array() {
     let db = table();
     let rows = "{\"i\":1,\"s\":\"a,b\",\"d\":1.5,\"dt\":\"2026-01-02\",\"n\":null,\
