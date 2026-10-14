@@ -405,6 +405,7 @@ impl TableFunction {
                     ("null_padding", LogicalType::Boolean),
                     ("nullstr", LogicalType::Varchar),
                     ("quote", LogicalType::Varchar),
+                    ("sample_size", LogicalType::BigInt),
                     ("sep", LogicalType::Varchar),
                     ("skip", LogicalType::BigInt),
                     ("types", LogicalType::Null),
