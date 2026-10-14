@@ -54,7 +54,7 @@ use rudb_io::{Filesystem, Mapped, OpenMode, RealFilesystem};
 use rudb_kernels::Recipe;
 use rudb_metrics::{LoadProfile, Stage};
 use rudb_storage::sieve::Sieve;
-use rudb_storage::{Probe, Range, Zone};
+use rudb_storage::{Probe, Range};
 use rudb_vector::string::StringColumn;
 use rudb_vector::validity::{Live, Validity};
 use rudb_vector::{
@@ -72,8 +72,10 @@ mod nested;
 pub mod postings;
 mod prepare;
 mod projection;
+mod ranges;
 mod run_projection;
 use prepare::Lent;
+use ranges::Ranges;
 pub mod section;
 pub mod stats;
 mod zones;
@@ -1223,7 +1225,9 @@ pub struct Stripe {
     /// column reads the ends of that column and not of the hundred and four beside it. Read lazily
     /// for the same reason, like the sieves.
     part_ranges: Pages,
-    zone: Zone,
+    /// The two ends, the null count and the total of every column over the whole stripe, packed.
+    /// See [`ranges`] for why they are not held as [`Range`]s.
+    zone: Ranges,
 }
 
 impl Stripe {
@@ -1239,14 +1243,15 @@ impl Stripe {
         self.parts.len()
     }
 
-    /// The two ends and the null count of every column over the whole stripe.
+    /// The two ends and the null count of one column over the whole stripe, or `None` for a column
+    /// past the end of the table.
     ///
     /// In the directory and so in memory, which is what makes it the one a planner can ask. The
     /// finer ones are a page per column per stripe in the file, read by [`Reader::skips`] when a
     /// scan wants to know which parts to open.
     #[must_use]
-    pub fn zone(&self) -> &Zone {
-        &self.zone
+    pub fn range(&self, column: usize) -> Option<Range> {
+        self.zone.column(column)
     }
 }
 
@@ -3854,7 +3859,7 @@ impl Writer {
             memberships: Pages::from_slots(memberships)?,
             sieves: Pages::from_slots(sieves)?,
             part_ranges: Pages::from_slots(part_ranges)?,
-            zone: Zone::from_ranges(ranges),
+            zone: Ranges::pack(&ranges)?,
         });
         drop(timing);
         if let Some(profile) = &profile {
@@ -10989,7 +10994,7 @@ impl Reader {
     pub fn ruled_by(&self, part: usize, column: usize, rule: impl Fn(&Range) -> bool) -> bool {
         let Some(place) = self.places.get(part).copied() else { return false };
         let Some(stripe) = self.table.stripes.get(place.stripe as usize) else { return false };
-        if stripe.zone.column(column).is_some_and(&rule) {
+        if stripe.zone.column(column).is_some_and(|range| rule(&range)) {
             return true;
         }
         self.stripe_part_ranges(place.stripe as usize, column)
@@ -11005,7 +11010,7 @@ impl Reader {
         let own = self
             .stripe_part_ranges(place.stripe as usize, column)
             .and_then(|ranges| ranges.get(place.part as usize));
-        own.or_else(|| self.table.stripes.get(place.stripe as usize)?.zone.column(column)).cloned()
+        own.cloned().or_else(|| self.table.stripes.get(place.stripe as usize)?.zone.column(column))
     }
 
     /// The half of [`Self::ruled_by`] that reads nothing, asked about a whole stripe.
@@ -11016,7 +11021,11 @@ impl Reader {
         column: usize,
         rule: impl Fn(&Range) -> bool,
     ) -> bool {
-        self.table.stripes.get(stripe).and_then(|held| held.zone.column(column)).is_some_and(rule)
+        self.table
+            .stripes
+            .get(stripe)
+            .and_then(|held| held.zone.column(column))
+            .is_some_and(|range| rule(&range))
     }
 
     /// Whether the bounds of one part rule out one probe.
@@ -13804,7 +13813,7 @@ fn read_directory(mut cur: Cursor<'_>, size: u64, stored_at: Option<u64>) -> Res
             memberships: Pages::from_slots(memberships)?,
             sieves: Pages::from_slots(sieves)?,
             part_ranges: Pages::from_slots(part_ranges)?,
-            zone: Zone::from_ranges(ranges),
+            zone: Ranges::pack(&ranges)?,
         });
     }
     if total != rows {
