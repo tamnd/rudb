@@ -29,9 +29,9 @@
 //! being honest about what it has rather than this crate guessing.
 //!
 //! `PLAIN` or dictionary encoded values. The delta encodings and `BYTE_STREAM_SPLIT` are named in
-//! the error when a file uses one, and so are `INT96`, fixed length byte arrays that are not
-//! decimals, and byte arrays whose bytes are not text. See `spec/engine/05-scan.md` sections 5.3
-//! to 5.6 and the checklist on the sub-milestone issue.
+//! the error when a file uses one, and so are fixed length byte arrays that are not decimals, and
+//! byte arrays whose bytes are not text. See `spec/engine/05-scan.md` sections 5.3 to 5.6 and the
+//! checklist on the sub-milestone issue.
 
 #![forbid(unsafe_code)]
 

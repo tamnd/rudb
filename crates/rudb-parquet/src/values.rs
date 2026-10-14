@@ -59,7 +59,8 @@ impl Page {
     /// If the page is a dictionary or index page, if it is in an encoding this reader does not
     /// read yet, if a dictionary encoded page arrives without a dictionary, or if the values run
     /// off the end of the body. Also if the column is one of the types named as not read yet:
-    /// `INT96`, fixed length byte arrays, and byte arrays that are not text.
+    /// fixed length byte arrays that are not decimals, UUIDs or intervals, and byte arrays that are
+    /// not text.
     pub fn decode(
         &mut self,
         column: &SchemaColumn,
@@ -228,13 +229,7 @@ impl Page {
                 let width = match column.physical {
                     Physical::Int32 | Physical::Float => 4,
                     Physical::Int64 | Physical::Double => 8,
-                    Physical::Int96 => {
-                        return Err(Error::io(
-                            "an INT96 column, which is the timestamp the format deprecated and \
-                             this reader does not read yet"
-                                .to_string(),
-                        ));
-                    }
+                    Physical::Int96 => 12,
                     Physical::FixedLenByteArray => fixed_width(column)?,
                     Physical::Boolean | Physical::ByteArray => {
                         unreachable!("booleans take the fallback and byte arrays their own arm")
@@ -413,11 +408,12 @@ fn plain(
             text(column)?;
             strings(column, body, at, count, levels, total)
         }
-        Physical::Int96 => Err(Error::io(
-            "an INT96 column, which is the timestamp the format deprecated and this reader does \
-             not read yet"
-                .to_string(),
-        )),
+        Physical::Int96 => {
+            let bytes = fixed::<12>(tail(body, at)?, count)?;
+            let nanos = matches!(column.ty, LogicalType::TimestampNs | LogicalType::TimestampTzNs);
+            let stamps = words::<12>(bytes).map(|word| impala(word, nanos));
+            narrow(target, count, stamps, levels, total)
+        }
         Physical::FixedLenByteArray => {
             let width = fixed_width(column)?;
             let wanted = count.checked_mul(width).ok_or_else(|| {
@@ -454,6 +450,24 @@ fn plain(
                 _ => narrow(target, count, values.map(signed_big_endian), levels, total),
             }
         }
+    }
+}
+
+/// A value of an `INT96` column, the timestamp Impala wrote, as microseconds since the epoch, or
+/// as nanoseconds when `nanos` is set.
+///
+/// The first eight bytes are the nanoseconds into the day and the last four are the Julian day. The
+/// nanoseconds are taken as signed and divided toward zero, and the arithmetic wraps where the
+/// pin's would overflow, which is what its `ImpalaTimestampToTimestamp` does.
+fn impala(word: [u8; 12], nanos: bool) -> i64 {
+    /// The Julian day of 1970-01-01.
+    const EPOCH: i64 = 2_440_588;
+    let into_day = i64::from_le_bytes(word[..8].try_into().unwrap_or_default());
+    let day = i64::from(u32::from_le_bytes(word[8..].try_into().unwrap_or_default())) - EPOCH;
+    if nanos {
+        day.wrapping_mul(86_400_000_000_000).wrapping_add(into_day)
+    } else {
+        day.wrapping_mul(86_400_000_000).wrapping_add(into_day / 1_000)
     }
 }
 
@@ -981,7 +995,12 @@ mod tests {
     /// after it, which is the arrangement the format is built around and the reason the dictionary
     /// is a parameter rather than something a page finds for itself.
     fn column(at: usize) -> (SchemaColumn, Vec<Vector>) {
-        let file = open();
+        column_of(&fixture(), at)
+    }
+
+    /// Every value of one column of the file at `path`, read as [`column`] reads them.
+    fn column_of(path: &Path, at: usize) -> (SchemaColumn, Vec<Vector>) {
+        let file = RealFilesystem::new().open(path, OpenMode::Read).expect("the file is there");
         let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
         let schema = metadata.schema[at].clone();
         let mut out = Vec::new();
@@ -1007,6 +1026,49 @@ mod tests {
     /// Every value of a column, in order, nulls included.
     fn values(at: usize) -> Vec<Value> {
         column(at).1.iter().flat_map(Vector::iter).collect()
+    }
+
+    #[test]
+    fn an_int96_column_reads_as_the_timestamps_the_pin_reads() {
+        // pyarrow wrote this with `use_deprecated_int96_timestamps`, `d` dictionary encoded and `p`
+        // plain, and the microseconds are what the pin's `epoch_us` gives for each row of it.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/int96.parquet");
+        let wanted = [
+            Value::Timestamp(1_454_486_129_123_456),
+            Value::Null,
+            Value::Timestamp(-9_214_570_800_000_000),
+            Value::Timestamp(-62_135_596_799_999_999),
+            Value::Timestamp(253_402_300_799_999_999),
+            Value::Timestamp(0),
+            Value::Null,
+            Value::Timestamp(-1),
+        ];
+        for at in 0..2 {
+            let (schema, pages) = column_of(&path, at);
+            assert_eq!(schema.physical, Physical::Int96);
+            assert_eq!(schema.ty, LogicalType::Timestamp);
+            let read: Vec<Value> = pages.iter().flat_map(Vector::iter).collect();
+            assert_eq!(read, wanted, "{}", schema.name);
+        }
+        // The same values asked for at a few positions, which takes the plain shortcut.
+        let file = RealFilesystem::new().open(&path, OpenMode::Read).expect("the file is there");
+        let metadata = Metadata::read(file.as_ref()).expect("the footer reads");
+        let chunk = &metadata.row_groups[0].columns[1];
+        let mut bytes = vec![0u8; chunk.compressed_size as usize];
+        file.read_at(chunk.start(), &mut bytes).expect("the chunk is in the file");
+        let mut page = Pages::new(&bytes, chunk.compression, chunk.values)
+            .next()
+            .expect("a page")
+            .expect("the page walks");
+        let picked = page.decode_at(&metadata.schema[1], None, &[1, 2, 7]).expect("decodes");
+        let picked: Vec<Value> = picked.iter().collect();
+        assert_eq!(picked, [Value::Null, wanted[2].clone(), wanted[7].clone()]);
+        // Nanoseconds, for a column read as a nanosecond timestamp.
+        let mut stamp = [0_u8; 12];
+        stamp[..8].copy_from_slice(&1_234_567_i64.to_le_bytes());
+        stamp[8..].copy_from_slice(&2_440_589_u32.to_le_bytes());
+        assert_eq!(super::impala(stamp, true), 86_400_000_000_000 + 1_234_567);
+        assert_eq!(super::impala(stamp, false), 86_400_000_000 + 1_234);
     }
 
     #[test]
