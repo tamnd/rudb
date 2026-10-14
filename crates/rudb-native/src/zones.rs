@@ -98,7 +98,7 @@ impl Zones for Stripes {
         let mut read = 0;
         for stripe in self.reader.table().stripes() {
             let rows = rows(stripe.rows());
-            let spread = fraction(tests, stripe.zone());
+            let spread = fraction(tests, stripe);
             whole += rows;
             passing += rows * spread.fraction;
             // The most any one stripe could read rather than a total of them, the same as the
@@ -560,7 +560,7 @@ fn rows(count: usize) -> f64 {
 ///
 /// A stripe this cannot read keeps a fraction of one rather than dropping out of the total. Leaving
 /// it out would report the fraction of the stripes that were read as the fraction of the table.
-fn fraction(tests: &[Test], zone: &rudb_storage::Zone) -> Spread {
+fn fraction(tests: &[Test], stripe: &crate::Stripe) -> Spread {
     let mut spread = Spread { fraction: 1.0, read: 0 };
     for (position, test) in tests.iter().enumerate() {
         // Once per column rather than once per test, because `kept` is handed every test on the
@@ -569,7 +569,7 @@ fn fraction(tests: &[Test], zone: &rudb_storage::Zone) -> Spread {
         if tests[..position].iter().any(|earlier| earlier.column == test.column) {
             continue;
         }
-        let Some(range) = zone.column(test.column) else { continue };
+        let Some(range) = stripe.range(test.column) else { continue };
         let (Some(low), Some(high)) = (range.low.as_ref(), range.high.as_ref()) else { continue };
         let Some(kept) = kept(tests, test.column, low, high) else { continue };
         spread.fraction *= kept.fraction;
