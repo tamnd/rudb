@@ -348,6 +348,9 @@ impl TableFunction {
     /// than accepting names and ignoring them, which is the failure mode that makes an option look
     /// supported when it is not.
     ///
+    /// `can_have_nan` says a float column of a Parquet file may hold NaN beside the bounds its
+    /// footer gives, which keeps the row groups a NaN would pass, as the pin keeps them.
+    ///
     /// The CSV ones here are the ones that say how the file is written, which are the ones where
     /// guessing wrong changes the answer rather than the speed. `sep` is DuckDB's other name for
     /// `delim` and is a separate row rather than an alias, because the list is also what the
@@ -368,6 +371,7 @@ impl TableFunction {
     pub fn parameters(self) -> &'static [(&'static str, LogicalType)] {
         static READ_PARQUET: &[(&str, LogicalType)] = &[
             ("binary_as_string", LogicalType::Boolean),
+            ("can_have_nan", LogicalType::Boolean),
             ("file_row_number", LogicalType::Boolean),
             ("filename", LogicalType::Null),
             ("hive_partitioning", LogicalType::Boolean),

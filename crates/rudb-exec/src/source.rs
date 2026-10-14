@@ -29,7 +29,7 @@ use rudb_kernels::json::scan;
 use rudb_kernels::{Stepping, cast, moment_steps, zoned_steps};
 use rudb_metrics::Counters;
 use rudb_native::{Reader as NativeReader, RunProjectionPart, RunProjectionScan};
-use rudb_parquet::{Bound, Op, Reader, Test, skips};
+use rudb_parquet::{Bound, Op, Reader, Test, skips_with_nan};
 use rudb_pipeline::{Compaction, Gauge, Morsel, Progress, Source, narrow};
 use rudb_plan::{CompareOp, ConjunctionOp, Expr, ExprRef, Node, NodeRef, Plan, Slice};
 use rudb_seam::{Context, SeamId, Settings};
@@ -3693,6 +3693,9 @@ pub(crate) struct FileScan<'a> {
     /// answer, or when the source is a CSV, and empty means every row group is handed out, which is
     /// what every scan did before this existed.
     tests: Vec<(usize, Op, Bound)>,
+    /// Whether a float column may hold NaN beside the bounds the file gives it, which is
+    /// `can_have_nan` and keeps a row group a NaN would pass. See [`skips_with_nan`].
+    can_have_nan: bool,
     /// How far through the file list the cutting has got, and the file it is in the middle of.
     cutting: Mutex<Cutting>,
     /// What each morsel handed out covers, by [`Morsel::index`].
@@ -4034,6 +4037,7 @@ impl<'a> FileScan<'a> {
             named_options(plan, options, settings)?
         };
         let slots = slots(&produced, &named, &paths);
+        let can_have_nan = named.contains(&("can_have_nan", Value::Boolean(true)));
         let numbered = slots.contains(&Slot::Number);
         let wanted: Vec<Field> = produced
             .iter()
@@ -4062,6 +4066,7 @@ impl<'a> FileScan<'a> {
             slots: if plain { Vec::new() } else { slots },
             schema: Schema::numbered(produced, index),
             tests,
+            can_have_nan,
             cutting: Mutex::new(Cutting {
                 at: 0,
                 reader: None,
@@ -4239,7 +4244,7 @@ impl<'a> FileScan<'a> {
             let metadata = reader.metadata();
             while cutting.group < cutting.groups {
                 let Some(group) = metadata.row_groups.get(cutting.group) else { break };
-                if !skips(&cutting.skipping, group, &metadata.schema) {
+                if !skips_with_nan(&cutting.skipping, group, &metadata.schema, self.can_have_nan) {
                     break;
                 }
                 cutting.group += 1;
@@ -4261,7 +4266,14 @@ impl<'a> FileScan<'a> {
                     let later = metadata.row_groups.get(at + 1..cutting.groups).unwrap_or(&[]);
                     let later = later
                         .iter()
-                        .take_while(|group| !skips(&cutting.skipping, group, &metadata.schema))
+                        .take_while(|group| {
+                            !skips_with_nan(
+                                &cutting.skipping,
+                                group,
+                                &metadata.schema,
+                                self.can_have_nan,
+                            )
+                        })
                         .map(|group| usize::try_from(group.rows).unwrap_or(usize::MAX));
                     gathered(rows, later, cutting.gather)
                 } else {

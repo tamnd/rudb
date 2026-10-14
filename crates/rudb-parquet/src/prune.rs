@@ -231,23 +231,60 @@ fn rows(count: i64) -> f64 {
 /// test this cannot decide, for any of the reasons in [`Bound`], says nothing and the next one is
 /// tried. With no tests at all, or no bounds written, nothing is skipped, which is exactly the
 /// behaviour every caller had before this existed.
+///
+/// The bounds of a float column are taken at their word, which is what the pin does without
+/// `can_have_nan`. See [`skips_with_nan`].
 #[must_use]
 pub fn skips(tests: &[Test], group: &RowGroup, schema: &[SchemaColumn]) -> bool {
+    skips_with_nan(tests, group, schema, false)
+}
+
+/// [`skips`], with `can_have_nan` saying whether a float column may hold NaN beside its bounds,
+/// which is the option of the pin's `read_parquet`.
+///
+/// The format leaves NaN out of the bounds, so without the option a group of a column holding one
+/// can be skipped for a filter the NaN rows pass, as the pin skips it. With the option a float
+/// group is only skipped when a NaN would fail the test too.
+#[must_use]
+pub fn skips_with_nan(
+    tests: &[Test],
+    group: &RowGroup,
+    schema: &[SchemaColumn],
+    can_have_nan: bool,
+) -> bool {
     tests.iter().any(|test| {
         let Some(column) = schema.get(test.column) else { return false };
         let Some(chunk) = group.columns.iter().find(|chunk| chunk.column == test.column) else {
             return false;
         };
-        rules_out(test, chunk, column)
+        rules_out(test, chunk, column, can_have_nan)
     })
 }
 
 /// Whether one test rules out one column chunk.
-fn rules_out(test: &Test, chunk: &ColumnChunk, column: &SchemaColumn) -> bool {
+fn rules_out(test: &Test, chunk: &ColumnChunk, column: &SchemaColumn, can_have_nan: bool) -> bool {
     let Some(stats) = chunk.stats.as_ref() else { return false };
     let low = stats.min.as_deref().and_then(|bytes| read_bound(bytes, column));
     let high = stats.max.as_deref().and_then(|bytes| read_bound(bytes, column));
-    rudb_common::bounds::excluded(test.op, &test.value, low.as_ref(), high.as_ref())
+    if !matches!(column.physical, Physical::Float | Physical::Double) {
+        return rudb_common::bounds::excluded(test.op, &test.value, low.as_ref(), high.as_ref());
+    }
+    let nan = matches!(test.value, Bound::Real(value) if value.is_nan());
+    // The pin orders NaN above every number, so a NaN is past the largest bound.
+    let outside = if nan {
+        let numbers = matches!(high, Some(Bound::Real(high)) if !high.is_nan());
+        numbers && matches!(test.op, Op::Equal | Op::Greater | Op::GreaterOrEqual)
+    } else {
+        rudb_common::bounds::excluded(test.op, &test.value, low.as_ref(), high.as_ref())
+    };
+    // Whether a NaN row fails the test, with NaN equal to NaN and above every number.
+    let fails = match test.op {
+        Op::Less => true,
+        Op::Greater => nan,
+        Op::Equal | Op::LessOrEqual => !nan,
+        Op::GreaterOrEqual => false,
+    };
+    outside && (!can_have_nan || fails)
 }
 
 /// Reads a bound out of the bytes a writer put in the footer, in the column's own domain.
@@ -343,7 +380,7 @@ mod tests {
     use rudb_common::bounds::{MICROS, Zones};
     use rudb_common::stat::Provenance;
 
-    use super::{Bound, Footer, Op, Test, read_bound, skips};
+    use super::{Bound, Footer, Op, Test, read_bound, skips, skips_with_nan};
     use crate::metadata::{
         ColumnChunk, Encoding, Metadata, Physical, RowGroup, SchemaColumn, Stats, Unit,
     };
@@ -394,6 +431,41 @@ mod tests {
     /// One test against column zero.
     fn test(op: Op, number: i32) -> Vec<Test> {
         vec![Test { column: 0, op, value: Bound::Int(i128::from(number)) }]
+    }
+
+    /// One row group of a double column holding values between `low` and `high`, and its schema.
+    fn doubles(low: f64, high: f64) -> (RowGroup, Vec<SchemaColumn>) {
+        let mut group = group(None, None);
+        group.columns[0].physical = Physical::Double;
+        if let Some(stats) = group.columns[0].stats.as_mut() {
+            stats.min = Some(low.to_le_bytes().to_vec());
+            stats.max = Some(high.to_le_bytes().to_vec());
+        }
+        let mut schema = schema();
+        schema[0].physical = Physical::Double;
+        schema[0].ty = LogicalType::Double;
+        (group, schema)
+    }
+
+    #[test]
+    fn a_float_group_is_skipped_by_its_bounds_unless_it_can_hold_nan() {
+        let (group, schema) = doubles(-1.0, 1.0);
+        let real = |op, value: f64| vec![Test { column: 0, op, value: Bound::Real(value) }];
+        // Without `can_have_nan` the bounds are believed, and NaN is above every number.
+        assert!(skips(&real(Op::Greater, 1.0), &group, &schema));
+        assert!(skips(&real(Op::Equal, f64::NAN), &group, &schema));
+        assert!(skips(&real(Op::GreaterOrEqual, f64::NAN), &group, &schema));
+        assert!(!skips(&real(Op::Less, f64::NAN), &group, &schema));
+        assert!(!skips(&real(Op::Equal, 0.5), &group, &schema));
+        // With it, a group is only skipped when a NaN row would fail the test as well.
+        let nan = |op, value| skips_with_nan(&real(op, value), &group, &schema, true);
+        assert!(!nan(Op::Greater, 1.0));
+        assert!(!nan(Op::GreaterOrEqual, 2.0));
+        assert!(!nan(Op::Equal, f64::NAN));
+        assert!(nan(Op::Less, -1.0));
+        assert!(nan(Op::LessOrEqual, -2.0));
+        assert!(nan(Op::Equal, 5.0));
+        assert!(nan(Op::Greater, f64::NAN));
     }
 
     #[test]
