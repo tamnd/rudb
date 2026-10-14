@@ -34,13 +34,17 @@
 //! LZ4 blocks in [`lz4`], both ways, which is what Parquet calls `LZ4_RAW` and what the pin writes
 //! for either `lz4` or `lz4_raw`.
 //!
+//! Brotli in [`brotli`], both ways. The reader reads everything RFC 7932 allows, since the pin
+//! writes at quality 11, and the writer writes plain streams that any reader reads.
+//!
 //! # What is not here yet
 //!
-//! Brotli and the older `LZ4` framing. `spec/engine/05-scan.md` defers them by name at 2d. A file
-//! in one of them should say so clearly rather than be read slowly by an untested decoder.
+//! The older `LZ4` framing. `spec/engine/05-scan.md` defers it by name at 2d. A file in it should
+//! say so clearly rather than be read slowly by an untested decoder.
 
 #![deny(unsafe_code)]
 
+pub mod brotli;
 pub mod deflate;
 pub mod gzip;
 pub mod lz4;
@@ -66,7 +70,7 @@ pub enum Codec {
     Gzip,
     /// LZO. Not implemented, and effectively extinct in files written this decade.
     Lzo,
-    /// Brotli. Not implemented.
+    /// Brotli, which the pin writes at quality 11.
     Brotli,
     /// LZ4, the pre-2.9.0 framing that turned out to be ambiguous between writers. Not
     /// implemented, and the reason `Lz4Raw` exists.
@@ -118,7 +122,15 @@ impl Codec {
     /// Whether this build can decompress it.
     #[must_use]
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Uncompressed | Self::Snappy | Self::Gzip | Self::Zstd | Self::Lz4Raw)
+        matches!(
+            self,
+            Self::Uncompressed
+                | Self::Snappy
+                | Self::Gzip
+                | Self::Brotli
+                | Self::Zstd
+                | Self::Lz4Raw
+        )
     }
 
     /// The number Parquet's metadata gives this codec, the other way from [`Codec::from_parquet`].
@@ -150,6 +162,7 @@ impl Codec {
             Self::Uncompressed => Some(Cow::Borrowed(input)),
             Self::Snappy => Some(Cow::Owned(snappy::compress(input))),
             Self::Gzip => Some(Cow::Owned(gzip::compress(input))),
+            Self::Brotli => Some(Cow::Owned(brotli::compress(input))),
             Self::Zstd => Some(Cow::Owned(zstd::compress(input, level))),
             Self::Lz4Raw => Some(Cow::Owned(lz4::compress(input))),
             _ => None,
@@ -172,12 +185,13 @@ impl Codec {
             Self::Uncompressed => input.to_vec(),
             Self::Snappy => snappy::decompress(input, expected)?,
             Self::Gzip => gzip::decompress(input)?,
+            Self::Brotli => brotli::decompress(input)?,
             Self::Zstd => zstd::decompress(input)?,
             Self::Lz4Raw => lz4::decompress(input, expected)?,
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
-                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY, GZIP, ZSTD and \
-                     LZ4_RAW are",
+                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY, GZIP, BROTLI, \
+                     ZSTD and LZ4_RAW are",
                     other.name()
                 )));
             }
@@ -220,6 +234,11 @@ impl Codec {
                 gzip::decompress_onto(input, out)?;
                 return self.exactly(out.len(), expected);
             }
+            Self::Brotli => {
+                out.clear();
+                brotli::decompress_onto(input, out)?;
+                return self.exactly(out.len(), expected);
+            }
             Self::Zstd => {
                 out.clear();
                 zstd::decompress_onto(input, out)?;
@@ -231,8 +250,8 @@ impl Codec {
             }
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
-                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY, GZIP, ZSTD and \
-                     LZ4_RAW are",
+                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY, GZIP, BROTLI, \
+                     ZSTD and LZ4_RAW are",
                     other.name()
                 )));
             }
@@ -277,14 +296,22 @@ mod tests {
     #[test]
     fn what_this_build_can_write_comes_back_through_the_reader() {
         let page = b"the same few words and the same few words again".repeat(40);
-        for codec in [Codec::Uncompressed, Codec::Snappy, Codec::Gzip, Codec::Lz4Raw] {
+        let codecs = [
+            Codec::Uncompressed,
+            Codec::Snappy,
+            Codec::Gzip,
+            Codec::Brotli,
+            Codec::Zstd,
+            Codec::Lz4Raw,
+        ];
+        for codec in codecs {
             let stored = codec.compress(&page).expect("writes");
             assert_eq!(codec.decompress(&stored, page.len()).unwrap(), page, "{codec:?}");
             let mut out = vec![1, 2, 3];
             codec.decompress_into(&stored, page.len(), &mut out).unwrap();
             assert_eq!(out[..page.len()], page[..], "{codec:?}");
         }
-        assert!(Codec::Brotli.compress(&page).is_none());
+        assert!(Codec::Lz4.compress(&page).is_none());
     }
 
     #[test]
@@ -295,8 +322,8 @@ mod tests {
 
     #[test]
     fn a_codec_we_cannot_read_says_so_by_name() {
-        let error = Codec::Brotli.decompress(&[0], 1).unwrap_err();
-        assert!(error.message().contains("BROTLI"), "{}", error.message());
+        let error = Codec::Lz4.decompress(&[0], 1).unwrap_err();
+        assert!(error.message().contains("LZ4"), "{}", error.message());
     }
 
     #[test]
@@ -320,6 +347,7 @@ mod tests {
         assert!(Codec::Zstd.is_supported());
         assert!(Codec::Lz4Raw.is_supported());
         assert!(Codec::Gzip.is_supported());
-        assert!(!Codec::Brotli.is_supported());
+        assert!(Codec::Brotli.is_supported());
+        assert!(!Codec::Lz4.is_supported());
     }
 }

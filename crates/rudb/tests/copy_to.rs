@@ -107,10 +107,6 @@ fn what_this_does_not_write_is_refused_by_name() {
     for (sql, message) in [
         ("COPY (SELECT 1 AS x) TO 'o.csv' (BOGUS 1)", "Unrecognized option \"bogus\" for csv"),
         (
-            "COPY (SELECT 1 AS x) TO 'o.parquet' (COMPRESSION brotli)",
-            "brotli codec is not supported yet",
-        ),
-        (
             "COPY (SELECT 1 AS x) TO 'o.parquet' (BOGUS 1)",
             "Unrecognized option \"bogus\" for parquet",
         ),
@@ -702,7 +698,7 @@ fn a_parquet_file_reads_back_as_what_was_written() {
     // The blob is text, because a blob that is not reads back only once the reader has a byte
     // column to put it in.
     db.execute("SET TimeZone = 'UTC'").expect("sets");
-    let codecs = ["snappy", "uncompressed", "gzip", "lz4", "lz4_raw", "zstd"];
+    let codecs = ["snappy", "uncompressed", "gzip", "brotli", "lz4", "lz4_raw", "zstd"];
     let levels = ["zstd, COMPRESSION_LEVEL -7", "zstd, COMPRESSION_LEVEL 22"];
     for (at, codec) in codecs.into_iter().chain(levels).enumerate() {
         let path =
