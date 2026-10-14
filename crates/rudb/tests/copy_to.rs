@@ -702,7 +702,7 @@ fn a_parquet_file_reads_back_as_what_was_written() {
     // The blob is text, because a blob that is not reads back only once the reader has a byte
     // column to put it in.
     db.execute("SET TimeZone = 'UTC'").expect("sets");
-    for codec in ["snappy", "uncompressed", "lz4", "lz4_raw"] {
+    for codec in ["snappy", "uncompressed", "gzip", "lz4", "lz4_raw"] {
         let path = std::env::temp_dir()
             .join(format!("rudb-copy-to-{codec}-{}.parquet", std::process::id()));
         let sql = format!("COPY p TO '{}' (COMPRESSION {codec})", path.display());
