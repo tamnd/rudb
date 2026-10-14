@@ -31,16 +31,23 @@
 //! Gzip in [`gzip`], for whole files rather than Parquet pages. A JSON or CSV file ending in `.gz`
 //! is the common case, and it is a stream with members and a trailer rather than a block.
 //!
+//! LZ4 blocks in [`lz4`], both ways, which is what Parquet calls `LZ4_RAW` and what the pin writes
+//! for either `lz4` or `lz4_raw`.
+//!
 //! # What is not here yet
 //!
-//! LZ4 and brotli, and gzip as a Parquet codec. `spec/engine/05-scan.md` defers them by name at 2d.
-//! A file in one of them should say so clearly rather than be read slowly by an untested decoder.
+//! Brotli, the older `LZ4` framing, and gzip as a Parquet codec. `spec/engine/05-scan.md` defers
+//! them by name at 2d. A file in one of them should say so clearly rather than be read slowly by
+//! an untested decoder.
 
 #![deny(unsafe_code)]
 
 pub mod gzip;
+pub mod lz4;
 pub mod snappy;
 pub mod zstd;
+
+use std::borrow::Cow;
 
 use rudb_common::Result;
 
@@ -66,7 +73,7 @@ pub enum Codec {
     Lz4,
     /// Zstd, which is what a writer emits when somebody chose.
     Zstd,
-    /// LZ4 raw blocks, the framing that replaced `Lz4`. Not implemented.
+    /// LZ4 raw blocks, the framing that replaced `Lz4`.
     Lz4Raw,
 }
 
@@ -111,7 +118,34 @@ impl Codec {
     /// Whether this build can decompress it.
     #[must_use]
     pub fn is_supported(self) -> bool {
-        matches!(self, Self::Uncompressed | Self::Snappy | Self::Zstd)
+        matches!(self, Self::Uncompressed | Self::Snappy | Self::Zstd | Self::Lz4Raw)
+    }
+
+    /// The number Parquet's metadata gives this codec, the other way from [`Codec::from_parquet`].
+    #[must_use]
+    pub fn to_parquet(self) -> i32 {
+        match self {
+            Self::Uncompressed => 0,
+            Self::Snappy => 1,
+            Self::Gzip => 2,
+            Self::Lzo => 3,
+            Self::Brotli => 4,
+            Self::Lz4 => 5,
+            Self::Zstd => 6,
+            Self::Lz4Raw => 7,
+        }
+    }
+
+    /// Compresses `input`, the way the pin's Parquet writer compresses a page, or `None` for a
+    /// codec this build cannot write.
+    #[must_use]
+    pub fn compress(self, input: &[u8]) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Self::Uncompressed => Some(Cow::Borrowed(input)),
+            Self::Snappy => Some(Cow::Owned(snappy::compress(input))),
+            Self::Lz4Raw => Some(Cow::Owned(lz4::compress(input))),
+            _ => None,
+        }
     }
 
     /// Decompresses `input`, which is expected to produce exactly `expected` bytes.
@@ -130,9 +164,11 @@ impl Codec {
             Self::Uncompressed => input.to_vec(),
             Self::Snappy => snappy::decompress(input, expected)?,
             Self::Zstd => zstd::decompress(input)?,
+            Self::Lz4Raw => lz4::decompress(input, expected)?,
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
-                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY and ZSTD are",
+                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY, ZSTD and LZ4_RAW \
+                     are",
                     other.name()
                 )));
             }
@@ -175,9 +211,14 @@ impl Codec {
                 zstd::decompress_onto(input, out)?;
                 return self.exactly(out.len(), expected);
             }
+            Self::Lz4Raw => {
+                out.clear();
+                return lz4::decompress_onto(input, expected, out);
+            }
             other => {
                 return Err(rudb_common::Error::not_implemented(format!(
-                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY and ZSTD are",
+                    "the {} codec is not implemented, only UNCOMPRESSED, SNAPPY, ZSTD and LZ4_RAW \
+                     are",
                     other.name()
                 )));
             }
@@ -214,6 +255,22 @@ mod tests {
         assert_eq!(Codec::from_parquet(1).unwrap(), Codec::Snappy);
         assert_eq!(Codec::from_parquet(6).unwrap(), Codec::Zstd);
         assert_eq!(Codec::from_parquet(7).unwrap(), Codec::Lz4Raw);
+        for code in 0..8 {
+            assert_eq!(Codec::from_parquet(code).unwrap().to_parquet(), code);
+        }
+    }
+
+    #[test]
+    fn what_this_build_can_write_comes_back_through_the_reader() {
+        let page = b"the same few words and the same few words again".repeat(40);
+        for codec in [Codec::Uncompressed, Codec::Snappy, Codec::Lz4Raw] {
+            let stored = codec.compress(&page).expect("writes");
+            assert_eq!(codec.decompress(&stored, page.len()).unwrap(), page, "{codec:?}");
+            let mut out = vec![1, 2, 3];
+            codec.decompress_into(&stored, page.len(), &mut out).unwrap();
+            assert_eq!(out[..page.len()], page[..], "{codec:?}");
+        }
+        assert!(Codec::Gzip.compress(&page).is_none());
     }
 
     #[test]
@@ -247,6 +304,7 @@ mod tests {
         assert!(Codec::Snappy.is_supported());
         assert!(Codec::Uncompressed.is_supported());
         assert!(Codec::Zstd.is_supported());
+        assert!(Codec::Lz4Raw.is_supported());
         assert!(!Codec::Gzip.is_supported());
     }
 }

@@ -603,6 +603,66 @@ fn an_option_written_as_null_or_as_the_wrong_type_is_refused_in_the_pins_words()
             "nosuch 1",
             "Binder Error: Unknown option for COPY ... TO ... (FORMAT JSON): nosuch.",
         ),
+        (
+            "parquet",
+            "codec 'blablabla'",
+            "Binder Error: Expected \"codec\" argument to be any of [uncompressed, brotli, gzip, snappy, lz4, lz4_raw or zstd]",
+        ),
+        (
+            "parquet",
+            "compression 'x'",
+            "Binder Error: Expected \"compression\" argument to be any of [uncompressed, brotli, gzip, snappy, lz4, lz4_raw or zstd]",
+        ),
+        (
+            "parquet",
+            "codec",
+            "Invalid Input Error: Copy option \"codec\" requires an argument of type VARCHAR",
+        ),
+        (
+            "parquet",
+            "compression",
+            "Invalid Input Error: Copy option \"compression\" requires an argument of type VARCHAR",
+        ),
+        (
+            "parquet",
+            "codec 3",
+            "Invalid Input Error: Copy option \"codec\" expected an argument of type VARCHAR - the argument \"3\" of type INTEGER could not be cast as this type",
+        ),
+        (
+            "parquet",
+            "codec NULL",
+            "Binder Error: NULL is not supported as a valid option for COPY option \"codec\"",
+        ),
+        (
+            "parquet",
+            "compression_level 3",
+            "Binder Error: Compression level is only supported for the ZSTD compression codec",
+        ),
+        (
+            "parquet",
+            "codec 'lz4', compression_level 3",
+            "Binder Error: Compression level is only supported for the ZSTD compression codec",
+        ),
+        (
+            "parquet",
+            "compression_level 99, codec 'snappy'",
+            "Binder Error: Compression level must be between -131072 and 22",
+        ),
+        (
+            "parquet",
+            "compression_level -200000",
+            "Binder Error: Compression level must be between -131072 and 22",
+        ),
+        (
+            "parquet",
+            "compression_level",
+            "Invalid Input Error: Copy option \"compression_level\" requires an argument of type BIGINT",
+        ),
+        (
+            "parquet",
+            "compression_level 'abc'",
+            "Invalid Input Error: Copy option \"compression_level\" expected an argument of type BIGINT - the argument \"abc\" of type VARCHAR could not be cast as this type",
+        ),
     ] {
         let sql = format!("COPY (SELECT 1 AS a) TO 'o.{format}' (FORMAT {format}, {option})");
         let error = db.execute(&sql).expect_err(&sql).to_string();
@@ -642,7 +702,7 @@ fn a_parquet_file_reads_back_as_what_was_written() {
     // The blob is text, because a blob that is not reads back only once the reader has a byte
     // column to put it in.
     db.execute("SET TimeZone = 'UTC'").expect("sets");
-    for codec in ["snappy", "uncompressed"] {
+    for codec in ["snappy", "uncompressed", "lz4", "lz4_raw"] {
         let path = std::env::temp_dir()
             .join(format!("rudb-copy-to-{codec}-{}.parquet", std::process::id()));
         let sql = format!("COPY p TO '{}' (COMPRESSION {codec})", path.display());
