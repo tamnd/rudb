@@ -652,6 +652,7 @@ impl<'a> Sink<'a> {
                 "snappy" => Codec::Snappy,
                 "gzip" => Codec::Gzip,
                 "lz4_raw" => Codec::Lz4Raw,
+                "zstd" => Codec::Zstd,
                 _ => Codec::Uncompressed,
             };
             let mut writer = rudb_parquet::Writer::new(out, &fields, codec, CREATED_BY)?;
@@ -664,6 +665,9 @@ impl<'a> Sink<'a> {
             });
             writer.set_field_ids(&copy.field_ids);
             writer.set_version(copy.parquet_version);
+            if let Some(level) = copy.compression_level {
+                writer.set_compression_level(level);
+            }
             Body::Parquet { writer: Box::new(writer), stored, group: Vec::new(), waiting: 0 }
         } else if copy.json {
             let moments = Moments {

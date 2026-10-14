@@ -769,6 +769,8 @@ pub struct Writer<W: Write> {
     field_ids: Vec<Option<i32>>,
     /// The format version the footer states, from [`Writer::set_version`].
     version: i32,
+    /// The zstd level, from [`Writer::set_compression_level`].
+    level: i64,
 }
 
 /// The field id `FIELD_IDS` gives a column, with the ones it gives the columns under it.
@@ -955,6 +957,7 @@ impl<W: Write> Writer<W> {
             limits: Limits::default(),
             field_ids: Vec::new(),
             version: 1,
+            level: rudb_compress::zstd::DEFAULT_LEVEL,
         };
         writer.put(b"PAR1")?;
         Ok(writer)
@@ -977,6 +980,11 @@ impl<W: Write> Writer<W> {
     /// version one pages, as the pin's are.
     pub fn set_version(&mut self, version: i32) {
         self.version = version;
+    }
+
+    /// Sets the level a ZSTD page is compressed at, which `COMPRESSION_LEVEL` gives.
+    pub fn set_compression_level(&mut self, level: i64) {
+        self.level = level;
     }
 
     /// Gives the columns that `ids` names their field ids, which go in the footer's schema.
@@ -1260,7 +1268,7 @@ impl<W: Write> Writer<W> {
         inner: (i16, thrift::Writer),
         written: &mut Written,
     ) -> Result<()> {
-        let stored = self.codec.compress(body).unwrap_or(Cow::Borrowed(body));
+        let stored = self.codec.compress_at(body, self.level).unwrap_or(Cow::Borrowed(body));
         let mut header = thrift::Writer::default();
         header.i32(1, kind);
         header.i32(2, i32::try_from(body.len()).map_err(|_| too_big())?);
