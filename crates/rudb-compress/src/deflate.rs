@@ -275,7 +275,7 @@ fn fixed() -> ([u8; 288], [u8; 30]) {
 /// The lengths are Huffman's, and when some come out longer than `limit` the longest are cut down
 /// and others lengthened until the code is complete again, which is what miniz does. A code with
 /// fewer than two symbols gets two of length one, since an inflater wants a complete code.
-fn lengths(counts: &[u32], limit: u8) -> Vec<u8> {
+pub(crate) fn lengths(counts: &[u32], limit: u8) -> Vec<u8> {
     let mut lengths = vec![0_u8; counts.len()];
     let mut used: Vec<usize> = (0..counts.len()).filter(|&symbol| counts[symbol] > 0).collect();
     if used.len() < 2 {

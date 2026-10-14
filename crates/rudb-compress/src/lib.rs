@@ -16,17 +16,16 @@
 //!
 //! # What is here
 //!
-//! Snappy in [`snappy`], both ways, and Zstandard in [`zstd`], decompression only. Snappy is what a
-//! Parquet writer emits when nobody chose, and zstd is what somebody chose, which between them is
-//! most of the Parquet anybody has.
+//! Snappy in [`snappy`] and Zstandard in [`zstd`], both ways. Snappy is what a Parquet writer
+//! emits when nobody chose, and zstd is what somebody chose, which between them is most of the
+//! Parquet anybody has.
 //!
 //! The two are not the same size of problem. Snappy is a few hundred lines of copy instructions and
 //! zstd is a few thousand, because zstd carries a Huffman coder and an arithmetic coder and most of
 //! the work is in them rather than in the format around them.
 //!
-//! Zstandard is decompression only because reading came before writing in this project, and a
-//! compressor belongs with the writer that uses it, since a compressor that nothing writes with is
-//! a compressor nothing tests.
+//! Reading came before writing in this project, and the zstd compressor came with the Parquet
+//! writer that uses it, since a compressor that nothing writes with is a compressor nothing tests.
 //!
 //! Gzip in [`gzip`], for whole files and for Parquet pages. A JSON or CSV file ending in `.gz` is
 //! the common case, and it is a stream with members and a trailer rather than a block. A Parquet
@@ -141,10 +140,17 @@ impl Codec {
     /// codec this build cannot write.
     #[must_use]
     pub fn compress(self, input: &[u8]) -> Option<Cow<'_, [u8]>> {
+        self.compress_at(input, zstd::DEFAULT_LEVEL)
+    }
+
+    /// [`Codec::compress`] at a compression level, which only zstd has and the others ignore.
+    #[must_use]
+    pub fn compress_at(self, input: &[u8], level: i64) -> Option<Cow<'_, [u8]>> {
         match self {
             Self::Uncompressed => Some(Cow::Borrowed(input)),
             Self::Snappy => Some(Cow::Owned(snappy::compress(input))),
             Self::Gzip => Some(Cow::Owned(gzip::compress(input))),
+            Self::Zstd => Some(Cow::Owned(zstd::compress(input, level))),
             Self::Lz4Raw => Some(Cow::Owned(lz4::compress(input))),
             _ => None,
         }

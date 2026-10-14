@@ -1,4 +1,4 @@
-//! Zstandard, decompression only.
+//! Zstandard, both ways.
 //!
 //! The first codec here after Snappy, and the one that changes what files this project can read.
 //! Snappy is what a Parquet writer emits when nobody chose, and zstd is what somebody chose: every
@@ -29,6 +29,12 @@
 //! is the assembly level work, and `spec/engine/05-scan.md` is the place that will say when the
 //! difference starts showing up in a scan rather than in a microbenchmark.
 //!
+//! # Writing
+//!
+//! [`compress`] is in the `encode` module, with the literals section in the `literals` module.
+//! Each block picks, for each of the three codes of its sequences, the predefined table, one code
+//! repeated, or a table it describes, whichever is cheapest.
+//!
 //! # What is not here
 //!
 //! Dictionaries, because Parquet does not use them and a dictionary is a second format. A frame
@@ -38,8 +44,12 @@
 pub(crate) mod bits;
 pub(crate) mod block;
 pub(crate) mod checksum;
+mod encode;
 pub(crate) mod fse;
 pub(crate) mod huffman;
+mod literals;
+
+pub use encode::{DEFAULT_LEVEL, compress};
 
 use rudb_common::{Error, Result};
 

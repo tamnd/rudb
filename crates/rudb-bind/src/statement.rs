@@ -1479,9 +1479,11 @@ fn parquet_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                 }
                 let codec = written.to_ascii_lowercase();
                 match codec.as_str() {
-                    "uncompressed" | "snappy" | "gzip" | "lz4_raw" => out.compression = codec,
+                    "uncompressed" | "snappy" | "gzip" | "lz4_raw" | "zstd" => {
+                        out.compression = codec;
+                    }
                     "lz4" => out.compression = "lz4_raw".to_string(),
-                    "brotli" | "zstd" => {
+                    "brotli" => {
                         return Err(Error::not_implemented(format!(
                             "COPY TO a Parquet file with the {codec} codec is not supported yet"
                         )));

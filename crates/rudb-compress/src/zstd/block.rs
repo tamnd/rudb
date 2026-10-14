@@ -47,22 +47,22 @@ impl Default for Recent {
 }
 
 /// The literal length codes, as a base and a number of extra bits.
-const LENGTH_BASE: [u32; 36] = [
+pub(crate) const LENGTH_BASE: [u32; 36] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64,
     128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
 ];
-const LENGTH_BITS: [u32; 36] = [
+pub(crate) const LENGTH_BITS: [u32; 36] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
     12, 13, 14, 15, 16,
 ];
 
 /// The match length codes, which start at three because a shorter copy is not worth coding.
-const MATCH_BASE: [u32; 53] = [
+pub(crate) const MATCH_BASE: [u32; 53] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
     28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
     2051, 4099, 8195, 16387, 32771, 65539,
 ];
-const MATCH_BITS: [u32; 53] = [
+pub(crate) const MATCH_BITS: [u32; 53] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
 ];
@@ -72,15 +72,15 @@ const MATCH_BITS: [u32; 53] = [
 /// Worth having rather than always describing a table, because a small block's own table costs more
 /// than it saves, and these three are close enough to what real data looks like that a compressor
 /// reaches for them often.
-const LENGTH_DEFAULT: [i32; 36] = [
+pub(crate) const LENGTH_DEFAULT: [i32; 36] = [
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
     -1, -1, -1, -1,
 ];
-const MATCH_DEFAULT: [i32; 53] = [
+pub(crate) const MATCH_DEFAULT: [i32; 53] = [
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1,
 ];
-const OFFSET_DEFAULT: [i32; 29] =
+pub(crate) const OFFSET_DEFAULT: [i32; 29] =
     [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1];
 
 /// Decompresses one compressed block onto the end of the frame's output.
@@ -158,7 +158,7 @@ pub(crate) fn decompress(
 /// literals is the part that looks arbitrary and is not: a sequence with no literals cannot be
 /// repeating the most recent distance, because the encoder would have merged it into the previous
 /// copy, so that code is free to mean something else and it means the one before.
-fn resolve(coded: u64, no_literals: bool, recent: &mut [u64; 3]) -> Result<u64> {
+pub(super) fn resolve(coded: u64, no_literals: bool, recent: &mut [u64; 3]) -> Result<u64> {
     if coded > 3 {
         let offset = coded - 3;
         recent[2] = recent[1];
@@ -293,7 +293,7 @@ fn read_table(
 }
 
 /// Reads the literals section and gives back the bytes it regenerates.
-fn read_literals(input: &[u8], carried: &mut Carried) -> Result<(Vec<u8>, usize)> {
+pub(super) fn read_literals(input: &[u8], carried: &mut Carried) -> Result<(Vec<u8>, usize)> {
     let short = "a zstd block that ends inside its literals";
     let &first = input.first().ok_or_else(|| Error::io(short))?;
     let kind = first & 0x03;
