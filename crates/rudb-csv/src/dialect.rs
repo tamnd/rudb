@@ -80,6 +80,13 @@ pub struct Given {
     /// for a value that does not convert, which tells somebody who set the type to look at the data
     /// and somebody who did not to set one.
     pub typed: bool,
+    /// How many columns the read has to have when something other than the call said so, which is
+    /// the table a `COPY t FROM` loads.
+    ///
+    /// The delimiter is then the first that splits every line of the sample that many ways, as it
+    /// is for a call that set its columns, which is how the pin's sniffer, told the width, reads a
+    /// file of bytes with a `|` in them as one column.
+    pub width: Option<usize>,
     /// The column types the call set, first column first, which is `columns` on a call.
     ///
     /// The names come with them in [`Given::names`], and the file has to have exactly this many
@@ -128,6 +135,17 @@ pub struct Given {
     /// call rounded up to a whole chunk, the way the pin counts it. `None` is the pin's default of
     /// ten, and `usize::MAX` is `-1`, which is the whole file.
     pub sample_chunks: Option<usize>,
+    /// Whether a row that does not fit the file is left out rather than refused, which is
+    /// `ignore_errors` on a call.
+    ///
+    /// A row with too few or too many fields is left out whatever the query reads of it, and a
+    /// value that does not convert only in a column the query reads. Measured on
+    /// `v2.0.0-dev84237`, where `count(*)` over such a file counts the rows with a bad value and
+    /// not the rows of the wrong width, and `count(b)` counts neither.
+    pub ignore_errors: bool,
+    /// Whether a row with too few fields is read with nulls for the rest, which is `null_padding`
+    /// on a call. A row with too many is refused either way.
+    pub null_padding: bool,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.
@@ -272,6 +290,21 @@ pub fn delimiter(sample: &[u8], quote: Option<u8>) -> u8 {
     best.1
 }
 
+/// The first delimiter that splits every line of `sample` into `columns` fields, for a read that
+/// set its columns.
+///
+/// The pin's sniffer only takes a dialect that finds as many columns as were set, so a file of one
+/// column set as one is not split on a `|` that happens to be in it. Measured on
+/// `v2.0.0-dev84237`, where a one line file with a `|` and a `;` in it is two columns sniffed and
+/// one column read with `columns={'col1': 'BLOB'}`.
+#[must_use]
+pub fn delimiter_of_width(sample: &[u8], quote: Option<u8>, columns: usize) -> Option<u8> {
+    DELIMITERS.into_iter().find(|&candidate| {
+        let dialect = Dialect { delimiter: candidate, quote, escape: quote, header: false };
+        consistent_width(sample, dialect) == Some(columns)
+    })
+}
+
 /// The number of fields every line has under `dialect`, when they all have the same number.
 fn consistent_width(sample: &[u8], dialect: Dialect) -> Option<usize> {
     let mut at = 0;
@@ -337,6 +370,14 @@ mod tests {
     #[test]
     fn a_file_with_nothing_to_split_on_is_comma_separated_and_one_column() {
         assert_eq!(delimiter(b"a\nb\n", None), b',');
+    }
+
+    #[test]
+    fn a_read_that_set_its_columns_takes_the_delimiter_that_finds_that_many() {
+        assert_eq!(delimiter(b"a|b;c\n", None), b'|');
+        assert_eq!(delimiter_of_width(b"a|b;c\n", None, 1), Some(b','));
+        assert_eq!(delimiter_of_width(b"a|b;c\n", None, 2), Some(b'|'));
+        assert_eq!(delimiter_of_width(b"a|b;c\n", None, 3), None);
     }
 
     #[test]

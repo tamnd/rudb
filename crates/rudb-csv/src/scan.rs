@@ -358,6 +358,24 @@ impl Records {
         })
     }
 
+    /// Keeps the records `keep` says yes to, in order, which is how a read that ignores errors
+    /// leaves out the rows it ignores.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        let (mut spans, mut rows, mut start) = (0, 0, 0);
+        for row in 0..self.ends.len() {
+            let end = self.ends[row];
+            if keep(row) {
+                self.spans.copy_within(start..end, spans);
+                spans += end - start;
+                self.ends[rows] = spans;
+                rows += 1;
+            }
+            start = end;
+        }
+        self.spans.truncate(spans);
+        self.ends.truncate(rows);
+    }
+
     /// Moves every range down by `by` bytes, for a buffer that has just had that many bytes taken
     /// off its front.
     pub fn shift(&mut self, by: usize) {

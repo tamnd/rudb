@@ -103,10 +103,39 @@ fn timed(text: &str) -> bool {
 /// takes a date in front and any amount of rubbish behind, so it would take a whole timestamp
 /// column and every value in it would lose its day. A column of `12:34:56 UTC` is a `VARCHAR` to
 /// the binary, which is what this refuses it for.
+///
+/// The shape is the one the pin's sniffer holds a value to, which is `Time::TryConvertTime` in its
+/// strict mode: hours, a colon, a minute of one or two digits, and then either the end, where the
+/// minute has to have two, or a colon and a second of one or two digits, a fraction after that if
+/// there is one, and nothing but spaces around it. So `12:00` and `12:0:5` are clocks, and `12:`,
+/// `12:0` and `12:0:` are not, although the cast takes all five.
 fn clock(text: &str) -> bool {
-    let text = text.trim();
-    !text.is_empty()
-        && text.bytes().all(|byte| byte.is_ascii_digit() || byte == b':' || byte == b'.')
+    let text = text.trim().as_bytes();
+    let digits = |from: usize, most: usize| {
+        text[from..].iter().take(most).take_while(|byte| byte.is_ascii_digit()).count()
+    };
+    let hours = digits(0, 10);
+    if hours == 0 || hours > 9 || text.get(hours) != Some(&b':') {
+        return false;
+    }
+    let minute = digits(hours + 1, 2);
+    let at = hours + 1 + minute;
+    if minute == 0 {
+        return false;
+    }
+    if at == text.len() {
+        return minute == 2;
+    }
+    let second = if text[at] == b':' { digits(at + 1, 2) } else { 0 };
+    if second == 0 {
+        return false;
+    }
+    let at = at + 1 + second;
+    match text.get(at) {
+        None => true,
+        Some(b'.') => text[at + 1..].iter().all(u8::is_ascii_digit),
+        Some(_) => false,
+    }
 }
 
 /// The spellings DuckDB's sniffer reads as a boolean.
@@ -202,6 +231,11 @@ mod tests {
         assert_eq!(of(&["12:34"]), LogicalType::Time);
         assert_eq!(of(&["12:34:56.5"]), LogicalType::Time);
         assert_eq!(of(&["12:34:56 UTC"]), LogicalType::Varchar);
+        // The pin's sniffer, measured on `v2.0.0-dev84237`, which casts all of these.
+        assert_eq!(of(&["12:0"]), LogicalType::Varchar);
+        assert_eq!(of(&["12:"]), LogicalType::Varchar);
+        assert_eq!(of(&["12:0:"]), LogicalType::Varchar);
+        assert_eq!(of(&["12:0:5", " 7:05:06.25 "]), LogicalType::Time);
         assert_eq!(of(&["2020-01-02 03:04:05"]), LogicalType::Timestamp);
         for taken in ["12:34:56 UTC", "2020-01-02 03:04:05"] {
             let value = Value::Varchar(taken.into());

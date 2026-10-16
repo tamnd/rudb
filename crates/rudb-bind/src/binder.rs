@@ -4876,10 +4876,13 @@ impl<'a> Binder<'a> {
     /// sniffer error that says so. The rest of that error is a list of fixes for a sniffer this one
     /// is not, and is left out.
     ///
-    /// The names go into the plan as a `names` parameter and the flag that the types were set as
-    /// `types_set`, because the executor opens the file again from what the plan says, and the
-    /// columns it finds have to be the ones the plan was built against. The types need nothing,
-    /// since the executor already reads a CSV file as the types the plan holds.
+    /// The file is sniffed knowing how many columns the table has, so the delimiter is one that
+    /// splits it that many ways when there is one, which is what the pin's sniffer does with them.
+    ///
+    /// The names go into the plan as a `names` parameter and the width as `types_set`, which also
+    /// says the types were set, because the executor opens the file again from what the plan says,
+    /// and the columns it finds have to be the ones the plan was built against. The types need
+    /// nothing, since the executor already reads a CSV file as the types the plan holds.
     fn copy_fields(
         &mut self,
         paths: &[String],
@@ -4887,6 +4890,7 @@ impl<'a> Binder<'a> {
         into: &[Field],
         written: &mut Vec<(&'static str, Value, ExprRef)>,
     ) -> Result<Vec<Field>> {
+        let given = &Given { width: Some(into.len()), ..given.clone() };
         let (sniffed, _) = csv_fields(paths, given.clone())?;
         // A file with nothing in it is read as no rows whatever the table looks like.
         let empty = || {
@@ -4908,12 +4912,13 @@ impl<'a> Binder<'a> {
                 sniffed.len()
             )));
         }
+        let width = i64::try_from(into.len()).unwrap_or(i64::MAX);
         let names: Vec<Value> =
             into.iter().map(|field| Value::Varchar(field.name.clone())).collect();
         let names = Value::List { element: LogicalType::Varchar, values: names };
         let list = LogicalType::List(Box::new(LogicalType::Varchar));
         for (parameter, value, ty) in
-            [("names", names, list), (TYPES_SET, Value::Boolean(true), LogicalType::Boolean)]
+            [("names", names, list), (TYPES_SET, Value::BigInt(width), LogicalType::BigInt)]
         {
             self.hidden(written, parameter, value, ty);
         }
@@ -8398,7 +8403,7 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         return format!("Cannot use NULL as argument to key \"{parameter}\"");
     }
     match parameter {
-        "header" | "auto_detect" | "null_padding" => {
+        "header" | "auto_detect" | "null_padding" | "ignore_errors" => {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
         "buffer_size" | "files_to_sniff" | "max_line_size" | "maximum_line_size"

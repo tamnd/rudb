@@ -77,6 +77,9 @@ pub struct Reader {
     /// all, which is what the binder weighs when it combines the files of a read.
     sampled: usize,
     empty: bool,
+    /// Whether the sample had rows of more than one width, which is where this sniffer and the
+    /// pin's part ways, see [`Reader::check_widths`].
+    ragged: bool,
 }
 
 impl Reader {
@@ -136,6 +139,7 @@ impl Reader {
             cap: u64::MAX,
             sampled: 0,
             empty: false,
+            ragged: false,
         };
         reader.fill(0)?;
         reader.skip_lines()?;
@@ -151,24 +155,42 @@ impl Reader {
             let quote = given.quote.or_else(|| dialect::quote(&sample));
             let delimiter = match given.delimiter {
                 Some(byte) => byte,
-                None => dialect::delimiter(&sample, quote),
+                None => given
+                    .types
+                    .as_ref()
+                    .map(Vec::len)
+                    .or(given.width)
+                    .and_then(|width| dialect::delimiter_of_width(&sample, quote, width))
+                    .unwrap_or_else(|| dialect::delimiter(&sample, quote)),
             };
             (quote, delimiter, given.header)
         };
         let escape = given.escape.or(quote);
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
-        let mut rows = reader.sample_rows(&sample)?;
-        let empty = sample.is_empty();
-        drop(sample);
         // The punctuation comes from the first block, as the pin's comes from its first chunk, and
         // only the rows go on to more of the file when the sample asks for more than a block held.
         // A block that came back short was the end of the file, which is nearly every file, so
-        // those are not read again to find that out.
+        // those are not read again to find that out, and its last line is a row whether or not a
+        // newline ends it.
         let mut more = reader.buffer.len() >= reader.block;
+        let mut rows = reader.sample_rows(&sample, !more)?;
+        let empty = sample.is_empty();
+        drop(sample);
         while more && rows.len() <= reader.given.sample() {
             more = reader.grow()?;
-            rows = reader.sample_rows(&reader.buffer)?;
+            rows = reader.sample_rows(&reader.buffer, !more)?;
         }
+        // A read that ignores errors is as wide as most of its rows rather than its widest, since
+        // the rest are the ones it is going to leave out. Measured on `v2.0.0-dev84237`, where a
+        // file of rows of two fields with one of one and one of three reads as two columns with
+        // `ignore_errors` and as three with `null_padding` as well.
+        if reader.given.ignore_errors && !reader.given.null_padding {
+            let width = commonest(&rows);
+            rows.retain(|row| row.len() == width);
+        }
+        let widest = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let blank = |row: &Vec<Option<String>>| row.len() == 1 && row[0].is_none();
+        reader.ragged = rows.iter().any(|row| row.len() != widest && !blank(row));
         let (header, mut fields) = describe(&rows, told, reader.given.types.as_deref());
         reader.sampled = rows.len().saturating_sub(usize::from(header));
         reader.empty = empty;
@@ -255,8 +277,10 @@ impl Reader {
             })
         };
         let skipped = usize::from(header);
+        let padding = self.given.null_padding;
+        let misfit = |row: &[Option<String>]| !self.given.ignore_errors && !wide(row, set, padding);
         let Some((at, row)) =
-            rows.iter().enumerate().skip(skipped).find(|(_, row)| row.len() != set || !fits(row))
+            rows.iter().enumerate().skip(skipped).find(|(_, row)| misfit(row) || !fits(row))
         else {
             return Ok(());
         };
@@ -267,12 +291,16 @@ impl Reader {
         Err(Error::invalid_input(format!(
             "CSV Error on Line: {}\nOriginal Line: {}\nExpected Number of Columns: {set} Found: \
              {}\nPossible fixes:\n* Disable the parser's strict mode (strict_mode=false) to allow \
-             reading rows that do not comply with the CSV standard.\n* Enable null padding \
-             (null_padding=true) to replace missing values with NULL\n* Enable ignore errors \
+             reading rows that do not comply with the CSV standard.\n{}* Enable ignore errors \
              (ignore_errors=true) to skip this row\n\n  file = {}\n",
             at + 1,
             written.join(&char::from(self.dialect.delimiter).to_string()),
             row.len(),
+            if padding {
+                ""
+            } else {
+                "* Enable null padding (null_padding=true) to replace missing values with NULL\n"
+            },
             self.path,
         )))
     }
@@ -384,23 +412,42 @@ impl Reader {
     /// reported ahead of a value that does not convert, and among values the first projected
     /// column's first bad row is the one named.
     ///
+    /// A read that ignores errors leaves out the records that are not as wide as the file, and then
+    /// the ones with a value that does not convert, and a chunk it leaves nothing of is passed over
+    /// for the next one.
+    ///
     /// # Errors
     ///
-    /// A read error, a malformed record, or a value that does not fit the type the sample chose
-    /// for its column.
+    /// A read error, a malformed record, a record with too few or too many fields, or a value that
+    /// does not fit the type the sample chose for its column.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-        let rows = self.next_records()?;
-        if rows == 0 {
-            return Ok(None);
+        loop {
+            let rows = self.next_records()?;
+            if rows == 0 {
+                return Ok(None);
+            }
+            let first = self.line;
+            self.line += rows as u64;
+            let mut index = self.check_widths(first)?;
+            while !self.records.is_empty() {
+                match self.convert_chunk(first, index.as_deref()) {
+                    Ok(chunk) => return Ok(Some(chunk)),
+                    Err(error) if self.given.ignore_errors => {
+                        if !self.leave_out_refused(&mut index) {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
-        let first = self.line;
-        self.line += rows as u64;
-        let cells = Cells {
-            bytes: &self.buffer,
-            records: &self.records,
-            dialect: self.dialect,
-            nulls: self.nulls.as_deref(),
-        };
+    }
+
+    /// The records of the chunk as columns, where `index` is the row of the chunk as it was split
+    /// that each record is, once some have been left out.
+    fn convert_chunk(&self, first: u64, index: Option<&[usize]>) -> Result<Chunk> {
+        let rows = self.records.len();
+        let cells = self.cells();
         let projected: Vec<_> =
             self.projection.iter().map(|&at| (at, &self.fields[at].ty)).collect();
         let mut builders = convert::builders(&cells, &projected);
@@ -408,23 +455,39 @@ impl Reader {
         while start < rows {
             let end = rows.min(start + BLOCK_ROWS);
             for (build, &at) in builders.iter_mut().zip(&self.projection) {
-                let refuse = |text: &str, row: usize| {
-                    let original = self.original_line(row);
-                    Error::conversion(self.conversion_error(
-                        text,
-                        &original,
-                        at,
-                        first + row as u64,
-                    ))
-                };
+                let refuse = |text: &str, row: usize| self.refusal(text, at, first, row, index);
                 if let Err(error) = build.rows(&cells, at, start..end, &refuse) {
-                    return Err(self.first_bad_value(&cells, first).unwrap_or(error));
+                    return Err(self.first_bad_value(&cells, first, index).unwrap_or(error));
                 }
             }
             start = end;
         }
         let columns = builders.into_iter().map(|build| build.finish()).collect::<Result<_>>()?;
-        Ok(Some(Chunk::with_rows(columns, rows)?))
+        Chunk::with_rows(columns, rows)
+    }
+
+    /// The chunk's fields, the way the conversion reads them.
+    fn cells(&self) -> Cells<'_> {
+        Cells {
+            bytes: &self.buffer,
+            records: &self.records,
+            dialect: self.dialect,
+            nulls: self.nulls.as_deref(),
+        }
+    }
+
+    /// The error for `text` in column `at` of `row`, where the chunk starts at line `first`.
+    fn refusal(
+        &self,
+        text: &str,
+        at: usize,
+        first: u64,
+        row: usize,
+        index: Option<&[usize]>,
+    ) -> Error {
+        let row = index.map_or(row, |index| index[row]);
+        let original = self.original_line(row);
+        Error::conversion(self.conversion_error(text, &original, at, first + row as u64))
     }
 
     /// The error for the first projected column's first value that does not convert, found by
@@ -433,15 +496,119 @@ impl Reader {
     /// A chunk is converted a block of rows at a time, so the first value it trips on can be in a
     /// later column than one with a bad value further down. This is only run once one has been
     /// found, to name the same value the reader always named.
-    fn first_bad_value(&self, cells: &Cells<'_>, first: u64) -> Option<Error> {
+    fn first_bad_value(
+        &self,
+        cells: &Cells<'_>,
+        first: u64,
+        index: Option<&[usize]>,
+    ) -> Option<Error> {
         self.projection.iter().find_map(|&at| {
             let field = &self.fields[at];
-            let refuse = |text: &str, row: usize| {
-                let original = self.original_line(row);
-                Error::conversion(self.conversion_error(text, &original, at, first + row as u64))
-            };
+            let refuse = |text: &str, row: usize| self.refusal(text, at, first, row, index);
             convert::column(cells, at, &field.ty, &refuse).err()
         })
+    }
+
+    /// Leaves out every record of the chunk with a value in a projected column that does not
+    /// convert, and answers whether there was one, which there always is unless the parsers and
+    /// the cast disagree.
+    fn leave_out_refused(&mut self, index: &mut Option<Vec<usize>>) -> bool {
+        let cells = self.cells();
+        let mut bad = vec![false; self.records.len()];
+        for &at in &self.projection {
+            convert::refused(&cells, at, &self.fields[at].ty, &mut bad);
+        }
+        if !bad.contains(&true) {
+            return false;
+        }
+        let rows = index.take().unwrap_or_else(|| (0..bad.len()).collect());
+        *index = Some(
+            rows.into_iter().zip(&bad).filter(|(_, bad)| !**bad).map(|(row, _)| row).collect(),
+        );
+        self.records.retain(|row| !bad[row]);
+        true
+    }
+
+    /// Holds every record of the chunk to the width of the file, and answers which rows of the
+    /// chunk are left when some were left out.
+    ///
+    /// A record as wide as the file is a row. So is one with more fields than the file when the
+    /// ones past its width are empty, and an empty line is no row at all in a file of more than
+    /// one column. A record with fewer fields is read with nulls for the rest under
+    /// `null_padding`, and otherwise any record of the wrong width is left out under
+    /// `ignore_errors` and refused without it. All of it was measured on `v2.0.0-dev84237`: under a
+    /// header of `a,b`, both `3,4,,` and `3,"4",` read as `3,4`, `3,4, ` is refused for having
+    /// three columns, and `5` is refused for having one with `null_padding` off.
+    ///
+    /// A read where nothing but the sniffer said how wide the file is, and whose sample already
+    /// had rows of more than one width, still pads a short record and cuts a long one down, as
+    /// every read did before the widths were held to. The pin's sniffer weighs every dialect it
+    /// tries by how many rows agree with it and steps over the lines at the top that do not, and
+    /// this one takes the first delimiter every line agrees on, so a ragged sample is where the
+    /// two read a file differently and this one would refuse rows the pin's never sees. A sample
+    /// of one width is one both sniffers read the same way, so a row after it of another width is
+    /// refused: a file of 30000 rows of `n,n` and then `5` fails on the line `5` is on.
+    fn check_widths(&mut self, first: u64) -> Result<Option<Vec<usize>>> {
+        let width = self.fields.len();
+        let given = &self.given;
+        let loose = !given.fixed && given.types.is_none() && !given.ignore_errors;
+        let loose = loose && !given.null_padding && self.ragged;
+        let bytes = &self.buffer;
+        let records = &self.records;
+        let empty = |span: &Span| span.raw(bytes).is_empty();
+        // What a record is: a row, a line with nothing on it, or a row of the wrong width.
+        let fits = |row: usize| {
+            let fields = records.fields(row);
+            match fields.len() {
+                found if found == width => Some(true),
+                1 if width > 1 && empty(&fields[0]) => None,
+                found if found > width => Some(loose || fields[width..].iter().all(empty)),
+                _ => Some(loose || self.given.null_padding),
+            }
+        };
+        if (0..records.len()).all(|row| fits(row) == Some(true)) {
+            return Ok(None);
+        }
+        let mut keep = Vec::with_capacity(records.len());
+        for row in 0..records.len() {
+            match fits(row) {
+                Some(true) => keep.push(true),
+                None => keep.push(false),
+                Some(false) if self.given.ignore_errors => keep.push(false),
+                Some(false) => {
+                    let found = records.fields(row).len();
+                    return Err(self.wrong_width(
+                        &self.original_line(row),
+                        first + row as u64,
+                        found,
+                    ));
+                }
+            }
+        }
+        let index = (0..keep.len()).filter(|&row| keep[row]).collect();
+        self.records.retain(|row| keep[row]);
+        Ok(Some(index))
+    }
+
+    /// The pin's error for a row of `found` fields at `line` in a file of a different width.
+    ///
+    /// The advice to pad with nulls is there whenever padding is off, which was measured: a row
+    /// with too many fields gets it too, and the only thing that leaves it out is padding being on
+    /// already.
+    fn wrong_width(&self, original: &str, line: u64, found: usize) -> Error {
+        let padding = if self.given.null_padding {
+            ""
+        } else {
+            "* Enable null padding (null_padding=true) to replace missing values with NULL\n"
+        };
+        Error::invalid_input(format!(
+            "CSV Error on Line: {line}\nOriginal Line: {original}\nExpected Number of Columns: {} \
+             Found: {found}\nPossible fixes:\n* Disable the parser's strict mode \
+             (strict_mode=false) to allow reading rows that do not comply with the CSV \
+             standard.\n{padding}* Enable ignore errors (ignore_errors=true) to skip this row\n{}",
+            self.fields.len(),
+            self.settings(),
+        ))
     }
 
     /// Splits the next chunk's worth of records into [`Self::records`] and answers how many there
@@ -542,6 +709,7 @@ impl Reader {
             cap: u64::MAX,
             sampled: self.sampled,
             empty: self.empty,
+            ragged: self.ragged,
         }
     }
 
@@ -714,35 +882,46 @@ impl Reader {
     /// record into owned strings and one cell into a `Value` at a time.
     #[cfg(test)]
     fn next_chunk_by_record(&mut self) -> Result<Option<Chunk>> {
-        let mut rows: Vec<Vec<Option<String>>> = Vec::new();
-        let mut lines = Vec::new();
-        while rows.len() < VECTOR_SIZE {
-            let from = self.here();
-            match self.next_record()? {
-                Some(fields) => rows.push(fields),
-                None => break,
+        loop {
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            let mut lines = Vec::new();
+            let mut numbers = Vec::new();
+            let mut split = 0;
+            while split < VECTOR_SIZE {
+                let from = self.here();
+                let Some(fields) = self.next_record()? else { break };
+                split += 1;
+                // An empty line is no row in a file of more than one column, as in
+                // `Reader::check_widths`, and the chunk is the rows left of the ones split.
+                if self.fields.len() > 1 && fields.len() == 1 && fields[0].is_none() {
+                    continue;
+                }
+                let size = usize::try_from(self.here() - from).unwrap_or(usize::MAX);
+                let line = &self.buffer[self.at - size..self.at];
+                let line = line.strip_suffix(b"\n").unwrap_or(line);
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                lines.push(String::from_utf8_lossy(line).into_owned());
+                numbers.push(self.line - 1);
+                rows.push(fields);
             }
-            let size = usize::try_from(self.here() - from).unwrap_or(usize::MAX);
-            let line = &self.buffer[self.at - size..self.at];
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            lines.push(String::from_utf8_lossy(line).into_owned());
-        }
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let mut columns = Vec::with_capacity(self.projection.len());
-        for &at in &self.projection {
-            let field = &self.fields[at];
-            let mut values = Vec::with_capacity(rows.len());
-            for (row, held) in rows.iter().enumerate() {
-                let text = held.get(at).and_then(Option::as_deref);
-                let line = self.line - rows.len() as u64 + row as u64;
-                values.push(self.convert(text, &lines[row], at, line)?);
+            if split == 0 {
+                return Ok(None);
             }
-            columns.push(rudb_vector::Vector::from_values(field.ty.clone(), &values)?);
+            if rows.is_empty() {
+                continue;
+            }
+            let mut columns = Vec::with_capacity(self.projection.len());
+            for &at in &self.projection {
+                let field = &self.fields[at];
+                let mut values = Vec::with_capacity(rows.len());
+                for (row, held) in rows.iter().enumerate() {
+                    let text = held.get(at).and_then(Option::as_deref);
+                    values.push(self.convert(text, &lines[row], at, numbers[row])?);
+                }
+                columns.push(rudb_vector::Vector::from_values(field.ty.clone(), &values)?);
+            }
+            return Ok(Some(Chunk::with_rows(columns, rows.len())?));
         }
-        Ok(Some(Chunk::with_rows(columns, rows.len())?))
     }
 
     /// One value, cast from its text to the column's type.
@@ -894,14 +1073,14 @@ impl Reader {
 
     /// The records the sniffer gets to look at, which is the sample or the file, whichever is
     /// shorter.
-    fn sample_rows(&self, sample: &[u8]) -> Result<Vec<Vec<Option<String>>>> {
+    fn sample_rows(&self, sample: &[u8], eof: bool) -> Result<Vec<Vec<Option<String>>>> {
         let mut rows = Vec::new();
         let mut fields = Vec::new();
         let mut at = 0;
         while rows.len() <= self.given.sample() {
-            // The end of the block is not the end of the file, so a record the block cut in half is
-            // simply not part of the sample.
-            let Some(next) = crate::scan::record(sample, at, self.dialect, false, &mut fields)?
+            // Unless the block is the end of the file, a record the block cut in half is simply not
+            // part of the sample.
+            let Some(next) = crate::scan::record(sample, at, self.dialect, eof, &mut fields)?
             else {
                 break;
             };
@@ -1045,6 +1224,31 @@ fn unique(header: &[Option<String>], width: usize) -> Vec<String> {
         taken.push(name);
     }
     taken
+}
+
+/// The number of fields most of `rows` have, the larger of two that are as common, leaving out
+/// empty lines, which are not rows in a file of more than one column.
+fn commonest(rows: &[Vec<Option<String>>]) -> usize {
+    let mut counts: Vec<usize> = Vec::new();
+    for row in rows.iter().filter(|row| !matches!(row[..], [None])) {
+        if counts.len() <= row.len() {
+            counts.resize(row.len() + 1, 0);
+        }
+        counts[row.len()] += 1;
+    }
+    let most = counts.iter().copied().max().unwrap_or(0);
+    counts.iter().rposition(|&count| count == most && count > 0).unwrap_or(1)
+}
+
+/// Whether a sampled row is as wide as `width` columns, by the rule [`Reader::check_widths`] holds
+/// the rows that are read to, with `padding` for `null_padding`.
+fn wide(row: &[Option<String>], width: usize, padding: bool) -> bool {
+    match row.len() {
+        found if found == width => true,
+        1 if width > 1 && row[0].is_none() => true,
+        found if found > width => row[width..].iter().all(Option::is_none),
+        _ => padding,
+    }
 }
 
 /// The type of each of `width` columns, over these rows.
@@ -1496,11 +1700,12 @@ mod tests {
                     }
                 });
             }
+            // Short rows are read padded, and one cut down to an empty field is an empty line.
             if rng.below(200) == 0 {
                 fields.pop();
             }
             if rng.below(200) == 0 {
-                fields.push("extra".to_string());
+                fields.push(String::new());
             }
             text.push_str(&fields.join(","));
             text.push_str(["\n", "\n", "\n", "\r\n", "\r"][rng.below(5)]);
@@ -1518,7 +1723,7 @@ mod tests {
         file.write_at(0, text).expect("writes");
         drop(file);
         let file = filesystem.open(path, OpenMode::Read).expect("opens");
-        Reader::open_sized(file, "/t.csv", Given::default(), block)
+        Reader::open_sized(file, "/t.csv", Given { null_padding: true, ..Given::default() }, block)
     }
 
     /// The chunk at a time reader and the record at a time one, over generated files, read with
@@ -1656,6 +1861,99 @@ mod tests {
             "{ROWS} rows, {megabytes:.1} MB: a record at a time {old:.1} MB/s, a chunk at a time"
         );
         println!("{new:.1} MB/s, {:.2}x", best[0] / best[1]);
+    }
+
+    fn two_integers(given: Given) -> Given {
+        Given {
+            fixed: true,
+            header: Some(true),
+            names: Some(vec!["a".into(), "b".into()]),
+            types: Some(vec![LogicalType::Integer, LogicalType::Integer]),
+            ..given
+        }
+    }
+
+    fn integers(rows: &[&[Option<i32>]]) -> Vec<Vec<Value>> {
+        let value = |cell: &Option<i32>| cell.map_or(Value::Null, Value::Integer);
+        rows.iter().map(|row| row.iter().map(value).collect()).collect()
+    }
+
+    #[test]
+    fn a_row_of_the_wrong_width_is_refused_unless_it_is_padded_or_left_out() {
+        let text = "a,b\n1,2\n3\n4,5\n";
+        let error = read_or_error(text, two_integers(Given::default())).unwrap_err();
+        assert!(
+            error.message().starts_with(
+                "CSV Error on Line: 3\nOriginal Line: 3\nExpected Number of Columns: 2 Found: 1\n"
+            ),
+            "{error}"
+        );
+        assert!(error.message().contains("(null_padding=true)"), "{error}");
+        let padded = two_integers(Given { null_padding: true, ..Given::default() });
+        assert_eq!(
+            all(&mut read_with(text, padded)),
+            integers(&[&[Some(1), Some(2)], &[Some(3), None], &[Some(4), Some(5)]])
+        );
+        let ignored = two_integers(Given { ignore_errors: true, ..Given::default() });
+        assert_eq!(
+            all(&mut read_with("a,b\n1,2\n3\n4,5,6\n7,8\n", ignored)),
+            integers(&[&[Some(1), Some(2)], &[Some(7), Some(8)]])
+        );
+        // Padding does nothing for a row that is too long, and the advice to pad is left out.
+        let padded = two_integers(Given { null_padding: true, ..Given::default() });
+        let error = read_or_error("a,b\n1,2\n4,5,6\n", padded).unwrap_err();
+        assert!(error.message().contains("Found: 3\n"), "{error}");
+        assert!(!error.message().contains("(null_padding=true)"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_line_and_empty_fields_past_the_last_column_are_not_errors() {
+        let text = "a,b\n1,2\n\n3,4,,\n5,\"6\",\n";
+        assert_eq!(
+            all(&mut read_with(text, two_integers(Given::default()))),
+            integers(&[&[Some(1), Some(2)], &[Some(3), Some(4)], &[Some(5), Some(6)]])
+        );
+        let error = read_or_error("a,b\n1,2\n3,4, \n", two_integers(Given::default())).unwrap_err();
+        assert!(error.message().contains("Found: 3\n"), "{error}");
+        // A line left out still counts when a later one is named.
+        let error = read_or_error("a,b\n1,2\n\n4,x\n", two_integers(Given::default())).unwrap_err();
+        assert!(
+            error.message().starts_with("CSV Error on Line: 4\nOriginal Line: 4,x\n"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ignoring_errors_leaves_out_the_rows_with_a_value_a_read_column_cannot_take() {
+        let text = "a,b\n1,2\n3,x\n5,6\n";
+        let ignored = || two_integers(Given { ignore_errors: true, ..Given::default() });
+        assert_eq!(
+            all(&mut read_with(text, ignored())),
+            integers(&[&[Some(1), Some(2)], &[Some(5), Some(6)]])
+        );
+        let mut reader = read_with(text, ignored());
+        reader.project(&[0]).expect("projects");
+        assert_eq!(all(&mut reader), integers(&[&[Some(1)], &[Some(3)], &[Some(5)]]));
+        // Sniffed, the file is as wide as most of its rows and the rest are left out.
+        let text = "a,b\n1,2\n3\n4,5\n6,7,8\n9,x\n10,11\n";
+        let mut reader = read_with(text, Given { ignore_errors: true, ..Given::default() });
+        assert_eq!(
+            names_and_types(&reader),
+            [("a".into(), "BIGINT".into()), ("b".into(), "VARCHAR".into())]
+        );
+        assert_eq!(all(&mut reader).len(), 4);
+    }
+
+    /// Every row of the file, or the error opening or reading it, since a file that is not sniffed
+    /// is held to its width from the first rows on.
+    fn read_or_error(text: &str, given: Given) -> Result<Vec<Vec<Value>>> {
+        let filesystem = SimFilesystem::new();
+        let path = Path::new("/t.csv");
+        let file = filesystem.open(path, OpenMode::Create).expect("creates");
+        file.write_at(0, text.as_bytes()).expect("writes");
+        drop(file);
+        let file = filesystem.open(path, OpenMode::Read).expect("opens");
+        all_or_error(&mut Reader::open_with(file, "/t.csv", given)?)
     }
 
     fn all_or_error(reader: &mut Reader) -> Result<Vec<Vec<Value>>> {

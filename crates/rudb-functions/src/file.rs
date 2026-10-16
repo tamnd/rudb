@@ -85,9 +85,14 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             ("names" | "column_names", Value::List { values, .. }) => {
                 given.names = Some(strings(name, values)?)
             }
-            (TYPES_SET, Value::Boolean(on)) => given.typed = *on,
+            (TYPES_SET, Value::BigInt(width)) => {
+                given.typed = true;
+                given.width = usize::try_from(*width).ok();
+            }
             ("auto_detect", Value::Boolean(on)) => given.fixed = !*on,
             ("all_varchar", Value::Boolean(on)) => given.all_varchar = *on,
+            ("ignore_errors", Value::Boolean(on)) => given.ignore_errors = *on,
+            ("null_padding", Value::Boolean(on)) => given.null_padding = *on,
             ("buffer_size", Value::UBigInt(size)) => {
                 if *size == 0 {
                     return Err(Error::invalid_input("Buffer Size option must be higher than 0"));
@@ -321,11 +326,11 @@ pub fn json_text(path: &str, compression: scan::Compression) -> Result<String> {
 }
 
 /// The name of the setting the binder writes into a `COPY t FROM` plan to say the column types are
-/// the table's rather than the sniffer's.
+/// the table's rather than the sniffer's, with the number of columns the table has as its value.
 ///
 /// It is not in `read_csv`'s parameter list, so a call cannot write it, and it rides with the named
 /// parameters rather than beside them because that list is what the executor rebuilds the reader
-/// from. See [`Given::typed`] for what it changes.
+/// from. See [`Given::typed`] and [`Given::width`] for what it changes.
 pub const TYPES_SET: &str = "types_set";
 
 /// The name of the setting the binder writes into the plan of a read of several CSV files to say
