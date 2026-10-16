@@ -67,9 +67,26 @@ pub struct Given {
     /// `None` is DuckDB's default, where an empty field is a null. A field is compared once its
     /// quotes and escapes are gone, so `"NA"` is as much a null as `NA` is, and with any list here
     /// an empty field is an empty string rather than a null. Both were measured on
-    /// `v2.0.0-dev84237`, where `allow_quoted_nulls` is on unless it is turned off, and it cannot
-    /// be turned off here.
+    /// `v2.0.0-dev84237`, where `allow_quoted_nulls` is on unless [`Given::quoted_values`] turns
+    /// it off.
     pub nulls: Option<Vec<String>>,
+    /// Whether a quoted field is the string it spells even when that is a null string, which is
+    /// `allow_quoted_nulls=false` on a call and on a `COPY`.
+    ///
+    /// Then `"null"` with `nullstr='null'` is the word and `""` is the empty string, while `null`
+    /// and an empty field with no quotes are still nulls. The sniffer reads the sample the same
+    /// way. Measured on `v2.0.0-dev84237`, where `42,""` reads as `42` and the empty string.
+    pub quoted_values: bool,
+    /// The columns whose nulls are read as empty strings, which is `force_not_null` on a call and
+    /// `FORCE_NOT_NULL` on a `COPY`, by name with case not mattering.
+    ///
+    /// The sniffer does not look at this, so the empty string goes to whatever type the column
+    /// has, and a column that is not text with a null in it is an error. The binder checks every
+    /// name is a column of the read before any file is read.
+    pub force_not_null: Vec<String>,
+    /// The types the sniffer tries, in the order it tries them, which is `auto_type_candidates`
+    /// on a call. `None` is [`crate::infer::LADDER`].
+    pub candidates: Option<Vec<LogicalType>>,
     /// What to call the columns, first column first, in place of what the header or the generator
     /// called them. A list shorter than the file names the columns it reaches.
     pub names: Option<Vec<String>>,

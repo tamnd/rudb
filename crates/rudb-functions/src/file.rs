@@ -132,6 +132,14 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
                 given.retype = Some(csv_types(name, value, &mut LogicalType::parse)?);
             }
             ("union_by_name", Value::Boolean(on)) => given.union_by_name = *on,
+            ("allow_quoted_nulls", Value::Boolean(on)) => given.quoted_values = !*on,
+            ("force_not_null", Value::List { values, .. }) => {
+                given.force_not_null = strings(name, values)?;
+            }
+            ("auto_type_candidates", value) => {
+                let types = csv_candidates(value, &mut LogicalType::parse)?;
+                given.candidates = Some(rudb_csv::infer::ladder(&types));
+            }
             ("files_to_sniff", Value::BigInt(count)) => {
                 given.files_to_sniff = Some(match *count {
                     -1 => usize::MAX,
@@ -304,6 +312,53 @@ pub fn csv_columns(
         types.push(read(written)?);
     }
     Ok((names, types))
+}
+
+/// The types `auto_type_candidates` names, each read with `read`, in the order it names them.
+///
+/// The sniffer tries them in its own order, which [`rudb_csv::infer::ladder`] puts them in, and
+/// it always has `VARCHAR` to fall back on whether or not it is named.
+///
+/// # Errors
+///
+/// A binder error in the pin's words for a value that is not a list, a list that is empty, an entry
+/// that is not a string, and a type the sniffer cannot try, which is named by what kind of type it
+/// is, so a list type is `LIST`. An entry that does not name a type is whatever `read` says.
+pub fn csv_candidates(
+    value: &Value,
+    read: &mut dyn FnMut(&str) -> Result<LogicalType>,
+) -> Result<Vec<LogicalType>> {
+    let Value::List { values, .. } = value else {
+        return Err(Error::binder("read_csv auto_types requires a list as input"));
+    };
+    if values.is_empty() {
+        return Err(Error::binder("auto_type_candidates requires at least one type"));
+    }
+    let mut types = Vec::with_capacity(values.len());
+    for child in values {
+        let Value::Varchar(written) = child else {
+            return Err(Error::binder(
+                "auto_type_candidates requires a type specification as string",
+            ));
+        };
+        let ty = read(written)?;
+        if rudb_csv::infer::specificity(&ty).is_none() {
+            let kind = match &ty {
+                LogicalType::List(_) => "LIST".to_string(),
+                LogicalType::Array(..) => "ARRAY".to_string(),
+                LogicalType::Struct(_) => "STRUCT".to_string(),
+                LogicalType::Map(..) => "MAP".to_string(),
+                LogicalType::Union(_) => "UNION".to_string(),
+                LogicalType::Enum(_) => "ENUM".to_string(),
+                other => other.to_string(),
+            };
+            return Err(Error::binder(format!(
+                "Auto Type Candidate of type {kind} is not accepted as a valid input"
+            )));
+        }
+        types.push(ty);
+    }
+    Ok(types)
 }
 
 /// The text of a JSON file, which the JSON readers take whole, decompressed the way the call said.

@@ -30,9 +30,9 @@ pub use entrycatalog::{
     show_expanded_fields, show_table_fields, table_fields, trigger_fields, view_fields,
 };
 pub use file::{
-    Footers, MAIN_FILE, TYPES_SET, content_files, csv_columns, csv_fields, csv_given, csv_types,
-    files, is_file, is_pattern, json_text, open_csv, open_parquet, parquet_bloom_excludes,
-    parquet_footer, parquet_footers, parquet_outline, union_fields,
+    Footers, MAIN_FILE, TYPES_SET, content_files, csv_candidates, csv_columns, csv_fields,
+    csv_given, csv_types, files, is_file, is_pattern, json_text, open_csv, open_parquet,
+    parquet_bloom_excludes, parquet_footer, parquet_footers, parquet_outline, union_fields,
 };
 pub use functioncatalog::{
     CONSISTENT, FUNCTION_CATALOG, FUNCTION_SCHEMA, FunctionEntry, function_entries, function_fields,

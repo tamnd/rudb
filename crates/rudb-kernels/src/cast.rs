@@ -216,7 +216,13 @@ pub fn cast_in_time_zone(
     Vector::from_values(target.clone(), &values)
 }
 
-pub(crate) fn cast_value_in_time_zone(
+/// One value through the cast, with `time_zone` the session zone the casts that need one read
+/// their wall clocks in, and the cast in UTC without one.
+///
+/// # Errors
+///
+/// As for [`cast_value`].
+pub fn cast_value_in_time_zone(
     value: &Value,
     target: &LogicalType,
     try_cast: bool,
@@ -3105,6 +3111,21 @@ pub(crate) fn timestamp_offset(text: &str) -> Option<bool> {
         Ok((_, Suffix::Offset(_))) => Some(true),
         Ok(_) => Some(false),
         Err(_) => None,
+    }
+}
+
+/// Whether a string reads as a `TIMESTAMP` the way the CSV sniffer asks it to, which is the pin's
+/// strict timestamp parse: an offset or a `Z` after the clock does not read, and neither does a
+/// zone name other than `UTC`, so those are left for `TIMESTAMP WITH TIME ZONE` to read.
+#[must_use]
+pub fn plain_timestamp(text: &str) -> bool {
+    if special_day(text).is_some() {
+        return true;
+    }
+    match parse_timestamp_zoned(text) {
+        Ok((_, Suffix::Nothing)) => true,
+        Ok((_, Suffix::Named(name))) => name.eq_ignore_ascii_case("utc"),
+        _ => false,
     }
 }
 

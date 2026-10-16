@@ -384,7 +384,9 @@ impl TableFunction {
             std::sync::LazyLock::new(|| {
                 vec![
                     ("all_varchar", LogicalType::Boolean),
+                    ("allow_quoted_nulls", LogicalType::Boolean),
                     ("auto_detect", LogicalType::Boolean),
+                    ("auto_type_candidates", LogicalType::Null),
                     ("buffer_size", LogicalType::UBigInt),
                     ("column_names", LogicalType::list(LogicalType::Varchar)),
                     ("column_types", LogicalType::Null),
@@ -395,6 +397,7 @@ impl TableFunction {
                     ("escape", LogicalType::Varchar),
                     ("filename", LogicalType::Null),
                     ("files_to_sniff", LogicalType::BigInt),
+                    ("force_not_null", LogicalType::list(LogicalType::Varchar)),
                     ("header", LogicalType::Boolean),
                     ("hive_partitioning", LogicalType::Boolean),
                     ("hive_types", LogicalType::Null),
@@ -406,6 +409,7 @@ impl TableFunction {
                     ("new_line", LogicalType::Varchar),
                     ("null_padding", LogicalType::Boolean),
                     ("nullstr", LogicalType::Varchar),
+                    ("parallel", LogicalType::Boolean),
                     ("quote", LogicalType::Varchar),
                     ("sample_size", LogicalType::BigInt),
                     ("sep", LogicalType::Varchar),

@@ -147,7 +147,10 @@ pub use aggregate::{
     update_general, update_runs, update_scattered, update_shared_runs, update_shared_slots,
     update_tallied, whole_answers,
 };
-pub use cast::{cast, cast_in_time_zone, cast_value, percentage, row_count};
+pub use cast::{
+    cast, cast_in_time_zone, cast_value, cast_value_in_time_zone, percentage, plain_timestamp,
+    row_count,
+};
 pub use compare::{
     Bound, Comparison, compare, compare_prepared, compare_values, mask_against, mask_selection,
     mask_within, order, order_with_nulls, rank_at, rank_within, refine, refine_prepared,
