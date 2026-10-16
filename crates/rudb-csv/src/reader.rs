@@ -84,6 +84,9 @@ pub struct Reader {
     line_ending: &'static str,
     /// The formats the dates and timestamps are read with, the call's or the sniffer's.
     clocks: Clocks,
+    /// For each column of the file, whether `force_not_null` named it, or nothing when it named
+    /// none.
+    forced: Vec<bool>,
 }
 
 impl Reader {
@@ -146,6 +149,7 @@ impl Reader {
             ragged: false,
             line_ending: "\\n",
             clocks: Clocks::default(),
+            forced: Vec::new(),
         };
         reader.fill(0)?;
         reader.skip_lines()?;
@@ -200,8 +204,9 @@ impl Reader {
         reader.ragged = rows.iter().any(|row| row.len() != widest && !blank(row));
         let given = &reader.given;
         let set = given.types.as_deref();
+        let ladder = given.candidates.as_deref().unwrap_or(&infer::LADDER);
         let (header, mut fields, clocks) =
-            describe(&rows, told, set, &given.clocks()?, !given.fixed);
+            describe(&rows, told, set, &given.clocks()?, !given.fixed, ladder);
         reader.clocks = clocks;
         reader.sampled = rows.len().saturating_sub(usize::from(header));
         reader.empty = empty;
@@ -236,6 +241,15 @@ impl Reader {
             retype(&mut fields, set)?;
         }
         reader.dialect.header = header;
+        let named = &reader.given.force_not_null;
+        if !named.is_empty() {
+            reader.forced = fields
+                .iter()
+                .map(|field| {
+                    named.iter().any(|name| name == "*" || name.eq_ignore_ascii_case(&field.name))
+                })
+                .collect();
+        }
         reader.fields = fields;
         reader.projection = (0..reader.fields.len()).collect();
         if header {
@@ -477,6 +491,8 @@ impl Reader {
             dialect: self.dialect,
             nulls: self.nulls.as_deref(),
             clocks: &self.clocks,
+            quoted_values: self.given.quoted_values,
+            forced: &self.forced,
         }
     }
 
@@ -705,6 +721,7 @@ impl Reader {
             ragged: self.ragged,
             line_ending: self.line_ending,
             clocks: self.clocks.clone(),
+            forced: self.forced.clone(),
         }
     }
 
@@ -975,7 +992,7 @@ impl Reader {
         Ok(Some(
             self.scratch
                 .iter()
-                .map(|text| if self.is_null(text) { None } else { Some(text.clone()) })
+                .map(|text| if self.is_null(text, false) { None } else { Some(text.clone()) })
                 .collect(),
         ))
     }
@@ -1083,8 +1100,12 @@ impl Reader {
     }
 
     /// Whether a field read one record at a time is a null, which is the same test
-    /// [`convert::is_null`] makes on a range.
-    fn is_null(&self, text: &str) -> bool {
+    /// [`convert::is_null`] makes on a range. A field that was `quoted` is never one when the call
+    /// turned `allow_quoted_nulls` off.
+    fn is_null(&self, text: &str, quoted: bool) -> bool {
+        if quoted && self.given.quoted_values {
+            return false;
+        }
         match &self.nulls {
             None => text.is_empty(),
             Some(nulls) => nulls.iter().any(|null| null.as_slice() == text.as_bytes()),
@@ -1096,11 +1117,14 @@ impl Reader {
     fn sample_rows(&self, sample: &[u8], eof: bool) -> Result<Vec<Vec<Option<String>>>> {
         let mut rows = Vec::new();
         let mut fields = Vec::new();
+        let mut quoted = Vec::new();
         let mut at = 0;
         while rows.len() <= self.given.sample() {
             // Unless the block is the end of the file, a record the block cut in half is simply not
             // part of the sample.
-            let Some(next) = crate::scan::record(sample, at, self.dialect, eof, &mut fields)?
+            let dialect = self.dialect;
+            let Some(next) =
+                crate::scan::record_quoted(sample, at, dialect, eof, &mut fields, &mut quoted)?
             else {
                 break;
             };
@@ -1108,7 +1132,12 @@ impl Reader {
             rows.push(
                 fields
                     .iter()
-                    .map(|text| if self.is_null(text) { None } else { Some(text.clone()) })
+                    .zip(&quoted)
+                    .map(
+                        |(text, &quoted)| {
+                            if self.is_null(text, quoted) { None } else { Some(text.clone()) }
+                        },
+                    )
                     .collect(),
             );
         }
@@ -1139,19 +1168,21 @@ fn shown(written: Option<&infer::Written>) -> &str {
 /// `given` is the date and timestamp formats the call gave, and the formats that come back are the
 /// ones the columns are read with, which the sniffer found when the call gave none and `detect` is
 /// on. The question about the first row is asked with them, so `a` over `05/06/2019` has a header.
+/// The columns the call did not set walk down `ladder`.
 fn describe(
     rows: &[Vec<Option<String>>],
     told: Option<bool>,
     set: Option<&[LogicalType]>,
     given: &Clocks,
     detect: bool,
+    ladder: &[LogicalType],
 ) -> (bool, Vec<Field>, Clocks) {
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
     let sniffed = |rows: &[Vec<Option<String>>]| {
         let columns: Vec<Vec<Option<&str>>> = (0..width)
             .map(|at| rows.iter().map(|row| row.get(at).and_then(Option::as_deref)).collect())
             .collect();
-        infer::sniff(&columns, set, given, detect)
+        infer::sniff(&columns, set, given, detect, ladder)
     };
     let (body, clocks) = sniffed(&rows[1.min(rows.len())..]);
     let body = set.map_or(body, <[LogicalType]>::to_vec);
@@ -1431,6 +1462,61 @@ mod tests {
         assert_eq!(
             all(&mut reader),
             [vec![Value::BigInt(1), Value::Null], vec![Value::Null, Value::Varchar("y".into())],]
+        );
+    }
+
+    #[test]
+    fn a_timestamp_with_an_offset_reads_as_the_instant_it_names() {
+        // Measured with `TimeZone` set to UTC: the first is 08:00 UTC and the second 10:00.
+        let mut reader = read("a\n2020-01-01 10:00:00+02\n2020-01-01 10:00:00\n");
+        assert_eq!(
+            names_and_types(&reader),
+            [("a".to_string(), "TIMESTAMP WITH TIME ZONE".into())]
+        );
+        let hour = 3_600_000_000_i64;
+        let day = 1_577_836_800_000_000_i64;
+        assert_eq!(
+            all(&mut reader),
+            [vec![Value::TimestampTz(day + 8 * hour)], vec![Value::TimestampTz(day + 10 * hour)]]
+        );
+    }
+
+    #[test]
+    fn allow_quoted_nulls_off_keeps_a_quoted_empty_field_as_the_empty_string() {
+        let text = "a,b\nx,\n\"\",y\n";
+        let given = Given { quoted_values: true, ..Given::default() };
+        let mut reader = read_with(text, given);
+        let empty = Value::Varchar(String::new());
+        assert_eq!(
+            all(&mut reader),
+            [
+                vec![Value::Varchar("x".into()), Value::Null],
+                vec![empty, Value::Varchar("y".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn force_not_null_reads_a_null_in_the_columns_it_names_as_the_empty_string() {
+        let text = "a,b\nx,\n\"\",y\n";
+        let empty = Value::Varchar(String::new());
+        let given = Given { force_not_null: vec!["B".into()], ..Given::default() };
+        let mut reader = read_with(text, given);
+        assert_eq!(
+            all(&mut reader),
+            [
+                vec![Value::Varchar("x".into()), empty.clone()],
+                vec![Value::Null, Value::Varchar("y".into())]
+            ]
+        );
+        let given = Given { force_not_null: vec!["*".into()], ..Given::default() };
+        let mut reader = read_with(text, given);
+        assert_eq!(
+            all(&mut reader),
+            [
+                vec![Value::Varchar("x".into()), empty.clone()],
+                vec![empty, Value::Varchar("y".into())]
+            ]
         );
     }
 

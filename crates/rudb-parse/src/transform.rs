@@ -3371,6 +3371,43 @@ impl<'a> Transform<'a> {
         Ok(text.to_string())
     }
 
+    /// The columns `FORCE_NOT_NULL` names, as the list of strings `read_csv` takes for it.
+    ///
+    /// They are names and not expressions, so `(a, b)`, `a`, `'a'` and `*` are each read as the
+    /// text they were written with, and `42` is the column called 42, which the binder then does
+    /// not find. That is the pin's reading, which turns each into a string and warns that it did.
+    fn copy_column_names(&mut self, value: u32, parenthesized: bool) -> Result<ExprRef> {
+        if value == NONE {
+            return Err(Error::binder(
+                "\"force_not_null\" expects a column list or * as parameter",
+            ));
+        }
+        let list = self.descendant(value, "OrderByExpressionList");
+        let mut names = Vec::new();
+        if parenthesized && list != NONE {
+            for item in self.kids(list).collect::<Vec<_>>() {
+                let name = self.copy_option_text(item)?;
+                names.push(
+                    name.strip_prefix('"')
+                        .and_then(|name| name.strip_suffix('"'))
+                        .map_or(name.clone(), str::to_string),
+                );
+            }
+        } else {
+            let text = self.copy_option_text(value)?;
+            let text =
+                text.strip_prefix('(').and_then(|text| text.strip_suffix(')')).unwrap_or(&text);
+            names.push(text.trim().to_string());
+        }
+        let mut items = Vec::with_capacity(names.len());
+        for name in names {
+            let text = self.intern(&name);
+            items.push(self.push(Expr::Literal { kind: LiteralKind::String, text }));
+        }
+        let items = self.expr_slice(items);
+        Ok(self.push(Expr::List { items }))
+    }
+
     /// `CopyOptions <- 'WITH'? CopyOptionList`, as the format it named, if it named one, and the
     /// rest as they were written, each name in lower case with its value if it was given one.
     ///
@@ -3402,6 +3439,11 @@ impl<'a> Transform<'a> {
                 value != NONE && self.name(self.first(value)) != "GenericCopyOptionExpression";
             if parenthesized && name == "format" {
                 return self.unsupported(value);
+            }
+            if name == "force_not_null" {
+                let list = self.copy_column_names(value, parenthesized)?;
+                options.push((name, Some(list), None));
+                continue;
             }
             if parenthesized {
                 // `dateformat ('%d')` is the one string it holds, and a list of any other length
@@ -7422,9 +7464,12 @@ fn copy_parameter(name: &str) -> Result<&'static str> {
         "strict_mode" => "strict_mode",
         "dateformat" | "date_format" => "dateformat",
         "timestampformat" | "timestamp_format" => "timestampformat",
-        "all_varchar" | "allow_quoted_nulls" | "auto_detect" | "columns" | "comment"
-        | "compression" | "decimal_separator" | "encoding" | "force_not_null" | "force_quote"
-        | "max_line_size" | "names" | "types" | "dtypes" => {
+        "allow_quoted_nulls" => "allow_quoted_nulls",
+        "force_not_null" => "force_not_null",
+        "parallel" => "parallel",
+        "all_varchar" | "auto_detect" | "columns" | "comment" | "compression"
+        | "decimal_separator" | "encoding" | "force_quote" | "max_line_size" | "names"
+        | "types" | "dtypes" => {
             return Err(Error::not_implemented(format!(
                 "COPY FROM with the option {name} is not supported yet"
             )));
@@ -8738,6 +8783,22 @@ mod tests {
             round_statement("COPY t FROM 'x.ndjson' (DATEFORMAT '%d', IGNORE_ERRORS, COLUMNS 1)"),
             "INSERT INTO t SELECT * FROM read_json('x.ndjson', dateformat := '%d', \
              ignore_errors := TRUE)"
+        );
+        assert_eq!(
+            round_statement(
+                "COPY t FROM 'in.csv' (FORCE_NOT_NULL (b, \"C\"), ALLOW_QUOTED_NULLS false)"
+            ),
+            "INSERT INTO t SELECT * FROM read_csv('in.csv', force_not_null := ['b', 'C'], \
+             allow_quoted_nulls := FALSE)"
+        );
+        assert_eq!(
+            round_statement("COPY t FROM 'in.csv' (FORCE_NOT_NULL *)"),
+            "INSERT INTO t SELECT * FROM read_csv('in.csv', force_not_null := ['*'])"
+        );
+        let error = parse_ast("COPY t FROM 'in.csv' (FORCE_NOT_NULL)").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Binder Error: \"force_not_null\" expects a column list or * as parameter"
         );
         let error = parse_ast("COPY t FROM 'x.json' (timestampformat)").unwrap_err().to_string();
         assert_eq!(

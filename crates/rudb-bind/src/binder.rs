@@ -24,9 +24,10 @@ use rudb_common::{
 };
 use rudb_functions::{
     Columns, Extras, FILE_ROW_NUMBER, Footers, FunctionKind, Given, MAIN_FILE, Resolved, Retype,
-    TYPES_SET, TableFunction, add_extras, content_files, csv_columns, csv_fields, csv_given,
-    csv_types, extras, files, is_file, is_pattern, json_text, kind_of, open_csv, open_parquet,
-    parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table, union_fields,
+    TYPES_SET, TableFunction, add_extras, content_files, csv_candidates, csv_columns, csv_fields,
+    csv_given, csv_types, extras, files, is_file, is_pattern, json_text, kind_of, open_csv,
+    open_parquet, parquet_footers, parquet_outline, resolve, resolve_pragma, resolve_table,
+    union_fields,
 };
 use rudb_kernels::json::scan;
 use rudb_kernels::{percentage, row_count};
@@ -4709,6 +4710,21 @@ impl<'a> Binder<'a> {
                         }
                     }
                 };
+                // Every name has to be a column of the read, with case not mattering, which is
+                // what the corpus holds the pin to. A column only some of the files of a
+                // `union_by_name` read have is one, and each file forces it where it has it. A `*`
+                // is every column.
+                if matches!(columns, Columns::Csv)
+                    && let Some(name) = options.given.force_not_null.iter().find(|name| {
+                        *name != "*"
+                            && !fields.iter().any(|field| field.name.eq_ignore_ascii_case(name))
+                    })
+                {
+                    return Err(Error::binder(format!(
+                        "\"force_not_null\" expected to find {name}, but it was not found in the \
+                         table"
+                    )));
+                }
                 if options.binary_as_string {
                     // A byte array column with no annotation on it is a BLOB, and this is the caller
                     // saying that the file's writer meant text. The reader already holds both in the
@@ -5246,6 +5262,20 @@ impl<'a> Binder<'a> {
                 ),
             };
             let at = self.plan.add_value(value.clone());
+            let expr = self.plan.add_expr(Expr::Constant(at), ty);
+            return Ok((parameter, value, expr));
+        }
+        if *parameter == "auto_type_candidates" {
+            // Read here against the catalog the same way, and kept as written, in the order given.
+            let catalog = self.catalog;
+            let mut read = |text: &str| crate::statement::read_type(catalog, text);
+            let types = csv_candidates(&value, &mut read)?;
+            let value = Value::List {
+                element: LogicalType::Varchar,
+                values: types.into_iter().map(|ty| Value::Varchar(ty.to_string())).collect(),
+            };
+            let at = self.plan.add_value(value.clone());
+            let ty = LogicalType::list(LogicalType::Varchar);
             let expr = self.plan.add_expr(Expr::Constant(at), ty);
             return Ok((parameter, value, expr));
         }
@@ -8411,9 +8441,12 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         return format!("Cannot use NULL as argument to key \"{parameter}\"");
     }
     match parameter {
-        "header" | "auto_detect" | "null_padding" | "ignore_errors" | "strict_mode" => {
+        "header" | "auto_detect" | "null_padding" | "ignore_errors" | "strict_mode"
+        | "allow_quoted_nulls" | "parallel" => {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
+        "force_not_null" => format!("Invalid value for '{parameter}' parameter"),
+        "auto_type_candidates" => "read_csv auto_types requires a list as input".to_string(),
         "buffer_size" | "files_to_sniff" | "max_line_size" | "maximum_line_size"
         | "sample_size" | "skip" => {
             format!("\"{parameter}\" expects a non-null integer value")

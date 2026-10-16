@@ -22,8 +22,8 @@
 
 use std::ops::Range;
 
-use rudb_common::{Error, LogicalType, Result, Value, days_from_civil};
-use rudb_kernels::cast_value;
+use rudb_common::{Error, LogicalType, Result, SessionTimeZone, Value, days_from_civil};
+use rudb_kernels::{cast_value, cast_value_in_time_zone};
 use rudb_vector::{Buffer, Data, INLINE_LIMIT, StringColumn, StringView, Validity, Vector};
 
 use crate::dialect::Dialect;
@@ -41,6 +41,12 @@ pub(crate) struct Cells<'a> {
     pub(crate) nulls: Option<&'a [Vec<u8>]>,
     /// The formats the dates and the timestamps are read with.
     pub(crate) clocks: &'a Clocks,
+    /// Whether a quoted field is a value even when it spells a null, which is
+    /// `allow_quoted_nulls=false`.
+    pub(crate) quoted_values: bool,
+    /// For each column of the file, whether a null in it is read as the empty string, which is
+    /// `force_not_null`. Empty when no column is.
+    pub(crate) forced: &'a [bool],
 }
 
 impl Cells<'_> {
@@ -48,22 +54,45 @@ impl Cells<'_> {
     /// strings, an empty one unless it was told otherwise, or one the row is too short to have.
     #[inline]
     fn at(&self, row: usize, column: usize) -> Option<Span> {
-        self.records.field(row, column).filter(|&span| self.kept(span))
+        self.records.field(row, column).and_then(|span| self.held(span, column))
     }
 
     /// Field `column` of each row in `rows`, in order, each the way [`Self::at`] answers it.
     #[inline]
     fn column(&self, column: usize, rows: Range<usize>) -> impl Iterator<Item = Option<Span>> + '_ {
-        self.records.column(column, rows).map(|span| span.filter(|&span| self.kept(span)))
+        self.records
+            .column(column, rows)
+            .map(move |span| span.and_then(|span| self.held(span, column)))
+    }
+
+    /// A field the row has in column `column`, or `None` when it is a null, with a null in a
+    /// column `force_not_null` named read as an empty field.
+    #[inline]
+    fn held(&self, span: Span, column: usize) -> Option<Span> {
+        if self.kept(span) {
+            Some(span)
+        } else if self.forced.get(column) == Some(&true) {
+            Some(Span::new(0, 0, false))
+        } else {
+            None
+        }
     }
 
     /// Whether a field the row has is a value and not a null.
     #[inline]
     fn kept(&self, span: Span) -> bool {
-        match self.nulls {
+        let value = match self.nulls {
             None => !span.is_empty(),
             Some(nulls) => !is_null(span, self.bytes, self.dialect, nulls),
-        }
+        };
+        value || (self.quoted_values && self.quoted(span))
+    }
+
+    /// Whether a field was written in quotes. A quoted field's range starts after its opening
+    /// quote, and an unquoted one's starts after a delimiter, a line ending or nothing.
+    fn quoted(&self, span: Span) -> bool {
+        let start = span.start();
+        self.dialect.quote.is_some_and(|quote| start > 0 && self.bytes[start - 1] == quote)
     }
 }
 
@@ -458,6 +487,18 @@ fn cast(
             .timestamp
             .as_ref()
             .map(|timestamp| timestamp.timestamp(&text).map(Value::Timestamp)),
+        // The pin reads these with the cast in the session zone, which takes an offset written
+        // after the clock as the instant it names. The reader is not told the zone, so a clock
+        // with no offset is read as UTC, which is what the pin does with `TimeZone` set to UTC.
+        LogicalType::TimestampTz => Some(
+            cast_value_in_time_zone(
+                &Value::Varchar(text.to_string()),
+                ty,
+                false,
+                Some(SessionTimeZone::default()),
+            )
+            .ok(),
+        ),
         _ => None,
     };
     match formatted {

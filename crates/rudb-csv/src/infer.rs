@@ -7,15 +7,18 @@
 //!
 //! The ladder is walked a value at a time, which is the pin's `CSVSniffer::SniffTypes`. A column
 //! goes onto the first rung its first value fits, and each value after that moves it down to the
-//! first rung below that it fits, except that a column on `BOOLEAN`, `TIME`, `DATE` or `TIMESTAMP`
-//! that meets a value which does not fit falls straight to `VARCHAR`. So `2020-01-02` over
-//! `2020-01-03 03:04:05` is a `VARCHAR` column and the other way round is a `TIMESTAMP` one, both
-//! measured on `v2.0.0-dev84237`.
+//! first rung below that it fits, except that a column on `BOOLEAN`, `TIME`, `DATE` or
+//! `TIMESTAMP WITH TIME ZONE` that meets a value which does not fit falls straight to `VARCHAR`,
+//! and so does one on `TIMESTAMP` unless the rung under it is `TIMESTAMP WITH TIME ZONE`. So
+//! `2020-01-02` over `2020-01-03 03:04:05` is a `VARCHAR` column, the other way round is a
+//! `TIMESTAMP` one, and `2020-01-03 03:04:05` over `2020-01-03 03:04:05+02` is a `TIMESTAMP WITH
+//! TIME ZONE` one, all measured on `v2.0.0-dev84237`.
 //!
 //! The order is the pin's `auto_type_candidates` read from the back, `BOOLEAN`, `TIME`, `DATE`,
-//! `TIMESTAMP`, `BIGINT` and `DOUBLE`, less the `TIMESTAMP WITH TIME ZONE`, `HUGEINT` and `BIGNUM`
-//! rungs it has and this does not. `BOOLEAN` before `BIGINT` matters, because a column of `true`
-//! and `false` is a boolean and not a pair of words. `BIGINT` before `DOUBLE` matters, because a
+//! `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE`, `BIGINT`, `HUGEINT`, `BIGNUM` and `DOUBLE`, and a call
+//! that sets its own candidates gets them in the same order, which [`ladder`] puts them in.
+//! `BOOLEAN` before `BIGINT` matters, because a column of `true` and `false` is a boolean and not a
+//! pair of words. `BIGINT` before `DOUBLE` matters, because a
 //! column of whole numbers should be whole. `DATE` before `TIMESTAMP` is the order the binary uses,
 //! and those two do overlap because a cast to `DATE` reads a time on the end and throws it away, so
 //! `timed` below keeps a timestamp off the `DATE` rung.
@@ -45,20 +48,70 @@
 //! the cast, the column comes out `VARCHAR`, and the file reads.
 
 use rudb_common::{LogicalType, Value};
-use rudb_kernels::cast_value;
 use rudb_kernels::strftime::Format;
 use rudb_kernels::strptime::{fits_strictly, try_date, try_timestamp};
+use rudb_kernels::{cast_value, plain_timestamp};
 
 /// The types tried, in the order they are tried. `VARCHAR` is the bottom and is not in here because
 /// it never fails.
-pub const LADDER: [LogicalType; 6] = [
+pub const LADDER: [LogicalType; 9] = [
     LogicalType::Boolean,
     LogicalType::Time,
     LogicalType::Date,
     LogicalType::Timestamp,
+    LogicalType::TimestampTz,
     LogicalType::BigInt,
+    LogicalType::HugeInt,
+    LogicalType::BigNum,
     LogicalType::Double,
 ];
+
+/// Where a type goes among the sniffer's candidates, the pin's `auto_type_candidates_specificity`,
+/// or `None` for a type that cannot be one. The higher it is the earlier the type is tried.
+#[must_use]
+pub fn specificity(ty: &LogicalType) -> Option<u8> {
+    Some(match ty {
+        LogicalType::Varchar => 0,
+        LogicalType::Double => 1,
+        LogicalType::Float => 2,
+        LogicalType::Decimal { .. } => 3,
+        LogicalType::BigNum => 4,
+        LogicalType::HugeInt => 5,
+        LogicalType::BigInt => 6,
+        LogicalType::Integer => 7,
+        LogicalType::SmallInt => 8,
+        LogicalType::TinyInt => 9,
+        LogicalType::TimestampTz => 10,
+        LogicalType::Timestamp => 11,
+        LogicalType::Date => 12,
+        LogicalType::Time => 13,
+        LogicalType::Boolean => 14,
+        LogicalType::Null => 15,
+        _ => return None,
+    })
+}
+
+/// The ladder a call's `auto_type_candidates` make, the most specific first.
+///
+/// Each place holds one type, so of two decimals the later one stays, and `VARCHAR` and `NULL`
+/// are left out, because every column ends on the first if nothing above it fits and no value
+/// fits the second. A type [`specificity`] has no place for is left out too, and the binder has
+/// refused it before this is asked.
+#[must_use]
+pub fn ladder(candidates: &[LogicalType]) -> Vec<LogicalType> {
+    let mut placed = std::collections::BTreeMap::new();
+    for ty in candidates {
+        if let Some(place) = specificity(ty) {
+            placed.insert(place, ty.clone());
+        }
+    }
+    placed
+        .into_iter()
+        .rev()
+        .filter(|(place, _)| !matches!(place, 0 | 15))
+        .map(|(_, ty)| ty)
+        .collect()
+}
 
 /// How many rows the sniffer looks at.
 ///
@@ -126,13 +179,15 @@ pub fn column(values: &[Option<&str>]) -> LogicalType {
 ///
 /// `set` is the types the call set for the columns, which come back as they are. Their values are
 /// still looked at for a format, which is what the pin does: `05/06/2019` over `13/01/2020` loaded
-/// into a `DATE` column is the fifth of June and the thirteenth of January.
+/// into a `DATE` column is the fifth of June and the thirteenth of January. The other columns walk
+/// down `ladder`, which is [`LADDER`] unless the call set its own.
 #[must_use]
 pub fn sniff(
     columns: &[Vec<Option<&str>>],
     set: Option<&[LogicalType]>,
     given: &Clocks,
     detect: bool,
+    ladder: &[LogicalType],
 ) -> (Vec<LogicalType>, Clocks) {
     let mut sniffer = Sniffer::new(given, detect);
     let types: Vec<LogicalType> = columns
@@ -144,7 +199,7 @@ pub fn sniff(
                 sniffer.column(values, std::slice::from_ref(ty));
                 ty.clone()
             }
-            None => sniffer.column(values, &LADDER),
+            None => sniffer.column(values, ladder),
         })
         .collect();
     let kept = |kind: Kind| {
@@ -168,14 +223,25 @@ pub fn fits_in(text: &str, candidate: &LogicalType, clocks: &Clocks) -> bool {
 }
 
 /// Whether one value would read as `candidate`.
+///
+/// A `TIMESTAMP` takes no offset and no zone but `UTC` here, although the cast takes both and
+/// throws them away, which is the pin's strict parse and leaves those values for the `TIMESTAMP
+/// WITH TIME ZONE` under it. A decimal goes to the cast with none of the rules the other numbers
+/// have, which was measured: `007`, `+1` and `1e3` are all decimals to the pin.
 #[must_use]
 pub fn fits(text: &str, candidate: &LogicalType) -> bool {
+    use LogicalType::{
+        BigInt, BigNum, Boolean, Date, Double, Float, HugeInt, Integer, SmallInt, Time, Timestamp,
+        TinyInt,
+    };
     match candidate {
-        LogicalType::Boolean => is_boolean(text),
-        LogicalType::BigInt if !numeric(text) || !whole(text) => false,
-        LogicalType::Double if !numeric(text) => false,
-        LogicalType::Date if timed(text) => false,
-        LogicalType::Time if !clock(text) => false,
+        Boolean => is_boolean(text),
+        TinyInt | SmallInt | Integer | BigInt | HugeInt if !numeric(text) || !whole(text) => false,
+        BigNum => bignum(text),
+        Float | Double if !numeric(text) => false,
+        Date if timed(text) => false,
+        Time if !clock(text) => false,
+        Timestamp if !plain_timestamp(text) => false,
         _ => {
             let value = Value::Varchar(text.to_string());
             matches!(cast_value(&value, candidate, true), Ok(converted) if !converted.is_null())
@@ -305,15 +371,16 @@ impl<'a> Sniffer<'a> {
                     break;
                 }
                 // A column that settled on one of these drops straight to text when a value does
-                // not fit, rather than trying the numbers under it.
-                if top.is_some_and(|top| {
-                    matches!(
-                        top,
-                        LogicalType::Boolean
-                            | LogicalType::Time
-                            | LogicalType::Date
-                            | LogicalType::Timestamp
-                    )
+                // not fit, rather than trying the numbers under it. A timestamp still has the one
+                // with a zone under it to try, when that is next.
+                let zoned = || ladder.get(rung.unwrap_or(0) + 1) == Some(&LogicalType::TimestampTz);
+                if top.is_some_and(|top| match top {
+                    LogicalType::Boolean
+                    | LogicalType::Time
+                    | LogicalType::Date
+                    | LogicalType::TimestampTz => true,
+                    LogicalType::Timestamp => !zoned(),
+                    _ => false,
                 }) {
                     at = ladder.len();
                     break;
@@ -497,6 +564,17 @@ fn numeric(text: &str) -> bool {
     }
 }
 
+/// Whether a number is one the sniffer puts on the `BIGNUM` rung, the pin's `CanYouCastBignum`:
+/// digits with an optional minus in front and spaces around, no `+`, and no zero in front of
+/// another digit.
+fn bignum(text: &str) -> bool {
+    let text = text.trim();
+    let digits = text.strip_prefix('-').unwrap_or(text).as_bytes();
+    !digits.is_empty()
+        && digits.iter().all(u8::is_ascii_digit)
+        && !(digits.len() > 1 && digits[0] == b'0')
+}
+
 /// Whether a whole number written like this is one to the sniffer.
 ///
 /// The sixth rule that is not the cast's, and the one the rest of #369 turned up. The cast reads
@@ -598,7 +676,7 @@ mod tests {
                 values.iter().map(|text| Some(*text).filter(|text| !text.is_empty())).collect()
             })
             .collect();
-        let (types, clocks) = sniff(&columns, None, &Clocks::default(), true);
+        let (types, clocks) = sniff(&columns, None, &Clocks::default(), true, &LADDER);
         let text = |written: Option<Written>| written.map(|written| written.text);
         (types, text(clocks.date), text(clocks.timestamp))
     }
@@ -652,10 +730,10 @@ mod tests {
         let given =
             Clocks { date: Some(Written::parse("%m/%d/%Y").expect("parses")), timestamp: None };
         let columns = [vec![Some("05/06/2019"), Some("13/01/2020")], vec![Some("12/31/2019")]];
-        let (types, clocks) = sniff(&columns, None, &given, true);
+        let (types, clocks) = sniff(&columns, None, &given, true, &LADDER);
         assert_eq!(types, [LogicalType::Varchar, LogicalType::Date]);
         assert_eq!(clocks.date.map(|written| written.text).as_deref(), Some("%m/%d/%Y"));
-        let (types, clocks) = sniff(&[vec![Some("1")]], None, &given, true);
+        let (types, clocks) = sniff(&[vec![Some("1")]], None, &given, true, &LADDER);
         assert_eq!(types, [LogicalType::BigInt]);
         assert!(clocks.date.is_some(), "a format the call set is kept without a date column");
         assert!(Written::parse("%Q").is_err());
@@ -665,10 +743,10 @@ mod tests {
     fn a_column_the_call_typed_keeps_its_type_and_still_settles_the_format() {
         let columns = [vec![Some("05/06/2019"), Some("13/01/2020")], vec![Some("x")]];
         let set = [LogicalType::Date, LogicalType::Varchar];
-        let (types, clocks) = sniff(&columns, Some(&set), &Clocks::default(), true);
+        let (types, clocks) = sniff(&columns, Some(&set), &Clocks::default(), true, &LADDER);
         assert_eq!(types, set);
         assert_eq!(clocks.date.map(|written| written.text).as_deref(), Some("%d/%m/%Y"));
-        let (types, clocks) = sniff(&columns[..1], None, &Clocks::default(), false);
+        let (types, clocks) = sniff(&columns[..1], None, &Clocks::default(), false, &LADDER);
         assert_eq!(types, [LogicalType::Varchar]);
         assert!(clocks.date.is_none());
     }
@@ -740,7 +818,54 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_number_too_big_for_a_bigint_widens_to_a_double() {
-        assert_eq!(of(&["99999999999999999999"]), LogicalType::Double);
+    fn a_whole_number_too_big_for_a_bigint_widens_to_a_hugeint_and_then_a_bignum() {
+        assert_eq!(of(&["99999999999999999999"]), LogicalType::HugeInt);
+        let long = "1".repeat(42);
+        assert_eq!(of(&[long.as_str()]), LogicalType::BigNum);
+        assert_eq!(of(&["1", long.as_str()]), LogicalType::BigNum);
+        assert_eq!(of(&[long.as_str(), "1.5"]), LogicalType::Double);
+        let padded = format!("0{long}");
+        assert_eq!(of(&[padded.as_str()]), LogicalType::Varchar);
+        assert!(bignum(" -12 ") && !bignum("+12") && !bignum("-") && !bignum("1_0"));
+    }
+
+    #[test]
+    fn a_timestamp_with_an_offset_is_one_with_a_time_zone() {
+        assert_eq!(of(&["2020-01-02 03:04:05+02"]), LogicalType::TimestampTz);
+        assert_eq!(of(&["2020-01-02 03:04:05Z"]), LogicalType::TimestampTz);
+        assert_eq!(of(&["2020-01-02 03:04:05 UTC"]), LogicalType::Timestamp);
+        // A plain one first, then one with an offset, moves the column down a rung.
+        let mixed = ["2020-01-02 03:04:05", "2020-01-02 03:04:05+02"];
+        assert_eq!(of(&mixed), LogicalType::TimestampTz);
+        // A day first goes to text, as it always did, since a date falls straight there.
+        assert_eq!(of(&["2020-01-02", "2020-01-02 03:04:05+02"]), LogicalType::Varchar);
+        assert_eq!(of(&["2020-01-02 03:04:05+02", "x"]), LogicalType::Varchar);
+        assert_eq!(of(&["2020-01-02 03:04:05+02", "2020-01-02"]), LogicalType::TimestampTz);
+        // With no zoned rung under it a timestamp falls straight to text too.
+        let ladder = [LogicalType::Timestamp, LogicalType::BigInt];
+        let column = vec![Some("2020-01-02 03:04:05"), Some("1")];
+        let (types, _) = sniff(&[column], None, &Clocks::default(), true, &ladder);
+        assert_eq!(types, [LogicalType::Varchar]);
+    }
+
+    #[test]
+    fn a_call_sets_the_ladder_and_it_is_put_in_the_pin_order() {
+        let set = ladder(&[
+            LogicalType::Varchar,
+            LogicalType::Double,
+            LogicalType::TinyInt,
+            LogicalType::Boolean,
+            LogicalType::Null,
+            LogicalType::Float,
+        ]);
+        let want =
+            [LogicalType::Boolean, LogicalType::TinyInt, LogicalType::Float, LogicalType::Double];
+        assert_eq!(set, want);
+        assert_eq!(ladder(&LADDER), LADDER);
+        assert_eq!(specificity(&LogicalType::UTinyInt), None);
+        let column = vec![Some("300"), Some("1")];
+        let tiny = ladder(&[LogicalType::TinyInt, LogicalType::Float]);
+        let (types, _) = sniff(&[column], None, &Clocks::default(), true, &tiny);
+        assert_eq!(types, [LogicalType::Float]);
     }
 }

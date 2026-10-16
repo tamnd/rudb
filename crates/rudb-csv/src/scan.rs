@@ -54,6 +54,36 @@ pub fn record(
     eof: bool,
     out: &mut Vec<String>,
 ) -> Result<Option<usize>> {
+    split(bytes, from, dialect, eof, out, None)
+}
+
+/// [`record`], with whether each field was quoted put in `quoted`, one entry per field.
+///
+/// # Errors
+///
+/// As for [`record`].
+pub fn record_quoted(
+    bytes: &[u8],
+    from: usize,
+    dialect: Dialect,
+    eof: bool,
+    out: &mut Vec<String>,
+    quoted: &mut Vec<bool>,
+) -> Result<Option<usize>> {
+    split(bytes, from, dialect, eof, out, Some(quoted))
+}
+
+fn split(
+    bytes: &[u8],
+    from: usize,
+    dialect: Dialect,
+    eof: bool,
+    out: &mut Vec<String>,
+    mut quoted: Option<&mut Vec<bool>>,
+) -> Result<Option<usize>> {
+    if let Some(quoted) = quoted.as_deref_mut() {
+        quoted.clear();
+    }
     if from >= bytes.len() {
         // No bytes left is no record, and it is not a record of one empty field. The difference
         // matters at the end of a file, where a reader that took the second reading would hand back
@@ -68,7 +98,8 @@ pub fn record(
     let mut field = Vec::new();
     loop {
         field.clear();
-        if bytes.get(at) == Some(&quote) {
+        let opened = bytes.get(at) == Some(&quote);
+        if opened {
             at += 1;
             loop {
                 let Some(&byte) = bytes.get(at) else { return Ok(None) };
@@ -113,6 +144,9 @@ pub fn record(
             }
         }
         place(out, count, &field);
+        if let Some(quoted) = quoted.as_deref_mut() {
+            quoted.push(opened);
+        }
         count += 1;
         match bytes.get(at) {
             Some(&byte) if byte == dialect.delimiter => at += 1,

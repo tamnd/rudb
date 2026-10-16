@@ -1314,10 +1314,15 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
             }
             "compression" | "dateformat" | "date_format" | "timestampformat"
             | "timestamp_format" | "new_line" | "prefix" | "suffix" | "preserve_order"
-            | "force_not_null" | "encoding" => {
+            | "encoding" => {
                 return Err(Error::not_implemented(format!(
                     "COPY TO with the option {name} is not supported yet"
                 )));
+            }
+            "force_not_null" => {
+                return Err(Error::invalid_input(
+                    "Option \"force_not_null\" is not supported for writing - only for reading",
+                ));
             }
             _ => {
                 return Err(Error::not_implemented(format!(
