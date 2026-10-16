@@ -521,6 +521,9 @@ pub(crate) struct Binder<'a> {
     /// these is not a column of the grouped table, so the rule about grouping every column does not
     /// reach it, and the join that produces it goes on top of the `Aggregate` rather than under it.
     pub(crate) joined_above: Vec<u32>,
+    /// Each `typeof` answered so far, as the constant it became and the argument it was asked of,
+    /// so that `typeof(b)` in a select list can be the `typeof(b)` it is grouped by.
+    pub(crate) typeofs: Vec<(ExprRef, ExprRef)>,
     pub(crate) outer_scopes: Vec<Scope>,
     /// The nulls that stand for parameters of no known type while a statement is described, each
     /// with the parameter's name, so a cast of one gives the parameter its type.
@@ -664,6 +667,7 @@ impl<'a> Binder<'a> {
             subquery_types: Vec::new(),
             multi_assigned: Vec::new(),
             joined_above: Vec::new(),
+            typeofs: Vec::new(),
             outer_scopes: Vec::new(),
             placeholders: Vec::new(),
             lateral_scopes: Vec::new(),
