@@ -5212,6 +5212,13 @@ impl<'a> Binder<'a> {
         if value == Value::Null && format && function == TableFunction::ReadCsv {
             return Err(Error::invalid_input("Could not parse DATEFORMAT: Empty format string"));
         }
+        // A null comment is no comment, the same as an empty one, so it arrives as an empty one.
+        if value == Value::Null && *parameter == "comment" && function == TableFunction::ReadCsv {
+            let value = Value::Varchar(String::new());
+            let at = self.plan.add_value(value.clone());
+            let expr = self.plan.add_expr(Expr::Constant(at), LogicalType::Varchar);
+            return Ok((parameter, value, expr));
+        }
         if value == Value::Null {
             return Err(Error::binder(null_parameter(function, parameter)));
         }

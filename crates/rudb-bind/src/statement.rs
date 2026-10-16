@@ -1319,6 +1319,9 @@ fn csv_to(copy: &ast::CopyTo, plan: Plan) -> Result<CopyTo> {
                     "COPY TO with the option {name} is not supported yet"
                 )));
             }
+            // A comment is something to skip when reading, and the pin takes one when writing too
+            // and writes none.
+            "comment" => {}
             "force_not_null" => {
                 return Err(Error::invalid_input(
                     "Option \"force_not_null\" is not supported for writing - only for reading",

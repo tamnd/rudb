@@ -12,12 +12,17 @@
 
 use rudb_common::LogicalType;
 
+use crate::scan::Comments;
+
 /// The delimiters tried, in the order they are tried.
 ///
 /// Order settles a tie and ties happen: a one column file of `a;b` has neither a comma nor a tab in
 /// it and is one column under both. Comma first is DuckDB's order and is the one that matters,
 /// since the file that arrives with no clue in it is a comma separated one often enough.
 pub const DELIMITERS: [u8; 4] = *b",|;\t";
+
+/// The comments the sniffer tries when the call names none, which are the pin's: none, and `#`.
+pub const COMMENTS: [Option<u8>; 2] = [None, Some(b'#')];
 
 /// How a CSV file is punctuated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +38,8 @@ pub struct Dialect {
     pub escape: Option<u8>,
     /// Whether the first line names the columns rather than being one of them.
     pub header: bool,
+    /// The byte that starts a comment, which runs to the end of its line, if the file has one.
+    pub comment: Option<u8>,
 }
 
 /// What the caller said about how the file is written, where the sniffer would otherwise decide.
@@ -60,6 +67,11 @@ pub struct Given {
     pub quote: Option<u8>,
     /// The byte that makes the next quote a literal one.
     pub escape: Option<u8>,
+    /// The byte that starts a comment, which is `comment` on a call and `COMMENT` on a `COPY`.
+    ///
+    /// `Some(None)` is a call that said there is none, with `comment=''`, and then the sniffer
+    /// does not look for one. Unset, it tries the pin's candidates, which are none and `#`.
+    pub comment: Option<Option<u8>>,
     /// Whether the first line names the columns.
     pub header: Option<bool>,
     /// The strings that read as a null, which is `nullstr` on a call and `NULL` on a `COPY`.
@@ -319,7 +331,7 @@ impl Dialect {
     /// The dialect a file with nothing unusual in it has.
     #[must_use]
     pub const fn comma_separated() -> Self {
-        Self { delimiter: b',', quote: None, escape: None, header: true }
+        Self { delimiter: b',', quote: None, escape: None, header: true, comment: None }
     }
 
     /// The quote byte, or the double quote when the file has none.
@@ -377,17 +389,27 @@ pub fn line_ending(sample: &[u8]) -> &'static str {
 /// candidates that agree, the one that found the most columns wins, since a file is more likely to
 /// have three columns separated by something than one column containing it. An empty sample has
 /// nothing to count and is a comma.
+///
+/// Each comment in `comments` is tried with each delimiter, and a comment only counts when the
+/// lines it takes out look like comments, which [`comments_fit`] decides. A file with no comment in
+/// it splits the same with one as without, and the earlier candidate wins a tie, so the answer is
+/// the delimiter and the comment.
 #[must_use]
-pub fn delimiter(sample: &[u8], quote: Option<u8>) -> u8 {
-    let mut best = (1usize, DELIMITERS[0]);
-    for candidate in DELIMITERS {
-        let dialect = Dialect { delimiter: candidate, quote, escape: quote, header: false };
-        let Some(width) = consistent_width(sample, dialect) else { continue };
-        if width > best.0 {
-            best = (width, candidate);
+pub fn delimiter(sample: &[u8], quote: Option<u8>, comments: &[Option<u8>]) -> (u8, Option<u8>) {
+    let mut best = (1usize, DELIMITERS[0], comments.first().copied().flatten());
+    for &comment in comments {
+        for candidate in DELIMITERS {
+            let dialect =
+                Dialect { delimiter: candidate, quote, escape: quote, header: false, comment };
+            let Some(width) = consistent_width(sample, dialect, comments.len() > 1) else {
+                continue;
+            };
+            if width > best.0 {
+                best = (width, candidate, comment);
+            }
         }
     }
-    best.1
+    (best.1, best.2)
 }
 
 /// The first delimiter that splits every line of `sample` into `columns` fields, for a read that
@@ -398,21 +420,60 @@ pub fn delimiter(sample: &[u8], quote: Option<u8>) -> u8 {
 /// `v2.0.0-dev84237`, where a one line file with a `|` and a `;` in it is two columns sniffed and
 /// one column read with `columns={'col1': 'BLOB'}`.
 #[must_use]
-pub fn delimiter_of_width(sample: &[u8], quote: Option<u8>, columns: usize) -> Option<u8> {
-    DELIMITERS.into_iter().find(|&candidate| {
-        let dialect = Dialect { delimiter: candidate, quote, escape: quote, header: false };
-        consistent_width(sample, dialect) == Some(columns)
+pub fn delimiter_of_width(
+    sample: &[u8],
+    quote: Option<u8>,
+    comments: &[Option<u8>],
+    columns: usize,
+) -> Option<(u8, Option<u8>)> {
+    comments.iter().find_map(|&comment| {
+        DELIMITERS.into_iter().find_map(|candidate| {
+            let dialect =
+                Dialect { delimiter: candidate, quote, escape: quote, header: false, comment };
+            let width = consistent_width(sample, dialect, comments.len() > 1);
+            (width == Some(columns)).then_some((candidate, comment))
+        })
     })
 }
 
+/// The comment of `comments` that goes with a delimiter the call set, which is the first that
+/// gives every line the same width, or the first of them when none does.
+#[must_use]
+pub fn delimiter_with(
+    sample: &[u8],
+    quote: Option<u8>,
+    comments: &[Option<u8>],
+    delimiter: u8,
+) -> Option<u8> {
+    let mut best = (0, comments.first().copied().flatten());
+    for &comment in comments {
+        let dialect = Dialect { delimiter, quote, escape: quote, header: false, comment };
+        if let Some(width) = consistent_width(sample, dialect, comments.len() > 1)
+            && width > best.0
+        {
+            best = (width, comment);
+        }
+    }
+    best.1
+}
+
 /// The number of fields every line has under `dialect`, when they all have the same number.
-fn consistent_width(sample: &[u8], dialect: Dialect) -> Option<usize> {
+///
+/// With `doubt` set the dialect's comment is a guess, and a width it gives only counts when the
+/// lines the comment took out look like comments.
+fn consistent_width(sample: &[u8], dialect: Dialect, doubt: bool) -> Option<usize> {
     let mut at = 0;
     let mut fields = Vec::new();
     let mut width = None;
     let mut lines = 0;
+    let mut comments = Comments::default();
     while at < sample.len() {
-        let next = crate::scan::record(sample, at, dialect, true, &mut fields).ok()??;
+        let Some(next) =
+            crate::scan::record_noting(sample, at, dialect, true, &mut fields, &mut comments)
+                .ok()?
+        else {
+            break;
+        };
         at = next;
         lines += 1;
         match width {
@@ -421,7 +482,28 @@ fn consistent_width(sample: &[u8], dialect: Dialect) -> Option<usize> {
             Some(_) => return None,
         }
     }
-    if lines == 0 { None } else { width }
+    let width = if lines == 0 { None } else { width }?;
+    if doubt && dialect.comment.is_some() && !comments_fit(&comments, width) {
+        return None;
+    }
+    Some(width)
+}
+
+/// Whether what a guessed comment took out of a file looks like comments, the pin's
+/// `AreCommentsAcceptable`.
+///
+/// At least one whole line has to have been a comment, and of the lines the comment touched, three
+/// in five have to fit: a whole line that would not have had the file's width, or a line the
+/// comment cut short that still has it. A `#` that is only ever part way through a line is data.
+#[must_use]
+pub fn comments_fit(comments: &Comments, width: usize) -> bool {
+    let whole = if width == 1 { 0 } else { comments.lines };
+    if whole == 0 {
+        return false;
+    }
+    let cut = comments.mids.iter().filter(|&&found| found == width).count();
+    let seen = comments.lines + comments.mids.len();
+    (whole + cut) * 5 >= seen * 3
 }
 
 /// Whether the file uses a quote character at all, and which one.
@@ -447,10 +529,10 @@ mod tests {
 
     #[test]
     fn the_delimiter_is_the_one_every_line_agrees_on() {
-        assert_eq!(delimiter(b"a,b,c\n1,2,3\n", None), b',');
-        assert_eq!(delimiter(b"a|b\n1|x\n", None), b'|');
-        assert_eq!(delimiter(b"a;b\n1;x\n", None), b';');
-        assert_eq!(delimiter(b"a\tb\n1\tx\n", None), b'\t');
+        assert_eq!(delimiter(b"a,b,c\n1,2,3\n", None, &[None]).0, b',');
+        assert_eq!(delimiter(b"a|b\n1|x\n", None, &[None]).0, b'|');
+        assert_eq!(delimiter(b"a;b\n1;x\n", None, &[None]).0, b';');
+        assert_eq!(delimiter(b"a\tb\n1\tx\n", None, &[None]).0, b'\t');
     }
 
     #[test]
@@ -458,18 +540,18 @@ mod tests {
         // The semicolon splits the first line into two and the second into one, so it is a
         // character in the data. The comma splits both into two and is the answer.
         let sample = b"a,b;c\n1,2\n";
-        assert_eq!(delimiter(sample, None), b',');
+        assert_eq!(delimiter(sample, None, &[None]).0, b',');
     }
 
     #[test]
     fn the_delimiter_that_finds_more_columns_wins_among_the_ones_that_agree() {
         // Every line is one field under a tab and three under a comma, and both are consistent.
-        assert_eq!(delimiter(b"a,b,c\nx,y,z\n", None), b',');
+        assert_eq!(delimiter(b"a,b,c\nx,y,z\n", None, &[None]).0, b',');
     }
 
     #[test]
     fn a_file_with_nothing_to_split_on_is_comma_separated_and_one_column() {
-        assert_eq!(delimiter(b"a\nb\n", None), b',');
+        assert_eq!(delimiter(b"a\nb\n", None, &[None]).0, b',');
     }
 
     #[test]
@@ -485,16 +567,44 @@ mod tests {
 
     #[test]
     fn a_read_that_set_its_columns_takes_the_delimiter_that_finds_that_many() {
-        assert_eq!(delimiter(b"a|b;c\n", None), b'|');
-        assert_eq!(delimiter_of_width(b"a|b;c\n", None, 1), Some(b','));
-        assert_eq!(delimiter_of_width(b"a|b;c\n", None, 2), Some(b'|'));
-        assert_eq!(delimiter_of_width(b"a|b;c\n", None, 3), None);
+        assert_eq!(delimiter(b"a|b;c\n", None, &[None]).0, b'|');
+        assert_eq!(delimiter_of_width(b"a|b;c\n", None, &[None], 1), Some((b',', None)));
+        assert_eq!(delimiter_of_width(b"a|b;c\n", None, &[None], 2), Some((b'|', None)));
+        assert_eq!(delimiter_of_width(b"a|b;c\n", None, &[None], 3), None);
+    }
+
+    #[test]
+    fn a_comment_is_sniffed_when_the_lines_it_takes_out_look_like_comments() {
+        assert_eq!(delimiter(b"a,b\n# c\n1,2\n3,4", None, &COMMENTS), (b',', Some(b'#')));
+        assert_eq!(delimiter(b"a;b\n1;2\n#x\n", None, &COMMENTS), (b';', Some(b'#')));
+        // A file with no comment in it is read without one.
+        assert_eq!(delimiter(b"a,b\n1,2\n", None, &COMMENTS), (b',', None));
+        // A `#` that is only ever part way through a line is data.
+        assert_eq!(delimiter(b"a,#b,c\n1,#2,3\n", None, &COMMENTS), (b',', None));
+        // A comment the call set is taken without the doubt.
+        assert_eq!(delimiter(b"a,#b\n1,#2\n", None, &[Some(b'#')]), (b',', Some(b'#')));
+        assert_eq!(delimiter_with(b"a|b\n#x\n1|2\n", None, &COMMENTS, b'|'), Some(b'#'));
+        let sample = b"#x\na,b\n";
+        assert_eq!(delimiter_of_width(sample, None, &COMMENTS, 2), Some((b',', Some(b'#'))));
+    }
+
+    #[test]
+    fn comments_fit_when_three_in_five_of_the_lines_they_touch_do() {
+        let fit = |lines, mids: &[usize], width| {
+            comments_fit(&Comments { lines, mids: mids.to_vec() }, width)
+        };
+        assert!(fit(1, &[], 2));
+        assert!(!fit(0, &[2, 2], 2));
+        assert!(fit(1, &[2, 3], 2));
+        assert!(!fit(1, &[3, 3], 2));
+        // A whole line comment in a file of one column has the file's width and says nothing.
+        assert!(!fit(3, &[], 1));
     }
 
     #[test]
     fn a_delimiter_inside_a_quoted_field_does_not_count() {
         let sample = b"a,b\n1,\"x,y\"\n";
-        assert_eq!(delimiter(sample, Some(b'"')), b',');
+        assert_eq!(delimiter(sample, Some(b'"'), &[None]).0, b',');
     }
 
     #[test]

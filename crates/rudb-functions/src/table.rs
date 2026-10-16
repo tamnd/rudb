@@ -391,6 +391,7 @@ impl TableFunction {
                     ("column_names", LogicalType::list(LogicalType::Varchar)),
                     ("column_types", LogicalType::Null),
                     ("columns", LogicalType::Null),
+                    ("comment", LogicalType::Varchar),
                     ("dateformat", LogicalType::Varchar),
                     ("delim", LogicalType::Varchar),
                     ("dtypes", LogicalType::Null),

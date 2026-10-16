@@ -316,6 +316,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    column_names VARCHAR[]\n",
         "    column_types ANY\n",
         "    columns ANY\n",
+        "    comment VARCHAR\n",
         "    dateformat VARCHAR\n",
         "    delim VARCHAR\n",
         "    dtypes ANY\n",
