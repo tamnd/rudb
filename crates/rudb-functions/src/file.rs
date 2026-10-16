@@ -93,6 +93,8 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             ("all_varchar", Value::Boolean(on)) => given.all_varchar = *on,
             ("ignore_errors", Value::Boolean(on)) => given.ignore_errors = *on,
             ("null_padding", Value::Boolean(on)) => given.null_padding = *on,
+            ("strict_mode", Value::Boolean(on)) => given.strict_mode = Some(*on),
+            ("new_line", Value::Varchar(text)) => given.new_line = Some(Given::new_line(text)?),
             ("buffer_size", Value::UBigInt(size)) => {
                 if *size == 0 {
                     return Err(Error::invalid_input("Buffer Size option must be higher than 0"));
@@ -111,11 +113,11 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
                 given.max_line = Some(size);
             }
             ("skip", Value::BigInt(lines)) => {
-                given.skip = usize::try_from(*lines).map_err(|_| {
+                given.skip = Some(usize::try_from(*lines).map_err(|_| {
                     Error::invalid_input(
                         "skip_rows option from read_csv scanner, must be equal or higher than 0",
                     )
-                })?;
+                })?);
             }
             ("types" | "dtypes" | "column_types", value) => {
                 if given.retype.is_some() {
