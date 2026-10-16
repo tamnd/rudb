@@ -112,7 +112,13 @@ impl Format {
         })
     }
 
-    pub(crate) fn parsed(format: &str) -> std::result::Result<Self, String> {
+    /// Takes a format apart, with the reason alone when it does not parse, which is what the CSV
+    /// reader quotes after its own `Could not parse DATEFORMAT: `.
+    ///
+    /// # Errors
+    ///
+    /// The reasons [`Format::parse`] gives.
+    pub fn parsed(format: &str) -> std::result::Result<Self, String> {
         if format.is_empty() {
             return Err("Empty format string".to_string());
         }

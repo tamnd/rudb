@@ -389,6 +389,7 @@ impl TableFunction {
                     ("column_names", LogicalType::list(LogicalType::Varchar)),
                     ("column_types", LogicalType::Null),
                     ("columns", LogicalType::Null),
+                    ("dateformat", LogicalType::Varchar),
                     ("delim", LogicalType::Varchar),
                     ("dtypes", LogicalType::Null),
                     ("escape", LogicalType::Varchar),
@@ -410,6 +411,7 @@ impl TableFunction {
                     ("sep", LogicalType::Varchar),
                     ("skip", LogicalType::BigInt),
                     ("strict_mode", LogicalType::Boolean),
+                    ("timestampformat", LogicalType::Varchar),
                     ("types", LogicalType::Null),
                     ("union_by_name", LogicalType::Boolean),
                 ]

@@ -314,6 +314,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    column_names VARCHAR[]\n",
         "    column_types ANY\n",
         "    columns ANY\n",
+        "    dateformat VARCHAR\n",
         "    delim VARCHAR\n",
         "    dtypes ANY\n",
         "    escape VARCHAR\n",
@@ -335,6 +336,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    sep VARCHAR\n",
         "    skip BIGINT\n",
         "    strict_mode BOOLEAN\n",
+        "    timestampformat VARCHAR\n",
         "    types ANY\n",
         "    union_by_name BOOLEAN\n",
     );
@@ -965,5 +967,75 @@ fn hive_partitioning_and_filename_are_refused_where_the_pin_refuses_them() {
         ),
     ] {
         assert_eq!(read(options), Err(expected.replace("ROOT", &root)), "{options}");
+    }
+}
+
+/// Every answer here was read off `v2.0.0-dev84237` with the same files.
+#[test]
+fn a_day_written_day_or_month_first_is_sniffed_with_the_format_that_reads_it() {
+    let database = Database::new();
+    let answer = |sql: &str| {
+        let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        let rows: Vec<String> = result
+            .rows()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(":"))
+            .collect();
+        rows.join(" ")
+    };
+    let read =
+        |file: &str, options: &str| format!("SELECT typeof(a), a FROM read_csv({file}{options})");
+    let day_first = written("dates-day.csv", "a\n05/06/2019\n13/01/2020\n");
+    assert_eq!(answer(&read(&day_first, "")), "DATE:2019-06-05 DATE:2020-01-13");
+    let month_first = written("dates-month.csv", "a\n01/13/2020\n05/06/2019\n");
+    assert_eq!(answer(&read(&month_first, "")), "DATE:2020-01-13 DATE:2019-05-06");
+    let short = written("dates-short.csv", "a\n05/06/19\n");
+    assert_eq!(answer(&read(&short, "")), "DATE:2005-06-19");
+    let stamped = written("dates-stamped.csv", "a\n05/06/2019 10:11:12\n");
+    assert_eq!(answer(&read(&stamped, "")), "TIMESTAMP:2019-06-05 10:11:12");
+    let options = ", timestampformat='%m/%d/%Y %H:%M:%S'";
+    assert_eq!(answer(&read(&stamped, options)), "TIMESTAMP:2019-05-06 10:11:12");
+    // A format the call gives is the only one tried, and the second row does not fit it.
+    let options = ", dateformat='%m/%d/%Y'";
+    assert_eq!(answer(&read(&day_first, options)), "VARCHAR:05/06/2019 VARCHAR:13/01/2020");
+    // The second row moves the format on and the first row is then refused.
+    let both = written("dates-both.csv", "a\n13/01/2020\n01/13/2020\n");
+    let error = database.query(&read(&both, "")).unwrap_err();
+    assert!(
+        error.message().starts_with("CSV Error on Line: 2\nOriginal Line: 13/01/2020\n"),
+        "{error}"
+    );
+    assert!(
+        error.message().contains("Could not convert string \"13/01/2020\" to 'DATE'"),
+        "{error}"
+    );
+    assert!(error.message().contains("\n  date_format = %m/%d/%Y (Auto-Detected)\n"), "{error}");
+    database.execute("CREATE TABLE days(a DATE)").expect("creates");
+    database.execute(&format!("COPY days FROM {day_first}")).expect("loads");
+    assert_eq!(answer("SELECT a FROM days"), "2019-06-05 2020-01-13");
+    database.execute("DELETE FROM days").expect("empties");
+    let copy = format!("COPY days FROM {day_first} (DATEFORMAT '%m/%d/%Y', IGNORE_ERRORS)");
+    database.execute(&copy).expect("loads");
+    assert_eq!(answer("SELECT a FROM days"), "2019-05-06");
+    let copy = format!("COPY days FROM {day_first} (DATE_FORMAT '%m/%d/%Y')");
+    let error = database.execute(&copy).unwrap_err();
+    assert!(
+        error.message().starts_with("CSV Error on Line: 3\nOriginal Line: 13/01/2020\n"),
+        "{error}"
+    );
+    assert!(error.message().contains("This type was either manually set"), "{error}");
+    assert!(error.message().contains("\n  date_format = %m/%d/%Y (Set By User)\n"), "{error}");
+    for (option, message) in [
+        (
+            "dateformat='%Q'",
+            "Could not parse DATEFORMAT: Unrecognized format for strftime/strptime: %Q",
+        ),
+        (
+            "timestampformat='%Q'",
+            "Could not parse DATEFORMAT: Unrecognized format for strftime/strptime: %Q",
+        ),
+        ("dateformat=NULL", "Could not parse DATEFORMAT: Empty format string"),
+    ] {
+        let error = database.query(&read(&day_first, &format!(", {option}"))).unwrap_err();
+        assert_eq!(error.message(), message, "{option}");
     }
 }

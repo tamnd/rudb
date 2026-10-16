@@ -15,6 +15,10 @@
 //! decimal number handed to the same `str::parse` the cast ends in, with `inf`, `nan` and anything
 //! with a space or an underscore left to the cast. A boolean is one of the ten spellings the cast
 //! knows, in any case, without spaces. A date is exactly `YYYY-MM-DD`.
+//!
+//! A date or a timestamp column with a format, the call's or the one the sniffer found, is read
+//! with that format and nothing else, so a value it does not read is refused even when the cast
+//! would have taken it. That is the pin's `TryParseDate` and `TryParseTimestamp`.
 
 use std::ops::Range;
 
@@ -23,6 +27,7 @@ use rudb_kernels::cast_value;
 use rudb_vector::{Buffer, Data, INLINE_LIMIT, StringColumn, StringView, Validity, Vector};
 
 use crate::dialect::Dialect;
+use crate::infer::Clocks;
 use crate::scan::{Records, Span};
 
 /// One chunk's fields and the buffer their ranges point into.
@@ -34,6 +39,8 @@ pub(crate) struct Cells<'a> {
     /// The strings that read as a null, or `None` for the empty one, which is the default and is
     /// answered off the range without looking at a byte.
     pub(crate) nulls: Option<&'a [Vec<u8>]>,
+    /// The formats the dates and the timestamps are read with.
+    pub(crate) clocks: &'a Clocks,
 }
 
 impl Cells<'_> {
@@ -168,13 +175,16 @@ pub(crate) fn builders(
         .iter()
         .map(|&(_, ty)| {
             let long = if *ty == LogicalType::Varchar { long.next().unwrap_or(0) } else { 0 };
-            builder(ty, rows, long)
+            builder(ty, rows, long, cells.clocks)
         })
         .collect()
 }
 
 /// A builder for a column of `ty`, with room for `rows` and, for text, `long` bytes of long strings.
-fn builder(ty: &LogicalType, rows: usize, long: usize) -> Box<dyn Build> {
+///
+/// A date column with a format goes through [`cast`], which reads it with the format, rather than
+/// the parser for the ISO form.
+fn builder(ty: &LogicalType, rows: usize, long: usize, clocks: &Clocks) -> Box<dyn Build> {
     match ty {
         LogicalType::Varchar => Box::new(Text {
             ty: ty.clone(),
@@ -253,7 +263,7 @@ fn builder(ty: &LogicalType, rows: usize, long: usize) -> Box<dyn Build> {
             |value| if let Value::Float(x) = value { Some(*x) } else { None },
             Data::Float32,
         ),
-        LogicalType::Date => fixed(
+        LogicalType::Date if clocks.date.is_none() => fixed(
             ty,
             rows,
             day,
@@ -439,7 +449,23 @@ fn cast(
     refuse: &dyn Fn(&str, usize) -> Error,
 ) -> Result<Value> {
     let text = span.text(cells.bytes, cells.dialect);
-    cast_value(&Value::Varchar(text.to_string()), ty, false).map_err(|_| refuse(&text, row))
+    let formatted = match ty {
+        LogicalType::Date => {
+            cells.clocks.date.as_ref().map(|date| date.date(&text).map(Value::Date))
+        }
+        LogicalType::Timestamp => cells
+            .clocks
+            .timestamp
+            .as_ref()
+            .map(|timestamp| timestamp.timestamp(&text).map(Value::Timestamp)),
+        _ => None,
+    };
+    match formatted {
+        Some(value) => value.ok_or_else(|| refuse(&text, row)),
+        None => {
+            cast_value(&Value::Varchar(text.to_string()), ty, false).map_err(|_| refuse(&text, row))
+        }
+    }
 }
 
 /// A whole number written as an optional sign and up to twenty digits, if it fits in an `i64`.

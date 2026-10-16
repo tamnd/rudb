@@ -208,20 +208,32 @@ fn special(data: &[u8]) -> Option<(Special, usize)> {
     })
 }
 
-/// A string read as a date with one format, which is how `read_json` tries its date formats.
-pub(crate) fn try_date(format: &Format, text: &str) -> Option<i32> {
-    i32::try_from(parse(format, text).ok()?.days()?).ok()
+/// A string read as a date with one format, which is how `read_json` tries its date formats and
+/// how `read_csv` reads a `dateformat`.
+#[must_use]
+pub fn try_date(format: &Format, text: &str) -> Option<i32> {
+    i32::try_from(parse(format, text, false).ok()?.days()?).ok()
 }
 
 /// A string read as a timestamp with one format, which is how `read_json` tries its timestamp
-/// formats.
-pub(crate) fn try_timestamp(format: &Format, text: &str) -> Option<i64> {
-    parse(format, text).ok()?.micros(false).ok().flatten()
+/// formats and how `read_csv` reads a `timestampformat`.
+#[must_use]
+pub fn try_timestamp(format: &Format, text: &str) -> Option<i64> {
+    parse(format, text, false).ok()?.micros(false).ok().flatten()
 }
 
-/// Upstream's `StrpTimeFormat::Parse`.
+/// Whether a string reads with one format in the pin's strict mode, which is how its CSV sniffer
+/// tries a date format against a value. Strict refuses a year of one digit, so `5/06/19` is not
+/// `%y/%m/%d`.
+#[must_use]
+pub fn fits_strictly(format: &Format, text: &str) -> bool {
+    parse(format, text, true).is_ok()
+}
+
+/// Upstream's `StrpTimeFormat::Parse`, which only refuses more in `strict`, a year written with
+/// fewer than two digits.
 #[allow(clippy::too_many_lines)]
-fn parse(format: &Format, text: &str) -> std::result::Result<Parsed, Failure> {
+fn parse(format: &Format, text: &str, strict: bool) -> std::result::Result<Parsed, Failure> {
     let mut parsed = Parsed {
         year: 1900,
         month: 1,
@@ -320,6 +332,9 @@ fn parse(format: &Format, text: &str) -> std::result::Result<Parsed, Failure> {
                     offset_spec = spec;
                 }
                 Spec::ShortYearPadded | Spec::ShortYear | Spec::Year => {
+                    if strict && digits < 2 {
+                        return failed("", start);
+                    }
                     if matches!(offset_spec, Spec::IsoYear | Spec::IsoWeek | Spec::Weekday) {
                         offset_spec = spec;
                     }
@@ -720,7 +735,7 @@ impl Formats {
         };
         let mut last = None;
         for format in &self.formats {
-            match parse(format, text) {
+            match parse(format, text, false) {
                 Ok(parsed) => {
                     let stamp = if *returns == LogicalType::TimestampNs {
                         parsed.nanos(strict)?
