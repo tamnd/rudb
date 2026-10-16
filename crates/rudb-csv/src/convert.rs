@@ -89,6 +89,24 @@ pub(crate) fn column(
     build.finish()
 }
 
+/// Marks the rows of `cells` whose column `column` does not convert to `ty`, through the cast and
+/// not the parsers, which agree with it on every value they take.
+///
+/// This is the slow way round and is only taken once a chunk has failed to convert under a read
+/// that ignores errors, to find every row it has to leave out rather than the first.
+pub(crate) fn refused(cells: &Cells<'_>, column: usize, ty: &LogicalType, bad: &mut [bool]) {
+    if *ty == LogicalType::Varchar {
+        return;
+    }
+    let refuse = |_: &str, _: usize| Error::conversion("");
+    let rows = 0..cells.records.len();
+    for ((row, span), bad) in rows.clone().zip(cells.column(column, rows)).zip(bad) {
+        if let Some(span) = span {
+            *bad |= cast(cells, span, ty, row, &refuse).is_err();
+        }
+    }
+}
+
 /// A column being built a block of rows at a time.
 ///
 /// The reader converts a chunk a block of rows at a time and every projected column within a

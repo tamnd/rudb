@@ -359,10 +359,9 @@ impl TableFunction {
     /// with no type, which is how the pin's `ANY` is written here, and so do `types`, `dtypes` and
     /// `column_types`, which take a struct or a list.
     ///
-    /// `null_padding=true` asks for a row that is short to be read with nulls for the columns it is
-    /// missing, which is what this reader does with every short row, so it is listed for being
-    /// what already happens. The pin refuses a short row when it is false, and this reader does not
-    /// refuse it yet, which is the one place a setting here is not followed to the letter.
+    /// `null_padding=true` reads a row that is short with nulls for the columns it is missing, and
+    /// `ignore_errors=true` leaves out a row that is short, long or holds a value that does not
+    /// convert. Without either a short row is refused, as the pin refuses it.
     ///
     /// `filename`, `hive_partitioning`, `hive_types` and `hive_types_autocast` are the pin's shared
     /// multi file options, which both readers take, and they add columns that are in no file. See
@@ -399,6 +398,7 @@ impl TableFunction {
                     ("hive_partitioning", LogicalType::Boolean),
                     ("hive_types", LogicalType::Null),
                     ("hive_types_autocast", LogicalType::Boolean),
+                    ("ignore_errors", LogicalType::Boolean),
                     ("max_line_size", LogicalType::Varchar),
                     ("maximum_line_size", LogicalType::Varchar),
                     ("names", LogicalType::list(LogicalType::Varchar)),

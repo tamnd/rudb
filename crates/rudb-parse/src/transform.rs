@@ -7414,11 +7414,13 @@ fn copy_parameter(name: &str) -> Result<&'static str> {
         "quote" => "quote",
         "escape" => "escape",
         "null" | "nullstr" => "nullstr",
+        "ignore_errors" => "ignore_errors",
+        "null_padding" => "null_padding",
+        "sample_size" => "sample_size",
         "all_varchar" | "allow_quoted_nulls" | "auto_detect" | "columns" | "comment"
         | "compression" | "dateformat" | "date_format" | "decimal_separator" | "encoding"
-        | "force_not_null" | "force_quote" | "ignore_errors" | "max_line_size" | "names"
-        | "new_line" | "null_padding" | "sample_size" | "skip" | "strict_mode"
-        | "timestampformat" | "timestamp_format" | "types" | "dtypes" => {
+        | "force_not_null" | "force_quote" | "max_line_size" | "names" | "new_line" | "skip"
+        | "strict_mode" | "timestampformat" | "timestamp_format" | "types" | "dtypes" => {
             return Err(Error::not_implemented(format!(
                 "COPY FROM with the option {name} is not supported yet"
             )));

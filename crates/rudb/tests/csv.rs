@@ -323,6 +323,7 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    hive_partitioning BOOLEAN\n",
         "    hive_types ANY\n",
         "    hive_types_autocast BOOLEAN\n",
+        "    ignore_errors BOOLEAN\n",
         "    max_line_size VARCHAR\n",
         "    maximum_line_size VARCHAR\n",
         "    names VARCHAR[]\n",
@@ -660,6 +661,62 @@ fn null_padding_reads_a_short_row_with_nulls_for_what_it_is_missing() {
         error.message(),
         "\"null_padding\" expects a non-null boolean value (e.g. TRUE or 1)"
     );
+}
+
+/// Measured on `v2.0.0-dev84237` with these bytes, where the file sniffed without the option is one
+/// column of text.
+#[test]
+fn ignore_errors_leaves_out_the_rows_that_do_not_fit() {
+    let database = Database::new();
+    let file = written("ignore-errors.csv", "a,b\n1,2\n3\n4,5\n6,7,8\n9,x\n10,11\n");
+    let answer = |sql: &str| {
+        let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        let rows: Vec<String> = result
+            .rows()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(":"))
+            .collect();
+        rows.join(" ")
+    };
+    let sql = format!("SELECT * FROM read_csv({file}, ignore_errors=true)");
+    assert_eq!(answer(&sql), "1:2 4:5 9:x 10:11");
+    let columns = "columns={'a': 'INTEGER', 'b': 'INTEGER'}";
+    let sql = format!("SELECT * FROM read_csv({file}, {columns}, ignore_errors=true)");
+    assert_eq!(answer(&sql), "1:2 4:5 10:11");
+    // A value that does not convert is only an error in a column that is read.
+    let sql =
+        format!("SELECT count(*), count(a) FROM read_csv({file}, {columns}, ignore_errors=1)");
+    assert_eq!(answer(&sql), "4:4");
+    database.execute("CREATE TABLE t (a INT, b INT)").expect("creates");
+    database.execute(&format!("COPY t FROM {file} (IGNORE_ERRORS, HEADER)")).expect("copies");
+    assert_eq!(answer("SELECT * FROM t"), "1:2 4:5 10:11");
+    let sql = format!("SELECT * FROM read_csv({file}, ignore_errors=NULL)");
+    let error = database.query(&sql).unwrap_err();
+    assert_eq!(
+        error.message(),
+        "\"ignore_errors\" expects a non-null boolean value (e.g. TRUE or 1)"
+    );
+}
+
+#[test]
+fn copy_from_splits_a_file_as_many_ways_as_the_table_has_columns() {
+    let database = Database::new();
+    let answer = |sql: &str| {
+        let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        let rows: Vec<String> = result
+            .rows()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(":"))
+            .collect();
+        rows.join(" ")
+    };
+    let words = written("copy-width-words.csv", "x|y\nz|w\n");
+    let numbers = written("copy-width-numbers.csv", "1|2\n3|4\n");
+    database.execute("CREATE TABLE t (a VARCHAR)").expect("creates");
+    database.execute("CREATE TABLE u (a VARCHAR, b VARCHAR)").expect("creates");
+    database.execute(&format!("COPY t FROM {words}")).expect("copies");
+    database.execute(&format!("COPY t FROM {numbers}")).expect("copies");
+    database.execute(&format!("COPY u FROM {words}")).expect("copies");
+    assert_eq!(answer("SELECT * FROM t"), "z|w 3|4");
+    assert_eq!(answer("SELECT * FROM u"), "z:w");
 }
 
 /// A directory of CSV files laid out the way `PARTITION_BY` writes one, each file under the path
