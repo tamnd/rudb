@@ -160,6 +160,17 @@ pub struct Given {
     /// Every line ending ends a line whatever this says, as the pin's scanner does. What it
     /// changes is what the block under an error shows.
     pub new_line: Option<&'static str>,
+    /// The format the dates in the file are written in, which is `dateformat` on a call and
+    /// `DATEFORMAT` on a `COPY`, in place of the one the sniffer would look for.
+    ///
+    /// A column the sniffer would have called a `DATE` is one only when its values are in this
+    /// format, and a value that is not is refused at read time. Measured on `v2.0.0-dev84237`,
+    /// where `05/06/2019` over `13/01/2020` read with `dateformat='%m/%d/%Y'` is a `VARCHAR`
+    /// column, and loaded into a `DATE` column is an error at the second row.
+    pub date_format: Option<String>,
+    /// The format the timestamps in the file are written in, which is `timestampformat` on a call
+    /// and `TIMESTAMPFORMAT` on a `COPY`, the same way.
+    pub timestamp_format: Option<String>,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.
@@ -231,6 +242,35 @@ impl Given {
             Some([only]) if only.is_empty() => None,
             Some(nulls) => Some(nulls.iter().map(|text| text.as_bytes().to_vec()).collect()),
         }
+    }
+
+    /// A date or timestamp format a call gave, once it is known to be one.
+    ///
+    /// # Errors
+    ///
+    /// When it does not parse, in the pin's words, which say `DATEFORMAT` for a timestamp format as
+    /// well. Measured on `v2.0.0-dev84237` with `timestampformat='%Q'`.
+    pub fn format(text: &str) -> rudb_common::Result<String> {
+        Self::written(text)?;
+        Ok(text.to_string())
+    }
+
+    fn written(text: &str) -> rudb_common::Result<crate::infer::Written> {
+        crate::infer::Written::parse(text).map_err(|why| {
+            rudb_common::Error::invalid_input(format!("Could not parse DATEFORMAT: {why}"))
+        })
+    }
+
+    /// The formats the call gave, taken apart.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Given::format`], which a call has been through already.
+    pub fn clocks(&self) -> rudb_common::Result<crate::infer::Clocks> {
+        Ok(crate::infer::Clocks {
+            date: self.date_format.as_deref().map(Self::written).transpose()?,
+            timestamp: self.timestamp_format.as_deref().map(Self::written).transpose()?,
+        })
     }
 
     /// How the call writes the line ending it says a file has, in the pin's words when it is not

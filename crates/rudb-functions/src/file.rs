@@ -95,6 +95,10 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             ("null_padding", Value::Boolean(on)) => given.null_padding = *on,
             ("strict_mode", Value::Boolean(on)) => given.strict_mode = Some(*on),
             ("new_line", Value::Varchar(text)) => given.new_line = Some(Given::new_line(text)?),
+            ("dateformat", Value::Varchar(text)) => given.date_format = Some(Given::format(text)?),
+            ("timestampformat", Value::Varchar(text)) => {
+                given.timestamp_format = Some(Given::format(text)?);
+            }
             ("buffer_size", Value::UBigInt(size)) => {
                 if *size == 0 {
                     return Err(Error::invalid_input("Buffer Size option must be higher than 0"));

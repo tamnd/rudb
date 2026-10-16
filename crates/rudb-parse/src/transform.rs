@@ -7420,10 +7420,11 @@ fn copy_parameter(name: &str) -> Result<&'static str> {
         "new_line" => "new_line",
         "skip" => "skip",
         "strict_mode" => "strict_mode",
+        "dateformat" | "date_format" => "dateformat",
+        "timestampformat" | "timestamp_format" => "timestampformat",
         "all_varchar" | "allow_quoted_nulls" | "auto_detect" | "columns" | "comment"
-        | "compression" | "dateformat" | "date_format" | "decimal_separator" | "encoding"
-        | "force_not_null" | "force_quote" | "max_line_size" | "names" | "timestampformat"
-        | "timestamp_format" | "types" | "dtypes" => {
+        | "compression" | "decimal_separator" | "encoding" | "force_not_null" | "force_quote"
+        | "max_line_size" | "names" | "types" | "dtypes" => {
             return Err(Error::not_implemented(format!(
                 "COPY FROM with the option {name} is not supported yet"
             )));

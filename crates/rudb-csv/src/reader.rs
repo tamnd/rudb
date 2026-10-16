@@ -21,7 +21,7 @@ use rudb_vector::{Chunk, VECTOR_SIZE};
 
 use crate::convert::{self, Cells};
 use crate::dialect::{self, Dialect, Given, Retype};
-use crate::infer;
+use crate::infer::{self, Clocks};
 use crate::scan::{Records, Span};
 
 /// How much is read at a time, and how much the sniffer gets to look at.
@@ -82,6 +82,8 @@ pub struct Reader {
     ragged: bool,
     /// The line ending the block under an error shows, which is the call's or the first line's.
     line_ending: &'static str,
+    /// The formats the dates and timestamps are read with, the call's or the sniffer's.
+    clocks: Clocks,
 }
 
 impl Reader {
@@ -143,6 +145,7 @@ impl Reader {
             empty: false,
             ragged: false,
             line_ending: "\\n",
+            clocks: Clocks::default(),
         };
         reader.fill(0)?;
         reader.skip_lines()?;
@@ -195,7 +198,11 @@ impl Reader {
         let widest = rows.iter().map(Vec::len).max().unwrap_or(0);
         let blank = |row: &Vec<Option<String>>| row.len() == 1 && row[0].is_none();
         reader.ragged = rows.iter().any(|row| row.len() != widest && !blank(row));
-        let (header, mut fields) = describe(&rows, told, reader.given.types.as_deref());
+        let given = &reader.given;
+        let set = given.types.as_deref();
+        let (header, mut fields, clocks) =
+            describe(&rows, told, set, &given.clocks()?, !given.fixed);
+        reader.clocks = clocks;
         reader.sampled = rows.len().saturating_sub(usize::from(header));
         reader.empty = empty;
         if let Some(types) = &reader.given.types {
@@ -223,6 +230,7 @@ impl Reader {
             for field in &mut fields {
                 field.ty = LogicalType::Varchar;
             }
+            reader.clocks = reader.given.clocks()?;
         }
         if let Some(set) = &reader.given.retype {
             retype(&mut fields, set)?;
@@ -276,7 +284,7 @@ impl Reader {
         let types = self.given.types.as_deref().unwrap_or_default();
         let fits = |row: &[Option<String>]| {
             row.iter().zip(types).all(|(cell, ty)| match cell {
-                Some(text) => infer::fits(text, ty),
+                Some(text) => infer::fits_in(text, ty, &self.clocks),
                 None => true,
             })
         };
@@ -468,6 +476,7 @@ impl Reader {
             records: &self.records,
             dialect: self.dialect,
             nulls: self.nulls.as_deref(),
+            clocks: &self.clocks,
         }
     }
 
@@ -695,6 +704,7 @@ impl Reader {
             empty: self.empty,
             ragged: self.ragged,
             line_ending: self.line_ending,
+            clocks: self.clocks.clone(),
         }
     }
 
@@ -796,8 +806,9 @@ impl Reader {
     /// The block, for a file whose first row is a header or not as `header` says, which is the
     /// pin's `CSVReaderOptions::ToString`.
     ///
-    /// The comment and the two formats are never set here, and the sniffer here never steps over
-    /// lines, so those lines say what the pin's say for a file the call said nothing about.
+    /// The comment is never set here, and the sniffer here never steps over lines, so those lines
+    /// say what the pin's say for a file the call said nothing about. A format is the one the
+    /// dates or timestamps are read with, which is empty when they are read with the cast.
     fn settings_with(&self, header: bool) -> String {
         let given = &self.given;
         let skip = given.skip.unwrap_or(0);
@@ -805,9 +816,8 @@ impl Reader {
         format!(
             "\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  new_line = {} {}\n  \
              header = {header} {}\n  skip_rows = {skip} {}\n  comment = (empty) (Auto-Detected)\n  \
-             strict_mode = {strict} {}\n  date_format =  (Auto-Detected)\n  timestamp_format =  \
-             (Auto-Detected)\n  null_padding = {}\n  sample_size = {}\n  ignore_errors = {}\n  \
-             all_varchar = {}\n",
+             strict_mode = {strict} {}\n  date_format = {} {}\n  timestamp_format = {} {}\n  \
+             null_padding = {}\n  sample_size = {}\n  ignore_errors = {}\n  all_varchar = {}\n",
             self.path,
             Given::shown(given.delimiter, Some(self.dialect.delimiter)),
             Given::shown(given.quote, self.dialect.quote),
@@ -817,6 +827,10 @@ impl Reader {
             Given::source(given.header.is_some()),
             Given::source(given.skip.is_some()),
             Given::source(given.strict_mode.is_some()),
+            shown(self.clocks.date.as_ref()),
+            Given::source(given.date_format.is_some()),
+            shown(self.clocks.timestamp.as_ref()),
+            Given::source(given.timestamp_format.is_some()),
             u8::from(given.null_padding),
             given.sample_shown(),
             given.ignore_errors,
@@ -1102,6 +1116,11 @@ impl Reader {
     }
 }
 
+/// A format as the block under an error shows it, which is nothing for none.
+fn shown(written: Option<&infer::Written>) -> &str {
+    written.map_or("", |written| written.text.as_str())
+}
+
 /// Whether the first row is a header, and what the columns are called and typed.
 ///
 /// The rule is DuckDB's and both halves of it were measured. A file whose columns are all `VARCHAR`
@@ -1116,47 +1135,58 @@ impl Reader {
 /// `set` is the types the call gave its columns, which the question is then asked against rather
 /// than against what the rest of the sample looks like, and which are the types that come back.
 /// The question is asked of one row as well then, since the types no longer come from the rest.
+///
+/// `given` is the date and timestamp formats the call gave, and the formats that come back are the
+/// ones the columns are read with, which the sniffer found when the call gave none and `detect` is
+/// on. The question about the first row is asked with them, so `a` over `05/06/2019` has a header.
 fn describe(
     rows: &[Vec<Option<String>>],
     told: Option<bool>,
     set: Option<&[LogicalType]>,
-) -> (bool, Vec<Field>) {
+    given: &Clocks,
+    detect: bool,
+) -> (bool, Vec<Field>, Clocks) {
     let width = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let body = match set {
-        Some(set) => set.to_vec(),
-        None => types(&rows[1.min(rows.len())..], width),
+    let sniffed = |rows: &[Vec<Option<String>>]| {
+        let columns: Vec<Vec<Option<&str>>> = (0..width)
+            .map(|at| rows.iter().map(|row| row.get(at).and_then(Option::as_deref)).collect())
+            .collect();
+        infer::sniff(&columns, set, given, detect)
     };
+    let (body, clocks) = sniffed(&rows[1.min(rows.len())..]);
+    let body = set.map_or(body, <[LogicalType]>::to_vec);
     let all_text = body.iter().all(|ty| *ty == LogicalType::Varchar);
     let first_fits = rows.first().is_some_and(|first| {
         first.iter().zip(&body).all(|(text, ty)| match text {
             None => true,
-            Some(text) => infer::fits(text, ty),
+            Some(text) => infer::fits_in(text, ty, &clocks),
         })
     });
     // An empty file has no row to take names from, so it has no header whatever it was told.
     // A single row is a header too once the call set the types, which was measured: `1,2` alone
     // read as two `VARCHAR` columns comes back with no rows. So is a single row that is all text,
     // which was measured as well: `a,b` alone is a header and `a,1` alone is a row.
-    let text = || types(rows, width).iter().all(|ty| *ty == LogicalType::Varchar);
+    let text = || sniffed(rows).0.iter().all(|ty| *ty == LogicalType::Varchar);
     let enough = rows.len() > 1 || set.is_some() || (rows.len() == 1 && text());
     let header = !rows.is_empty() && told.unwrap_or(enough && (all_text || !first_fits));
     if !header {
-        let types = match set {
-            Some(set) => set.to_vec(),
+        // The first row is data, so the types and the formats are the whole sample's.
+        let (types, clocks) = match set {
+            Some(set) => (set.to_vec(), sniffed(rows).1),
             // An empty file is one text column, which is the pin's answer for one.
-            None if rows.is_empty() => vec![LogicalType::Varchar],
-            None => types(rows, width),
+            None if rows.is_empty() => (vec![LogicalType::Varchar], clocks),
+            None => sniffed(rows),
         };
         let fields = types
             .into_iter()
             .enumerate()
             .map(|(at, ty)| Field::new(format!("column{at}"), ty))
             .collect();
-        return (false, fields);
+        return (false, fields, clocks);
     }
     let names = unique(&rows[0], width);
     let fields = body.into_iter().zip(names).map(|(ty, name)| Field::new(name, ty)).collect();
-    (true, fields)
+    (true, fields, clocks)
 }
 
 /// Puts the types a call set in place of the ones the sniffer found, refusing a set that names a
@@ -1288,17 +1318,6 @@ fn wide(row: &[Option<String>], width: usize, padding: bool, strict: bool) -> bo
         found if found > width => !strict || row[width..].iter().all(Option::is_none),
         _ => padding,
     }
-}
-
-/// The type of each of `width` columns, over these rows.
-fn types(rows: &[Vec<Option<String>>], width: usize) -> Vec<LogicalType> {
-    (0..width)
-        .map(|at| {
-            let values: Vec<Option<&str>> =
-                rows.iter().map(|row| row.get(at).and_then(Option::as_deref)).collect();
-            infer::column(&values)
-        })
-        .collect()
 }
 
 #[cfg(test)]

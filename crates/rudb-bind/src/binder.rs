@@ -5192,6 +5192,10 @@ impl<'a> Binder<'a> {
         if value == Value::Null && *parameter == "new_line" && function.json().is_none() {
             return Err(Error::invalid_input("This is not accepted as a newline: "));
         }
+        let format = matches!(*parameter, "dateformat" | "timestampformat");
+        if value == Value::Null && format && function == TableFunction::ReadCsv {
+            return Err(Error::invalid_input("Could not parse DATEFORMAT: Empty format string"));
+        }
         if value == Value::Null {
             return Err(Error::binder(null_parameter(function, parameter)));
         }
