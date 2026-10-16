@@ -7417,10 +7417,13 @@ fn copy_parameter(name: &str) -> Result<&'static str> {
         "ignore_errors" => "ignore_errors",
         "null_padding" => "null_padding",
         "sample_size" => "sample_size",
+        "new_line" => "new_line",
+        "skip" => "skip",
+        "strict_mode" => "strict_mode",
         "all_varchar" | "allow_quoted_nulls" | "auto_detect" | "columns" | "comment"
         | "compression" | "dateformat" | "date_format" | "decimal_separator" | "encoding"
-        | "force_not_null" | "force_quote" | "max_line_size" | "names" | "new_line" | "skip"
-        | "strict_mode" | "timestampformat" | "timestamp_format" | "types" | "dtypes" => {
+        | "force_not_null" | "force_quote" | "max_line_size" | "names" | "timestampformat"
+        | "timestamp_format" | "types" | "dtypes" => {
             return Err(Error::not_implemented(format!(
                 "COPY FROM with the option {name} is not supported yet"
             )));
@@ -8768,7 +8771,7 @@ mod tests {
     fn a_copy_this_does_not_read_is_refused_by_name() {
         for (query, message) in [
             ("COPY t FROM 'in.csv' (FOO 1)", "Unrecognized option \"foo\" for csv"),
-            ("COPY t FROM 'in.csv' (SKIP 1)", "the option skip is not supported yet"),
+            ("COPY t FROM 'in.csv' (COMMENT '#')", "the option comment is not supported yet"),
             ("COPY t FROM 'in.json' (FORMAT xml)", "FORMAT xml is not supported yet"),
             (
                 "COPY t FROM 'in.json' (FILENAME true)",

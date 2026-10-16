@@ -327,12 +327,14 @@ fn a_named_parameter_read_csv_does_not_take_lists_the_ones_it_does() {
         "    max_line_size VARCHAR\n",
         "    maximum_line_size VARCHAR\n",
         "    names VARCHAR[]\n",
+        "    new_line VARCHAR\n",
         "    null_padding BOOLEAN\n",
         "    nullstr VARCHAR\n",
         "    quote VARCHAR\n",
         "    sample_size BIGINT\n",
         "    sep VARCHAR\n",
         "    skip BIGINT\n",
+        "    strict_mode BOOLEAN\n",
         "    types ANY\n",
         "    union_by_name BOOLEAN\n",
     );
@@ -695,6 +697,77 @@ fn ignore_errors_leaves_out_the_rows_that_do_not_fit() {
         error.message(),
         "\"ignore_errors\" expects a non-null boolean value (e.g. TRUE or 1)"
     );
+}
+
+#[test]
+fn strict_mode_off_drops_the_fields_past_the_last_column_and_the_block_says_so() {
+    let database = Database::new();
+    let answer = |sql: &str| {
+        let result = database.query(sql).unwrap_or_else(|error| panic!("{sql} failed: {error}"));
+        let rows: Vec<String> = result
+            .rows()
+            .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>().join(":"))
+            .collect();
+        rows.join(" ")
+    };
+    let fixed = "columns={'a': 'INTEGER', 'b': 'INTEGER'}, auto_detect=false, header=true";
+    let long = written("strict-long.csv", "a,b\n1,2\n6,7,8\n");
+    let sql = format!("SELECT * FROM read_csv({long}, {fixed}, strict_mode=false)");
+    assert_eq!(answer(&sql), "1:2 6:7");
+    let sql = format!("SELECT * FROM read_csv({long}, {fixed}, strict_mode=false, skip=1)");
+    assert_eq!(answer(&sql), "6:7");
+    let error = database.query(&format!("SELECT * FROM read_csv({long}, {fixed})")).unwrap_err();
+    assert!(error.message().contains("* Disable the parser's strict mode"), "{error}");
+    let block = "\n  delimiter = , (Auto-Detected)\n  quote = \" (Auto-Detected)\n  escape = \" \
+                 (Auto-Detected)\n  new_line = \\n (Auto-Detected)\n  header = true (Set By \
+                 User)\n  skip_rows = 0 (Auto-Detected)\n  comment = (empty) (Auto-Detected)\n  \
+                 strict_mode = true (Auto-Detected)\n  date_format =  (Auto-Detected)\n  \
+                 timestamp_format =  (Auto-Detected)\n  null_padding = 0\n  sample_size = \
+                 20480\n  ignore_errors = false\n  all_varchar = 0\n";
+    assert!(error.message().ends_with(block), "{error}");
+    // A short row is refused all the same, without the advice to turn strict mode off.
+    let short = written("strict-short.csv", "a,b\n1,2\n3\n");
+    let sql = format!("SELECT * FROM read_csv({short}, {fixed}, strict_mode=false)");
+    let error = database.query(&sql).unwrap_err();
+    assert!(
+        error.message().starts_with(
+            "CSV Error on Line: 3\nOriginal Line: 3\nExpected Number of Columns: 2 Found: 1\n\
+             Possible fixes:\n* Enable null padding"
+        ),
+        "{error}"
+    );
+    assert!(error.message().contains("\n  strict_mode = false (Set By User)\n"), "{error}");
+    // The block under a conversion error, with the line ending the file has and what was set.
+    let text = written("strict-block.csv", "z\na,b\n1,2\n3,x\n");
+    let sql = format!(
+        "SELECT max(b) FROM read_csv({text}, types={{'b': 'INTEGER'}}, skip=1, \
+         strict_mode=false, sample_size=5000, all_varchar=true)"
+    );
+    let error = database.query(&sql).unwrap_err();
+    let block = "\n  delimiter = , (Auto-Detected)\n  quote = (empty) (Auto-Detected)\n  escape = \
+                 (empty) (Auto-Detected)\n  new_line = \\n (Auto-Detected)\n  header = true \
+                 (Auto-Detected)\n  skip_rows = 1 (Set By User)\n  comment = (empty) \
+                 (Auto-Detected)\n  strict_mode = false (Set By User)\n  date_format =  \
+                 (Auto-Detected)\n  timestamp_format =  (Auto-Detected)\n  null_padding = 0\n  \
+                 sample_size = 6144\n  ignore_errors = false\n  all_varchar = 1\n";
+    assert!(error.message().ends_with(block), "{error}");
+    let text = written("strict-crlf.csv", "a,b\r\n1,2\r\n3,x\r\n");
+    let sql = format!("SELECT max(b) FROM read_csv({text}, types={{'b': 'INTEGER'}})");
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().contains("\n  new_line = \\r\\n (Auto-Detected)\n"), "{error}");
+    let sql =
+        format!("SELECT max(b) FROM read_csv({text}, types={{'b': 'INTEGER'}}, new_line='\\r\\n')");
+    let error = database.query(&sql).unwrap_err();
+    assert!(error.message().contains("\n  new_line = \\r\\n (Set By User)\n"), "{error}");
+    for (option, message) in [
+        ("new_line='x'", "This is not accepted as a newline: x"),
+        ("new_line=NULL", "This is not accepted as a newline: "),
+        ("strict_mode=NULL", "\"strict_mode\" expects a non-null boolean value (e.g. TRUE or 1)"),
+    ] {
+        let error =
+            database.query(&format!("SELECT * FROM read_csv({long}, {option})")).unwrap_err();
+        assert_eq!(error.message(), message, "{option}");
+    }
 }
 
 #[test]

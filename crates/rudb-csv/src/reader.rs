@@ -80,6 +80,8 @@ pub struct Reader {
     /// Whether the sample had rows of more than one width, which is where this sniffer and the
     /// pin's part ways, see [`Reader::check_widths`].
     ragged: bool,
+    /// The line ending the block under an error shows, which is the call's or the first line's.
+    line_ending: &'static str,
 }
 
 impl Reader {
@@ -140,6 +142,7 @@ impl Reader {
             sampled: 0,
             empty: false,
             ragged: false,
+            line_ending: "\\n",
         };
         reader.fill(0)?;
         reader.skip_lines()?;
@@ -166,6 +169,7 @@ impl Reader {
             (quote, delimiter, given.header)
         };
         let escape = given.escape.or(quote);
+        reader.line_ending = given.new_line.unwrap_or_else(|| dialect::line_ending(&sample));
         reader.dialect = Dialect { delimiter, quote, escape, header: false };
         // The punctuation comes from the first block, as the pin's comes from its first chunk, and
         // only the rows go on to more of the file when the sample asks for more than a block held.
@@ -278,7 +282,9 @@ impl Reader {
         };
         let skipped = usize::from(header);
         let padding = self.given.null_padding;
-        let misfit = |row: &[Option<String>]| !self.given.ignore_errors && !wide(row, set, padding);
+        let strict = self.given.strict_mode != Some(false);
+        let misfit =
+            |row: &[Option<String>]| !self.given.ignore_errors && !wide(row, set, padding, strict);
         let Some((at, row)) =
             rows.iter().enumerate().skip(skipped).find(|(_, row)| misfit(row) || !fits(row))
         else {
@@ -288,21 +294,10 @@ impl Reader {
             return Ok(());
         }
         let written: Vec<&str> = row.iter().map(|cell| cell.as_deref().unwrap_or("")).collect();
-        Err(Error::invalid_input(format!(
-            "CSV Error on Line: {}\nOriginal Line: {}\nExpected Number of Columns: {set} Found: \
-             {}\nPossible fixes:\n* Disable the parser's strict mode (strict_mode=false) to allow \
-             reading rows that do not comply with the CSV standard.\n{}* Enable ignore errors \
-             (ignore_errors=true) to skip this row\n\n  file = {}\n",
-            at + 1,
-            written.join(&char::from(self.dialect.delimiter).to_string()),
-            row.len(),
-            if padding {
-                ""
-            } else {
-                "* Enable null padding (null_padding=true) to replace missing values with NULL\n"
-            },
-            self.path,
-        )))
+        let written = written.join(&char::from(self.dialect.delimiter).to_string());
+        let line = self.line + at as u64;
+        let settings = self.settings_with(header);
+        Err(wrong_width(&self.given, &written, line, set, row.len(), &settings))
     }
 
     /// How many rows the sniffer saw past the header, which is none for a file that is empty or
@@ -538,7 +533,9 @@ impl Reader {
     /// `null_padding`, and otherwise any record of the wrong width is left out under
     /// `ignore_errors` and refused without it. All of it was measured on `v2.0.0-dev84237`: under a
     /// header of `a,b`, both `3,4,,` and `3,"4",` read as `3,4`, `3,4, ` is refused for having
-    /// three columns, and `5` is refused for having one with `null_padding` off.
+    /// three columns, and `5` is refused for having one with `null_padding` off. Under
+    /// `strict_mode=false` a record with too many fields is cut down to the width of the file and
+    /// one with too few is still refused, so `6,7,8` under `a,b` reads as `6,7`.
     ///
     /// A read where nothing but the sniffer said how wide the file is, and whose sample already
     /// had rows of more than one width, still pads a short record and cuts a long one down, as
@@ -552,7 +549,8 @@ impl Reader {
         let width = self.fields.len();
         let given = &self.given;
         let loose = !given.fixed && given.types.is_none() && !given.ignore_errors;
-        let loose = loose && !given.null_padding && self.ragged;
+        let loose = loose && !given.null_padding && given.strict_mode.is_none() && self.ragged;
+        let strict = given.strict_mode != Some(false);
         let bytes = &self.buffer;
         let records = &self.records;
         let empty = |span: &Span| span.raw(bytes).is_empty();
@@ -562,7 +560,9 @@ impl Reader {
             match fields.len() {
                 found if found == width => Some(true),
                 1 if width > 1 && empty(&fields[0]) => None,
-                found if found > width => Some(loose || fields[width..].iter().all(empty)),
+                found if found > width => {
+                    Some(loose || !strict || fields[width..].iter().all(empty))
+                }
                 _ => Some(loose || self.given.null_padding),
             }
         };
@@ -591,24 +591,8 @@ impl Reader {
     }
 
     /// The pin's error for a row of `found` fields at `line` in a file of a different width.
-    ///
-    /// The advice to pad with nulls is there whenever padding is off, which was measured: a row
-    /// with too many fields gets it too, and the only thing that leaves it out is padding being on
-    /// already.
     fn wrong_width(&self, original: &str, line: u64, found: usize) -> Error {
-        let padding = if self.given.null_padding {
-            ""
-        } else {
-            "* Enable null padding (null_padding=true) to replace missing values with NULL\n"
-        };
-        Error::invalid_input(format!(
-            "CSV Error on Line: {line}\nOriginal Line: {original}\nExpected Number of Columns: {} \
-             Found: {found}\nPossible fixes:\n* Disable the parser's strict mode \
-             (strict_mode=false) to allow reading rows that do not comply with the CSV \
-             standard.\n{padding}* Enable ignore errors (ignore_errors=true) to skip this row\n{}",
-            self.fields.len(),
-            self.settings(),
-        ))
+        wrong_width(&self.given, original, line, self.fields.len(), found, &self.settings())
     }
 
     /// Splits the next chunk's worth of records into [`Self::records`] and answers how many there
@@ -710,6 +694,7 @@ impl Reader {
             sampled: self.sampled,
             empty: self.empty,
             ragged: self.ragged,
+            line_ending: self.line_ending,
         }
     }
 
@@ -805,16 +790,37 @@ impl Reader {
 
     /// The block of settings at the bottom of DuckDB's errors about a line of the file.
     fn settings(&self) -> String {
+        self.settings_with(self.dialect.header)
+    }
+
+    /// The block, for a file whose first row is a header or not as `header` says, which is the
+    /// pin's `CSVReaderOptions::ToString`.
+    ///
+    /// The comment and the two formats are never set here, and the sniffer here never steps over
+    /// lines, so those lines say what the pin's say for a file the call said nothing about.
+    fn settings_with(&self, header: bool) -> String {
+        let given = &self.given;
+        let skip = given.skip.unwrap_or(0);
+        let strict = given.strict_mode.unwrap_or(true);
         format!(
-            "\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  header = {} {}\n  \
-             sample_size = {}\n",
+            "\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  new_line = {} {}\n  \
+             header = {header} {}\n  skip_rows = {skip} {}\n  comment = (empty) (Auto-Detected)\n  \
+             strict_mode = {strict} {}\n  date_format =  (Auto-Detected)\n  timestamp_format =  \
+             (Auto-Detected)\n  null_padding = {}\n  sample_size = {}\n  ignore_errors = {}\n  \
+             all_varchar = {}\n",
             self.path,
-            Given::shown(self.given.delimiter, Some(self.dialect.delimiter)),
-            Given::shown(self.given.quote, self.dialect.quote),
-            Given::shown(self.given.escape, self.dialect.escape),
-            self.dialect.header,
-            Given::source(self.given.header.is_some()),
-            self.given.sample_shown(),
+            Given::shown(given.delimiter, Some(self.dialect.delimiter)),
+            Given::shown(given.quote, self.dialect.quote),
+            Given::shown(given.escape, self.dialect.escape),
+            self.line_ending,
+            Given::source(given.new_line.is_some()),
+            Given::source(given.header.is_some()),
+            Given::source(given.skip.is_some()),
+            Given::source(given.strict_mode.is_some()),
+            u8::from(given.null_padding),
+            given.sample_shown(),
+            given.ignore_errors,
+            u8::from(given.all_varchar),
         )
     }
 
@@ -1000,7 +1006,7 @@ impl Reader {
     /// Steps over the lines [`Given::skip`] asks for and starts the buffer where they end, so the
     /// sniffer and everything after it see the file as if it began there.
     fn skip_lines(&mut self) -> Result<()> {
-        let mut left = self.given.skip;
+        let mut left = self.given.skip.unwrap_or(0);
         while left > 0 {
             match self.buffer[self.at..].iter().position(|&byte| byte == b'\n') {
                 Some(end) => {
@@ -1240,13 +1246,46 @@ fn commonest(rows: &[Vec<Option<String>>]) -> usize {
     counts.iter().rposition(|&count| count == most && count > 0).unwrap_or(1)
 }
 
+/// The pin's error for a row of `found` fields at `line` in a file of `width` columns, over the
+/// block of settings the reader shows.
+///
+/// The advice to pad with nulls is there whenever padding is off, which was measured: a row with
+/// too many fields gets it too, and the only thing that leaves it out is padding being on already.
+/// The advice to turn strict mode off is there unless the call turned it off, which leaves the
+/// short rows as the only ones refused.
+fn wrong_width(
+    given: &Given,
+    original: &str,
+    line: u64,
+    width: usize,
+    found: usize,
+    settings: &str,
+) -> Error {
+    let strict = if given.strict_mode == Some(false) {
+        ""
+    } else {
+        "* Disable the parser's strict mode (strict_mode=false) to allow reading rows that do not \
+         comply with the CSV standard.\n"
+    };
+    let padding = if given.null_padding {
+        ""
+    } else {
+        "* Enable null padding (null_padding=true) to replace missing values with NULL\n"
+    };
+    Error::invalid_input(format!(
+        "CSV Error on Line: {line}\nOriginal Line: {original}\nExpected Number of Columns: {width} \
+         Found: {found}\nPossible fixes:\n{strict}{padding}* Enable ignore errors \
+         (ignore_errors=true) to skip this row\n{settings}"
+    ))
+}
+
 /// Whether a sampled row is as wide as `width` columns, by the rule [`Reader::check_widths`] holds
-/// the rows that are read to, with `padding` for `null_padding`.
-fn wide(row: &[Option<String>], width: usize, padding: bool) -> bool {
+/// the rows that are read to, with `padding` for `null_padding` and `strict` for `strict_mode`.
+fn wide(row: &[Option<String>], width: usize, padding: bool, strict: bool) -> bool {
     match row.len() {
         found if found == width => true,
         1 if width > 1 && row[0].is_none() => true,
-        found if found > width => row[width..].iter().all(Option::is_none),
+        found if found > width => !strict || row[width..].iter().all(Option::is_none),
         _ => padding,
     }
 }

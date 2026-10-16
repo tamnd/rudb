@@ -118,8 +118,9 @@ pub struct Given {
     /// How many lines at the front of the file are stepped over before anything looks at it, which
     /// is `skip` on a call. A line here ends at a newline whatever quotes it has in it, and the
     /// lines stepped over still count when an error names a line. Both were measured on
-    /// `v2.0.0-dev84237`, where `"x` then `y",1` read with `skip=1` starts at `y",1`.
-    pub skip: usize,
+    /// `v2.0.0-dev84237`, where `"x` then `y",1` read with `skip=1` starts at `y",1`. `None` is
+    /// none, and is told apart from `skip=0` only by the block under an error.
+    pub skip: Option<usize>,
     /// Whether the files of a read are matched by column name, each sniffed alone, with a null
     /// for a column a file does not have. That is `union_by_name` on a call.
     pub union_by_name: bool,
@@ -146,6 +147,19 @@ pub struct Given {
     /// Whether a row with too few fields is read with nulls for the rest, which is `null_padding`
     /// on a call. A row with too many is refused either way.
     pub null_padding: bool,
+    /// Whether a row with more fields than the file is refused, which is `strict_mode` on a call.
+    /// `None` is on, which the block under an error calls auto-detected.
+    ///
+    /// Off, the fields past the last column are dropped and the errors stop suggesting it.
+    /// Measured on `v2.0.0-dev84237`, where `strict_mode=false` reads `6,7,8` under `a,b` as
+    /// `6,7` and a row of one field is refused all the same.
+    pub strict_mode: Option<bool>,
+    /// The line ending the call said the file has, which is `new_line` on a call, written the way
+    /// the call writes it: `\n`, `\r` or `\r\n` with the backslashes in the text.
+    ///
+    /// Every line ending ends a line whatever this says, as the pin's scanner does. What it
+    /// changes is what the block under an error shows.
+    pub new_line: Option<&'static str>,
 }
 
 /// The types a call set for some of a file's columns, by name or by position.
@@ -219,6 +233,24 @@ impl Given {
         }
     }
 
+    /// How the call writes the line ending it says a file has, in the pin's words when it is not
+    /// one of the three.
+    ///
+    /// # Errors
+    ///
+    /// When `text` is anything but `\n`, `\r` or `\r\n` with the backslashes written out, which
+    /// is what the pin takes. A real newline is refused, as `E'\n'` is on `v2.0.0-dev84237`.
+    pub fn new_line(text: &str) -> rudb_common::Result<&'static str> {
+        match text {
+            "\\n" => Ok("\\n"),
+            "\\r" => Ok("\\r"),
+            "\\r\\n" => Ok("\\r\\n"),
+            _ => Err(rudb_common::Error::invalid_input(format!(
+                "This is not accepted as a newline: {text}"
+            ))),
+        }
+    }
+
     /// What the block calls a value the caller gave and one it worked out.
     #[must_use]
     pub const fn source(given: bool) -> &'static str {
@@ -266,6 +298,17 @@ impl Dialect {
             Some(b'\t') => "\\t".to_string(),
             Some(byte) => (byte as char).to_string(),
         }
+    }
+}
+
+/// The line ending the first line of `sample` has, written the way the block under an error writes
+/// it, which is `\n` for a sample with no line ending in it.
+#[must_use]
+pub fn line_ending(sample: &[u8]) -> &'static str {
+    match sample.iter().position(|&byte| byte == b'\n' || byte == b'\r') {
+        Some(at) if sample[at] == b'\r' && sample.get(at + 1) == Some(&b'\n') => "\\r\\n",
+        Some(at) if sample[at] == b'\r' => "\\r",
+        _ => "\\n",
     }
 }
 
@@ -370,6 +413,17 @@ mod tests {
     #[test]
     fn a_file_with_nothing_to_split_on_is_comma_separated_and_one_column() {
         assert_eq!(delimiter(b"a\nb\n", None), b',');
+    }
+
+    #[test]
+    fn the_line_ending_is_the_one_the_first_line_has() {
+        assert_eq!(line_ending(b"a,b\r\n1,2\n"), "\\r\\n");
+        assert_eq!(line_ending(b"a,b\r1,2\r"), "\\r");
+        assert_eq!(line_ending(b"a,b\n1,2\r\n"), "\\n");
+        assert_eq!(line_ending(b"a,b"), "\\n");
+        assert_eq!(Given::new_line("\\r\\n").expect("takes it"), "\\r\\n");
+        let error = Given::new_line("\n").unwrap_err();
+        assert_eq!(error.message(), "This is not accepted as a newline: \n");
     }
 
     #[test]

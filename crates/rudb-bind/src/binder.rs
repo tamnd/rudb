@@ -5188,6 +5188,10 @@ impl<'a> Binder<'a> {
                 "Cannot use NULL as argument for \"{parameter}\""
             )));
         }
+        // The one the pin reads as a string before it looks at it, so a null is an empty one.
+        if value == Value::Null && *parameter == "new_line" && function.json().is_none() {
+            return Err(Error::invalid_input("This is not accepted as a newline: "));
+        }
         if value == Value::Null {
             return Err(Error::binder(null_parameter(function, parameter)));
         }
@@ -8403,7 +8407,7 @@ fn null_parameter(function: TableFunction, parameter: &str) -> String {
         return format!("Cannot use NULL as argument to key \"{parameter}\"");
     }
     match parameter {
-        "header" | "auto_detect" | "null_padding" | "ignore_errors" => {
+        "header" | "auto_detect" | "null_padding" | "ignore_errors" | "strict_mode" => {
             format!("\"{parameter}\" expects a non-null boolean value (e.g. TRUE or 1)")
         }
         "buffer_size" | "files_to_sniff" | "max_line_size" | "maximum_line_size"
