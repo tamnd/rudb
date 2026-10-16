@@ -54,7 +54,7 @@ pub fn record(
     eof: bool,
     out: &mut Vec<String>,
 ) -> Result<Option<usize>> {
-    split(bytes, from, dialect, eof, out, None)
+    split(bytes, from, dialect, eof, out, None, None)
 }
 
 /// [`record`], with whether each field was quoted put in `quoted`, one entry per field.
@@ -70,107 +70,195 @@ pub fn record_quoted(
     out: &mut Vec<String>,
     quoted: &mut Vec<bool>,
 ) -> Result<Option<usize>> {
-    split(bytes, from, dialect, eof, out, Some(quoted))
+    split(bytes, from, dialect, eof, out, Some(quoted), None)
 }
 
-fn split(
+/// What the comments a dialect has took out of the records [`record_noting`] read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Comments {
+    /// How many lines were left out whole because a comment started them.
+    pub lines: usize,
+    /// For each record a comment ended part way through, how many fields it was left with.
+    pub mids: Vec<usize>,
+}
+
+/// [`record`], with what the dialect's comment took out of the line added to `comments`, which is
+/// what the sniffer counts to decide whether a file has comments in it.
+///
+/// # Errors
+///
+/// As for [`record`].
+pub fn record_noting(
     bytes: &[u8],
     from: usize,
     dialect: Dialect,
     eof: bool,
     out: &mut Vec<String>,
-    mut quoted: Option<&mut Vec<bool>>,
+    comments: &mut Comments,
 ) -> Result<Option<usize>> {
-    if let Some(quoted) = quoted.as_deref_mut() {
-        quoted.clear();
+    split(bytes, from, dialect, eof, out, None, Some(comments))
+}
+
+/// Where the line a comment starts at `at` ends, which is where the next record starts, or `None`
+/// when the buffer ends before the line does and more bytes may follow.
+///
+/// A comment runs to the end of its line whatever is in it, quotes and delimiters included.
+fn comment_end(bytes: &[u8], at: usize, eof: bool) -> Option<usize> {
+    let end = bytes[at..].iter().position(|&byte| byte == b'\n' || byte == b'\r');
+    let Some(end) = end.map(|found| at + found) else {
+        return eof.then_some(bytes.len());
+    };
+    if bytes[end] == b'\r' {
+        return match bytes.get(end + 1) {
+            Some(b'\n') => Some(end + 2),
+            None if !eof => None,
+            _ => Some(end + 1),
+        };
     }
-    if from >= bytes.len() {
-        // No bytes left is no record, and it is not a record of one empty field. The difference
-        // matters at the end of a file, where a reader that took the second reading would hand back
-        // an empty row forever, and it matters for the last line of a file that ends in a newline,
-        // which is not a row of nothing.
-        return Ok(None);
-    }
-    let quote = dialect.quote_byte();
-    let escape = dialect.escape_byte();
-    let mut at = from;
-    let mut count = 0;
-    let mut field = Vec::new();
-    loop {
-        field.clear();
-        let opened = bytes.get(at) == Some(&quote);
-        if opened {
-            at += 1;
-            loop {
-                let Some(&byte) = bytes.get(at) else { return Ok(None) };
-                if byte == escape && escape != quote {
-                    // An escape of its own, such as the backslash the Join Order Benchmark's
-                    // files are written with, keeps whatever byte follows it, so `\"` is a quote
-                    // in the value, `\\` is one backslash and `\n` is the letter n. That last one
-                    // looks like a line break and is not one, which is DuckDB's reading.
-                    let Some(&next) = bytes.get(at + 1) else { return Ok(None) };
-                    field.push(next);
-                    at += 2;
-                    continue;
-                }
-                if byte == escape && bytes.get(at + 1) == Some(&quote) {
-                    field.push(quote);
-                    at += 2;
-                    continue;
-                }
-                if byte == quote {
-                    at += 1;
-                    break;
-                }
-                field.push(byte);
-                at += 1;
-            }
-            match bytes.get(at) {
-                None if !eof => return Ok(None),
-                None => {}
-                Some(&byte) if byte == dialect.delimiter || byte == b'\n' || byte == b'\r' => {}
-                Some(&byte) => return Err(after_quote(byte)),
-            }
-        } else {
-            while let Some(&byte) = bytes.get(at) {
-                if byte == dialect.delimiter || byte == b'\n' || byte == b'\r' {
-                    break;
-                }
-                field.push(byte);
-                at += 1;
-            }
-            if at >= bytes.len() && !eof {
-                return Ok(None);
-            }
-        }
-        place(out, count, &field);
+    Some(end + 1)
+}
+
+/// Whether a comment that starts after `field` in a record that already has `count` fields before
+/// it takes the whole record with it, which is the pin's `UnsetComment`.
+///
+/// A field of nothing but spaces before the comment drops the record, the fields before it
+/// included, so `1; #x` is no row at all. A comment right at the start of a field drops it only
+/// when it is the first one, so `#x` is a comment line and `1;#x` is a row of `1` and a null.
+fn dropped(field: &[u8], count: usize) -> bool {
+    if field.is_empty() { count == 0 } else { field.iter().all(|&byte| byte == b' ') }
+}
+
+#[allow(clippy::too_many_lines)]
+fn split(
+    bytes: &[u8],
+    mut from: usize,
+    dialect: Dialect,
+    eof: bool,
+    out: &mut Vec<String>,
+    mut quoted: Option<&mut Vec<bool>>,
+    mut comments: Option<&mut Comments>,
+) -> Result<Option<usize>> {
+    'line: loop {
         if let Some(quoted) = quoted.as_deref_mut() {
-            quoted.push(opened);
+            quoted.clear();
         }
-        count += 1;
-        match bytes.get(at) {
-            Some(&byte) if byte == dialect.delimiter => at += 1,
-            Some(b'\r') => {
+        if from >= bytes.len() {
+            // No bytes left is no record, and it is not a record of one empty field. The
+            // difference matters at the end of a file, where a reader that took the second reading
+            // would hand back an empty row forever, and it matters for the last line of a file that
+            // ends in a newline, which is not a row of nothing.
+            return Ok(None);
+        }
+        let quote = dialect.quote_byte();
+        let escape = dialect.escape_byte();
+        let mut at = from;
+        let mut count = 0;
+        let mut field = Vec::new();
+        loop {
+            field.clear();
+            let opened = bytes.get(at) == Some(&quote);
+            if opened {
                 at += 1;
-                if bytes.get(at) == Some(&b'\n') {
+                loop {
+                    let Some(&byte) = bytes.get(at) else { return Ok(None) };
+                    if byte == escape && escape != quote {
+                        // An escape of its own, such as the backslash the Join Order Benchmark's
+                        // files are written with, keeps whatever byte follows it, so `\"` is a
+                        // quote in the value, `\\` is one backslash and `\n` is the letter n. That
+                        // last one looks like a line break and is not one, which is DuckDB's
+                        // reading.
+                        let Some(&next) = bytes.get(at + 1) else { return Ok(None) };
+                        field.push(next);
+                        at += 2;
+                        continue;
+                    }
+                    if byte == escape && bytes.get(at + 1) == Some(&quote) {
+                        field.push(quote);
+                        at += 2;
+                        continue;
+                    }
+                    if byte == quote {
+                        at += 1;
+                        break;
+                    }
+                    field.push(byte);
                     at += 1;
-                } else if at >= bytes.len() && !eof {
-                    // A trailing carriage return may be the first half of a `\r\n` that has not
-                    // arrived, and guessing wrong here splits one record into two.
+                }
+                match bytes.get(at) {
+                    None if !eof => return Ok(None),
+                    None => {}
+                    Some(&byte) if byte == dialect.delimiter || byte == b'\n' || byte == b'\r' => {}
+                    Some(&byte) if Some(byte) == dialect.comment => {}
+                    Some(&byte) => return Err(after_quote(byte)),
+                }
+            } else {
+                while let Some(&byte) = bytes.get(at) {
+                    if byte == dialect.delimiter
+                        || byte == b'\n'
+                        || byte == b'\r'
+                        || Some(byte) == dialect.comment
+                    {
+                        break;
+                    }
+                    field.push(byte);
+                    at += 1;
+                }
+                if at >= bytes.len() && !eof {
                     return Ok(None);
                 }
-                break;
             }
-            Some(b'\n') => {
-                at += 1;
-                break;
+            if at < bytes.len() && Some(bytes[at]) == dialect.comment {
+                let Some(next) = comment_end(bytes, at, eof) else { return Ok(None) };
+                if !opened && dropped(&field, count) {
+                    if let Some(comments) = comments.as_deref_mut() {
+                        if count == 0 {
+                            comments.lines += 1;
+                        } else {
+                            comments.mids.push(count + 1);
+                        }
+                    }
+                    from = next;
+                    continue 'line;
+                }
+                place(out, count, &field);
+                if let Some(quoted) = quoted.as_deref_mut() {
+                    quoted.push(opened);
+                }
+                if let Some(comments) = comments.as_deref_mut() {
+                    comments.mids.push(count + 1);
+                }
+                out.truncate(count + 1);
+                return Ok(Some(next));
             }
-            Some(_) => unreachable!("a field stops at a delimiter, a line ending or the end"),
-            None => break,
+            place(out, count, &field);
+            if let Some(quoted) = quoted.as_deref_mut() {
+                quoted.push(opened);
+            }
+            count += 1;
+            match bytes.get(at) {
+                Some(&byte) if byte == dialect.delimiter => at += 1,
+                Some(b'\r') => {
+                    at += 1;
+                    if bytes.get(at) == Some(&b'\n') {
+                        at += 1;
+                    } else if at >= bytes.len() && !eof {
+                        // A trailing carriage return may be the first half of a `\r\n` that has not
+                        // arrived, and guessing wrong here splits one record into two.
+                        return Ok(None);
+                    }
+                    break;
+                }
+                Some(b'\n') => {
+                    at += 1;
+                    break;
+                }
+                Some(_) => unreachable!("a field stops at a delimiter, a line ending or the end"),
+                None => break,
+            }
         }
+        out.truncate(count);
+        return Ok(Some(at));
     }
-    out.truncate(count);
-    Ok(Some(at))
 }
 
 /// Writes the field at `at`, reusing the string that is already there.
@@ -451,7 +539,9 @@ pub fn records(
     let escape = dialect.escape_byte();
     let structural = |byte: u8| byte == quote || byte == b'\n' || byte == b'\r';
     let masked = escape == quote || (!structural(escape) && escape != delimiter);
-    if masked && !structural(delimiter) {
+    // A comment can start anywhere a field can and hides everything up to the end of its line,
+    // which the masks have no way to see, so a dialect with one is read a byte at a time.
+    if masked && !structural(delimiter) && dialect.comment.is_none() {
         blocks(bytes, from, dialect, eof, limit, out)
     } else {
         let mut at = from;
@@ -690,100 +780,123 @@ fn enclosed(field: &[u8], quote: u8, escape: u8) -> Option<bool> {
 ///
 /// The same loop step for step, with the pushes of bytes taken out and a range recorded in their
 /// place. On `None` or an error nothing this call added is left in `out`.
+#[allow(clippy::too_many_lines)]
 fn spans(
     bytes: &[u8],
-    from: usize,
+    mut from: usize,
     dialect: Dialect,
     eof: bool,
     out: &mut Vec<Span>,
 ) -> Result<Option<usize>> {
-    if from >= bytes.len() {
-        return Ok(None);
-    }
     let mark = out.len();
-    let quote = dialect.quote_byte();
-    let escape = dialect.escape_byte();
-    let mut at = from;
-    loop {
-        let span;
-        if bytes.get(at) == Some(&quote) {
-            at += 1;
-            let start = at;
-            let mut escaped = false;
-            loop {
-                let Some(&byte) = bytes.get(at) else {
-                    out.truncate(mark);
-                    return Ok(None);
-                };
-                if byte == escape && escape != quote {
-                    if at + 1 >= bytes.len() {
+    'line: loop {
+        if from >= bytes.len() {
+            return Ok(None);
+        }
+        let quote = dialect.quote_byte();
+        let escape = dialect.escape_byte();
+        let mut at = from;
+        loop {
+            let span;
+            let opened = bytes.get(at) == Some(&quote);
+            if opened {
+                at += 1;
+                let start = at;
+                let mut escaped = false;
+                loop {
+                    let Some(&byte) = bytes.get(at) else {
+                        out.truncate(mark);
+                        return Ok(None);
+                    };
+                    if byte == escape && escape != quote {
+                        if at + 1 >= bytes.len() {
+                            out.truncate(mark);
+                            return Ok(None);
+                        }
+                        escaped = true;
+                        at += 2;
+                        continue;
+                    }
+                    if byte == escape && bytes.get(at + 1) == Some(&quote) {
+                        escaped = true;
+                        at += 2;
+                        continue;
+                    }
+                    if byte == quote {
+                        break;
+                    }
+                    at += 1;
+                }
+                span = Span::new(start, at, escaped);
+                at += 1;
+                match bytes.get(at) {
+                    None if !eof => {
                         out.truncate(mark);
                         return Ok(None);
                     }
-                    escaped = true;
-                    at += 2;
-                    continue;
+                    None => {}
+                    Some(&byte) if byte == dialect.delimiter || byte == b'\n' || byte == b'\r' => {}
+                    Some(&byte) if Some(byte) == dialect.comment => {}
+                    Some(&byte) => {
+                        out.truncate(mark);
+                        return Err(after_quote(byte));
+                    }
                 }
-                if byte == escape && bytes.get(at + 1) == Some(&quote) {
-                    escaped = true;
-                    at += 2;
-                    continue;
-                }
-                if byte == quote {
-                    break;
-                }
-                at += 1;
-            }
-            span = Span::new(start, at, escaped);
-            at += 1;
-            match bytes.get(at) {
-                None if !eof => {
-                    out.truncate(mark);
-                    return Ok(None);
-                }
-                None => {}
-                Some(&byte) if byte == dialect.delimiter || byte == b'\n' || byte == b'\r' => {}
-                Some(&byte) => {
-                    out.truncate(mark);
-                    return Err(after_quote(byte));
-                }
-            }
-        } else {
-            let start = at;
-            while let Some(&byte) = bytes.get(at) {
-                if byte == dialect.delimiter || byte == b'\n' || byte == b'\r' {
-                    break;
-                }
-                at += 1;
-            }
-            if at >= bytes.len() && !eof {
-                out.truncate(mark);
-                return Ok(None);
-            }
-            span = Span::new(start, at, false);
-        }
-        out.push(span);
-        match bytes.get(at) {
-            Some(&byte) if byte == dialect.delimiter => at += 1,
-            Some(b'\r') => {
-                at += 1;
-                if bytes.get(at) == Some(&b'\n') {
+            } else {
+                let start = at;
+                while let Some(&byte) = bytes.get(at) {
+                    if byte == dialect.delimiter
+                        || byte == b'\n'
+                        || byte == b'\r'
+                        || Some(byte) == dialect.comment
+                    {
+                        break;
+                    }
                     at += 1;
-                } else if at >= bytes.len() && !eof {
+                }
+                if at >= bytes.len() && !eof {
                     out.truncate(mark);
                     return Ok(None);
                 }
-                break;
+                span = Span::new(start, at, false);
             }
-            Some(b'\n') => {
-                at += 1;
-                break;
+            if at < bytes.len() && Some(bytes[at]) == dialect.comment {
+                let Some(next) = comment_end(bytes, at, eof) else {
+                    out.truncate(mark);
+                    return Ok(None);
+                };
+                let count = out.len() - mark;
+                if !opened && dropped(span.raw(bytes), count) {
+                    out.truncate(mark);
+                    from = next;
+                    continue 'line;
+                }
+                out.push(span);
+                return Ok(Some(next));
             }
-            Some(_) => unreachable!("a field stops at a delimiter, a line ending or the end"),
-            None => break,
+            out.push(span);
+            match bytes.get(at) {
+                Some(&byte) if byte == dialect.delimiter => at += 1,
+                Some(b'\r') => {
+                    at += 1;
+                    if bytes.get(at) == Some(&b'\n') {
+                        at += 1;
+                    } else if at >= bytes.len() && !eof {
+                        out.truncate(mark);
+                        return Ok(None);
+                    }
+                    break;
+                }
+                Some(b'\n') => {
+                    at += 1;
+                    break;
+                }
+                Some(_) => unreachable!("a field stops at a delimiter, a line ending or the end"),
+                None => break,
+            }
         }
+        return Ok(Some(at));
     }
-    Ok(Some(at))
 }
 
 #[cfg(test)]
@@ -805,7 +918,13 @@ mod tests {
     }
 
     fn comma() -> Dialect {
-        Dialect { delimiter: b',', quote: Some(b'"'), escape: Some(b'"'), header: true }
+        Dialect {
+            delimiter: b',',
+            quote: Some(b'"'),
+            escape: Some(b'"'),
+            header: true,
+            comment: None,
+        }
     }
 
     #[test]
@@ -883,6 +1002,46 @@ mod tests {
         // A doubled quote is not an escaped quote any more once the escape is something else.
         let mut fields = Vec::new();
         assert!(record(b"\"a\"\"b\"\n", 0, backslash, true, &mut fields).is_err());
+    }
+
+    /// The records of `bytes` under a comment of `#`, and what the comments in it came to.
+    fn noted(bytes: &[u8], delimiter: u8) -> (Vec<Vec<String>>, Comments) {
+        let dialect = Dialect { delimiter, comment: Some(b'#'), ..comma() };
+        let (mut rows, mut fields, mut comments) = (Vec::new(), Vec::new(), Comments::default());
+        let mut at = 0;
+        while let Some(next) =
+            record_noting(bytes, at, dialect, true, &mut fields, &mut comments).expect("splits")
+        {
+            rows.push(fields.clone());
+            at = next;
+        }
+        (rows, comments)
+    }
+
+    #[test]
+    fn a_comment_line_is_left_out_and_counted() {
+        let (rows, comments) = noted(b"a,b\n# c\n1,2\n#end", b',');
+        assert_eq!(rows, [["a", "b"], ["1", "2"]]);
+        assert_eq!(comments, Comments { lines: 2, mids: Vec::new() });
+        // Spaces in front of it are still a comment line.
+        assert_eq!(noted(b"  #x\na,b\n", b',').0, [["a", "b"]]);
+    }
+
+    #[test]
+    fn a_comment_part_way_through_ends_the_record_where_it_starts() {
+        let (rows, comments) = noted(b"1;#x\n1;3   #\n\"7\"#x\n2;3# \n", b';');
+        assert_eq!(rows, [vec!["1", ""], vec!["1", "3   "], vec!["7"], vec!["2", "3"]]);
+        assert_eq!(comments, Comments { lines: 0, mids: vec![2, 2, 1, 2] });
+        // Except after a field of only spaces, which leaves the whole record out.
+        let (rows, comments) = noted(b"1; #x\n2;3\n", b';');
+        assert_eq!(rows, [["2", "3"]]);
+        assert_eq!(comments, Comments { lines: 0, mids: vec![2] });
+    }
+
+    #[test]
+    fn a_comment_byte_in_quotes_or_with_no_comment_set_is_a_byte() {
+        assert_eq!(noted(b"\"a#b\",c\n", b',').0, [["a#b", "c"]]);
+        assert_eq!(split(b"a#b,#\n", comma()), [["a#b", "#"]]);
     }
 }
 
@@ -985,15 +1144,21 @@ mod agree {
         }
     }
 
-    fn dialects() -> [Dialect; 5] {
-        let comma =
-            Dialect { delimiter: b',', quote: Some(b'"'), escape: Some(b'"'), header: false };
+    fn dialects() -> [Dialect; 6] {
+        let comma = Dialect {
+            delimiter: b',',
+            quote: Some(b'"'),
+            escape: Some(b'"'),
+            header: false,
+            comment: None,
+        };
         [
             comma,
             Dialect { quote: None, escape: None, ..comma },
             Dialect { delimiter: b'|', ..comma },
             Dialect { delimiter: b'\t', quote: Some(b'\''), escape: Some(b'\''), ..comma },
             Dialect { escape: Some(b'\\'), ..comma },
+            Dialect { comment: Some(b'#'), ..comma },
         ]
     }
 
@@ -1032,6 +1197,9 @@ mod agree {
             format!("{long},\"a\nb\",c\n{long}\r\n\"{long}\"\"{long}\",d\n").into_bytes(),
             format!("{long}ab\r\n{long}abc\r\n").into_bytes(),
             format!("\"{long}\"\"\",\"\n\"\n{long},x\"\n").into_bytes(),
+            b"a,b\n# c\n1,2\n#end".to_vec(),
+            b"#\r\n#\r1,#x\r\n2, #y\n\"#\"#,z\n  #\n3,4#".to_vec(),
+            format!("{long},#{long}\n#{long}\n{long}\n").into_bytes(),
         ];
         // Backslash escapes on and either side of a block edge, a run of three among them.
         for pad in 58..70 {
@@ -1065,7 +1233,7 @@ mod agree {
 
     /// A file that is mostly a CSV file, with the kinds of damage real ones have.
     fn generate(rng: &mut Rng) -> Vec<u8> {
-        const PIECES: [&[u8]; 20] = [
+        const PIECES: [&[u8]; 21] = [
             b"a",
             b"1",
             b"-2.5",
@@ -1086,6 +1254,7 @@ mod agree {
             b"2020-01-02",
             b"",
             b"0123456789abcdef",
+            b"#",
         ];
         let mut out = Vec::new();
         let rows = rng.below(40);

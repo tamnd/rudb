@@ -80,6 +80,17 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
             }
             ("quote", Value::Varchar(text)) => given.quote = Some(one_byte(name, text)?),
             ("escape", Value::Varchar(text)) => given.escape = Some(one_byte(name, text)?),
+            ("comment", Value::Varchar(text)) => {
+                given.comment = Some(match *text.as_bytes() {
+                    [] => None,
+                    [byte] => Some(byte),
+                    _ => {
+                        return Err(Error::invalid_input(
+                            "The comment option cannot exceed a size of 1 byte.",
+                        ));
+                    }
+                });
+            }
             ("nullstr", Value::Varchar(text)) => given.nulls = Some(vec![text.clone()]),
             ("nullstr", Value::List { values, .. }) => given.nulls = Some(strings(name, values)?),
             ("names" | "column_names", Value::List { values, .. }) => {
@@ -177,6 +188,20 @@ pub fn csv_given(options: &[(&str, Value)]) -> Result<Given> {
     let named = options.iter().any(|(name, _)| matches!(*name, "names" | "column_names"));
     if named && options.iter().any(|(name, _)| *name == "columns") {
         return Err(Error::binder("read_csv column_names/names can only be supplied once"));
+    }
+    // The pin holds a comment apart from the punctuation the call set, though not from what it
+    // would have sniffed, so a comment of a double quote is fine unless the call set that quote.
+    if let Some(Some(comment)) = given.comment {
+        if given.delimiter == Some(comment) {
+            return Err(Error::binder(
+                "COMMENT must not appear in the DELIMITER specification and vice versa",
+            ));
+        }
+        if given.quote == Some(comment) {
+            return Err(Error::binder(
+                "COMMENT must not appear in the QUOTE specification and vice versa",
+            ));
+        }
     }
     // A buffer is where a line has to fit, so it is the longest line unless the call said, and the
     // call cannot say a longer one. The pin refuses that one either way round.
@@ -848,6 +873,24 @@ pub fn union_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_comment_is_one_byte_or_none_and_is_not_the_delimiter_or_the_quote() {
+        let text = |text: &str| Value::Varchar(text.to_string());
+        let given = csv_given(&[("comment", text("#"))]).expect("one byte");
+        assert_eq!(given.comment, Some(Some(b'#')));
+        let given = csv_given(&[("comment", text(""))]).expect("no comment");
+        assert_eq!(given.comment, Some(None));
+        let error = csv_given(&[("comment", text("##"))]).unwrap_err();
+        assert_eq!(error.message(), "The comment option cannot exceed a size of 1 byte.");
+        let error = csv_given(&[("comment", text(",")), ("delim", text(","))]).unwrap_err();
+        assert!(error.message().contains("in the DELIMITER specification"), "{error}");
+        let error = csv_given(&[("quote", text("'")), ("comment", text("'"))]).unwrap_err();
+        assert!(error.message().contains("in the QUOTE specification"), "{error}");
+        // Only against what the call set, so a double quote is a comment like any other.
+        let given = csv_given(&[("comment", text("\""))]).expect("a quote nobody set");
+        assert_eq!(given.comment, Some(Some(b'"')));
+    }
 
     #[test]
     fn a_file_that_is_not_there_is_duckdbs_own_message() {

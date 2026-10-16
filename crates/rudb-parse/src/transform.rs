@@ -3222,7 +3222,13 @@ impl<'a> Transform<'a> {
             } else if let Some(list) = listed {
                 return self.unsupported(list);
             } else {
-                copy_parameter(&name)?
+                let parameter = copy_parameter(&name)?;
+                if parameter == "comment" && value.is_none() {
+                    return Err(Error::invalid_input(
+                        "Copy option \"comment\" requires an argument of type VARCHAR",
+                    ));
+                }
+                parameter
             };
             let value = value.unwrap_or_else(|| {
                 self.push(Expr::Literal { kind: LiteralKind::True, text: NONE })
@@ -7467,9 +7473,9 @@ fn copy_parameter(name: &str) -> Result<&'static str> {
         "allow_quoted_nulls" => "allow_quoted_nulls",
         "force_not_null" => "force_not_null",
         "parallel" => "parallel",
-        "all_varchar" | "auto_detect" | "columns" | "comment" | "compression"
-        | "decimal_separator" | "encoding" | "force_quote" | "max_line_size" | "names"
-        | "types" | "dtypes" => {
+        "comment" => "comment",
+        "all_varchar" | "auto_detect" | "columns" | "compression" | "decimal_separator"
+        | "encoding" | "force_quote" | "max_line_size" | "names" | "types" | "dtypes" => {
             return Err(Error::not_implemented(format!(
                 "COPY FROM with the option {name} is not supported yet"
             )));
@@ -8830,10 +8836,17 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_comment_needs_its_byte() {
+        assert!(parse_ast("COPY t FROM 'in.csv' (COMMENT '#')").is_ok());
+        let error = parse_ast("COPY t FROM 'in.csv' (COMMENT)").unwrap_err().to_string();
+        assert!(error.contains("Copy option \"comment\" requires an argument"), "{error}");
+    }
+
+    #[test]
     fn a_copy_this_does_not_read_is_refused_by_name() {
         for (query, message) in [
             ("COPY t FROM 'in.csv' (FOO 1)", "Unrecognized option \"foo\" for csv"),
-            ("COPY t FROM 'in.csv' (COMMENT '#')", "the option comment is not supported yet"),
+            ("COPY t FROM 'in.csv' (ENCODING 'utf-8')", "the option encoding is not supported yet"),
             ("COPY t FROM 'in.json' (FORMAT xml)", "FORMAT xml is not supported yet"),
             (
                 "COPY t FROM 'in.json' (FILENAME true)",

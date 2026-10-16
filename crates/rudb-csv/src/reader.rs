@@ -155,29 +155,37 @@ impl Reader {
         reader.skip_lines()?;
         let sample = reader.buffer.clone();
         let given = &reader.given;
-        let (quote, delimiter, told) = if given.fixed {
+        let (quote, delimiter, comment, told) = if given.fixed {
             (
                 given.quote.or(Some(b'"')),
                 given.delimiter.unwrap_or(b','),
+                given.comment.flatten(),
                 given.header.or(Some(false)),
             )
         } else {
             let quote = given.quote.or_else(|| dialect::quote(&sample));
-            let delimiter = match given.delimiter {
-                Some(byte) => byte,
+            let comments = match given.comment {
+                Some(comment) => &[comment][..],
+                None => &dialect::COMMENTS[..],
+            };
+            let (delimiter, comment) = match given.delimiter {
+                Some(byte) => {
+                    let found = dialect::delimiter_with(&sample, quote, comments, byte);
+                    (byte, found)
+                }
                 None => given
                     .types
                     .as_ref()
                     .map(Vec::len)
                     .or(given.width)
-                    .and_then(|width| dialect::delimiter_of_width(&sample, quote, width))
-                    .unwrap_or_else(|| dialect::delimiter(&sample, quote)),
+                    .and_then(|width| dialect::delimiter_of_width(&sample, quote, comments, width))
+                    .unwrap_or_else(|| dialect::delimiter(&sample, quote, comments)),
             };
-            (quote, delimiter, given.header)
+            (quote, delimiter, comment, given.header)
         };
         let escape = given.escape.or(quote);
         reader.line_ending = given.new_line.unwrap_or_else(|| dialect::line_ending(&sample));
-        reader.dialect = Dialect { delimiter, quote, escape, header: false };
+        reader.dialect = Dialect { delimiter, quote, escape, header: false, comment };
         // The punctuation comes from the first block, as the pin's comes from its first chunk, and
         // only the rows go on to more of the file when the sample asks for more than a block held.
         // A block that came back short was the end of the file, which is nearly every file, so
@@ -823,16 +831,16 @@ impl Reader {
     /// The block, for a file whose first row is a header or not as `header` says, which is the
     /// pin's `CSVReaderOptions::ToString`.
     ///
-    /// The comment is never set here, and the sniffer here never steps over lines, so those lines
-    /// say what the pin's say for a file the call said nothing about. A format is the one the
-    /// dates or timestamps are read with, which is empty when they are read with the cast.
+    /// The sniffer here never steps over lines, so that line says what the pin's says for a file
+    /// the call said nothing about. A format is the one the dates or timestamps are read with,
+    /// which is empty when they are read with the cast.
     fn settings_with(&self, header: bool) -> String {
         let given = &self.given;
         let skip = given.skip.unwrap_or(0);
         let strict = given.strict_mode.unwrap_or(true);
         format!(
             "\n  file = {}\n  delimiter = {}\n  quote = {}\n  escape = {}\n  new_line = {} {}\n  \
-             header = {header} {}\n  skip_rows = {skip} {}\n  comment = (empty) (Auto-Detected)\n  \
+             header = {header} {}\n  skip_rows = {skip} {}\n  comment = {} {}\n  \
              strict_mode = {strict} {}\n  date_format = {} {}\n  timestamp_format = {} {}\n  \
              null_padding = {}\n  sample_size = {}\n  ignore_errors = {}\n  all_varchar = {}\n",
             self.path,
@@ -843,6 +851,8 @@ impl Reader {
             Given::source(given.new_line.is_some()),
             Given::source(given.header.is_some()),
             Given::source(given.skip.is_some()),
+            Dialect::shown(self.dialect.comment),
+            Given::source(given.comment.is_some()),
             Given::source(given.strict_mode.is_some()),
             shown(self.clocks.date.as_ref()),
             Given::source(given.date_format.is_some()),
@@ -1479,6 +1489,21 @@ mod tests {
             all(&mut reader),
             [vec![Value::TimestampTz(day + 8 * hour)], vec![Value::TimestampTz(day + 10 * hour)]]
         );
+    }
+
+    #[test]
+    fn a_sniffed_comment_leaves_its_lines_and_the_ends_of_lines_out() {
+        let mut reader = read("a,b\n# c\n1,2# three\n#\n3,#4\n");
+        assert_eq!(reader.dialect().comment, Some(b'#'));
+        assert_eq!(
+            all(&mut reader),
+            [vec![Value::BigInt(1), Value::BigInt(2)], vec![Value::BigInt(3), Value::Null]]
+        );
+        // A call that says there is no comment reads the `#` as data.
+        let given = Given { comment: Some(None), header: Some(true), ..Given::default() };
+        let reader = read_with("a\n#1\n2\n", given);
+        assert_eq!(reader.dialect().comment, None);
+        assert_eq!(names_and_types(&reader), [("a".to_string(), "VARCHAR".into())]);
     }
 
     #[test]
