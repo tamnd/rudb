@@ -193,6 +193,22 @@ fn typeof_is_the_name_of_a_type_rather_than_a_call() {
     assert!(text.contains("'VARCHAR'::VARCHAR"), "{text}");
 }
 
+/// A `typeof` that is grouped by is the group, by position, by alias and written out again, which
+/// the pin binds all three of.
+#[test]
+fn a_typeof_that_is_grouped_by_is_the_group() {
+    for sql in [
+        "SELECT typeof(url), count(*) FROM hits GROUP BY 1",
+        "SELECT typeof(url) AS k, count(*) FROM hits GROUP BY k",
+        "SELECT typeof(url), count(*) FROM hits GROUP BY typeof(url)",
+    ] {
+        let text = plan(sql);
+        assert!(text.contains("'VARCHAR'::VARCHAR"), "{sql}: {text}");
+    }
+    let message = failure("SELECT typeof(url), count(*) FROM hits GROUP BY typeof(counter)");
+    assert!(message.contains("must appear in the GROUP BY clause"), "{message}");
+}
+
 #[test]
 fn group_by_can_name_a_target_by_position_or_by_alias() {
     let by_position = plan("SELECT url, count(*) FROM hits GROUP BY 1");

@@ -159,6 +159,15 @@ impl Binder<'_> {
             ast::Expr::Literal { kind, text } => self.bind_literal(ast, kind, text),
             ast::Expr::Unary { op, operand } => self.bind_unary(ast, op, operand, scope),
             ast::Expr::Binary { op, left, right } => self.bind_binary(ast, op, left, right, scope),
+            // `s.upper()` is `upper(s)` when `s` is not a schema or a database, which is the pin's
+            // reading of it once no function of that name is found under the qualifier.
+            ast::Expr::Function { name, .. }
+                if name.len > 1
+                    && self.semantics.function_rules() == FunctionRules::Pin
+                    && self.receiver(ast, name) =>
+            {
+                self.bind_expr(&method_call(ast, expr), expr, scope)
+            }
             // A set-returning function in the select list of a PostgreSQL session makes a row per
             // value. See `Binder::bind_series`.
             ast::Expr::Function { name, args, distinct: false, filter }
@@ -1987,6 +1996,28 @@ impl Binder<'_> {
         if negated { self.call("not", vec![matched]) } else { Ok(matched) }
     }
 
+    /// Whether the qualifier of a call such as `s.upper()` or `t.s.upper()` is not a schema or a
+    /// database the function is looked for in, which makes it the column the call is made on.
+    ///
+    /// The pin does not ask whether the column is there, so `nope.upper()` is a column that is not
+    /// found rather than a schema that is not, and a struct field is a column as well, so
+    /// `s.a.upper()` is `upper(s.a)`. The schemas of the system database are left as qualifiers,
+    /// because the pin keeps some functions in `pg_catalog` and reads `pg_catalog.upper()` as a
+    /// column, and which are kept there is not something this binder knows.
+    fn receiver(&self, ast: &Ast, name: ast::Slice) -> bool {
+        let parts: Vec<&str> = ast.name(name).collect();
+        let catalog = self.catalog();
+        match &parts[..parts.len() - 1] {
+            [one] => {
+                catalog.attached(one).is_none()
+                    && !catalog.has_schema(catalog.default_catalog(), one)
+                    && !catalog.has_schema("system", one)
+            }
+            [database, schema] => !catalog.has_schema(database, schema),
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bind_call(
         &mut self,
@@ -2249,10 +2280,26 @@ impl Binder<'_> {
         // is then dropped: upstream refuses `SELECT typeof(x), count(*) FROM t` for the same reason
         // it refuses a bare `x` there, even though neither of them reads a value. Any other number
         // of arguments falls through to the ordinary path and gets the arity error from the table.
+        //
+        // A `typeof` that is itself grouped by is the group, which the pin finds by comparing the
+        // two as written, so `SELECT typeof(b), count(*) FROM t GROUP BY 1` binds.
         if rudb_catalog::same_name(&written, "typeof") && bound.len() == 1 {
-            self.over_aggregate(bound[0], scope)?;
+            if let Err(error) = self.over_aggregate(bound[0], scope) {
+                let groups = self.aggregation.as_ref().map(|found| found.groups.clone());
+                let typeofs = self.typeofs.clone();
+                let grouped = groups.unwrap_or_default().into_iter().find(|&group| {
+                    typeofs
+                        .iter()
+                        .any(|&(answer, of)| answer == group && self.same_expr(of, bound[0]))
+                });
+                if grouped.is_none() {
+                    return Err(error);
+                }
+            }
             let named = self.plan().expr_type(bound[0]).to_string();
-            return Ok(self.add_constant(Value::Varchar(named)));
+            let answer = self.add_constant(Value::Varchar(named));
+            self.typeofs.push((answer, bound[0]));
+            return Ok(answer);
         }
         // `can_cast_implicitly` is answered from the two types the same way, which is what the pin
         // does too. A null on either side is answered by the same rule, since a null becomes
@@ -6592,6 +6639,27 @@ pub(crate) fn postgres_oid(ty: &LogicalType) -> Option<u32> {
 fn reads_string(oid: u32) -> bool {
     rudb_pgtypes::has_plain_input(oid)
         || matches!(oid, rudb_pgtypes::oid::JSON | rudb_pgtypes::oid::JSONB)
+}
+
+/// A copy of `ast` with the call at `call`, written `x.f(a)`, rewritten as `f(x, a)`.
+///
+/// The copy keeps every index the original has and only adds to them, so the call and everything
+/// else in the statement mean the same thing in both.
+fn method_call(ast: &Ast, call: ast::ExprRef) -> Ast {
+    let mut copy = ast.clone();
+    let ast::Expr::Function { name, args, distinct, filter } = ast.expr(call) else {
+        return copy;
+    };
+    copy.exprs
+        .push(ast::Expr::Column { name: ast::Slice { start: name.start, len: name.len - 1 } });
+    copy.expr_spans.push(ast.expr_span(call));
+    let start = copy.expr_lists.len() as u32;
+    copy.expr_lists.push((copy.exprs.len() - 1) as ast::ExprRef);
+    copy.expr_lists.extend_from_slice(ast.expr_list(args));
+    let args = ast::Slice { start, len: args.len + 1 };
+    let name = ast::Slice { start: name.start + name.len - 1, len: 1 };
+    copy.exprs[call as usize] = ast::Expr::Function { name, args, distinct, filter };
+    copy
 }
 
 #[cfg(test)]
