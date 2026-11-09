@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: cargo fmt
         run: cargo fmt --all --check
       # spec/04-architecture.md section 4.2 gives every crate a rank and lets it depend only on
@@ -114,7 +114,7 @@ jobs:
       RUSTFLAGS: -D warnings ${{ matrix.cpu }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: ${{ matrix.profile }}
       - name: cargo build
@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       # Every crate is published, so every crate's documentation has to build. A broken intra-doc
       # link is a broken link on docs.rs.
       - name: cargo doc
@@ -160,7 +160,7 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - name: install
         run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: msrv
       # An embedded database that needs last week's stable Rust is a database people cannot embed,
@@ -175,7 +175,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       # spec/05-storage-format.md requires that writing the same data twice produces the same
       # bytes, because a format whose output depends on hash iteration order cannot be compared,
       # cached or verified. There is no writer yet, so this checks the property one level down,
@@ -197,7 +197,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: bench
       # The task rebuilds itself under the bench profile before it measures anything, so this also
@@ -236,7 +236,7 @@ jobs:
         with:
           repository: tamnd/rudb-compat
           path: rudb-compat
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: rudb
           key: conform
@@ -250,7 +250,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: taiki-e/install-action@v2.87.9
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: cargo-deny
       # Licenses, advisories, banned crates and unknown registries, all configured in deny.toml
