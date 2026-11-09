@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - name: install nightly
         run: rustup toolchain install nightly --profile minimal --component rust-src
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: san-${{ matrix.san }}
       # The unsafe in this workspace is in four crates and it is all of the kind sanitizers find:
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - name: install nightly with miri
         run: rustup toolchain install nightly --profile minimal --component miri
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: miri
       # Unit tests only. The integration tests open database files and spawn the shell, and Miri
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: taiki-e/install-action@v2.87.9
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: cargo-deny
       # The per-commit job checks the advisory database as it stood when the commit landed. This
@@ -102,7 +102,7 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, windows-2025]
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: nightly-release
       - run: cargo test --workspace --all-features --release
@@ -120,7 +120,7 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
         with:
           key: grammar-upstream
       - name: refetch at the recorded ref
